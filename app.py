@@ -1,6 +1,5 @@
 # ============================================================
-#  នំប៉ាវហុងកុង Supply Chain Hub  -  v3: fast, secure, self-healing
-#  Run with:  py watchdog_bot.py      (or:  py -m streamlit run app.py)
+#  នំប៉ាវហុងកុង Supply Chain Hub  -  CLOUD VERSION (WITH V3 FEATURES)
 # ============================================================
 import streamlit as st
 import pandas as pd
@@ -8,73 +7,46 @@ import os
 import io
 import re
 import csv
-import glob
 import time
-import pickle
-import shutil
+import dropbox
 import hmac
-import difflib
-import tempfile
-import warnings
 import traceback
-import threading
-import contextlib
-import secrets as pysecrets
-from collections import Counter
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
-if not hasattr(st, "fragment"):            # very old Streamlit: run everything normally
+if not hasattr(st, "fragment"):
     def _fragment_shim(func=None, **kwargs):
         return func if func is not None else (lambda f: f)
     st.fragment = _fragment_shim
 
-warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
-warnings.filterwarnings("ignore", message=".*Could not infer format.*")
-warnings.filterwarnings("ignore", message=".*Parsing dates.*")
-
 # ==========================================
-# CONFIGURATION
+# SECRETS & CONFIGURATION
 # ==========================================
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(CURRENT_DIR, "daily_delivery_expenses.csv")
-PACKING_FILE = os.path.join(CURRENT_DIR, "daily_packing_progress.csv")
-BACKUP_DIR = os.path.join(CURRENT_DIR, "backups")
-BOT_LOG_FILE = os.path.join(CURRENT_DIR, "bot_log.csv")
-AUDIT_FILE = os.path.join(CURRENT_DIR, "audit_log.csv")
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache")       # outside Dropbox = faster
-CODES_DIR = os.path.join(os.path.expanduser("~"), ".hk_supply_hub")          # access codes live OUTSIDE Dropbox
+def get_secret(key, default=""):
+    try: return st.secrets[key]
+    except Exception: return default
 
-# Excel journal. The bot tries EXCEL_PATTERN first; if nothing matches it switches to
-# EXCEL_FALLBACK_PATTERN by itself. To force one exact file: EXCEL_OVERRIDE = "name.xlsx"
-EXCEL_PATTERN = "*conflicted copy*.xlsx"
-EXCEL_FALLBACK_PATTERN = "*Sale_Journal*.xlsx"
-EXCEL_OVERRIDE = ""
+DBX_APP_KEY = get_secret("DROPBOX_APP_KEY")
+DBX_APP_SECRET = get_secret("DROPBOX_APP_SECRET")
+DBX_REFRESH_TOKEN = get_secret("DROPBOX_REFRESH_TOKEN")
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "hk2026")
+APP_PASSWORD = get_secret("APP_PASSWORD", "staff2026")  # Using the new v3 password name
+TEAM_PASSWORD = get_secret("TEAM_PASSWORD", "staff2026") # Fallback just in case
+
+# Dropbox paths
+DBX_EXCEL_PATH = "/dropbox/4- Sale Jounal/10_Sale_Journal_OCT_2026.xlsx"
+DBX_DATA_PATH = "/dropbox/4- Sale Jounal/daily_delivery_expenses.csv"
+DBX_PACKING_PATH = "/dropbox/4- Sale Jounal/daily_packing_progress.csv"
 
 SHEET_NAME = "Master List"
 JOURNAL_SHEET = "DAILY SALE JOUNAL"
 COLUMN_NAME = "Customer Name"
 JOURNAL_HEADER_TEXT = "ឈ្មោះអតិថិជន"
-JOURNAL_CASES_HEADER = "កេស"           # journal column: cases ordered
-JOURNAL_INVOICE_HEADER = "វិក្កយប័ត្រ"   # journal column: invoice number
-JOURNAL_REMARK_HEADER = "ចំណាំ"          # journal column: remark / note
-INVOICE_PREFIX = "NP"                  # if the invoice column is empty, the first cell starting with this is used
-URGENT_WORDS = ["ប្រញាប់", "URGENT"]    # a remark containing one of these gets a 🔥
-SNAPSHOT_VERSION = 3                   # change this number to force the journal to be re-read
+JOURNAL_CASES_HEADER = "កេស"          
+JOURNAL_INVOICE_HEADER = "វិក្កយបត្រ"
 
 TZ = ZoneInfo("Asia/Phnom_Penh")
-DAYFIRST = True                        # only used for ambiguous TEXT dates with no other hint
-
-BOT_INTERVAL_MIN = 30                  # the bot checks everything by itself every 30 minutes
-LIVE_REFRESH_SECONDS = 20              # dashboard "Live" refresh
-
-# --- security ---
-LOGIN_TTL_HOURS = 12                   # automatic log-out after this many hours
-MAX_FAILS = 5                          # wrong codes before a temporary lock-out
-LOCKOUT_MIN = 5                        # lock-out length (minutes)
-MAX_CASES = 10000
-MAX_RIEL = 50_000_000
-MAX_TEXT = 200
+DAYFIRST = True                        
 
 LOCAL_DRIVERS = ["ងិន វុទ្ធា", "អួន តួ"]
 OPS_STAFF = ["ឆែម សំណុក", "សាយ ប៊ុនលី", "ប៉ៅ រីណា", "ពេជ រដ្ឋា", "រ៉ូ សុវណ្ណាឌែន", "ហេង រតនា", "កង សៀន", "ណាត ផានិត"]
@@ -87,65 +59,107 @@ DISPATCH_NUM_COLS = ["Cases", "Phnom_Penh_Expense", "Taxi_Expense"]
 PACKING_COLS = ["Date", "Prepared_By", "Customer", "Cases_Packed", "Status"]
 PACKING_NUM_COLS = ["Cases_Packed"]
 NUM_COLS_ALL = set(DISPATCH_NUM_COLS + PACKING_NUM_COLS)
-FILES = {
-    "dispatch": (DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, "Dispatch CSV"),
-    "packing": (PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, "Packing CSV"),
-}
-
 STATUS_RANK = {"✅ Sent": 1, "🔵 Partial": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5}
-ROLE_LABEL = {"admin": "Admin", "staff": "Staff", "viewer": "Viewer (read-only)"}
 
+# ==========================================
+# DROPBOX CONNECTION
+# ==========================================
+@st.cache_resource(show_spinner=False)
+def get_dbx():
+    if not DBX_REFRESH_TOKEN:
+        st.error("Missing Dropbox API credentials in Streamlit Secrets.")
+        st.stop()
+    return dropbox.Dropbox(
+        app_key=DBX_APP_KEY,
+        app_secret=DBX_APP_SECRET,
+        oauth2_refresh_token=DBX_REFRESH_TOKEN
+    )
+
+dbx = get_dbx()
+
+def download_csv_from_dbx(dbx_path, cols):
+    try:
+        _, res = dbx.files_download(dbx_path)
+        df = pd.read_csv(io.BytesIO(res.content), dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    except dropbox.exceptions.ApiError:
+        df = pd.DataFrame(columns=cols)
+    except Exception as e:
+        st.warning(f"Error reading {dbx_path}: {e}")
+        df = pd.DataFrame(columns=cols)
+
+    for c in cols:
+        if c not in df.columns: df[c] = "0" if c in NUM_COLS_ALL else "-"
+    for c in df.columns:
+        df[c] = df[c].astype(str).str.strip()
+    for c in cols:
+        if c == "Date": continue
+        if c in NUM_COLS_ALL:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round().astype(int)
+        else:
+            df[c] = df[c].replace({"": "-", "nan": "-", "NaN": "-", "None": "-"})
+            if c == "Customer": df[c] = df[c].str.replace(r"\s+", " ", regex=True)
+    df["_dt"] = parse_dates(df["Date"])
+    return df.reset_index(drop=True)
+
+def upload_csv_to_dbx(df, dbx_path):
+    out = df.drop(columns=[c for c in ("_dt",) if c in df.columns])
+    csv_str = out.to_csv(index=False, encoding="utf-8-sig")
+    try:
+        dbx.files_upload(
+            csv_str.encode('utf-8-sig'), 
+            dbx_path, 
+            mode=dropbox.files.WriteMode("overwrite")
+        )
+    except Exception as e:
+        st.error(f"Error saving to Dropbox: {e}")
+
+def append_row_to_dbx(dbx_path, cols, row):
+    df = download_csv_from_dbx(dbx_path, cols)
+    ordered_row = {c: row.get(c, "-" if c not in NUM_COLS_ALL else 0) for c in cols}
+    df = pd.concat([df, pd.DataFrame([ordered_row])], ignore_index=True)
+    upload_csv_to_dbx(df, dbx_path)
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_excel_from_dbx(dbx_path):
+    try:
+        _, res = dbx.files_download(dbx_path)
+        excel_bytes = io.BytesIO(res.content)
+        df_cust = pd.read_excel(excel_bytes, sheet_name=SHEET_NAME)
+        customers = sorted({str(x).strip() for x in df_cust[COLUMN_NAME].dropna() if str(x).strip()})
+        excel_bytes.seek(0)
+        df_journal = pd.read_excel(excel_bytes, sheet_name=JOURNAL_SHEET, header=None)
+        return customers, df_journal, None
+    except Exception as e:
+        return [], None, str(e)
 
 # ==========================================
 # TIME HELPERS
 # ==========================================
-def now_kh():
-    return datetime.now(TZ)
+def now_kh(): return datetime.now(TZ)
+def today_kh(): return now_kh().date()
+def now_str(): return now_kh().strftime("%Y-%m-%d %H:%M:%S")
 
-
-def today_kh():
-    return now_kh().date()
-
-
-def now_str():
-    return now_kh().strftime("%Y-%m-%d %H:%M:%S")
-
-
-# ==========================================
-# DATE PARSING (never guesses blindly, never loses rows)
-# ==========================================
 def _try_parse(s, dayfirst):
     try:
         t = pd.to_datetime(s, dayfirst=dayfirst, errors="coerce")
         return None if pd.isna(t) else pd.Timestamp(t)
-    except Exception:
-        return None
-
+    except Exception: return None
 
 def parse_dt(v):
-    """One CSV date value. ISO is read as written; ambiguous text dates (10/12/2026)
-    pick the reading that is closest to today."""
-    if isinstance(v, (datetime, pd.Timestamp)):
-        return pd.Timestamp(v)
+    if isinstance(v, (datetime, pd.Timestamp)): return pd.Timestamp(v)
     s = str(v).strip()
-    if not s or s.lower() in ("nan", "nat", "-", "none"):
-        return pd.NaT
+    if not s or s.lower() in ("nan", "nat", "-", "none"): return pd.NaT
     if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", s):
         t = _try_parse(s, False)
         return pd.NaT if t is None else t
     us, eu = _try_parse(s, False), _try_parse(s, True)
-    if us is None and eu is None:
-        return pd.NaT
-    if us is None:
-        return eu
-    if eu is None or us == eu:
-        return us
+    if us is None and eu is None: return pd.NaT
+    if us is None: return eu
+    if eu is None or us == eu: return us
     today = pd.Timestamp(today_kh())
     return us if abs((us - today).days) <= abs((eu - today).days) else eu
 
-
 def parse_dates(series):
-    """Fast path for ISO rows, slow path only for the odd hand-typed ones."""
     s = series.astype(str).str.strip()
     out = pd.to_datetime(s, format="%Y-%m-%d %H:%M:%S", errors="coerce")
     bad = out.isna()
@@ -153,1023 +167,63 @@ def parse_dates(series):
         out.loc[bad] = pd.to_datetime(s[bad].map(parse_dt), errors="coerce")
     return out
 
-
 def cell_to_date(v, dominant=None):
-    """One Excel journal cell -> date (or None). `dominant` = (year, month) most journal dates use."""
-    if v is None:
-        return None
-    if isinstance(v, (datetime, pd.Timestamp)):
-        return v.date()
-    if isinstance(v, date):
-        return v
+    if v is None: return None
+    if isinstance(v, (datetime, pd.Timestamp)): return v.date()
+    if isinstance(v, date): return v
     s = str(v).strip()
-    if not s:
-        return None
+    if not s: return None
     if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", s):
         t = _try_parse(s, False)
         return None if t is None else t.date()
     us, eu = _try_parse(s, False), _try_parse(s, True)
-    if us is None and eu is None:
-        return None
-    if us is None:
-        return eu.date()
-    if eu is None or us == eu:
-        return us.date()
+    if us is None and eu is None: return None
+    if us is None: return eu.date()
+    if eu is None or us == eu: return us.date()
     if dominant:
-        if (us.year, us.month) == dominant:
-            return us.date()
-        if (eu.year, eu.month) == dominant:
-            return eu.date()
+        if (us.year, us.month) == dominant: return us.date()
+        if (eu.year, eu.month) == dominant: return eu.date()
     return (eu if DAYFIRST else us).date()
 
-
-def norm_name(s):
-    return re.sub(r"\s+", " ", str(s)).strip().casefold()
-
-
-# ==========================================
-# SECURITY: input cleaning, access codes, login, audit log
-# ==========================================
-_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-_PHONE = re.compile(r"[+\-]?[\d\s().\-]+")
-
-
-def safe_text(v, maxlen=MAX_TEXT):
-    """Removes control characters, cuts the length and blocks Excel formula injection (=, @, +cmd, -cmd)."""
-    s = _CTRL.sub(" ", str(v)).replace("\r", " ").replace("\n", " ").strip()[:maxlen]
-    if s and (s[0] in "=@" or (s[0] in "+-" and not _PHONE.fullmatch(s))):
-        s = "'" + s
-    return s
-
-
-def _append_log(path, cols, row, max_bytes=300_000, keep=300):
-    try:
-        new = (not os.path.exists(path)) or os.path.getsize(path) == 0
-        with open(path, "a", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(cols)
-            w.writerow(row)
-        if os.path.getsize(path) > max_bytes:
-            with open(path, "r", encoding="utf-8-sig") as f:
-                lines = f.readlines()
-            with open(path, "w", encoding="utf-8-sig", newline="") as f:
-                f.writelines([lines[0]] + lines[-keep:])
-    except Exception:
-        pass
-
-
-BOT_LOG_COLS = ["Time", "Level", "Check", "Message", "Action"]
-AUDIT_COLS = ["Time", "Role", "Client", "Event", "Detail"]
-
-
-def bot_log(level, check, message, action="-"):
-    _append_log(BOT_LOG_FILE, BOT_LOG_COLS, [now_str(), level, check, message, action])
-
-
-def client_id():
-    try:
-        h = st.context.headers
-        xff = h.get("X-Forwarded-For") or h.get("x-forwarded-for")
-        if xff:
-            return str(xff).split(",")[0].strip()[:45]
-        ip = getattr(st.context, "ip_address", None)
-        if ip:
-            return str(ip)[:45]
-    except Exception:
-        pass
-    return "local"
-
-
-def current_role():
-    return st.session_state.get("role")
-
-
-def audit(event, detail=""):
-    _append_log(AUDIT_FILE, AUDIT_COLS,
-                [now_str(), current_role() or "-", client_id(), event, safe_text(detail, 200)], keep=2000, max_bytes=800_000)
-
-
-def _secret(name):
-    try:
-        v = st.secrets[name]
-        return str(v).strip() if v else ""
-    except Exception:
-        return os.environ.get(name, "").strip()
-
-
-def _stored_code(filename):
-    """Access codes that are not set in secrets.toml are created once as random codes in your user folder."""
-    path = os.path.join(CODES_DIR, filename)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            v = f.read().strip()
-        if v:
-            return v
-    except OSError:
-        pass
-    code = "".join(pysecrets.choice("ABCDEFGHJKMNPQRSTUVWXYZ23456789") for _ in range(8))
-    try:
-        os.makedirs(CODES_DIR, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(code + "\n")
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    except OSError:
-        pass
-    return code
-
-
-def get_codes():
-    """(admin, staff, viewer). viewer is optional (empty = no read-only login)."""
-    admin = _secret("ADMIN_PASSWORD") or _stored_code("admin_code.txt")
-    staff = _secret("APP_PASSWORD") or _stored_code("staff_code.txt")
-    viewer = _secret("VIEWER_PASSWORD")
-    return admin, staff, viewer
-
-
-@st.cache_resource(show_spinner=False)
-def _login_guard():
-    return {"fails": {}, "locked": {}, "lock": threading.Lock()}
-
-
-def _try_login(code):
-    guard, cid, now = _login_guard(), client_id(), time.time()
-    with guard["lock"]:
-        locked_until = guard["locked"].get(cid, 0)
-    if locked_until > now:
-        st.error(f"Too many wrong codes. Please wait {int((locked_until - now) // 60) + 1} minute(s) and try again.")
-        audit("login_blocked", "client is locked out")
-        return
-    admin, staff, viewer = get_codes()
-    given = (code or "").strip().encode()
-    matched = {r: bool(c) and hmac.compare_digest(given, c.encode())
-               for r, c in (("viewer", viewer), ("staff", staff), ("admin", admin))}
-    role = next((r for r in ("viewer", "staff", "admin") if matched[r]), None)   # lowest privilege wins
-    if role:
-        with guard["lock"]:
-            guard["fails"].pop(cid, None)
-        st.session_state["role"] = role
-        st.session_state["login_time"] = time.time()
-        audit("login", role)
-        st.rerun()
-    with guard["lock"]:
-        guard["fails"][cid] = guard["fails"].get(cid, 0) + 1
-        if guard["fails"][cid] >= MAX_FAILS:
-            guard["locked"][cid] = time.time() + LOCKOUT_MIN * 60
-            guard["fails"][cid] = 0
-    audit("login_failed", "wrong code")
-    time.sleep(1)                                                # slows down guessing
-    st.error("❌ Wrong access code.")
-
-
-def require_login():
-    """Shows the login page and stops the app until the person is logged in. Returns the role."""
-    role = st.session_state.get("role")
-    if role and time.time() - st.session_state.get("login_time", 0) < LOGIN_TTL_HOURS * 3600:
-        return role
-    if role:
-        audit("logout", "session expired")
-        st.session_state.pop("role", None)
-    st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
-    _, mid, _ = st.columns([1, 2, 1])
-    with mid:
-        st.markdown("## 🔐 នំប៉ាវហុងកុង Hub")
-        st.caption("Enter your access code to continue.")
-        with st.form("login_form"):
-            code = st.text_input("Access code", type="password", max_chars=64)
-            go = st.form_submit_button("Log in", type="primary")
-        if go:
-            _try_login(code)
-    st.stop()
-
-
-def failed_logins(hours=24):
-    try:
-        if not os.path.exists(AUDIT_FILE):
-            return 0
-        df = pd.read_csv(AUDIT_FILE, encoding="utf-8-sig", dtype=str, keep_default_na=False)
-        t = pd.to_datetime(df["Time"], errors="coerce")
-        cutoff = now_kh().replace(tzinfo=None) - timedelta(hours=hours)
-        return int(((df["Event"] == "login_failed") & (t >= cutoff)).sum())
-    except Exception:
-        return 0
-
-
-# ==========================================
-# SAFE FILE HELPERS (lock, atomic write, backup)
-# ==========================================
-@contextlib.contextmanager
-def file_lock(path, timeout=6.0):
-    lock, fd, start = path + ".lock", None, time.time()
-    while True:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(lock) > 15:     # stale lock -> remove
-                    os.remove(lock)
-                    continue
-            except OSError:
-                pass
-            if time.time() - start > timeout:                     # never block the staff
-                break
-            time.sleep(0.05)
-        except OSError:
-            break
-    try:
-        yield
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-                os.remove(lock)
-            except OSError:
-                pass
-
-
-def _retry(fn, tries=6, delay=0.4):
-    """Retry when Excel / Dropbox is holding the file for a moment."""
-    last = None
-    for _ in range(tries):
-        try:
-            return fn()
-        except PermissionError as e:
-            last = e
-            time.sleep(delay)
-    raise PermissionError("The file is open in another program (Excel?). Close it and try again.") from last
-
-
-def backup_file(path, tag):
-    try:
-        if not os.path.exists(path):
-            return None
-        os.makedirs(BACKUP_DIR, exist_ok=True)
-        stamp = now_kh().strftime("%Y-%m-%d_%H%M%S")
-        dest = os.path.join(BACKUP_DIR, f"{stamp}_{tag}_{os.path.basename(path)}")
-        shutil.copy2(path, dest)
-        return dest
-    except Exception:
-        return None
-
-
-def latest_good_backup(path):
-    base = os.path.basename(path)
-    pat = re.compile(r"^\d{4}-\d{2}-\d{2}_" + re.escape(base) + r"$")
-    files = [f for f in glob.glob(os.path.join(BACKUP_DIR, "*")) if pat.match(os.path.basename(f))]
-    return max(files, key=os.path.getmtime) if files else None
-
-
-def prune_backups():
-    removed = 0
-    try:
-        now = time.time()
-        for f in glob.glob(os.path.join(BACKUP_DIR, "*")):
-            age_days = (now - os.path.getmtime(f)) / 86400
-            extra = re.match(r"^\d{4}-\d{2}-\d{2}_\d{6}_", os.path.basename(f))
-            if age_days > 30 or (extra and age_days > 7):
-                os.remove(f)
-                removed += 1
-    except Exception:
-        pass
-    return removed
-
-
-@st.cache_resource(show_spinner=False)
-def daily_backup_once(day_str):
-    """One copy of each CSV per day (cached, so it costs nothing on later runs)."""
-    try:
-        os.makedirs(BACKUP_DIR, exist_ok=True)
-        for f in (DATA_FILE, PACKING_FILE):
-            dest = os.path.join(BACKUP_DIR, f"{day_str}_{os.path.basename(f)}")
-            if os.path.exists(f) and not os.path.exists(dest):
-                shutil.copy2(f, dest)
-        prune_backups()
-    except Exception:
-        pass
-    return True
-
-
-# ==========================================
-# CSV READ (cached by file change) / WRITE
-# ==========================================
-def _csv_read(path, cols):
-    df = pd.DataFrame()
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        try:
-            df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-        except Exception:
-            try:
-                df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig",
-                                 engine="python", on_bad_lines="skip")
-            except Exception:
-                df = pd.DataFrame()
-    for c in cols:
-        if c not in df.columns:
-            df[c] = "0" if c in NUM_COLS_ALL else "-"
-    for c in df.columns:
-        df[c] = df[c].astype(str).str.strip()
-    for c in cols:
-        if c == "Date":
-            continue
-        if c in NUM_COLS_ALL:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round().astype(int)
-        else:
-            df[c] = df[c].replace({"": "-", "nan": "-", "NaN": "-", "None": "-"})
-            if c == "Customer":
-                df[c] = df[c].str.replace(r"\s+", " ", regex=True)
-    df["_dt"] = parse_dates(df["Date"])
-    return df.reset_index(drop=True)
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def _csv_cached(path, mtime_ns, size, cols):
-    return _csv_read(path, list(cols))
-
-
-def read_raw(path, cols):
-    """Cleaned DataFrame of a CSV (with hidden `_dt` datetime column). Fast: cached until the file changes."""
-    try:
-        stt = os.stat(path)
-        key = (stt.st_mtime_ns, stt.st_size)
-    except OSError:
-        key = (0, 0)
-    return _csv_cached(path, key[0], key[1], tuple(cols)).copy()
-
-
-def save_csv(path, df):
-    out = df.drop(columns=[c for c in ("_dt",) if c in df.columns])
-    tmp = path + ".tmp"
-
-    def _do():
-        with file_lock(path):
-            out.to_csv(tmp, index=False, encoding="utf-8-sig")
-            os.replace(tmp, path)
-    _retry(_do)
-
-
-def append_row(path, row):
-    """Add ONE row (text is cleaned first) using the column order of the existing file."""
-    row = {k: (v if k == "Date" or not isinstance(v, str) else safe_text(v)) for k, v in row.items()}
-
-    def _do():
-        with file_lock(path):
-            exists = os.path.exists(path) and os.path.getsize(path) > 0
-            if not exists:
-                pd.DataFrame([row]).to_csv(path, index=False, encoding="utf-8-sig")
-                return
-            header = list(pd.read_csv(path, nrows=0, encoding="utf-8-sig").columns)
-            if set(row) <= set(header):
-                with open(path, "rb") as fh:                       # file must end with a newline
-                    fh.seek(-1, os.SEEK_END)
-                    needs_nl = fh.read(1) not in (b"\n", b"\r")
-                if needs_nl:
-                    with open(path, "ab") as fh:
-                        fh.write(b"\r\n")
-                ordered = {c: row.get(c, "-") for c in header}
-                pd.DataFrame([ordered]).to_csv(path, mode="a", header=False, index=False, encoding="utf-8-sig")
-            else:                                                # file lacks some columns -> rewrite once
-                df = pd.read_csv(path, encoding="utf-8-sig")
-                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-                df.to_csv(path, index=False, encoding="utf-8-sig")
-    _retry(_do)
-
-
 def rows_for_day(df, target_date):
-    if df.empty or "_dt" not in df.columns:
-        return df.iloc[0:0].copy()
+    if df.empty or "_dt" not in df.columns: return df.iloc[0:0].copy()
     mask = df["_dt"].dt.normalize() == pd.Timestamp(target_date)
     out = df[mask].copy()
     out["Time"] = out["_dt"].dt.strftime("%I:%M %p")
     return out
 
-
 # ==========================================
-# EXCEL JOURNAL SNAPSHOT (fast read-only parse + memory cache + disk cache)
+# UI HELPERS & FORMS
 # ==========================================
-def find_excel_file():
-    def _files(pattern):
-        fs = glob.glob(os.path.join(CURRENT_DIR, pattern))
-        return [f for f in fs if not os.path.basename(f).startswith("~$")]
-
-    if EXCEL_OVERRIDE:
-        p = os.path.join(CURRENT_DIR, EXCEL_OVERRIDE)
-        if os.path.exists(p):
-            return p
-    for pat in (EXCEL_PATTERN, EXCEL_FALLBACK_PATTERN):
-        fs = _files(pat)
-        if fs:
-            return max(fs, key=os.path.getmtime)
-    return None
-
-
-def _cell_text(v):
-    if v is None:
-        return ""
-    if isinstance(v, float) and v.is_integer():
-        return str(int(v))
-    if isinstance(v, (datetime, date)):
-        return v.strftime("%Y-%m-%d")
-    s = re.sub(r"\s+", " ", str(v)).strip()
-    return "" if s.lower() in ("nan", "none", "nat") else s
-
-
-def _find_invoice(row, inv_col):
-    """Smart search: Look for NP followed ONLY by numbers (e.g., NP312578) to ignore NPHK-00018"""
-    if inv_col is not None and inv_col < len(row):
-        s = _cell_text(row[inv_col])
-        if s:
-            return s
-            
-    for c_i in range(2, len(row)):
-        v = row[c_i]
-        if isinstance(v, str):
-            s = v.strip().upper()
-            if re.match(r"^" + re.escape(INVOICE_PREFIX.upper()) + r"\d+$", s):
-                return s
-    return "-"
-
-
-def _read_excel_snapshot(path):
-    from openpyxl import load_workbook
-    wb = load_workbook(path, read_only=True, data_only=True)
-    try:
-        names = wb.sheetnames
-        if SHEET_NAME not in names:
-            raise ValueError(f"Sheet '{SHEET_NAME}' not found. Sheets in file: {names}")
-        if JOURNAL_SHEET not in names:
-            raise ValueError(f"Sheet '{JOURNAL_SHEET}' not found. Sheets in file: {names}")
-
-        # --- Master List: customer names ---
-        ws = wb[SHEET_NAME]
-        try:
-            ws.reset_dimensions()
-        except Exception:
-            pass
-        col_idx, seen = None, set()
-        for row in ws.iter_rows(values_only=True):
-            if col_idx is None:
-                for i, v in enumerate(row):
-                    if v is not None and str(v).strip() == COLUMN_NAME:
-                        col_idx = i
-                        break
-                continue
-            if col_idx < len(row) and row[col_idx] is not None:
-                n = re.sub(r"\s+", " ", str(row[col_idx])).strip()
-                if n:
-                    seen.add(n)
-        customers = sorted(seen)
-
-        # --- Journal: date / customer / cases / invoice / remark ---
-        ws = wb[JOURNAL_SHEET]
-        try:
-            ws.reset_dimensions()
-        except Exception:
-            pass
-        raw_rows = []
-        cases_col = inv_col = rem_col = None
-        for r_i, row in enumerate(ws.iter_rows(values_only=True)):
-            if r_i < 15 and (cases_col is None or inv_col is None or rem_col is None):
-                for c_i, v in enumerate(row):
-                    if v is None:
-                        continue
-                    sv = str(v)
-                    if cases_col is None and JOURNAL_CASES_HEADER in sv:
-                        cases_col = c_i
-                    elif inv_col is None and JOURNAL_INVOICE_HEADER in sv:
-                        inv_col = c_i
-                    elif rem_col is None and JOURNAL_REMARK_HEADER in sv:
-                        rem_col = c_i
-            if len(row) < 2 or row[1] is None:
-                continue
-            name = re.sub(r"\s+", " ", str(row[1])).strip()
-            if not name or name == JOURNAL_HEADER_TEXT:
-                continue
-            qty = row[cases_col] if (cases_col is not None and cases_col < len(row)) else None
-            inv = _find_invoice(row, inv_col)
-            rem = _cell_text(row[rem_col]) if (rem_col is not None and rem_col < len(row)) else ""
-            raw_rows.append((row[0], name, qty, inv, rem or "-"))
-    finally:
-        wb.close()
-
-    months = Counter((r[0].year, r[0].month) for r in raw_rows if isinstance(r[0], datetime))
-    dominant = months.most_common(1)[0][0] if months else None
-    out = []
-    for v, name, qty, inv, rem in raw_rows:
-        d = cell_to_date(v, dominant)
-        if d is None:
-            continue
-        try:
-            q = pd.to_numeric(qty, errors="coerce")
-            q = None if pd.isna(q) else float(q)
-        except Exception:
-            q = None
-        out.append((d, name, q, inv, rem))
-    journal = pd.DataFrame(out, columns=["Date", "Customer", "Cases", "Invoice", "Remark"])
-    journal["Cases"] = pd.to_numeric(journal["Cases"], errors="coerce")
-    return {"customers": customers, "journal": journal, "cases_col_found": cases_col is not None,
-            "invoice_col_found": inv_col is not None}
-
-
-def load_snapshot(path, mtime_ns, size):
-    """Returns (data, source). source = 'disk' | 'fresh' | 'stale' (last good copy used)."""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    cache_file = os.path.join(CACHE_DIR, "excel_snapshot.pkl")
-    key = (SNAPSHOT_VERSION, os.path.basename(path), mtime_ns, size)
-    obj = None
-    try:
-        with open(cache_file, "rb") as f:
-            obj = pickle.load(f)
-        if obj.get("key") == key:
-            return obj["data"], "disk"
-    except Exception:
-        obj = None
-    try:
-        data = _read_excel_snapshot(path)
-    except Exception as e:
-        if obj and obj.get("data") and obj.get("key", (0,))[0] == SNAPSHOT_VERSION:
-            bot_log("fixed", "Excel", f"Could not read journal ({str(e)[:120]}); using last good copy", "used saved copy")
-            return obj["data"], "stale"
-        raise
-    try:
-        tmp = cache_file + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump({"key": key, "data": data}, f)
-        os.replace(tmp, cache_file)
-    except Exception:
-        pass
-    return data, "fresh"
-
-
-@st.cache_data(ttl=120, show_spinner="📄 Loading journal (first time only)...", max_entries=4)
-def get_snapshot(path, mtime_ns, size):
-    return load_snapshot(path, mtime_ns, size)
-
-
-def current_snapshot():
-    """(snapshot | None, source, path, error text | None). Never raises."""
-    path = find_excel_file()
-    if not path or not os.path.exists(path):
-        return None, None, path, f"No journal file found in {CURRENT_DIR}"
-    try:
-        stt = os.stat(path)
-        data, src = get_snapshot(path, stt.st_mtime_ns, stt.st_size)
-        return data, src, path, None
-    except Exception as e:
-        return None, None, path, str(e)
-
-
-def get_customer_list():
-    snap, _, _, err = current_snapshot()
-    if snap and snap["customers"]:
-        return snap["customers"]
-    return [f"⚠️ Error: {err or 'Master List is empty'}"]
-
-
-# ==========================================
-# 🤖 HEALTH BOT  (detects problems and fixes them by itself)
-# ==========================================
-LEVEL_ICON = {"ok": "✅ OK", "fixed": "🔧 Fixed", "warn": "⚠️ Warning", "error": "❌ Error", "info": "ℹ️ Info"}
-
-
-def canonical_map(master):
-    groups = {}
-    for n in master:
-        groups.setdefault(norm_name(n), []).append(n)
-    return {k: v[0] for k, v in groups.items() if len(v) == 1}
-
-
-def _check_csv(add, key, master, auto_fix):
-    path, cols, nums, label = FILES[key]
-    base = os.path.basename(path)
-    suggestions = []
-
-    # 1) missing / empty file
-    if (not os.path.exists(path)) or os.path.getsize(path) == 0:
-        if auto_fix:
-            pd.DataFrame(columns=cols).to_csv(path, index=False, encoding="utf-8-sig")
-            add("fixed", label, f"{base} was missing or empty", "created a new file with headers")
-        else:
-            add("warn", label, f"{base} is missing or empty", "would create a new file")
-        return suggestions
-
-    # 2) corrupted file (broken lines, bad encoding)
-    try:
-        raw = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-    except Exception as e:
-        reason = str(e).splitlines()[0] if str(e) else type(e).__name__
-        if not auto_fix:
-            add("error", label, f"{base} cannot be read: {reason}", "would repair")
-            return suggestions
-        backup_file(path, "corrupt")
-        repaired = None
-        try:
-            repaired = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig",
-                                   engine="python", on_bad_lines="skip")
-        except Exception:
-            pass
-        if repaired is not None and len(repaired) > 0:
-            save_csv(path, repaired)
-            add("fixed", label, f"{base} had broken lines ({reason})", "kept good rows; original saved in backups")
-        else:
-            good = latest_good_backup(path)
-            if good:
-                shutil.copy2(good, path)
-                add("fixed", label, f"{base} was unreadable", f"restored from backup {os.path.basename(good)}")
-            else:
-                add("error", label, f"{base} is unreadable and there is no backup", "needs manual help")
-                return suggestions
-        raw = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-
-    df = _csv_read(path, cols)
-    fixed = df.copy()
-    notes = []
-
-    missing = [c for c in cols if c not in raw.columns]
-    if missing:
-        notes.append(f"added missing columns {missing}")
-
-    n_nan = int(raw.isin(["nan", "NaN", "None"]).sum().sum())
-    if n_nan:
-        notes.append(f"cleaned {n_nan} 'nan' texts")
-
-    n_name = 0
-    if master and "Customer" in fixed.columns:
-        canon = canonical_map(master)
-        master_set = set(master)
-
-        def _fix_name(n):
-            if n in master_set:
-                return n
-            return canon.get(norm_name(n), n)
-        new_names = fixed["Customer"].map(_fix_name)
-        n_name = int((new_names != fixed["Customer"]).sum())
-        fixed["Customer"] = new_names
-    if n_name:
-        notes.append(f"corrected {n_name} customer names (spaces/capitals)")
-
-    dup = fixed.duplicated(subset=cols, keep="first")
-    n_dup = int(dup.sum())
-    if n_dup:
-        fixed = fixed[~dup]
-        notes.append(f"removed {n_dup} double-click duplicates")
-
-    if notes:
-        if auto_fix:
-            backup_file(path, "before-fix")
-            save_csv(path, fixed)
-            add("fixed", label, f"{base}: " + "; ".join(notes), "saved clean file (backup kept)")
-        else:
-            add("warn", label, f"{base}: " + "; ".join(notes), "would fix automatically")
-
-    bad_dates = fixed.index[fixed["_dt"].isna()].tolist()
-    if bad_dates:
-        lines = ", ".join(str(i + 2) for i in bad_dates[:8])
-        add("warn", label, f"{base}: {len(bad_dates)} rows have an unreadable Date (file lines {lines})",
-            "fix them in the Admin tool")
-    for c in nums:
-        if c in fixed.columns and (fixed[c] < 0).any():
-            add("warn", label, f"{base}: negative numbers in {c}", "check them in the Admin tool")
-
-    if master and "Customer" in fixed.columns:
-        master_set = set(master)
-        unknown = sorted({n for n in fixed["Customer"].unique() if n not in master_set and n != "-"})
-        no_match = []
-        for n in unknown[:60]:
-            close = difflib.get_close_matches(n, master, n=1, cutoff=0.9)
-            if close:
-                suggestions.append((key, n, close[0]))
-            else:
-                no_match.append(n)
-        if suggestions:
-            add("warn", label, f"{base}: {len(suggestions)} customer names look like typos", "see suggestions below")
-        if no_match:
-            add("info", label, f"{base}: names not in Master List: {', '.join(no_match[:4])}"
-                + (" ..." if len(no_match) > 4 else ""), "-")
-    return suggestions
-
-
-def run_health_check(auto_fix=True):
-    """Returns (findings, suggestions). With auto_fix=True the bot repairs what is safe to repair."""
-    findings, suggestions = [], []
-
-    def add(level, check, message, action="-"):
-        findings.append({"Level": LEVEL_ICON[level], "Check": check, "Message": message, "Action": action})
-        if level in ("fixed", "warn", "error") and auto_fix:
-            bot_log(level, check, message, action)
-
-    # --- Excel journal ---
-    path = find_excel_file()
-    master = []
-    if not path:
-        add("error", "Excel", f"No journal file found in {CURRENT_DIR}", "put the .xlsx next to the app")
-    else:
-        if (not EXCEL_OVERRIDE) and not [f for f in glob.glob(os.path.join(CURRENT_DIR, EXCEL_PATTERN))
-                                         if not os.path.basename(f).startswith("~$")]:
-            add("fixed", "Excel", f"No file matches '{EXCEL_PATTERN}'", f"switched to {os.path.basename(path)}")
-        snap, src, _, err = current_snapshot()
-        if err:
-            add("error", "Excel", f"Cannot read '{os.path.basename(path)}': {err}",
-                "close it in Excel / wait for Dropbox, bot retries automatically")
-        else:
-            master = snap["customers"]
-            if src == "stale":
-                add("fixed", "Excel", "Journal file was locked or half-synced", "using the last good copy")
-            if not master:
-                add("warn", "Excel", "Master List has no customers", "check sheet 'Master List'")
-            if not snap["cases_col_found"]:
-                add("warn", "Excel", f"No column '{JOURNAL_CASES_HEADER}' found in the journal", "ordered cases will be empty")
-            if not snap.get("invoice_col_found", True):
-                add("info", "Excel", f"No column '{JOURNAL_INVOICE_HEADER}' found; invoice numbers use the '{INVOICE_PREFIX}' cells", "-")
-            if "conflicted copy" in os.path.basename(path).lower():
-                add("info", "Excel", "Using a Dropbox 'conflicted copy' file", "-")
-
-    # --- CSV files ---
-    for key in FILES:
-        try:
-            suggestions += _check_csv(add, key, master, auto_fix)
-        except Exception as e:
-            add("error", FILES[key][3], f"Check failed: {e}", "-")
-
-    # --- backups, locks, disk ---
-    if auto_fix:
-        daily_backup_once(today_kh().strftime("%Y-%m-%d"))
-    elif not glob.glob(os.path.join(BACKUP_DIR, f"{today_kh():%Y-%m-%d}_*")):
-        add("warn", "Backup", "No backup made today yet", "would create one")
-    for lk in glob.glob(os.path.join(CURRENT_DIR, "*.lock")):
-        try:
-            if time.time() - os.path.getmtime(lk) > 30:
-                if auto_fix:
-                    os.remove(lk)
-                    add("fixed", "Locks", f"Removed stuck lock {os.path.basename(lk)}", "deleted")
-                else:
-                    add("warn", "Locks", f"Stuck lock {os.path.basename(lk)}", "would delete")
-        except OSError:
-            pass
-    try:
-        free_gb = shutil.disk_usage(CURRENT_DIR).free / 1e9
-        if free_gb < 1:
-            add("warn", "Disk", f"Only {free_gb:.1f} GB free on this drive", "free some space")
-    except Exception:
-        pass
-
-    # --- security ---
-    try:
-        admin, staff, viewer = get_codes()
-        if admin == staff:
-            add("warn", "Security", "Admin and staff use the SAME access code", "give admin its own code")
-        if min(len(admin), len(staff)) < 6:
-            add("warn", "Security", "An access code is shorter than 6 characters", "use a longer code")
-        n_fail = failed_logins(1)
-        if n_fail >= 15:
-            add("warn", "Security", f"{n_fail} wrong-code login attempts in the last hour", "see Audit log; consider changing codes")
-    except Exception:
-        pass
-    try:
-        major, minor = [int(x) for x in st.__version__.split(".")[:2]]
-        if (major, minor) < (1, 37):
-            add("warn", "Streamlit", f"Version {st.__version__} is old (fast mode needs 1.37+)", "pip install -U streamlit")
-    except Exception:
-        pass
-
-    if not findings:
-        add("ok", "All checks", "No problems found", "-")
-    return findings, suggestions
-
-
-@st.cache_data(ttl=BOT_INTERVAL_MIN * 60, show_spinner=False)
-def auto_bot(_token=0):
-    """Runs by itself at start-up and then every BOT_INTERVAL_MIN minutes."""
-    try:
-        return run_health_check(auto_fix=True)
-    except Exception as e:
-        bot_log("error", "Bot", f"Health check crashed: {e}", "-")
-        return [{"Level": LEVEL_ICON["error"], "Check": "Bot", "Message": str(e), "Action": "-"}], []
-
-
-def apply_name_fixes(suggestions):
-    by_file = {}
-    for key, bad, good in suggestions:
-        by_file.setdefault(key, {})[bad] = good
-    for key, mapping in by_file.items():
-        path, cols, _, label = FILES[key]
-        df = read_raw(path, cols)
-        df["Customer"] = df["Customer"].replace(mapping)
-        backup_file(path, "before-name-fix")
-        save_csv(path, df)
-        bot_log("fixed", label, f"{len(mapping)} customer names corrected", "applied suggested names")
-        audit("name_fix", f"{label}: {len(mapping)} names")
-
-
-def safe_render(fn, label):
-    """If a tab crashes the bot logs it, runs a repair check and offers a retry button."""
-    try:
-        fn()
-    except Exception as e:
-        bot_log("error", label, f"{type(e).__name__}: {e}", "auto-repair started")
-        if current_role() == "admin":
-            st.error(f"⚠️ Problem in {label}: {e}")
-        else:
-            st.error("⚠️ Something went wrong. The bot is checking the data - press Retry in a moment.")
-        flag = f"bot_ran_{label}"
-        if time.time() - st.session_state.get(flag, 0) > 60:
-            st.session_state[flag] = time.time()
-            try:
-                run_health_check(auto_fix=True)
-                st.cache_data.clear()
-                st.info("🤖 The bot checked and repaired the data files. Press Retry.")
-            except Exception:
-                pass
-        if current_role() == "admin":
-            with st.expander("Technical details"):
-                st.code(traceback.format_exc())
-        if st.button("🔁 Retry now", key=f"retry_{label}"):
-            st.cache_data.clear()
-            st.rerun()
-
-
-# ==========================================
-# UI HELPERS
-# ==========================================
-CSS = """
-<style>
-.block-container {padding-top: 1.4rem; padding-bottom: 2.5rem; max-width: 1500px;}
-div[data-testid="stMetric"] {background: rgba(128,128,128,.07); border: 1px solid rgba(128,128,128,.22);
-    border-radius: 12px; padding: 8px 14px;}
-.stButton > button, .stDownloadButton > button, div[data-testid="stFormSubmitButton"] > button {
-    border-radius: 10px; min-height: 2.7rem; font-weight: 600;}
-footer {visibility: hidden;}
-@media (max-width: 640px) {
-  .block-container {padding-left: .7rem; padding-right: .7rem;}
-  h1 {font-size: 1.45rem !important;}
-}
-</style>
-"""
-
-
-def show_df(df, height=None, key=None, selectable=False, column_config=None):
-    """Shows a table. Returns the selection event when row-click is available (else None)."""
+def show_df(df, height=None, key=None, selectable=False):
     base = {"hide_index": True}
-    if height:
-        base["height"] = height
-    if column_config:
-        base["column_config"] = column_config
+    if height: base["height"] = height
     sel = dict(on_select="rerun", selection_mode="single-row", key=key) if selectable else {}
     for width_kw in ({"width": "stretch"}, {"use_container_width": True}):
-        try:
-            return st.dataframe(df, **base, **width_kw, **sel)
-        except Exception:
-            continue
+        try: return st.dataframe(df, **base, **width_kw, **sel)
+        except Exception: continue
     st.dataframe(df, **base)
     return None
-
-
-def kpi(container, label, value):
-    try:
-        container.metric(label, value, border=True)
-    except TypeError:
-        container.metric(label, value)
-
 
 def flash_and_refresh(msg):
     st.session_state["flash"] = msg
     st.session_state["clear_sel"] = True
     st.rerun()
 
-
-# ==========================================
-# FORMS
-# ==========================================
-def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
-    k = form_key
-    with st.form(form_key, clear_on_submit=True):
-        st.markdown("#### Order Details")
-        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_by")
-        if fixed_customer is None:
-            customer_name = st.selectbox("Customer Name / ID (Type to search):",
-                                         ["-- Select a Customer --"] + get_customer_list(), key=f"{k}_cust")
-        else:
-            customer_name = fixed_customer
-            st.markdown(f"**Customer:** {fixed_customer}")
-        d_cases = max(0, min(int(default_cases), MAX_CASES))
-        cases = st.number_input("ចំនួនកេស (Number of Cases):", min_value=0, max_value=MAX_CASES, step=1,
-                                value=d_cases, key=f"{k}_cases_{d_cases}")
-        if verify:
-            verified_by = st.selectbox("✅ Cases verified by (confirms the កេស number is correct):",
-                                       ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_vby")
-        else:
-            verified_by = st.selectbox("Cases verified by (optional):", ["-"] + ALL_STAFF_DRIVERS, key=f"{k}_vby")
-
-        st.markdown("---")
-        st.markdown("#### Transportation Details")
-        local_driver = st.selectbox("Local Driver (Phnom Penh):", ["None (Grab/TukTuk)"] + LOCAL_DRIVERS, key=f"{k}_drv")
-        taxi_station = st.text_input("Taxi Station Name (Leave blank if purely local Phnom Penh delivery):",
-                                     max_chars=MAX_TEXT, key=f"{k}_taxi")
-        delivery_note = st.text_input("📝 Note (Optional: Taxi phone number, plate, or instructions):",
-                                      max_chars=MAX_TEXT, key=f"{k}_note")
-
-        st.markdown("#### Expenses (៛ Riel)")
-        pp_expense = st.number_input("1. Phnom Penh Expense (៛) - Enter 0 if using own driver:",
-                                     min_value=0, max_value=MAX_RIEL, step=500, key=f"{k}_pp")
-        taxi_expense = st.number_input("2. Taxi Expense (៛) - Enter 0 if local delivery:",
-                                       min_value=0, max_value=MAX_RIEL, step=500, key=f"{k}_te")
-
-        submitted = st.form_submit_button("💾 Save Dispatch & Expenses", type="primary")
-
-        if submitted:
-            if dispatched_by == "-- Select Staff --":
-                st.error("❌ Please select who dispatched this order.")
-            elif customer_name == "-- Select a Customer --" or "⚠️ Error" in customer_name:
-                st.error("❌ Please select a valid Customer Name.")
-            elif cases == 0:
-                st.error("❌ Number of cases must be at least 1.")
-            elif verify and verified_by == "-- Select Staff --":
-                st.error("❌ Please select who verified the number of cases.")
-            elif local_driver == "None (Grab/TukTuk)" and pp_expense == 0:
-                st.error("❌ Please enter the Phnom Penh Expense for the Grab/TukTuk.")
-            elif taxi_station.strip() != "" and taxi_expense == 0:
-                st.error("❌ Please enter the Taxi Expense paid to the provincial taxi/bus.")
-            else:
-                try:
-                    handler_local = local_driver if local_driver != "None (Grab/TukTuk)" else "Grab/TukTuk"
-                    append_row(DATA_FILE, {
-                        "Date": now_str(),
-                        "Handled_By": dispatched_by,
-                        "Customer": customer_name.strip(),
-                        "Cases": cases,
-                        "Local_Driver": handler_local,
-                        "Taxi_Station": taxi_station.strip() or "-",
-                        "Phnom_Penh_Expense": pp_expense,
-                        "Taxi_Expense": taxi_expense,
-                        "Note": delivery_note.strip() or "-",
-                        "Verified_By": verified_by,
-                    })
-                    audit("dispatch", f"{customer_name} | {cases} cases | by {dispatched_by}")
-                    flash_and_refresh(f"Dispatched by {dispatched_by}: {customer_name} | {cases} កេស")
-                except Exception as save_err:
-                    bot_log("error", "Save dispatch", str(save_err), "-")
-                    st.error(f"⚠️ Could not save: {save_err}")
-
-
-def packing_form(form_key, fixed_customer=None, default_cases=1):
-    k = form_key
-    with st.form(form_key, clear_on_submit=True):
-        if fixed_customer is None:
-            customer = st.selectbox("Customer Name / ID (Type to search):",
-                                    ["-- Select a Customer --"] + get_customer_list(), key=f"{k}_cust")
-        else:
-            customer = fixed_customer
-            st.markdown(f"**Customer:** {fixed_customer}")
-        prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_by")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            d_cases = max(0, min(int(default_cases), MAX_CASES))
-            cases_packed = st.number_input("ចំនួនកេស (Cases Packed/Prepping):", min_value=0, max_value=MAX_CASES,
-                                           step=1, value=d_cases, key=f"{k}_cases_{d_cases}")
-        with col2:
-            pack_status = st.radio("Status of these cases:", ["In Progress (កំពុងធ្វើ)", "Completed (រួចរាល់)"],
-                                   key=f"{k}_status")
-
-        if st.form_submit_button("💾 Save Packing Progress", type="primary"):
-            if prepared_by == "-- Select Staff --":
-                st.error("❌ Please select who is preparing this order.")
-            elif customer == "-- Select a Customer --" or "⚠️ Error" in customer:
-                st.error("❌ Please select a valid Customer Name.")
-            elif cases_packed == 0:
-                st.error("❌ Number of cases must be at least 1.")
-            else:
-                try:
-                    append_row(PACKING_FILE, {
-                        "Date": now_str(),
-                        "Prepared_By": prepared_by,
-                        "Customer": customer.strip(),
-                        "Cases_Packed": cases_packed,
-                        "Status": pack_status,
-                    })
-                    audit("packing", f"{customer} | {cases_packed} cases | by {prepared_by}")
-                    flash_and_refresh(f"Packing logged: {customer} | {cases_packed} cases | {pack_status}")
-                except Exception as err:
-                    bot_log("error", "Save packing", str(err), "-")
-                    st.error(f"⚠️ Could not save: {err}")
-
-
-def admin_editor(path, cols, num_cols, key, label_cols):
-    if current_role() != "admin":
-        st.info("🔒 Admin only. Log in with the admin access code to fix or delete entries.")
+def admin_editor(dbx_path, cols, num_cols, key, label_cols):
+    entered = st.text_input("🔑 Enter Admin Password to unlock edit tools:", type="password", key=f"pw_{key}")
+    if entered == "": return
+    if not hmac.compare_digest(entered.encode(), ADMIN_PASSWORD.encode()):
+        st.error("❌ Incorrect Password.")
         return
     try:
-        df = read_raw(path, cols)
+        df = download_csv_from_dbx(dbx_path, cols)
         df_today = rows_for_day(df, today_kh())
         if df_today.empty:
             st.info("No entries logged for today.")
             return
         labels = {i: f"{i}: " + " | ".join(str(df_today.loc[i, c]) for c in label_cols) for i in df_today.index}
-        row_idx = st.selectbox("Select entry to correct:", list(labels.keys()),
-                               format_func=lambda i: labels[i], key=f"sel_{key}")
+        row_idx = st.selectbox("Select entry to correct:", list(labels.keys()), format_func=lambda i: labels[i], key=f"sel_{key}")
         current = df.loc[row_idx]
         with st.form(f"edit_form_{key}"):
             new_vals = {}
@@ -1177,453 +231,320 @@ def admin_editor(path, cols, num_cols, key, label_cols):
                 wkey = f"{key}_{c}_{row_idx}"
                 if c in num_cols:
                     step = 500 if c.endswith("Expense") else 1
-                    cap = MAX_CASES if "Cases" in c else MAX_RIEL
-                    new_vals[c] = st.number_input(f"Edit {c}:", min_value=0, max_value=cap,
-                                                  value=min(int(current[c]), cap), step=step, key=wkey)
-                else:
-                    new_vals[c] = st.text_input(f"Edit {c}:", value=str(current[c]), max_chars=MAX_TEXT, key=wkey)
+                    new_vals[c] = st.number_input(f"Edit {c}:", min_value=0, value=int(current[c]), step=step, key=wkey)
+                else: new_vals[c] = st.text_input(f"Edit {c}:", value=str(current[c]), key=wkey)
             col_upd, col_del = st.columns(2)
-            update_btn = col_upd.form_submit_button("🔄 Update Record")
-            delete_btn = col_del.form_submit_button("🗑️ Delete Wrong Entry")
-            if update_btn:
-                if pd.isna(parse_dt(new_vals["Date"])):
-                    st.error("❌ Date format is invalid. Use YYYY-MM-DD HH:MM:SS")
+            if col_upd.form_submit_button("🔄 Update Record"):
+                if pd.isna(parse_dt(new_vals["Date"])): st.error("❌ Date format is invalid.")
                 else:
-                    backup_file(path, "before-edit")
-                    changes = []
-                    for c in cols:
-                        val = new_vals[c] if c in num_cols or c == "Date" else safe_text(new_vals[c])
-                        if str(df.loc[row_idx, c]) != str(val):
-                            changes.append(f"{c}: {df.loc[row_idx, c]} -> {val}")
-                        df.loc[row_idx, c] = val
-                    save_csv(path, df)
-                    audit("edit", f"{os.path.basename(path)} #{row_idx} {current['Customer']} | " + "; ".join(changes))
+                    for c in cols: df.loc[row_idx, c] = new_vals[c]
+                    upload_csv_to_dbx(df, dbx_path)
                     flash_and_refresh("Record updated")
-            if delete_btn:
-                backup_file(path, "before-delete")
-                audit("delete", f"{os.path.basename(path)} #{row_idx} {current['Customer']} | {current['Date']}")
-                save_csv(path, df.drop(row_idx))
+            if col_del.form_submit_button("🗑️ Delete Wrong Entry"):
+                upload_csv_to_dbx(df.drop(row_idx), dbx_path)
                 flash_and_refresh("Record deleted")
     except Exception as e:
-        bot_log("error", "Admin editor", str(e), "-")
         st.warning(f"Could not load admin panel: {e}")
 
+def dispatch_form(form_key, cust_list, fixed_customer=None, default_cases=1, verify=False):
+    k = form_key
+    with st.form(form_key, clear_on_submit=True):
+        st.markdown("#### Order Details")
+        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_by")
+        if fixed_customer is None:
+            customer_name = st.selectbox("Customer Name / ID:", ["-- Select a Customer --"] + cust_list, key=f"{k}_cust")
+        else:
+            customer_name = fixed_customer
+            st.markdown(f"**Customer:** {fixed_customer}")
+        cases = st.number_input("ចំនួនកេស (Number of Cases):", min_value=0, step=1, value=int(default_cases), key=f"{k}_cases")
+        if verify: verified_by = st.selectbox("✅ Cases verified by:", ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_vby")
+        else: verified_by = st.selectbox("Cases verified by (optional):", ["-"] + ALL_STAFF_DRIVERS, key=f"{k}_vby")
+
+        st.markdown("---")
+        st.markdown("#### Transportation Details")
+        local_driver = st.selectbox("Local Driver (Phnom Penh):", ["None (Grab/TukTuk)"] + LOCAL_DRIVERS, key=f"{k}_drv")
+        taxi_station = st.text_input("Taxi Station Name (Leave blank if purely local):", key=f"{k}_taxi")
+        delivery_note = st.text_input("📝 Note:", key=f"{k}_note")
+
+        st.markdown("#### Expenses (៛ Riel)")
+        pp_expense = st.number_input("1. Phnom Penh Expense (៛):", min_value=0, step=500, key=f"{k}_pp")
+        taxi_expense = st.number_input("2. Taxi Expense (៛):", min_value=0, step=500, key=f"{k}_te")
+
+        if st.form_submit_button("💾 Save Dispatch & Expenses"):
+            if dispatched_by == "-- Select Staff --": st.error("❌ Please select who dispatched this order.")
+            elif customer_name == "-- Select a Customer --": st.error("❌ Please select a valid Customer Name.")
+            elif cases == 0: st.error("❌ Number of cases must be at least 1.")
+            elif verify and verified_by == "-- Select Staff --": st.error("❌ Please select who verified the number of cases.")
+            elif local_driver == "None (Grab/TukTuk)" and pp_expense == 0: st.error("❌ Please enter the Phnom Penh Expense.")
+            elif taxi_station.strip() != "" and taxi_expense == 0: st.error("❌ Please enter the Taxi Expense.")
+            else:
+                handler_local = local_driver if local_driver != "None (Grab/TukTuk)" else "Grab/TukTuk"
+                append_row_to_dbx(DBX_DATA_PATH, DISPATCH_COLS, {
+                    "Date": now_str(), "Handled_By": dispatched_by, "Customer": customer_name.strip(),
+                    "Cases": cases, "Local_Driver": handler_local, "Taxi_Station": taxi_station.strip() or "-",
+                    "Phnom_Penh_Expense": pp_expense, "Taxi_Expense": taxi_expense, "Note": delivery_note.strip() or "-",
+                    "Verified_By": verified_by,
+                })
+                flash_and_refresh(f"Dispatched by {dispatched_by}: {customer_name} | {cases} កេស")
+
+def packing_form(form_key, cust_list, fixed_customer=None, default_cases=1):
+    k = form_key
+    with st.form(form_key, clear_on_submit=True):
+        if fixed_customer is None:
+            customer = st.selectbox("Customer Name / ID:", ["-- Select a Customer --"] + cust_list, key=f"{k}_cust")
+        else:
+            customer = fixed_customer
+            st.markdown(f"**Customer:** {fixed_customer}")
+        prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_by")
+
+        col1, col2 = st.columns(2)
+        with col1: cases_packed = st.number_input("ចំនួនកេស (Cases Packed):", min_value=0, step=1, value=int(default_cases), key=f"{k}_cases")
+        with col2: pack_status = st.radio("Status:", ["In Progress (កំពុងធ្វើ)", "Completed (រួចរាល់)"], key=f"{k}_status")
+
+        if st.form_submit_button("💾 Save Packing Progress"):
+            if prepared_by == "-- Select Staff --": st.error("❌ Please select who is preparing this order.")
+            elif customer == "-- Select a Customer --": st.error("❌ Please select a valid Customer Name.")
+            elif cases_packed == 0: st.error("❌ Number of cases must be at least 1.")
+            else:
+                append_row_to_dbx(DBX_PACKING_PATH, PACKING_COLS, {
+                    "Date": now_str(), "Prepared_By": prepared_by, "Customer": customer.strip(),
+                    "Cases_Packed": cases_packed, "Status": pack_status,
+                })
+                flash_and_refresh(f"Packing logged: {customer} | {cases_packed} cases | {pack_status}")
+
 
 # ==========================================
-# TAB: PACKING
+# APP SETUP & LOGIN SYSTEM
 # ==========================================
-def _packing_body():
+st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="wide")
+
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+
+if not st.session_state["logged_in"]:
+    st.title("🔒 នំប៉ាវហុងកុង Login")
+    st.info("Please log in to access the Supply Chain Hub.")
+    
+    with st.form("login_form"):
+        user_name = st.selectbox("👤 User / Role:", ["-- Select Name --", "👨‍💻 Admin (Manager)"] + ALL_STAFF_DRIVERS)
+        password = st.text_input("🔑 Password:", type="password")
+        submitted = st.form_submit_button("Log In")
+        
+        if submitted:
+            if user_name == "-- Select Name --":
+                st.error("Please select your name or role.")
+            elif user_name == "👨‍💻 Admin (Manager)" and password == ADMIN_PASSWORD:
+                st.session_state["logged_in"] = True
+                st.session_state["user_name"] = "Admin"
+                st.rerun()
+            elif user_name != "-- Select Name --" and (password == APP_PASSWORD or password == TEAM_PASSWORD):
+                st.session_state["logged_in"] = True
+                st.session_state["user_name"] = user_name
+                st.rerun()
+            else:
+                st.error("❌ Incorrect Password.")
+    st.stop()
+
+# ==========================================
+# MAIN APP LAYOUT
+# ==========================================
+st.title("🚚 នំប៉ាវហុងកុង Supply Chain Hub")
+
+_flash = st.session_state.pop("flash", None)
+if _flash: st.toast(_flash, icon="✅")
+
+CUSTOMER_LIST, df_journal, EXCEL_ERROR = get_excel_from_dbx(DBX_EXCEL_PATH)
+
+c_head, c_live = st.columns([4, 1])
+with c_head:
+    st.caption(f"🕒 {now_kh():%Y-%m-%d %I:%M %p} | ☁️ Connected to Dropbox | 👤 Logged in as: {st.session_state['user_name']}")
+with c_live:
+    if st.button("🚪 Logout"):
+        st.session_state["logged_in"] = False
+        st.rerun()
+
+tab1, tab2, tab3 = st.tabs(["📦 1. Packing", "🚚 2. Dispatch", "📊 3. Live Dashboard"])
+
+with tab1:
     st.markdown("### 📦 Bun Preparation & Packing")
-    packing_form("packing_form")
-
+    packing_form("packing_form", CUSTOMER_LIST)
     with st.expander("🛠️ Admin: Fix or Edit Today's Packing"):
-        admin_editor(PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, key="pack",
-                     label_cols=["Customer", "Cases_Packed", "Status"])
-
+        admin_editor(DBX_PACKING_PATH, PACKING_COLS, PACKING_NUM_COLS, "pack", ["Customer", "Cases_Packed", "Status"])
+    
     st.markdown("---")
     st.subheader("📋 Today's Packing Log")
-    df_today = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), today_kh())
-    if df_today.empty:
-        st.info("No packing progress logged today yet.")
-        return
-    show_df(df_today[PACKING_COLS])
-    st.markdown("**👷 Cases packed per staff (today)**")
-    show_df(df_today.groupby("Prepared_By")["Cases_Packed"].sum().reset_index())
+    df_pack_today = rows_for_day(download_csv_from_dbx(DBX_PACKING_PATH, PACKING_COLS), today_kh())
+    if not df_pack_today.empty:
+        show_df(df_pack_today[PACKING_COLS])
+    else: st.info("No packing progress logged today yet.")
 
-
-@st.fragment
-def tab_packing():
-    safe_render(_packing_body, "Packing tab")
-
-
-# ==========================================
-# TAB: DELIVERY
-# ==========================================
-def _dispatch_body():
+with tab2:
     st.markdown("### 🚚 Log Delivery Slip")
-    dispatch_form("expense_form")
-
-    st.markdown("---")
+    dispatch_form("expense_form", CUSTOMER_LIST)
     with st.expander("🛠️ Admin: Fix or Edit Today's Dispatches"):
-        admin_editor(DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, key="disp",
-                     label_cols=["Customer", "Cases"])
-
+        admin_editor(DBX_DATA_PATH, DISPATCH_COLS, DISPATCH_NUM_COLS, "disp", ["Customer", "Cases"])
+    
     st.markdown("---")
     st.subheader("📊 Today's Operations Log")
-    df_today = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), today_kh())
-    total_expense = int(df_today["Phnom_Penh_Expense"].sum() + df_today["Taxi_Expense"].sum()) if not df_today.empty else 0
+    df_disp_today = rows_for_day(download_csv_from_dbx(DBX_DATA_PATH, DISPATCH_COLS), today_kh())
+    total_expense = int(df_disp_today["Phnom_Penh_Expense"].sum() + df_disp_today["Taxi_Expense"].sum()) if not df_disp_today.empty else 0
     m1, m2, m3 = st.columns(3)
-    kpi(m1, "Total Slips Today", len(df_today))
-    kpi(m2, "Total Cases Dispatched (សរុបចំនួនកេស)", int(df_today["Cases"].sum()) if not df_today.empty else 0)
-    kpi(m3, "Total Expenses Today (៛)", f"{total_expense:,}")
-    if df_today.empty:
-        st.info("No deliveries logged today yet.")
-        return
+    m1.metric("Total Slips Today", len(df_disp_today))
+    m2.metric("Total Cases Dispatched", int(df_disp_today["Cases"].sum()) if not df_disp_today.empty else 0)
+    m3.metric("Total Expenses Today (៛)", f"{total_expense:,}")
+    if not df_disp_today.empty:
+        show_df(df_disp_today[["Handled_By", "Customer", "Cases", "Note", "Local_Driver", "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Verified_By"]])
+    else: st.info("No deliveries logged today yet.")
 
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_today[DISPATCH_COLS].to_excel(writer, index=False, sheet_name="Ops_Log")
-    st.download_button("📥 Download Today's Expenses Log (Excel)", data=buf.getvalue(),
-                       file_name=f"Operations_Expenses_{today_kh()}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    show_df(df_today[["Handled_By", "Customer", "Cases", "Note", "Local_Driver",
-                      "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Verified_By"]])
-    st.markdown("**👷 Dispatch summary per staff (today)**")
-    per_staff = df_today.groupby("Handled_By").agg(
-        Slips=("Customer", "count"), Cases=("Cases", "sum"),
-        Expenses=("Phnom_Penh_Expense", "sum"), Taxi=("Taxi_Expense", "sum")).reset_index()
-    show_df(per_staff)
+with tab3:
+    c_live2, c_space = st.columns([1, 4])
+    with c_live2:
+        _live = st.checkbox(f"🔄 Auto-Refresh Dashboard", value=False, key="live_mode")
+    if _live:
+        try:
+            from streamlit_autorefresh import st_autorefresh
+            st_autorefresh(interval=30_000, key="dash_refresh")
+        except ImportError: pass
 
+    st.markdown("### 📊 Master Status Board")
+    c_date, c_view = st.columns([1, 1])
+    with c_date: selected_date = st.date_input("Select Report Date:", value=today_kh(), key="dash_date")
+    with c_view: view_mode = st.radio("Layout Mode:", ["🖥️ Desktop Screen", "📱 Mobile Phone"], horizontal=True, key="dash_view")
 
-@st.fragment
-def tab_dispatch():
-    safe_render(_dispatch_body, "Delivery tab")
+    if EXCEL_ERROR: st.warning(f"Dropbox Error: {EXCEL_ERROR}")
 
+    # Build the report and extract Invoice Number using v3 Smart Search
+    scheduled = {}
+    invoice_mapping = {}
+    if df_journal is not None:
+        cases_col = None
+        invoice_col = None
+        for r in range(min(15, len(df_journal))):
+            for c in range(df_journal.shape[1]):
+                val = str(df_journal.iloc[r, c])
+                if JOURNAL_CASES_HEADER in val:
+                    cases_col = c
+                if JOURNAL_INVOICE_HEADER in val:
+                    invoice_col = c
+            if cases_col is not None and invoice_col is not None: break
+            
+        for r in range(len(df_journal)):
+            d = cell_to_date(df_journal.iloc[r, 0])
+            if d == selected_date:
+                name = str(df_journal.iloc[r, 1]).strip()
+                if name and name != JOURNAL_HEADER_TEXT and name != "nan":
+                    qty = pd.to_numeric(df_journal.iloc[r, cases_col], errors="coerce") if cases_col is not None else None
+                    
+                    inv = "-"
+                    # 1. Try to get it from the explicit Invoice column if found
+                    if invoice_col is not None and invoice_col < df_journal.shape[1]:
+                        val_str = str(df_journal.iloc[r, invoice_col]).strip()
+                        if val_str not in ("", "nan", "None", "NaT"):
+                            inv = val_str
+                            
+                    # 2. V3 Smart Search: If still empty, look for NP followed ONLY by numbers (e.g., NP312578)
+                    if inv == "-":
+                        for c_i in range(2, df_journal.shape[1]):
+                            val_str = str(df_journal.iloc[r, c_i]).strip().upper()
+                            if re.match(r"^NP\d+$", val_str):
+                                inv = val_str
+                                break
 
-# ==========================================
-# TAB: DASHBOARD (search, filter, click a row to update it)
-# ==========================================
-def _join_unique(series, sep=", ", limit=3):
-    vals = [v for v in dict.fromkeys(series) if v and v != "-"]
-    if not vals:
-        return "-"
-    if len(vals) > limit:
-        return sep.join(vals[:limit]) + f" +{len(vals) - limit}"
-    return sep.join(vals)
+                    scheduled[name] = int(qty) if pd.notna(qty) else None
+                    invoice_mapping[name] = inv
 
-
-DASH_COLUMNS = ["🔥", "Customer", "Invoice", "Status", "កេស", "Packed Cases", "Prepared By", "Sent Cases",
-                "Handled By", "Verified By", "Driver/Station", "Journal Note", "Note", "Time", "Source"]
-
-
-def build_report(selected_date):
-    snap, _, _, err = current_snapshot()
-    scheduled, cases_found = {}, False
-    if snap:
-        cases_found = snap["cases_col_found"]
-        j = snap["journal"]
-        sub = j[j["Date"] == selected_date]
-        for name, g in sub.groupby("Customer", sort=False):
-            tot = g["Cases"].sum(min_count=1)
-            scheduled[name] = {"cases": int(tot) if pd.notna(tot) else None,
-                               "invoice": _join_unique(g["Invoice"]),
-                               "remark": _join_unique(g["Remark"], sep=" / ")}
-
-    pack_info = {}
-    df_pack = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), selected_date)
-    for cust, g in df_pack.groupby("Customer", sort=False):
-        pack_info[cust] = {"cases": int(g["Cases_Packed"].sum()), "by": g["Prepared_By"].iloc[-1],
-                           "status": str(g["Status"].iloc[-1])}
-
-    sent_info = {}
-    df_disp = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), selected_date)
-    for cust, g in df_disp.groupby("Customer", sort=False):
+    df_pack_all = download_csv_from_dbx(DBX_PACKING_PATH, PACKING_COLS)
+    df_disp_all = download_csv_from_dbx(DBX_DATA_PATH, DISPATCH_COLS)
+    
+    pack_info, sent_info = {}, {}
+    for cust, g in rows_for_day(df_pack_all, selected_date).groupby("Customer", sort=False):
+        pack_info[cust] = {"cases": int(g["Cases_Packed"].sum()), "by": g["Prepared_By"].iloc[-1], "status": str(g["Status"].iloc[-1])}
+    for cust, g in rows_for_day(df_disp_all, selected_date).groupby("Customer", sort=False):
         last = g.iloc[-1]
         station = str(last["Taxi_Station"]).strip()
         driver = f"{last['Local_Driver']} ➡️ {station}" if station not in ("-", "") else str(last["Local_Driver"])
-        sent_info[cust] = {"cases": int(g["Cases"].sum()), "driver": driver, "note": str(last["Note"]),
-                           "by": str(last["Handled_By"]), "verified": str(last["Verified_By"]), "time": last["Time"]}
+        sent_info[cust] = {"cases": int(g["Cases"].sum()), "driver": driver, "note": str(last["Note"]), "by": str(last["Handled_By"]), "verified": str(last["Verified_By"]), "time": last["Time"]}
 
     rows = []
     for cust in set(scheduled) | set(pack_info) | set(sent_info):
-        p, s, info = pack_info.get(cust), sent_info.get(cust), scheduled.get(cust)
-        packed = p["cases"] if p else 0
-        sent = s["cases"] if s else 0
-        ordered = info["cases"] if info else None
-        remark = info["remark"] if info else "-"
+        p, s = pack_info.get(cust), sent_info.get(cust)
+        packed, sent = p["cases"] if p else 0, s["cases"] if s else 0
+        ordered = scheduled.get(cust)
         target = packed if packed > 0 else (ordered or 0)
-        if s:
-            status = "🔵 Partial" if (target > 0 and sent < target) else "✅ Sent"
-        elif p:
-            status = "🟠 Packing" if "In Progress" in p["status"] else "🟡 Ready for Delivery"
-        else:
-            status = "⏳ Pending"
-        urgent = any(w.upper() in remark.upper() for w in URGENT_WORDS)
+        invoice_num = invoice_mapping.get(cust, "-")
+        
+        if s: status = "🔵 Partial" if (target > 0 and sent < target) else "✅ Sent"
+        elif p: status = "🟠 Packing" if "In Progress" in p["status"] else "🟡 Ready for Delivery"
+        else: status = "⏳ Pending"
+        
         rows.append({
-            "🔥": "🔥" if urgent else "", "Customer": cust, "Invoice": info["invoice"] if info else "-",
-            "Status": status, "កេស": ordered,
-            "Packed Cases": packed, "Prepared By": p["by"] if p else "-",
-            "Sent Cases": sent, "Handled By": s["by"] if s else "-",
-            "Verified By": s["verified"] if s else "-",
-            "Driver/Station": s["driver"] if s else "-", "Journal Note": remark,
-            "Note": s["note"] if s else "-", "Time": s["time"] if s else "-",
-            "Source": "Journal" if info else "⚠️ Not in journal",
+            "Invoice": invoice_num, "Customer": cust, "Status": status, "កេស": ordered, "Packed Cases": packed, "Prepared By": p["by"] if p else "-",
+            "Sent Cases": sent, "Handled By": s["by"] if s else "-", "Verified By": s["verified"] if s else "-",
+            "Driver/Station": s["driver"] if s else "-", "Note": s["note"] if s else "-", "Time": s["time"] if s else "-",
+            "Source": "Journal" if cust in scheduled else "⚠️ Not in journal",
         })
-    if not rows:
-        return pd.DataFrame(), cases_found, err
-    df = pd.DataFrame(rows)
-    df["កេស"] = pd.array(df["កេស"].tolist(), dtype="Int64")
-    df["_r"] = df["Status"].map(STATUS_RANK)
-    df["_u"] = (df["🔥"] == "").astype(int)
-    df = df.sort_values(by=["_r", "_u", "Customer"]).drop(columns=["_r", "_u"]).reset_index(drop=True)
-    return df[DASH_COLUMNS], cases_found, err
+        
+    df_report = pd.DataFrame(rows)
+    if not df_report.empty:
+        df_report["កេស"] = pd.array(df_report["កេស"].tolist(), dtype="Int64")
+        df_report["_r"] = df_report["Status"].map(STATUS_RANK)
+        df_report = df_report.sort_values(by=["_r", "Customer"]).drop(columns=["_r"]).reset_index(drop=True)
 
+        counts = df_report["Status"].value_counts()
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("⏳ Pending", int(counts.get("⏳ Pending", 0)))
+        k2.metric("🟠 Packing", int(counts.get("🟠 Packing", 0)))
+        k3.metric("🟡 Ready", int(counts.get("🟡 Ready for Delivery", 0)))
+        k4.metric("🔵 Partial", int(counts.get("🔵 Partial", 0)))
+        k5.metric("✅ Sent", int(counts.get("✅ Sent", 0)))
 
-def _dashboard_body():
-    can_edit = current_role() in ("staff", "admin")
-    st.markdown("### 📊 Master Status Board")
-    selected_date = st.date_input("Select Report Date:", value=today_kh(), key="dash_date")
-    df_report, cases_found, err = build_report(selected_date)
-    if err:
-        st.warning(f"Excel problem: {err}")
-    if df_report.empty:
+        st.markdown("---")
+        
+        search_query = st.text_input("🔍 Search Customer or Invoice:", placeholder="Type a name or invoice number (e.g., NP312578) to filter...")
+        if search_query:
+            mask = df_report["Customer"].str.contains(search_query, case=False, na=False) | df_report["Invoice"].str.contains(search_query, case=False, na=False)
+            df_report = df_report[mask].reset_index(drop=True)
+
+        if st.session_state.pop("clear_sel", False): st.session_state.pop("dash_table", None)
+
+        if view_mode == "🖥️ Desktop Screen": col_table, col_edit = st.columns([1.6, 1.4]) 
+        else:
+            col_table = st.container()
+            st.markdown("<br>", unsafe_allow_html=True)
+            col_edit = st.container() 
+
+        with col_table:
+            table_height = 550 if view_mode == "🖥️ Desktop Screen" else 350
+            event = show_df(df_report, height=table_height, key="dash_table", selectable=True)
+            if event:
+                rows_sel = event.selection.rows
+                if rows_sel: st.session_state["sel_cust"] = df_report.iloc[rows_sel[0]]["Customer"]
+                else: st.session_state.pop("sel_cust", None)
+
+        with col_edit:
+            selected = st.session_state.get("sel_cust")
+            if selected not in set(df_report["Customer"]): selected = None
+            if selected:
+                st.markdown(f"### ✏️ Quick Update")
+                st.success(f"**Selected:** {selected}")
+                if selected_date != today_kh(): st.info("⚠️ Updates can only be saved for today.")
+                else:
+                    p_row = df_report[df_report["Customer"] == selected].iloc[0]
+                    ordered_n = int(p_row["កេស"]) if pd.notna(p_row["កេស"]) else None
+                    packed_n, sent_n = int(p_row["Packed Cases"]), int(p_row["Sent Cases"])
+                    target_n = packed_n if packed_n > 0 else (ordered_n or 0)
+
+                    st.caption(f"**Invoice:** {p_row['Invoice']} | **Status:** {p_row['Status']}")
+                    st.caption(f"**Ordered:** {ordered_n if ordered_n is not None else '-'} កេស | **Packed:** {packed_n} | **Sent:** {sent_n}")
+
+                    pack_default = max((ordered_n or 0) - packed_n, 0) or 1
+                    send_default = (target_n - sent_n) if (target_n - sent_n) > 0 else 1
+
+                    t_pack, t_send = st.tabs(["📦 Step 1: Pack Buns", "🚚 Step 2: Send & Verify"])
+                    with t_pack: packing_form(f"dash_pack_{selected}", CUSTOMER_LIST, fixed_customer=selected, default_cases=pack_default)
+                    with t_send: dispatch_form(f"dash_send_{selected}", CUSTOMER_LIST, fixed_customer=selected, default_cases=send_default, verify=True)
+            else:
+                if view_mode == "🖥️ Desktop Screen": st.info("👈 **Click on any customer in the table** to update.")
+                else: st.info("👆 **Click on any customer in the table above** to update.")
+    else:
         st.info(f"📅 No orders scheduled or found in the journal for {selected_date}.")
-        return
-
-    counts = df_report["Status"].value_counts()
-    total, n_sent = len(df_report), int(counts.get("✅ Sent", 0))
-    k1, k2, k3, k4, k5 = st.columns(5)
-    kpi(k1, "⏳ Pending", int(counts.get("⏳ Pending", 0)))
-    kpi(k2, "🟠 Packing", int(counts.get("🟠 Packing", 0)))
-    kpi(k3, "🟡 Ready", int(counts.get("🟡 Ready for Delivery", 0)))
-    kpi(k4, "🔵 Partial", int(counts.get("🔵 Partial", 0)))
-    kpi(k5, "✅ Sent", n_sent)
-    try:
-        st.progress(n_sent / total, text=f"Delivered {n_sent} of {total} customers ({n_sent * 100 // total}%)")
-    except TypeError:
-        st.progress(n_sent / total)
-
-    f1, f2, f3 = st.columns([3, 3, 2])
-    q = f1.text_input("🔎 Search customer or invoice", key="dash_q", max_chars=60)
-    pick_status = f2.multiselect("Status filter", list(STATUS_RANK), key="dash_status", placeholder="All statuses")
-    with f3:
-        st.write("")
-        try:
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df_report.to_excel(writer, index=False, sheet_name="Master_Status")
-            st.download_button("📥 Download report (Excel)", data=buf.getvalue(),
-                               file_name=f"Master_Report_{selected_date}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception as e:
-            st.warning(f"Could not build Excel report: {e}")
-
-    df_view = df_report
-    if q.strip():
-        qq = q.strip()
-        m = (df_view["Customer"].str.contains(qq, case=False, regex=False, na=False)
-             | df_view["Invoice"].str.contains(qq, case=False, regex=False, na=False))
-        df_view = df_view[m]
-    if pick_status:
-        df_view = df_view[df_view["Status"].isin(pick_status)]
-    df_view = df_view.reset_index(drop=True)
-
-    if not cases_found:
-        st.caption(f"ℹ️ No column '{JOURNAL_CASES_HEADER}' found in the journal, so ordered cases are empty. "
-                   "Change JOURNAL_CASES_HEADER at the top of the file if your header is different.")
-    if can_edit:
-        st.caption("👆 Click a row to update it (who prepared, packing cases, who delivered, verify cases).")
-    if st.session_state.pop("clear_sel", False):
-        st.session_state.pop("dash_table", None)
-
-    cfg = {
-        "🔥": st.column_config.TextColumn("🔥", width="small"),
-        "Customer": st.column_config.TextColumn("Customer", width="large"),
-        "Invoice": st.column_config.TextColumn("Invoice", width="medium"),
-        "Status": st.column_config.TextColumn("Status", width="medium"),
-    }
-    if df_view.empty:
-        st.info("No customers match your search / filter.")
-        event = None
-    else:
-        event = show_df(df_view, height=430, key="dash_table", selectable=can_edit, column_config=cfg)
-
-    if not can_edit:
-        return
-    if event is None:
-        if not df_view.empty:
-            st.caption("Your Streamlit cannot click rows. Run: pip install -U streamlit  (use the list for now)")
-        pick_old = st.selectbox("Choose customer to update:", ["--"] + df_report["Customer"].tolist(), key="pick_old")
-        if pick_old != "--":
-            st.session_state["sel_cust"] = pick_old
-        else:
-            st.session_state.pop("sel_cust", None)
-    else:
-        rows_sel = event.selection.rows
-        if rows_sel:
-            st.session_state["sel_cust"] = df_view.iloc[rows_sel[0]]["Customer"]
-
-    selected = st.session_state.get("sel_cust")
-    if selected not in set(df_report["Customer"]):
-        return
-
-    st.markdown("---")
-    h1, h2 = st.columns([5, 1])
-    h1.subheader(f"✏️ Update: {selected}")
-    if h2.button("✖ Close", key="close_panel"):
-        st.session_state.pop("sel_cust", None)
-        st.session_state["clear_sel"] = True
-        st.rerun()
-
-    if selected_date != today_kh():
-        st.info("Updates can only be saved for today. Select today's date above.")
-        return
-
-    p_row = df_report[df_report["Customer"] == selected].iloc[0]
-    ordered_n = int(p_row["កេស"]) if pd.notna(p_row["កេស"]) else None
-    packed_n, sent_n = int(p_row["Packed Cases"]), int(p_row["Sent Cases"])
-    target_n = packed_n if packed_n > 0 else (ordered_n or 0)
-    st.info(f"Status: **{p_row['Status']}**  |  Invoice: {p_row['Invoice']}  |  "
-            f"កេស ordered: {ordered_n if ordered_n is not None else '-'}  |  "
-            f"Packed: {packed_n} (by {p_row['Prepared By']})  |  Sent: {sent_n} (by {p_row['Handled By']}, "
-            f"verified by {p_row['Verified By']})")
-    if p_row["Journal Note"] not in ("-", ""):
-        st.warning(f"📌 Journal note: {p_row['Journal Note']}")
-    pack_default = max((ordered_n or 0) - packed_n, 0) or 1
-    send_default = (target_n - sent_n) if (target_n - sent_n) > 0 else 1
-
-    t_pack, t_send = st.tabs(["📦 Step 1: Packing (who prepared the buns)",
-                              "🚚 Step 2: Send (who delivered + verify កេស)"])
-    with t_pack:
-        packing_form(f"dash_pack_{selected}_{pack_default}", fixed_customer=selected, default_cases=pack_default)
-    with t_send:
-        st.caption("Check the កេស number (you can edit it), choose who verified it, then save.")
-        dispatch_form(f"dash_send_{selected}_{send_default}", fixed_customer=selected,
-                      default_cases=send_default, verify=True)
-
-
-def tab_dashboard(live):
-    def _run():
-        safe_render(_dashboard_body, "Dashboard")
-    frag = st.fragment(run_every=LIVE_REFRESH_SECONDS)(_run) if live else st.fragment(_run)
-    frag()
-
-
-# ==========================================
-# TAB: HEALTH BOT + SECURITY (admin only)
-# ==========================================
-def _bot_body():
-    if current_role() != "admin":
-        st.info("🔒 Admin only.")
-        return
-    st.markdown("### 🤖 Health Bot")
-    st.caption(f"The bot checks files, names, backups and the Excel journal by itself every {BOT_INTERVAL_MIN} minutes "
-               "and repairs what is safe to repair. Every repair is written to the log and a backup is kept.")
-
-    c1, c2, c3 = st.columns(3)
-    if c1.button("🔧 Check & fix now", key="bot_fix"):
-        auto_bot.clear()
-    only_check = c2.button("👀 Check only (change nothing)", key="bot_check")
-    if c3.button("🧹 Clear speed cache", key="bot_cache"):
-        st.cache_data.clear()
-        try:
-            os.remove(os.path.join(CACHE_DIR, "excel_snapshot.pkl"))
-        except OSError:
-            pass
-        st.toast("Cache cleared - the journal will be re-read", icon="🧹")
-
-    if only_check:
-        findings, suggestions = run_health_check(auto_fix=False)
-        st.markdown("**Result (nothing was changed):**")
-    else:
-        findings, suggestions = auto_bot()
-        st.markdown("**Latest automatic check:**")
-    show_df(pd.DataFrame(findings))
-
-    if suggestions:
-        st.markdown("**Names that look like typos (the bot suggests the Master List name):**")
-        show_df(pd.DataFrame(suggestions, columns=["File", "Name in file", "Suggested name"]))
-        if st.button("✨ Apply all suggested names", key="bot_apply"):
-            apply_name_fixes(suggestions)
-            auto_bot.clear()
-            flash_and_refresh("Customer names corrected")
-
-    st.markdown("---")
-    st.markdown("### 🔐 Security")
-    admin, staff, viewer = get_codes()
-    src = lambda name: "secrets.toml / environment" if _secret(name) else f"file in {CODES_DIR}"
-    show_df(pd.DataFrame([
-        ("Login required", "Yes - everyone must enter an access code"),
-        ("Admin code", f"{len(admin)} characters, from {src('ADMIN_PASSWORD')}"),
-        ("Staff code", f"{len(staff)} characters, from {src('APP_PASSWORD')}"),
-        ("Viewer (read-only) code", "enabled" if viewer else "not set (set VIEWER_PASSWORD to enable)"),
-        ("Wrong-code attempts (24h)", failed_logins(24)),
-        ("Lock-out", f"{MAX_FAILS} wrong codes -> locked {LOCKOUT_MIN} minutes"),
-        ("Auto log-out", f"after {LOGIN_TTL_HOURS} hours"),
-    ], columns=["Setting", "Value"]).astype(str))
-
-    st.markdown("**🕵️ Audit log (logins, saves, edits, deletes)**")
-    try:
-        if os.path.exists(AUDIT_FILE):
-            alog = pd.read_csv(AUDIT_FILE, encoding="utf-8-sig").tail(60).iloc[::-1]
-            show_df(alog, height=300)
-            with open(AUDIT_FILE, "rb") as fh:
-                st.download_button("📥 Download audit log", data=fh.read(), file_name="audit_log.csv", mime="text/csv")
-        else:
-            st.info("No activity recorded yet.")
-    except Exception as e:
-        st.warning(f"Could not read audit log: {e}")
-
-    st.markdown("**📜 What the bot did recently**")
-    try:
-        if os.path.exists(BOT_LOG_FILE):
-            log = pd.read_csv(BOT_LOG_FILE, encoding="utf-8-sig").tail(40).iloc[::-1]
-            show_df(log, height=260)
-        else:
-            st.info("The bot has not needed to fix anything yet.")
-    except Exception as e:
-        st.warning(f"Could not read bot log: {e}")
-
-
-@st.fragment
-def tab_bot():
-    safe_render(_bot_body, "Bot tab")
-
-
-# ==========================================
-# APP LAYOUT
-# ==========================================
-st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="wide",
-                   initial_sidebar_state="collapsed")
-st.markdown(CSS, unsafe_allow_html=True)
-
-ROLE = require_login()                     # nothing below runs until the person is logged in
-
-_flash = st.session_state.pop("flash", None)
-if _flash:
-    st.toast(_flash, icon="✅")
-
-with st.sidebar:
-    st.markdown(f"### 👤 {ROLE_LABEL.get(ROLE, ROLE)}")
-    st.caption(f"Logged in. Auto log-out after {LOGIN_TTL_HOURS} h.")
-    if st.button("🚪 Log out", key="logout_btn"):
-        audit("logout", "manual")
-        for _k in ("role", "login_time", "sel_cust"):
-            st.session_state.pop(_k, None)
-        st.rerun()
-
-st.title("🚚 នំប៉ាវហុងកុង Supply Chain Hub")
-
-daily_backup_once(today_kh().strftime("%Y-%m-%d"))
-_snap, _src, _xl, _err = current_snapshot()
-_file_text = f"📄 {os.path.basename(_xl)}" if (_xl and not _err) else "📄 journal problem"
-_chips = f"{_file_text}  |  🕒 {now_kh():%Y-%m-%d %I:%M %p}"
-if ROLE in ("staff", "admin"):
-    _findings, _ = auto_bot()
-    _fixed = sum(1 for f in _findings if f["Level"] == LEVEL_ICON["fixed"])
-    _bad = sum(1 for f in _findings if f["Level"] in (LEVEL_ICON["warn"], LEVEL_ICON["error"]))
-    if ROLE == "admin":
-        _chips += "  |  " + ("🤖 Bot: all good" if (_fixed == 0 and _bad == 0)
-                             else f"🤖 Bot: {_fixed} fixed, {_bad} need a look (see Bot tab)")
-st.caption(_chips)
-
-if ROLE == "viewer":
-    labels = ["📊 Live Dashboard (Sales)"]
-elif ROLE == "staff":
-    labels = ["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)", "📊 3. Live Dashboard (Sales)"]
-else:
-    labels = ["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)", "📊 3. Live Dashboard (Sales)",
-              "🤖 4. Health Bot & Security"]
-_tabs = dict(zip(labels, st.tabs(labels)))
-
-for _label, _tab in _tabs.items():
-    with _tab:
-        if _label.startswith("📦"):
-            tab_packing()
-        elif _label.startswith("🚚"):
-            tab_dispatch()
-        elif _label.startswith("📊"):
-            _live = st.checkbox(f"🔄 Live mode (refresh every {LIVE_REFRESH_SECONDS}s)", value=False, key="live_mode")
-            tab_dashboard(_live)
-        else:
-            tab_bot()
