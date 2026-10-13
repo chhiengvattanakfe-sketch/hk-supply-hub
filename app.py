@@ -428,7 +428,7 @@ with tab3:
              name = str(df_journal.iloc[r, 1]).strip()
              if name and name != JOURNAL_HEADER_TEXT and name != "nan":
                  qty = pd.to_numeric(df_journal.iloc[r, cases_col], errors="coerce") if cases_col is not None else None
-                 inv = str(df_journal.iloc[r, 2]).strip()  # <--- Column 2 holds the Invoice numbers!
+                 inv = str(df_journal.iloc[r, 3]).strip()  # <--- Column 3 holds the actual Invoice numbers!
                  if inv in ("", "nan", "None", "ណាត", "NaT"): inv = "-"
                  scheduled[name] = int(qty) if pd.notna(qty) else None
                  invoice_mapping[name] = inv
