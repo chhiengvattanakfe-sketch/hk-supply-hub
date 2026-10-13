@@ -33,9 +33,9 @@ ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "hk2026")
 
 # Dropbox paths (Must start with a slash and match your Dropbox folder exactly)
 # Update these if your folder name is different
-DBX_EXCEL_PATH = "/4- Sale Jounal/10_Sale_Journal_OCT_2026.xlsx"
-DBX_DATA_PATH = "/4- Sale Jounal/daily_delivery_expenses.csv"
-DBX_PACKING_PATH = "/4- Sale Jounal/daily_packing_progress.csv"
+DBX_EXCEL_PATH = "/dropbox/4- Sale Jounal/10_Sale_Journal_OCT_2026.xlsx"
+DBX_DATA_PATH = "/dropbox/4- Sale Jounal/daily_delivery_expenses.csv"
+DBX_PACKING_PATH = "/dropbox/4- Sale Jounal/daily_packing_progress.csv"
 
 SHEET_NAME = "Master List"
 JOURNAL_SHEET = "DAILY SALE JOUNAL"
