@@ -1,5 +1,5 @@
 # ============================================================
-#  នំប៉ាវហុងកុង Supply Chain Hub  -  CLOUD VERSION (Dropbox API)
+#  នំប៉ាវហុងកុង Supply Chain Hub  -  CLOUD VERSION WITH LOGIN
 # ============================================================
 import streamlit as st
 import pandas as pd
@@ -30,9 +30,9 @@ DBX_APP_KEY = get_secret("DROPBOX_APP_KEY")
 DBX_APP_SECRET = get_secret("DROPBOX_APP_SECRET")
 DBX_REFRESH_TOKEN = get_secret("DROPBOX_REFRESH_TOKEN")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "hk2026")
+TEAM_PASSWORD = get_secret("TEAM_PASSWORD", "staff2026") # The password for your staff
 
-# Dropbox paths (Must start with a slash and match your Dropbox folder exactly)
-# Update these if your folder name is different
+# Dropbox paths
 DBX_EXCEL_PATH = "/dropbox/4- Sale Jounal/10_Sale_Journal_OCT_2026.xlsx"
 DBX_DATA_PATH = "/dropbox/4- Sale Jounal/daily_delivery_expenses.csv"
 DBX_PACKING_PATH = "/dropbox/4- Sale Jounal/daily_packing_progress.csv"
@@ -76,12 +76,10 @@ def get_dbx():
 dbx = get_dbx()
 
 def download_csv_from_dbx(dbx_path, cols):
-    """Downloads a CSV from Dropbox and returns a DataFrame"""
     try:
         _, res = dbx.files_download(dbx_path)
         df = pd.read_csv(io.BytesIO(res.content), dtype=str, keep_default_na=False, encoding="utf-8-sig")
     except dropbox.exceptions.ApiError:
-        # File doesn't exist yet, return empty
         df = pd.DataFrame(columns=cols)
     except Exception as e:
         st.warning(f"Error reading {dbx_path}: {e}")
@@ -102,7 +100,6 @@ def download_csv_from_dbx(dbx_path, cols):
     return df.reset_index(drop=True)
 
 def upload_csv_to_dbx(df, dbx_path):
-    """Uploads a DataFrame to Dropbox as a CSV, overwriting the old one"""
     out = df.drop(columns=[c for c in ("_dt",) if c in df.columns])
     csv_str = out.to_csv(index=False, encoding="utf-8-sig")
     try:
@@ -115,7 +112,6 @@ def upload_csv_to_dbx(df, dbx_path):
         st.error(f"Error saving to Dropbox: {e}")
 
 def append_row_to_dbx(dbx_path, cols, row):
-    """Downloads, appends row, and uploads back to Dropbox"""
     df = download_csv_from_dbx(dbx_path, cols)
     ordered_row = {c: row.get(c, "-" if c not in NUM_COLS_ALL else 0) for c in cols}
     df = pd.concat([df, pd.DataFrame([ordered_row])], ignore_index=True)
@@ -123,19 +119,13 @@ def append_row_to_dbx(dbx_path, cols, row):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_excel_from_dbx(dbx_path):
-    """Downloads the Excel journal directly from Dropbox"""
     try:
         _, res = dbx.files_download(dbx_path)
         excel_bytes = io.BytesIO(res.content)
-        
-        # Load customers
         df_cust = pd.read_excel(excel_bytes, sheet_name=SHEET_NAME)
         customers = sorted({str(x).strip() for x in df_cust[COLUMN_NAME].dropna() if str(x).strip()})
-        
-        # Load Journal
         excel_bytes.seek(0)
         df_journal = pd.read_excel(excel_bytes, sheet_name=JOURNAL_SHEET, header=None)
-        
         return customers, df_journal, None
     except Exception as e:
         return [], None, str(e)
@@ -143,24 +133,15 @@ def get_excel_from_dbx(dbx_path):
 # ==========================================
 # TIME HELPERS
 # ==========================================
-def now_kh():
-    return datetime.now(TZ)
+def now_kh(): return datetime.now(TZ)
+def today_kh(): return now_kh().date()
+def now_str(): return now_kh().strftime("%Y-%m-%d %H:%M:%S")
 
-def today_kh():
-    return now_kh().date()
-
-def now_str():
-    return now_kh().strftime("%Y-%m-%d %H:%M:%S")
-
-# ==========================================
-# DATE PARSING 
-# ==========================================
 def _try_parse(s, dayfirst):
     try:
         t = pd.to_datetime(s, dayfirst=dayfirst, errors="coerce")
         return None if pd.isna(t) else pd.Timestamp(t)
-    except Exception:
-        return None
+    except Exception: return None
 
 def parse_dt(v):
     if isinstance(v, (datetime, pd.Timestamp)): return pd.Timestamp(v)
@@ -252,7 +233,7 @@ def admin_editor(dbx_path, cols, num_cols, key, label_cols):
                 else: new_vals[c] = st.text_input(f"Edit {c}:", value=str(current[c]), key=wkey)
             col_upd, col_del = st.columns(2)
             if col_upd.form_submit_button("🔄 Update Record"):
-                if pd.isna(parse_dt(new_vals["Date"])): st.error("❌ Date format is invalid. Use YYYY-MM-DD HH:MM:SS")
+                if pd.isna(parse_dt(new_vals["Date"])): st.error("❌ Date format is invalid.")
                 else:
                     for c in cols: df.loc[row_idx, c] = new_vals[c]
                     upload_csv_to_dbx(df, dbx_path)
@@ -329,11 +310,47 @@ def packing_form(form_key, cust_list, fixed_customer=None, default_cases=1):
                 })
                 flash_and_refresh(f"Packing logged: {customer} | {cases_packed} cases | {pack_status}")
 
+
 # ==========================================
-# APP SETUP & LAYOUT
+# APP SETUP & LOGIN SYSTEM
 # ==========================================
 st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="wide")
-st.title("🚚 នំប៉ាវហុងកុង Supply Chain Hub (Cloud Sync)")
+
+# Check if user is logged in
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+
+# THE LOGIN SCREEN
+if not st.session_state["logged_in"]:
+    st.title("🔒 នំប៉ាវហុងកុង Login")
+    st.info("Please log in to access the Supply Chain Hub.")
+    
+    with st.form("login_form"):
+        user_name = st.selectbox("👤 User:", ["-- Select Name --", "👨‍💻 Admin (Manager)"] + OPS_STAFF + LOCAL_DRIVERS)
+        password = st.text_input("🔑 Password:", type="password")
+        submitted = st.form_submit_button("Log In")
+        
+        if submitted:
+            if user_name == "-- Select Name --":
+                st.error("Please select your name.")
+            elif user_name == "👨‍💻 Admin (Manager)" and password == ADMIN_PASSWORD:
+                st.session_state["logged_in"] = True
+                st.session_state["user_name"] = "Admin"
+                st.rerun()
+            elif user_name != "-- Select Name --" and password == TEAM_PASSWORD:
+                st.session_state["logged_in"] = True
+                st.session_state["user_name"] = user_name
+                st.rerun()
+            else:
+                st.error("❌ Incorrect Password.")
+    
+    st.stop() # Stops the rest of the app from showing until logged in!
+
+
+# ==========================================
+# MAIN APP LAYOUT (Only shows after login)
+# ==========================================
+st.title("🚚 នំប៉ាវហុងកុង Supply Chain Hub")
 
 _flash = st.session_state.pop("flash", None)
 if _flash: st.toast(_flash, icon="✅")
@@ -343,9 +360,11 @@ CUSTOMER_LIST, df_journal, EXCEL_ERROR = get_excel_from_dbx(DBX_EXCEL_PATH)
 
 c_head, c_live = st.columns([4, 1])
 with c_head:
-    st.caption(f"🕒 {now_kh():%Y-%m-%d %I:%M %p} | ☁️ Connected to Dropbox")
+    st.caption(f"🕒 {now_kh():%Y-%m-%d %I:%M %p} | ☁️ Connected to Dropbox | 👤 Logged in as: {st.session_state['user_name']}")
 with c_live:
-    _live = st.checkbox(f"🔄 Auto-Refresh Dashboard", value=False, key="live_mode")
+    if st.button("🚪 Logout"):
+        st.session_state["logged_in"] = False
+        st.rerun()
 
 tab1, tab2, tab3 = st.tabs(["📦 1. Packing", "🚚 2. Dispatch", "📊 3. Live Dashboard"])
 
@@ -381,6 +400,9 @@ with tab2:
     else: st.info("No deliveries logged today yet.")
 
 with tab3:
+    c_live2, c_space = st.columns([1, 4])
+    with c_live2:
+        _live = st.checkbox(f"🔄 Auto-Refresh Dashboard", value=False, key="live_mode")
     if _live:
         try:
             from streamlit_autorefresh import st_autorefresh
