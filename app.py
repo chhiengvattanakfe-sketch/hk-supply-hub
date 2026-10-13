@@ -42,6 +42,7 @@ JOURNAL_SHEET = "DAILY SALE JOUNAL"
 COLUMN_NAME = "Customer Name"
 JOURNAL_HEADER_TEXT = "ឈ្មោះអតិថិជន"
 JOURNAL_CASES_HEADER = "កេស"          
+JOURNAL_INVOICE_HEADER = "វិក្កយបត្រ"  # Exact Khmer header for Invoice
 
 TZ = ZoneInfo("Asia/Phnom_Penh")
 DAYFIRST = True                        
@@ -410,7 +411,7 @@ with tab3:
 
     if EXCEL_ERROR: st.warning(f"Dropbox Error: {EXCEL_ERROR}")
 
-    # Build the report and extract Invoice Number
+    # Build the report and accurately extract Invoice Number using the Khmer header
     scheduled = {}
     invoice_mapping = {}
     if df_journal is not None:
@@ -421,14 +422,10 @@ with tab3:
                 val = str(df_journal.iloc[r, c])
                 if JOURNAL_CASES_HEADER in val:
                     cases_col = c
-                if "invoice" in val.lower() or "វិក្កយបត្រ" in val or "លេខ" in val:
+                if JOURNAL_INVOICE_HEADER in val:
                     invoice_col = c
-            if cases_col is not None: break
+            if cases_col is not None and invoice_col is not None: break
             
-        # Default fallback to column index 0 or 2 if invoice header isn't explicitly named
-        if invoice_col is None and df_journal.shape[1] > 2:
-            invoice_col = 0 
-
         for r in range(len(df_journal)):
             d = cell_to_date(df_journal.iloc[r, 0])
             if d == selected_date:
@@ -487,7 +484,7 @@ with tab3:
 
         st.markdown("---")
         
-        search_query = st.text_input("🔍 Search Customer or Invoice:", placeholder="Type a name or invoice number to filter...")
+        search_query = st.text_input("🔍 Search Customer or Invoice:", placeholder="Type a name or invoice number (e.g., NP312578) to filter...")
         if search_query:
             mask = df_report["Customer"].str.contains(search_query, case=False, na=False) | df_report["Invoice"].str.contains(search_query, case=False, na=False)
             df_report = df_report[mask].reset_index(drop=True)
