@@ -30,7 +30,7 @@ DBX_APP_KEY = get_secret("DROPBOX_APP_KEY")
 DBX_APP_SECRET = get_secret("DROPBOX_APP_SECRET")
 DBX_REFRESH_TOKEN = get_secret("DROPBOX_REFRESH_TOKEN")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "hk2026")
-TEAM_PASSWORD = get_secret("TEAM_PASSWORD", "staff2026") # The password for your staff
+TEAM_PASSWORD = get_secret("TEAM_PASSWORD", "staff2026") # Password for Staff, Drivers, and For Sale
 
 # Dropbox paths
 DBX_EXCEL_PATH = "/dropbox/4- Sale Jounal/10_Sale_Journal_OCT_2026.xlsx"
@@ -50,6 +50,7 @@ LIVE_REFRESH_SECONDS = 20
 
 LOCAL_DRIVERS = ["ងិន វុទ្ធា", "អួន តួ"]
 OPS_STAFF = ["ឆែម សំណុក", "សាយ ប៊ុនលី", "ប៉ៅ រីណា", "ពេជ រដ្ឋា", "រ៉ូ សុវណ្ណាឌែន", "ហេង រតនា", "កង សៀន", "ណាត ផានិត"]
+FOR_SALE_TEAM = ["For Sale (Team 1)", "For Sale (Team 2)"]
 
 DISPATCH_COLS = ["Date", "Handled_By", "Customer", "Cases", "Local_Driver",
                  "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By"]
@@ -248,15 +249,15 @@ def dispatch_form(form_key, cust_list, fixed_customer=None, default_cases=1, ver
     k = form_key
     with st.form(form_key, clear_on_submit=True):
         st.markdown("#### Order Details")
-        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
+        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + OPS_STAFF + FOR_SALE_TEAM, key=f"{k}_by")
         if fixed_customer is None:
             customer_name = st.selectbox("Customer Name / ID:", ["-- Select a Customer --"] + cust_list, key=f"{k}_cust")
         else:
             customer_name = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
         cases = st.number_input("ចំនួនកេស (Number of Cases):", min_value=0, step=1, value=int(default_cases), key=f"{k}_cases")
-        if verify: verified_by = st.selectbox("✅ Cases verified by:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_vby")
-        else: verified_by = st.selectbox("Cases verified by (optional):", ["-"] + OPS_STAFF, key=f"{k}_vby")
+        if verify: verified_by = st.selectbox("✅ Cases verified by:", ["-- Select Staff --"] + OPS_STAFF + FOR_SALE_TEAM, key=f"{k}_vby")
+        else: verified_by = st.selectbox("Cases verified by (optional):", ["-"] + OPS_STAFF + FOR_SALE_TEAM, key=f"{k}_vby")
 
         st.markdown("---")
         st.markdown("#### Transportation Details")
@@ -293,7 +294,7 @@ def packing_form(form_key, cust_list, fixed_customer=None, default_cases=1):
         else:
             customer = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
-        prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
+        prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + OPS_STAFF + FOR_SALE_TEAM, key=f"{k}_by")
 
         col1, col2 = st.columns(2)
         with col1: cases_packed = st.number_input("ចំនួនកេស (Cases Packed):", min_value=0, step=1, value=int(default_cases), key=f"{k}_cases")
@@ -316,23 +317,22 @@ def packing_form(form_key, cust_list, fixed_customer=None, default_cases=1):
 # ==========================================
 st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="wide")
 
-# Check if user is logged in
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
 # THE LOGIN SCREEN
 if not st.session_state["logged_in"]:
     st.title("🔒 នំប៉ាវហុងកុង Login")
-    st.info("Please log in to access the Supply Chain Hub.")
+    st.info("Please log in to access the Supply Chain Hub. Your browser will remember your login while the tab is open.")
     
     with st.form("login_form"):
-        user_name = st.selectbox("👤 User:", ["-- Select Name --", "👨‍💻 Admin (Manager)"] + OPS_STAFF + LOCAL_DRIVERS)
+        user_name = st.selectbox("👤 User / Role:", ["-- Select Name --", "👨‍💻 Admin (Manager)"] + OPS_STAFF + LOCAL_DRIVERS + FOR_SALE_TEAM)
         password = st.text_input("🔑 Password:", type="password")
         submitted = st.form_submit_button("Log In")
         
         if submitted:
             if user_name == "-- Select Name --":
-                st.error("Please select your name.")
+                st.error("Please select your name or role.")
             elif user_name == "👨‍💻 Admin (Manager)" and password == ADMIN_PASSWORD:
                 st.session_state["logged_in"] = True
                 st.session_state["user_name"] = "Admin"
@@ -344,7 +344,7 @@ if not st.session_state["logged_in"]:
             else:
                 st.error("❌ Incorrect Password.")
     
-    st.stop() # Stops the rest of the app from showing until logged in!
+    st.stop()
 
 
 # ==========================================
@@ -355,7 +355,6 @@ st.title("🚚 នំប៉ាវហុងកុង Supply Chain Hub")
 _flash = st.session_state.pop("flash", None)
 if _flash: st.toast(_flash, icon="✅")
 
-# Load Excel data from Dropbox
 CUSTOMER_LIST, df_journal, EXCEL_ERROR = get_excel_from_dbx(DBX_EXCEL_PATH)
 
 c_head, c_live = st.columns([4, 1])
@@ -416,7 +415,6 @@ with tab3:
 
     if EXCEL_ERROR: st.warning(f"Dropbox Error: {EXCEL_ERROR}")
 
-    # Build the report
     scheduled = {}
     if df_journal is not None:
         cases_col = None
@@ -480,14 +478,14 @@ with tab3:
 
         st.markdown("---")
         
-        # 🔍 THE NEW SEARCH BAR
+        # 🔍 SEARCH BAR
         search_query = st.text_input("🔍 Search Customer:", placeholder="Type a name to filter the list...")
         if search_query:
             df_report = df_report[df_report["Customer"].str.contains(search_query, case=False, na=False)].reset_index(drop=True)
 
         if st.session_state.pop("clear_sel", False): st.session_state.pop("dash_table", None)
 
-        if view_mode == "🖥️ Desktop Screen": col_table, col_edit = st.columns([1.6, 1.4])
+        if view_mode == "🖥️ Desktop Screen": col_table, col_edit = st.columns([1.6, 1.4]) 
         else:
             col_table = st.container()
             st.markdown("<br>", unsafe_allow_html=True)
