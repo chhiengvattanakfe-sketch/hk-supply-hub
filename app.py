@@ -42,7 +42,6 @@ JOURNAL_SHEET = "DAILY SALE JOUNAL"
 COLUMN_NAME = "Customer Name"
 JOURNAL_HEADER_TEXT = "ឈ្មោះអតិថិជន"
 JOURNAL_CASES_HEADER = "កេស"          
-JOURNAL_INVOICE_HEADER = "វិក្កយបត្រ"  # Exact Khmer header for Invoice
 
 TZ = ZoneInfo("Asia/Phnom_Penh")
 DAYFIRST = True                        
@@ -411,34 +410,29 @@ with tab3:
 
     if EXCEL_ERROR: st.warning(f"Dropbox Error: {EXCEL_ERROR}")
 
-    # Build the report and accurately extract Invoice Number using the Khmer header
+    # Build the report and extract Invoice Number from Column 0
     scheduled = {}
     invoice_mapping = {}
     if df_journal is not None:
         cases_col = None
-        invoice_col = None
         for r in range(min(15, len(df_journal))):
             for c in range(df_journal.shape[1]):
                 val = str(df_journal.iloc[r, c])
                 if JOURNAL_CASES_HEADER in val:
                     cases_col = c
-                if JOURNAL_INVOICE_HEADER in val:
-                    invoice_col = c
-            if cases_col is not None and invoice_col is not None: break
+            if cases_col is not None: break
             
-  for r in range(len(df_journal)):
-         d = cell_to_date(df_journal.iloc[r, 0])
-         if d == selected_date:
-             name = str(df_journal.iloc[r, 1]).strip()
-             if name and name != JOURNAL_HEADER_TEXT and name != "nan":
-                 qty = pd.to_numeric(df_journal.iloc[r, cases_col], errors="coerce") if cases_col is not None else None
+        for r in range(len(df_journal)):
+            d = cell_to_date(df_journal.iloc[r, 0])
+            if d == selected_date:
+                name = str(df_journal.iloc[r, 1]).strip()
+                if name and name != JOURNAL_HEADER_TEXT and name != "nan":
+                    qty = pd.to_numeric(df_journal.iloc[r, cases_col], errors="coerce") if cases_col is not None else None
+                    inv = str(df_journal.iloc[r, 0]).strip()
+                    if inv in ("", "nan", "None", "ណាត", "NaT"): inv = "-"
+                    scheduled[name] = int(qty) if pd.notna(qty) else None
+                    invoice_mapping[name] = inv
 
-                 # Pull directly from Column 0 (Invoice column)
-                 inv = str(df_journal.iloc[r, 0]).strip()
-                 if inv in ("", "nan", "None", "ណាត", "NaT"): inv = "-"
-
-                 scheduled[name] = int(qty) if pd.notna(qty) else None
-                 invoice_mapping[name] = inv
     df_pack_all = download_csv_from_dbx(DBX_PACKING_PATH, PACKING_COLS)
     df_disp_all = download_csv_from_dbx(DBX_DATA_PATH, DISPATCH_COLS)
     
