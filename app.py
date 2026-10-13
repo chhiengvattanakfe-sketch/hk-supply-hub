@@ -428,7 +428,19 @@ with tab3:
              name = str(df_journal.iloc[r, 1]).strip()
              if name and name != JOURNAL_HEADER_TEXT and name != "nan":
                  qty = pd.to_numeric(df_journal.iloc[r, cases_col], errors="coerce") if cases_col is not None else None
-                 inv = str(df_journal.iloc[r, 3]).strip()  # <--- Column 3 holds the actual Invoice numbers!
+
+                 # Smart search: Automatically find the cell in this row that starts with "NP"
+                 inv = "-"
+                 for c_idx in range(df_journal.shape[1]):
+                     val_str = str(df_journal.iloc[r, c_idx]).strip()
+                     if val_str.startswith("NP") or val_str.startswith("np"):
+                         inv = val_str
+                         break
+                 if inv == "-":
+                     # Fallback if no "NP" prefix is found, try column 4 or 5
+                     if df_journal.shape[1] > 4:
+                         inv = str(df_journal.iloc[r, 4]).strip()
+
                  if inv in ("", "nan", "None", "ណាត", "NaT"): inv = "-"
                  scheduled[name] = int(qty) if pd.notna(qty) else None
                  invoice_mapping[name] = inv
