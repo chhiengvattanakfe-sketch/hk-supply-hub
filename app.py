@@ -1,5 +1,5 @@
 # ============================================================
-#  នំប៉ាវហុងកុង Supply Chain Hub  -  CLOUD VERSION WITH LOGIN
+#  នំប៉ាវហុងកុង Supply Chain Hub  -  CLOUD VERSION WITH INVOICE
 # ============================================================
 import streamlit as st
 import pandas as pd
@@ -30,7 +30,7 @@ DBX_APP_KEY = get_secret("DROPBOX_APP_KEY")
 DBX_APP_SECRET = get_secret("DROPBOX_APP_SECRET")
 DBX_REFRESH_TOKEN = get_secret("DROPBOX_REFRESH_TOKEN")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "hk2026")
-TEAM_PASSWORD = get_secret("TEAM_PASSWORD", "staff2026") # Password for Staff, Drivers, and For Sale
+TEAM_PASSWORD = get_secret("TEAM_PASSWORD", "staff2026")
 
 # Dropbox paths
 DBX_EXCEL_PATH = "/dropbox/4- Sale Jounal/10_Sale_Journal_OCT_2026.xlsx"
@@ -45,8 +45,6 @@ JOURNAL_CASES_HEADER = "កេស"
 
 TZ = ZoneInfo("Asia/Phnom_Penh")
 DAYFIRST = True                        
-
-LIVE_REFRESH_SECONDS = 20              
 
 LOCAL_DRIVERS = ["ងិន វុទ្ធា", "អួន តួ"]
 OPS_STAFF = ["ឆែម សំណុក", "សាយ ប៊ុនលី", "ប៉ៅ រីណា", "ពេជ រដ្ឋា", "រ៉ូ សុវណ្ណាឌែន", "ហេង រតនា", "កង សៀន", "ណាត ផានិត"]
@@ -320,10 +318,9 @@ st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="w
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
-# THE LOGIN SCREEN
 if not st.session_state["logged_in"]:
     st.title("🔒 នំប៉ាវហុងកុង Login")
-    st.info("Please log in to access the Supply Chain Hub. Your browser will remember your login while the tab is open.")
+    st.info("Please log in to access the Supply Chain Hub.")
     
     with st.form("login_form"):
         user_name = st.selectbox("👤 User / Role:", ["-- Select Name --", "👨‍💻 Admin (Manager)"] + OPS_STAFF + LOCAL_DRIVERS + FOR_SALE_TEAM)
@@ -343,12 +340,10 @@ if not st.session_state["logged_in"]:
                 st.rerun()
             else:
                 st.error("❌ Incorrect Password.")
-    
     st.stop()
 
-
 # ==========================================
-# MAIN APP LAYOUT (Only shows after login)
+# MAIN APP LAYOUT
 # ==========================================
 st.title("🚚 នំប៉ាវហុងកុង Supply Chain Hub")
 
@@ -415,22 +410,35 @@ with tab3:
 
     if EXCEL_ERROR: st.warning(f"Dropbox Error: {EXCEL_ERROR}")
 
+    # Build the report and extract Invoice Number
     scheduled = {}
+    invoice_mapping = {}
     if df_journal is not None:
         cases_col = None
+        invoice_col = None
         for r in range(min(15, len(df_journal))):
             for c in range(df_journal.shape[1]):
-                if JOURNAL_CASES_HEADER in str(df_journal.iloc[r, c]):
-                    cases_col = c; break
+                val = str(df_journal.iloc[r, c])
+                if JOURNAL_CASES_HEADER in val:
+                    cases_col = c
+                if "invoice" in val.lower() or "វិក្កយបត្រ" in val or "លេខ" in val:
+                    invoice_col = c
             if cases_col is not None: break
             
+        # Default fallback to column index 0 or 2 if invoice header isn't explicitly named
+        if invoice_col is None and df_journal.shape[1] > 2:
+            invoice_col = 0 
+
         for r in range(len(df_journal)):
             d = cell_to_date(df_journal.iloc[r, 0])
             if d == selected_date:
                 name = str(df_journal.iloc[r, 1]).strip()
                 if name and name != JOURNAL_HEADER_TEXT and name != "nan":
                     qty = pd.to_numeric(df_journal.iloc[r, cases_col], errors="coerce") if cases_col is not None else None
+                    inv = str(df_journal.iloc[r, invoice_col]).strip() if invoice_col is not None else "-"
+                    if inv in ("", "nan", "None"): inv = "-"
                     scheduled[name] = int(qty) if pd.notna(qty) else None
+                    invoice_mapping[name] = inv
 
     df_pack_all = download_csv_from_dbx(DBX_PACKING_PATH, PACKING_COLS)
     df_disp_all = download_csv_from_dbx(DBX_DATA_PATH, DISPATCH_COLS)
@@ -450,13 +458,14 @@ with tab3:
         packed, sent = p["cases"] if p else 0, s["cases"] if s else 0
         ordered = scheduled.get(cust)
         target = packed if packed > 0 else (ordered or 0)
+        invoice_num = invoice_mapping.get(cust, "-")
         
         if s: status = "🔵 Partial" if (target > 0 and sent < target) else "✅ Sent"
         elif p: status = "🟠 Packing" if "In Progress" in p["status"] else "🟡 Ready for Delivery"
         else: status = "⏳ Pending"
         
         rows.append({
-            "Customer": cust, "Status": status, "កេស": ordered, "Packed Cases": packed, "Prepared By": p["by"] if p else "-",
+            "Invoice": invoice_num, "Customer": cust, "Status": status, "កេស": ordered, "Packed Cases": packed, "Prepared By": p["by"] if p else "-",
             "Sent Cases": sent, "Handled By": s["by"] if s else "-", "Verified By": s["verified"] if s else "-",
             "Driver/Station": s["driver"] if s else "-", "Note": s["note"] if s else "-", "Time": s["time"] if s else "-",
             "Source": "Journal" if cust in scheduled else "⚠️ Not in journal",
@@ -478,10 +487,10 @@ with tab3:
 
         st.markdown("---")
         
-        # 🔍 SEARCH BAR
-        search_query = st.text_input("🔍 Search Customer:", placeholder="Type a name to filter the list...")
+        search_query = st.text_input("🔍 Search Customer or Invoice:", placeholder="Type a name or invoice number to filter...")
         if search_query:
-            df_report = df_report[df_report["Customer"].str.contains(search_query, case=False, na=False)].reset_index(drop=True)
+            mask = df_report["Customer"].str.contains(search_query, case=False, na=False) | df_report["Invoice"].str.contains(search_query, case=False, na=False)
+            df_report = df_report[mask].reset_index(drop=True)
 
         if st.session_state.pop("clear_sel", False): st.session_state.pop("dash_table", None)
 
@@ -512,9 +521,8 @@ with tab3:
                     packed_n, sent_n = int(p_row["Packed Cases"]), int(p_row["Sent Cases"])
                     target_n = packed_n if packed_n > 0 else (ordered_n or 0)
 
-                    st.caption(f"**Status:** {p_row['Status']}  |  **Ordered:** {ordered_n if ordered_n is not None else '-'} កេស")
-                    st.caption(f"**Packed:** {packed_n} (by {p_row['Prepared By']})")
-                    st.caption(f"**Sent:** {sent_n} (by {p_row['Handled By']}, verified by {p_row['Verified By']})")
+                    st.caption(f"**Invoice:** {p_row['Invoice']} | **Status:** {p_row['Status']}")
+                    st.caption(f"**Ordered:** {ordered_n if ordered_n is not None else '-'} កេស | **Packed:** {packed_n} | **Sent:** {sent_n}")
 
                     pack_default = max((ordered_n or 0) - packed_n, 0) or 1
                     send_default = (target_n - sent_n) if (target_n - sent_n) > 0 else 1
