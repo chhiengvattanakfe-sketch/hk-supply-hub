@@ -78,6 +78,8 @@ MAX_TEXT = 200
 
 LOCAL_DRIVERS = ["ងិន វុទ្ធា", "អួន តួ"]
 OPS_STAFF = ["ឆែម សំណុក", "សាយ ប៊ុនលី", "ប៉ៅ រីណា", "ពេជ រដ្ឋា", "រ៉ូ សុវណ្ណាឌែន", "ហេង រតនា", "កង សៀន", "ណាត ផានិត"]
+FOR_SALE_TEAM = ["For Sale (Team 1)", "For Sale (Team 2)"]
+ALL_STAFF_DRIVERS = OPS_STAFF + LOCAL_DRIVERS + FOR_SALE_TEAM
 
 DISPATCH_COLS = ["Date", "Handled_By", "Customer", "Cases", "Local_Driver",
                  "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By"]
@@ -319,7 +321,7 @@ def _try_login(code):
             guard["locked"][cid] = time.time() + LOCKOUT_MIN * 60
             guard["fails"][cid] = 0
     audit("login_failed", "wrong code")
-    time.sleep(1)                                            # slows down guessing
+    time.sleep(1)                                                # slows down guessing
     st.error("❌ Wrong access code.")
 
 
@@ -529,7 +531,7 @@ def append_row(path, row):
                         fh.write(b"\r\n")
                 ordered = {c: row.get(c, "-") for c in header}
                 pd.DataFrame([ordered]).to_csv(path, mode="a", header=False, index=False, encoding="utf-8-sig")
-            else:                                                  # file lacks some columns -> rewrite once
+            else:                                                # file lacks some columns -> rewrite once
                 df = pd.read_csv(path, encoding="utf-8-sig")
                 df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
                 df.to_csv(path, index=False, encoding="utf-8-sig")
@@ -576,17 +578,17 @@ def _cell_text(v):
 
 
 def _find_invoice(row, inv_col):
-    """Invoice column first; if empty, the first cell (from column 3 on) that starts with INVOICE_PREFIX."""
+    """Smart search: Look for NP followed ONLY by numbers (e.g., NP312578) to ignore NPHK-00018"""
     if inv_col is not None and inv_col < len(row):
         s = _cell_text(row[inv_col])
         if s:
             return s
-    pre = INVOICE_PREFIX.upper()
+            
     for c_i in range(2, len(row)):
         v = row[c_i]
         if isinstance(v, str):
-            s = v.strip()
-            if s.upper().startswith(pre) and len(s) > len(pre):
+            s = v.strip().upper()
+            if re.match(r"^" + re.escape(INVOICE_PREFIX.upper()) + r"\d+$", s):
                 return s
     return "-"
 
@@ -1045,7 +1047,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
     k = form_key
     with st.form(form_key, clear_on_submit=True):
         st.markdown("#### Order Details")
-        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
+        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_by")
         if fixed_customer is None:
             customer_name = st.selectbox("Customer Name / ID (Type to search):",
                                          ["-- Select a Customer --"] + get_customer_list(), key=f"{k}_cust")
@@ -1057,9 +1059,9 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
                                 value=d_cases, key=f"{k}_cases_{d_cases}")
         if verify:
             verified_by = st.selectbox("✅ Cases verified by (confirms the កេស number is correct):",
-                                       ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_vby")
+                                       ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_vby")
         else:
-            verified_by = st.selectbox("Cases verified by (optional):", ["-"] + OPS_STAFF, key=f"{k}_vby")
+            verified_by = st.selectbox("Cases verified by (optional):", ["-"] + ALL_STAFF_DRIVERS, key=f"{k}_vby")
 
         st.markdown("---")
         st.markdown("#### Transportation Details")
@@ -1121,7 +1123,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
         else:
             customer = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
-        prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
+        prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + ALL_STAFF_DRIVERS, key=f"{k}_by")
 
         col1, col2 = st.columns(2)
         with col1:
