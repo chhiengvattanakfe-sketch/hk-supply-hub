@@ -43,11 +43,11 @@ VIEWER_PASSWORD = get_secret("VIEWER_PASSWORD", "")
 
 # Dropbox Cloud Paths (Saving straight to your 4- Sale Jounal folder)
 # Dropbox Cloud Paths (TESTING STATE)
-DBX_EXCEL_PATH = "/4- Sale Jounal/Test_Environment/10_Sale_Journal_OCT_2026.xlsx"
-DBX_DATA_PATH = "/4- Sale Jounal/Test_Environment/test_daily_delivery.csv"
-DBX_PACKING_PATH = "/4- Sale Jounal/Test_Environment/test_daily_packing.csv"
-DBX_AUDIT_PATH = "/4- Sale Jounal/Test_Environment/test_audit_log.csv"
-DBX_BOT_LOG_PATH = "/4- Sale Jounal/Test_Environment/test_bot_log.csv"
+DBX_EXCEL_PATH = "/dropbox/4- Sale Jounal/Test_Environment/10_Sale_Journal_OCT_2026.xlsx"
+DBX_DATA_PATH = "/dropbox/4- Sale Jounal/Test_Environment/test_daily_delivery.csv"
+DBX_PACKING_PATH = "/dropbox/4- Sale Jounal/Test_Environment/test_daily_packing.csv"
+DBX_AUDIT_PATH = "/dropbox/4- Sale Jounal/Test_Environment/test_audit_log.csv"
+DBX_BOT_LOG_PATH = "/dropbox/4- Sale Jounal/Test_Environment/test_bot_log.csv"
 
 # Excel Headers
 SHEET_NAME = "Master List"
