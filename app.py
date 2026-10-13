@@ -423,15 +423,15 @@ with tab3:
             if cases_col is not None: break
             
         for r in range(len(df_journal)):
-            d = cell_to_date(df_journal.iloc[r, 0])
-            if d == selected_date:
-                name = str(df_journal.iloc[r, 1]).strip()
-                if name and name != JOURNAL_HEADER_TEXT and name != "nan":
-                    qty = pd.to_numeric(df_journal.iloc[r, cases_col], errors="coerce") if cases_col is not None else None
-                    inv = str(df_journal.iloc[r, 0]).strip()
-                    if inv in ("", "nan", "None", "ណាត", "NaT"): inv = "-"
-                    scheduled[name] = int(qty) if pd.notna(qty) else None
-                    invoice_mapping[name] = inv
+         d = cell_to_date(df_journal.iloc[r, 0])
+         if d == selected_date:
+             name = str(df_journal.iloc[r, 1]).strip()
+             if name and name != JOURNAL_HEADER_TEXT and name != "nan":
+                 qty = pd.to_numeric(df_journal.iloc[r, cases_col], errors="coerce") if cases_col is not None else None
+                 inv = str(df_journal.iloc[r, 2]).strip()  # <--- Column 2 holds the Invoice numbers!
+                 if inv in ("", "nan", "None", "ណាត", "NaT"): inv = "-"
+                 scheduled[name] = int(qty) if pd.notna(qty) else None
+                 invoice_mapping[name] = inv
 
     df_pack_all = download_csv_from_dbx(DBX_PACKING_PATH, PACKING_COLS)
     df_disp_all = download_csv_from_dbx(DBX_DATA_PATH, DISPATCH_COLS)
