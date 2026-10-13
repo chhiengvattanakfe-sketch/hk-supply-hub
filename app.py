@@ -479,9 +479,15 @@ with tab3:
         k5.metric("✅ Sent", int(counts.get("✅ Sent", 0)))
 
         st.markdown("---")
+        
+        # 🔍 THE NEW SEARCH BAR
+        search_query = st.text_input("🔍 Search Customer:", placeholder="Type a name to filter the list...")
+        if search_query:
+            df_report = df_report[df_report["Customer"].str.contains(search_query, case=False, na=False)].reset_index(drop=True)
+
         if st.session_state.pop("clear_sel", False): st.session_state.pop("dash_table", None)
 
-        if view_mode == "🖥️ Desktop Screen": col_table, col_edit = st.columns([1.6, 1.4]) 
+        if view_mode == "🖥️ Desktop Screen": col_table, col_edit = st.columns([1.6, 1.4])
         else:
             col_table = st.container()
             st.markdown("<br>", unsafe_allow_html=True)
