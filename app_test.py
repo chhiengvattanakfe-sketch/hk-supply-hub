@@ -22,6 +22,7 @@ import contextlib
 import secrets as pysecrets
 import fnmatch
 import json
+import html
 import unicodedata
 import hashlib
 from collections import Counter
@@ -1216,48 +1217,54 @@ def save_csv(path, df):
         push(path)
 
 
-def _append_local(path, row):
-    """Appends one row to the local file, keeping the column order of the existing file."""
+def _append_local_many(path, rows):
+    """Appends rows to the local file, keeping the column order of the existing file."""
     with file_lock(path):
         exists = os.path.exists(path) and os.path.getsize(path) > 0
         if not exists:
-            pd.DataFrame([row]).to_csv(path, index=False, encoding="utf-8-sig")
+            pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
             return
         header = list(pd.read_csv(path, nrows=0, encoding="utf-8-sig").columns)
-        if set(row) <= set(header):
+        if all(set(r) <= set(header) for r in rows):
             with open(path, "rb") as fh:                       # file must end with a newline
                 fh.seek(-1, os.SEEK_END)
                 needs_nl = fh.read(1) not in (b"\n", b"\r")
             if needs_nl:
                 with open(path, "ab") as fh:
                     fh.write(b"\r\n")
-            ordered = {c: row.get(c, "-") for c in header}
-            pd.DataFrame([ordered]).to_csv(path, mode="a", header=False, index=False, encoding="utf-8-sig")
+            ordered = [{c: r.get(c, "-") for c in header} for r in rows]
+            pd.DataFrame(ordered).to_csv(path, mode="a", header=False, index=False, encoding="utf-8-sig")
         else:                                                  # file lacks some columns -> rewrite once
             df = pd.read_csv(path, encoding="utf-8-sig")
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
             df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
-def append_row(path, row):
-    """Add ONE row (text is cleaned first). Online: downloads the latest file, adds the row, uploads it
-    with a version check, and retries if somebody else saved at the same moment."""
-    row = {k: (v if k == "Date" or not isinstance(v, str) else safe_text(v)) for k, v in row.items()}
+def append_rows(path, rows):
+    """Add several rows in ONE save (text is cleaned first). Online: one download, one upload."""
+    rows = [{k: (v if k == "Date" or not isinstance(v, str) else safe_text(v)) for k, v in r.items()} for r in rows]
+    if not rows:
+        return
     if not USE_DROPBOX:
-        _retry(lambda: _append_local(path, row))
+        _retry(lambda: _append_local_many(path, rows))
         return
     last = None
     for attempt in range(6):
         try:
             with _sync_state()["lock"]:
                 pull(path, force=True)
-                _append_local(path, row)
+                _append_local_many(path, rows)
                 push(path)
             return
         except ConflictError as e:
             last = e
             time.sleep(0.2 * (attempt + 1))
     raise RuntimeError("Dropbox is busy - please press Save again") from last
+
+
+def append_row(path, row):
+    """Add ONE row (see append_rows)."""
+    append_rows(path, [row])
 
 
 def modify_csv(path, cols, fn):
@@ -1799,9 +1806,23 @@ div[data-testid="stMetric"] {background: rgba(128,128,128,.07); border: 1px soli
 .stButton > button, .stDownloadButton > button, div[data-testid="stFormSubmitButton"] > button {
     border-radius: 10px; min-height: 2.7rem; font-weight: 600;}
 footer {visibility: hidden;}
+.hk-kpis {display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px;}
+.hk-pill {background: rgba(128,128,128,.10); border: 1px solid rgba(128,128,128,.25); border-radius: 999px;
+    padding: 4px 12px; font-size: .92rem; white-space: nowrap;}
+.hk-card {background: rgba(128,128,128,.07); border: 1px solid rgba(128,128,128,.22); border-radius: 12px;
+    padding: 10px 12px; margin: 7px 0;}
+.hk-top {display: flex; justify-content: space-between; gap: 8px; align-items: flex-start;}
+.hk-name {font-weight: 700; font-size: 1.02rem; word-break: break-word;}
+.hk-badge {border-radius: 999px; padding: 2px 10px; font-size: .78rem; white-space: nowrap;}
+.hk-sub {opacity: .75; font-size: .85rem; margin-top: 2px; word-break: break-word;}
+.hk-nums {display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 6px; font-size: .95rem;}
+.hk-note {margin-top: 6px; font-size: .85rem;}
+.hk-group {font-weight: 700; margin: 16px 0 4px; padding-bottom: 3px; border-bottom: 2px solid rgba(128,128,128,.3);}
 @media (max-width: 640px) {
   .block-container {padding-left: .7rem; padding-right: .7rem;}
   h1 {font-size: 1.45rem !important;}
+  h3 {font-size: 1.15rem !important;}
+  .hk-pill {font-size: .85rem; padding: 3px 9px;}
 }
 </style>
 """
@@ -2033,9 +2054,376 @@ def admin_editor(path, cols, num_cols, key, label_cols):
 # ==========================================
 # TAB: PACKING
 # ==========================================
+# ==========================================
+# FAST PACKING UPDATE: tick list + upload an Excel/CSV with "done / not yet"
+# ==========================================
+DONE_WORDS = {"done", "yes", "y", "ok", "okay", "✔", "✓", "✅", "☑", "✔️", "☑️", "true", "1", "complete", "completed",
+              "finish", "finished", "ready", "packed", "រួចរាល់", "រួច", "ហើយ", "រួចហើយ", "បានរួច", "បានហើយ", "បានរួចរាល់"}
+NOT_WORDS = {"not yet", "notyet", "no", "n", "pending", "wait", "waiting", "todo", "to do", "in progress", "progress",
+             "❌", "✗", "✘", "✖", "false", "0", "មិនទាន់", "មិនទាន់រួច", "មិនទាន់ហើយ", "កំពុងធ្វើ", "ចាំ", "ខ្វះ"}
+MAX_UPLOAD_BYTES = 5_000_000
+
+
+def parse_status(v):
+    """'done' | 'not' | None (not understood) for one cell of the uploaded file."""
+    t = "" if v is None else str(v).strip().lower()
+    if not t or t in ("nan", "none"):
+        return None
+    t = re.sub(r"[\s._\-]+", " ", t).strip()
+    if t in DONE_WORDS:
+        return "done"
+    if t in NOT_WORDS:
+        return "not"
+    if ("មិនទាន់" in t or "មិនរួច" in t or "កំពុង" in t or "not yet" in t or t.startswith("not ")
+            or "pending" in t or "wait" in t):
+        return "not"
+    if "រួច" in t or "ហើយ" in t or "done" in t or "complete" in t or "finish" in t or "packed" in t or "ready" in t:
+        return "done"
+    return None
+
+
+def _col_letter(i):
+    i, out = int(i), ""
+    while True:
+        out = chr(65 + i % 26) + out
+        i = i // 26 - 1
+        if i < 0:
+            return out
+
+
+def read_upload_tables(up):
+    """{sheet name: DataFrame of text} from an uploaded .xlsx / .csv file."""
+    name, data = (up.name or "").lower(), up.getvalue()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError("The file is bigger than 5 MB.")
+    if name.endswith((".xlsx", ".xlsm")):
+        tabs = pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=str, engine="openpyxl")
+    elif name.endswith((".csv", ".txt")):
+        text = None
+        for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+            try:
+                text = data.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        tabs = {"CSV": pd.read_csv(io.StringIO(text), sep=None, engine="python", header=None, dtype=str,
+                                   keep_default_na=False)}
+    else:
+        raise ValueError("Please upload an .xlsx or .csv file (for an old .xls, save it as .xlsx first).")
+    out = {}
+    for k, v in tabs.items():
+        v = v.fillna("").astype(str).apply(lambda col: col.str.strip())
+        v = v[(v != "").any(axis=1)].reset_index(drop=True)
+        if not v.empty and len(v) <= 3000:
+            out[str(k)] = v
+    return out
+
+
+def guess_columns(tbl, known):
+    """Best guess of (customer column, status column, cases column) of an uploaded table."""
+    scores = {}
+    for c in tbl.columns:
+        vals = [v for v in tbl[c] if v]
+        if vals:
+            scores[c] = {"name": sum(norm_name(v) in known for v in vals) / len(vals),
+                         "status": sum(parse_status(v) is not None for v in vals) / len(vals),
+                         "num": sum(bool(re.fullmatch(r"\d{1,4}", v)) for v in vals) / len(vals), "n": len(vals)}
+    if not scores:
+        return None, None, None
+    name_col = max(scores, key=lambda c: scores[c]["name"])
+    if scores[name_col]["name"] == 0:
+        txt = [c for c in scores if scores[c]["num"] < .5 and scores[c]["status"] < .5]
+        name_col = max(txt, key=lambda c: scores[c]["n"]) if txt else None
+    rest = [c for c in scores if c != name_col]
+    status_col = max(rest, key=lambda c: scores[c]["status"], default=None)
+    if status_col is not None and scores[status_col]["status"] == 0:
+        status_col = None
+    cases_col = None
+    for c in rest:
+        if c == status_col:
+            continue
+        head = " ".join(tbl[c].head(3)).lower()
+        if scores[c]["num"] > .6 and any(k in head for k in ("case", "កេស", "qty", "ចំនួន")):
+            cases_col = c
+            break
+    return name_col, status_col, cases_col
+
+
+def match_names(names, cand_today, cand_master):
+    """{name in file: (customer, how)}. Today's customers are tried first."""
+    nt = {norm_name(n): n for n in cand_today}
+    nm = {norm_name(n): n for n in cand_master}
+    out = {}
+    for fn in dict.fromkeys(names):
+        k = norm_name(fn)
+        if k in nt:
+            out[fn] = (nt[k], "✅ exact")
+        elif k in nm:
+            out[fn] = (nm[k], "⚠️ not scheduled today")
+        else:
+            res = ("", "❌ not found")
+            hit = [v for kk, v in nt.items() if len(k) >= 6 and (k in kk or kk in k)]
+            if len(hit) == 1:
+                res = (hit[0], "≈ similar - check")
+            else:
+                c = difflib.get_close_matches(k, list(nt), n=1, cutoff=0.86)
+                if c:
+                    res = (nt[c[0]], "≈ similar - check")
+                else:
+                    c = difflib.get_close_matches(k, list(nm), n=1, cutoff=0.9)
+                    if c:
+                        res = (nm[c[0]], "≈ similar, not scheduled today")
+            out[fn] = res
+    return out
+
+
+def packing_context():
+    """Today's customers and what is already packed (used to match and to avoid double entries)."""
+    df, _, _ = build_report(today_kh())
+    snap = current_snapshot()[0]
+    recs = df.to_dict("records") if not df.empty else []
+    return {"df": df, "master": snap["customers"] if snap else [],
+            "today": [r["Customer"] for r in recs if r["Source"] == "Journal"],
+            "ordered": {r["Customer"]: (None if pd.isna(r["កេស"]) else int(r["កេស"])) for r in recs},
+            "packed": {r["Customer"]: int(r["Packed Cases"]) for r in recs}}
+
+
+BULK_COLS = ["Save?", "Customer", "Name in file", "Match", "Status", "Cases", "Already packed", "Note"]
+
+
+def build_bulk_preview(tbl, name_col, status_col, cases_col, blank_means, mark_progress, ctx):
+    """One preview row per line of the uploaded file, with a safe default for 'Save?'."""
+    names = [tbl.at[i, name_col] for i in tbl.index if tbl.at[i, name_col]]
+    matches = match_names(names, ctx["today"], ctx["master"])
+    rows, seen = [], set()
+    for i in tbl.index:
+        fname = tbl.at[i, name_col]
+        if not fname:
+            continue
+        raw = tbl.at[i, status_col] if status_col is not None else ""
+        kind = parse_status(raw)
+        cust, how = matches[fname]
+        note = ""
+        if kind is None:
+            if raw == "" and blank_means == "Not yet":
+                kind = "not"
+            elif raw != "":
+                note = f"Status not understood: '{raw[:20]}'. "
+        if not cust and kind is None:
+            continue                                            # header line or an empty line
+        file_cases = None
+        if cases_col is not None:
+            m = re.search(r"\d+", tbl.at[i, cases_col] or "")
+            file_cases = int(m.group()) if m else None
+        already = ctx["packed"].get(cust, 0) if cust else 0
+        ordered = ctx["ordered"].get(cust) if cust else None
+        target = file_cases or ordered
+        exact = how.startswith("✅")
+        if kind == "done":
+            label = "Done"
+            if target:
+                cases = max(target - already, 0)
+                if cases == 0:
+                    note += f"Already packed {already} of {target}. "
+            else:
+                cases = 0
+                note += "Cases unknown - type the number. "
+            save = bool(cust) and exact and cases > 0
+        elif kind == "not":
+            label = "Not yet"
+            cases = (target - already) if (target and target > already) else (target or 1)
+            save = bool(cust) and exact and mark_progress
+        else:
+            label, cases, save = "Skip", 0, False
+        if not cust:
+            note += "Customer not found - pick the right name or leave it. "
+        elif not exact:
+            note += "Check that the customer is the right one. "
+        if cust and cust in seen:
+            save, note = False, note + "Appears twice in the file. "
+        if cust:
+            seen.add(cust)
+        rows.append({"Save?": bool(save), "Customer": cust, "Name in file": fname, "Match": how, "Status": label,
+                     "Cases": int(cases), "Already packed": int(already), "Note": note.strip()})
+    return pd.DataFrame(rows, columns=BULK_COLS)
+
+
+def _int(v, default=0):
+    try:
+        return default if pd.isna(v) else int(v)
+    except Exception:
+        return default
+
+
+def bulk_editor(df, ctx, key, check_col="Save?", column_order=None):
+    """Editable preview + save button. Saves ALL chosen rows in one go."""
+    if df.empty:
+        st.info("Nothing to show.")
+        return
+    prepared_by = st.selectbox("👷 Prepared / packed by", ["-- Select Staff --"] + OPS_STAFF, key=f"{key}_by")
+    opts = sorted(set(ctx["today"]) | {c for c in df["Customer"] if c})
+    d = df.rename(columns={"Save?": check_col}) if check_col != "Save?" else df
+    sig = hashlib.md5("|".join(d["Customer"].astype(str) + d["Name in file"].astype(str)).encode("utf-8")).hexdigest()[:8]
+    edited = st.data_editor(
+        d, hide_index=True, height=min(480, 60 + 36 * len(d)), key=f"{key}_{sig}_{st.session_state.get('bulk_key', 0)}",
+        disabled=[c for c in d.columns if c not in (check_col, "Customer", "Status", "Cases")],
+        column_order=column_order,
+        column_config={
+            check_col: st.column_config.CheckboxColumn(check_col),
+            "Customer": st.column_config.SelectboxColumn("Customer", options=opts),
+            "Status": st.column_config.SelectboxColumn("Status", options=["Done", "Not yet", "Skip"]),
+            "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1)})
+    n_pick = int(edited[check_col].sum())
+    st.caption(f"{n_pick} row(s) ticked. 'Cases' = how many to record now (the app never adds more than what is still missing).")
+    if st.button(f"💾 Save {n_pick} packing record(s)", key=f"{key}_save", type="primary"):
+        if prepared_by == "-- Select Staff --":
+            st.error("❌ Please choose who prepared these orders.")
+            return
+        valid, recs, total = set(ctx["today"]) | set(ctx["master"]), [], 0
+        for r in edited.to_dict("records"):
+            cust, cases = str(r["Customer"] or "").strip(), _int(r["Cases"])
+            if not r[check_col] or r["Status"] == "Skip" or cust not in valid or cases <= 0 or cases > MAX_CASES:
+                continue
+            recs.append({"Date": now_str(), "Prepared_By": prepared_by, "Customer": cust, "Cases_Packed": cases,
+                         "Status": "Completed (រួចរាល់)" if r["Status"] == "Done" else "In Progress (កំពុងធ្វើ)"})
+            total += cases
+        if not recs:
+            st.warning("Nothing to save: tick at least one row that has a customer and cases above 0.")
+            return
+        try:
+            append_rows(PACKING_FILE, recs)
+            audit("packing_bulk", f"{len(recs)} customers, {total} cases, by {prepared_by}")
+            st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
+            flash_and_refresh(f"Saved {len(recs)} packing records ({total} cases)")
+        except (RuntimeError, ConflictError, PermissionError) as err:
+            bot_log("error", "Save packing (bulk)", str(err), "-")
+            st.error(f"⚠️ Could not save: {err}")
+
+
+def checklist_xlsx(ctx):
+    """A ready-to-fill Excel list of today's customers with a Done / Not yet drop-down."""
+    df = ctx["df"]
+    if df.empty:
+        return None
+    d = df[df["Source"] == "Journal"].copy()
+    if d.empty:
+        return None
+    d["_a"] = d["Area"].map(AREA_RANK)
+    d["_g"] = d["Region"].map(_REGION_ORDER).fillna(99)
+    d = d.sort_values(["_a", "_g", "Province", "Customer"])
+    out = pd.DataFrame({"Customer": d["Customer"], "Area": d["Area"], "Province": d["Province"],
+                        "Cases": d["កេស"], "Status": "Not yet"})
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        out.to_excel(w, index=False, sheet_name="Packing")
+        ws = w.sheets["Packing"]
+        try:
+            from openpyxl.worksheet.datavalidation import DataValidation
+            dv = DataValidation(type="list", formula1='"Done,Not yet"', allow_blank=True)
+            ws.add_data_validation(dv)
+            dv.add(f"E2:E{len(out) + 1}")
+            for col, wd in zip("ABCDE", (46, 16, 20, 8, 12)):
+                ws.column_dimensions[col].width = wd
+            ws.freeze_panes = "A2"
+        except Exception:
+            pass
+    return buf.getvalue()
+
+
+def _ticklist_tab():
+    ctx = packing_context()
+    df = ctx["df"]
+    if df.empty:
+        st.info("No customers in today's journal yet.")
+        return
+    st.caption("Tick the customers whose buns are packed, check the cases, choose who packed them, and save. "
+               "Fastest way on a phone.")
+    show_all = st.checkbox("Also show customers that are already packed or sent", key="tick_all")
+    d = df[df["Source"] == "Journal"].copy()
+    if not show_all:
+        d = d[d["Status"].isin(["⏳ Pending", "🟠 Packing"])]
+    if d.empty:
+        st.success("Everything in today's journal is already packed. 🎉")
+        return
+    d["_a"] = d["Area"].map(AREA_RANK)
+    d["_g"] = d["Region"].map(_REGION_ORDER).fillna(99)
+    d = d.sort_values(["_a", "_g", "Province", "Customer"])
+    rows = []
+    for r in d.to_dict("records"):
+        ordered = None if pd.isna(r["កេស"]) else int(r["កេស"])
+        packed = int(r["Packed Cases"])
+        left = (ordered - packed) if (ordered and ordered > packed) else (0 if ordered else 1)
+        rows.append({"Save?": False, "Customer": r["Customer"], "Name in file": "", "Match": "✅ exact", "Status": "Done",
+                     "Cases": int(left), "Already packed": packed,
+                     "Note": f"{r['Province']} · ordered {ordered if ordered is not None else '-'} · packed {packed}"})
+    bulk_editor(pd.DataFrame(rows, columns=BULK_COLS), ctx, key="tick", check_col="Done ✅",
+                column_order=["Done ✅", "Customer", "Cases", "Note"])
+
+
+def _upload_tab():
+    ctx = packing_context()
+    st.caption("Upload an Excel (.xlsx) or CSV list of customers with **done / not yet**. The app finds the columns, "
+               "matches the names, and shows you everything before saving.")
+    data = checklist_xlsx(ctx)
+    if data:
+        st.download_button("📥 Download today's checklist (Excel with a Done / Not yet drop-down)", data=data,
+                           file_name=f"Packing_checklist_{today_kh()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    bk = st.session_state.get("bulk_key", 0)
+    up = st.file_uploader("Excel (.xlsx) or CSV file", type=["xlsx", "xlsm", "csv", "txt"], key=f"bulk_up_{bk}")
+    if not up:
+        return
+    try:
+        tables = read_upload_tables(up)
+    except Exception as e:
+        st.error(f"❌ Could not read the file: {e}")
+        return
+    if not tables:
+        st.error("❌ The file is empty (or has more than 3000 rows).")
+        return
+    known = {norm_name(n) for n in ctx["today"] + ctx["master"]}
+    sheet = list(tables)[0]
+    if len(tables) > 1:
+        sheet = st.selectbox("Sheet", list(tables), key="bulk_sheet")
+    tbl = tables[sheet]
+    ng, sg, cg = guess_columns(tbl, known)
+    cols = list(tbl.columns)
+
+    def _lab(c):
+        if c is None:
+            return "(none)"
+        sample = next((v for v in tbl[c] if v), "")
+        return f"Column {_col_letter(c)}  -  e.g. {sample[:28]}"
+    c1, c2, c3 = st.columns(3)
+    name_col = c1.selectbox("Customer column", cols, index=cols.index(ng) if ng in cols else 0, format_func=_lab, key="bulk_c1")
+    status_opts = [None] + cols
+    status_col = c2.selectbox("Status column (done / not yet)", status_opts,
+                              index=status_opts.index(sg) if sg in status_opts else 0, format_func=_lab, key="bulk_c2")
+    cases_col = c3.selectbox("Cases column (optional)", status_opts,
+                             index=status_opts.index(cg) if cg in status_opts else 0, format_func=_lab, key="bulk_c3")
+    o1, o2 = st.columns(2)
+    blank_means = o1.radio("Empty status means", ["Not yet", "Skip the row"], horizontal=True, key="bulk_blank")
+    mark_progress = o2.checkbox("Also save 'Not yet' rows as 🟠 In progress", value=False, key="bulk_prog")
+    df = build_bulk_preview(tbl, name_col, status_col, cases_col, blank_means, mark_progress, ctx)
+    if df.empty:
+        st.warning("No customer names were found in that column. Choose another 'Customer column'.")
+        return
+    n_done, n_not = int((df["Status"] == "Done").sum()), int((df["Status"] == "Not yet").sum())
+    n_bad = int((df["Customer"] == "").sum())
+    st.info(f"📄 {len(df)} lines: ✅ {n_done} done, ⏳ {n_not} not yet, ❌ {n_bad} names not found. "
+            f"Rows with a green match are ticked for you; check the others.")
+    bulk_editor(df, ctx, key="upl", check_col="Save?")
+
+
 def _packing_body():
     st.markdown("### 📦 Bun Preparation & Packing")
-    packing_form("packing_form")
+    t_tick, t_up, t_one = st.tabs(["📋 Quick tick list", "📤 Upload a file", "✍️ One customer"])
+    with t_tick:
+        _ticklist_tab()
+    with t_up:
+        _upload_tab()
+    with t_one:
+        packing_form("packing_form")
 
     with st.expander("🛠️ Admin: Fix or Edit Today's Packing"):
         admin_editor(PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, key="pack",
@@ -2249,8 +2637,84 @@ def render_cambodia_map(df, metric):
             st.bar_chart(dm.set_index("province")["value"])
 
 
+STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Partial": ("#1565c0", "#ffffff"),
+                "🟡 Ready for Delivery": ("#f9a825", "#222222"), "🟠 Packing": ("#ef6c00", "#ffffff"),
+                "⏳ Pending": ("#757575", "#ffffff")}
+COMPACT_COLUMNS = ["🔥", "Customer", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Invoice"]
+_REGION_ORDER = {r: i for i, r in enumerate(REGIONS)}
+
+
+def is_mobile():
+    try:
+        ua = (st.context.headers.get("User-Agent") or "").lower()
+        return any(k in ua for k in ("mobile", "android", "iphone", "ipad"))
+    except Exception:
+        return False
+
+
+def _e(x):
+    return html.escape(str(x), quote=True)
+
+
+def kpi_strip(counts, total):
+    items = [("⏳ Pending", "⏳ Pending"), ("🟠 Packing", "🟠 Packing"), ("🟡 Ready", "🟡 Ready for Delivery"),
+             ("🔵 Partial", "🔵 Partial"), ("✅ Sent", "✅ Sent")]
+    pills = "".join(f"<span class='hk-pill'>{lab} <b>{int(counts.get(key, 0))}</b></span>" for lab, key in items)
+    return f"<div class='hk-kpis'>{pills}<span class='hk-pill'>👥 Total <b>{total}</b></span></div>"
+
+
+def card_html(r):
+    bg, fg = STATUS_STYLE.get(r["Status"], ("#757575", "#ffffff"))
+    ordered = "-" if pd.isna(r["កេស"]) else int(r["កេស"])
+    inv = f" · 🧾 {_e(r['Invoice'])}" if r["Invoice"] not in ("-", "") else ""
+    note = f"<div class='hk-note'>📌 {_e(r['Journal Note'])}</div>" if r["Journal Note"] not in ("-", "") else ""
+    sent = ""
+    if int(r["Sent Cases"]) > 0:
+        sent = (f"<div class='hk-note'>🚚 {_e(r['Handled By'])} · {_e(r['Time'])} · {_e(r['Driver/Station'])}"
+                f" · ✅ {_e(r['Verified By'])}</div>")
+    prep = f" · 👷 {_e(r['Prepared By'])}" if r["Prepared By"] not in ("-", "") else ""
+    return (f"<div class='hk-card' style='border-left:6px solid {bg}'>"
+            f"<div class='hk-top'><span class='hk-name'>{'🔥 ' if r['🔥'] else ''}{_e(r['Customer'])}</span>"
+            f"<span class='hk-badge' style='background:{bg};color:{fg}'>{_e(r['Status'])}</span></div>"
+            f"<div class='hk-sub'>{_e(r['Area'])} · {_e(r['Province'])}{inv}</div>"
+            f"<div class='hk-nums'><span>កេស <b>{ordered}</b></span><span>📦 <b>{int(r['Packed Cases'])}</b>{prep}</span>"
+            f"<span>🚚 <b>{int(r['Sent Cases'])}</b></span></div>{note}{sent}</div>")
+
+
+def cards_html(df):
+    """Cards grouped by Phnom Penh / province. One string without blank lines, every text escaped."""
+    parts, last, counts = [], None, df.groupby(["Area", "Province"]).size().to_dict()
+    for r in df.to_dict("records"):
+        key = (r["Area"], r["Province"])
+        if key != last:
+            last = key
+            title = r["Area"] if r["Province"] == PP else f"{r['Area']} · {r['Province']}"
+            parts.append(f"<div class='hk-group'>{_e(title)} ({counts[key]})</div>")
+        parts.append(card_html(r))
+    return "".join(parts)
+
+
+def render_cards(df):
+    page = 30
+    limit = st.session_state.get("card_limit", page)
+    d = df.copy()
+    d["_a"] = d["Area"].map(AREA_RANK)
+    d["_g"] = d["Region"].map(_REGION_ORDER).fillna(99)
+    d["_s"] = d["Status"].map(STATUS_RANK)
+    d = d.sort_values(["_a", "_g", "Province", "_s", "Customer"]).drop(columns=["_a", "_g", "_s"])
+    st.markdown(cards_html(d.head(limit)), unsafe_allow_html=True)
+    st.caption(f"Showing {min(limit, len(d))} of {len(d)} customers")
+    if len(d) > limit and st.button(f"⬇️ Show {page} more", key="card_more"):
+        st.session_state["card_limit"] = limit + page
+        try:
+            st.rerun(scope="fragment")
+        except TypeError:
+            st.rerun()
+
+
 def _dashboard_body():
     can_edit = current_role() in ("staff", "admin")
+    mobile = is_mobile()
     st.markdown("### 📊 Master Status Board")
     selected_date = st.date_input("Select Report Date:", value=today_kh(), key="dash_date")
     df_report, cases_found, err = build_report(selected_date)
@@ -2272,18 +2736,13 @@ def _dashboard_body():
 
     counts = df_scope["Status"].value_counts()
     total, n_sent = len(df_scope), int(counts.get("✅ Sent", 0))
-    k1, k2, k3, k4, k5 = st.columns(5)
-    kpi(k1, "⏳ Pending", int(counts.get("⏳ Pending", 0)))
-    kpi(k2, "🟠 Packing", int(counts.get("🟠 Packing", 0)))
-    kpi(k3, "🟡 Ready", int(counts.get("🟡 Ready for Delivery", 0)))
-    kpi(k4, "🔵 Partial", int(counts.get("🔵 Partial", 0)))
-    kpi(k5, "✅ Sent", n_sent)
+    st.markdown(kpi_strip(counts, total), unsafe_allow_html=True)
     try:
         st.progress(n_sent / total, text=f"Delivered {n_sent} of {total} customers ({n_sent * 100 // total}%)")
     except TypeError:
         st.progress(n_sent / total)
 
-    with st.expander("📊 Summary: Phnom Penh vs Province, regions and provinces", expanded=True):
+    with st.expander("📊 Summary: Phnom Penh vs Province, regions and provinces", expanded=not mobile):
         t_area, t_region, t_prov = st.tabs(["By area", "By delivery region", "By province"])
         with t_area:
             show_df(summarize(df_report, "Area"))
@@ -2291,15 +2750,16 @@ def _dashboard_body():
             show_df(summarize(df_scope, "Region"))
         with t_prov:
             show_df(summarize(df_scope, "Province"))
-    with st.expander("🗺️ Map of Cambodia", expanded=True):
+    with st.expander("🗺️ Map of Cambodia", expanded=not mobile):
         metric = st.radio("Circle size shows", ["Customers", "Customers still waiting", "Cases ordered (កេស)", "Cases sent"],
                           horizontal=True, key="map_metric")
         render_cambodia_map(df_scope, metric)
 
-    f1, f2, f3 = st.columns([3, 3, 2])
-    q = f1.text_input("🔎 Search customer or invoice", key="dash_q", max_chars=60)
-    pick_status = f2.multiselect("Status filter", list(STATUS_RANK), key="dash_status", placeholder="All statuses")
-    with f3:
+    # ---- search + display style ----
+    c1, c2, c3 = st.columns([3, 2, 2])
+    q = c1.text_input("🔎 Search customer or invoice", key="dash_q", max_chars=60)
+    display = c2.radio("Display", ["📱 Cards", "🖥️ Table"], horizontal=True, index=0 if mobile else 1, key="dash_display")
+    with c3:
         st.write("")
         try:
             buf = io.BytesIO()
@@ -2311,11 +2771,12 @@ def _dashboard_body():
         except Exception as e:
             st.warning(f"Could not build Excel report: {e}")
 
-    g1, g2 = st.columns(2)
-    pick_region = g1.multiselect("Region filter", [r for r in REGIONS if r in set(df_scope["Region"])],
-                                 key="dash_region", placeholder="All regions")
-    prov_choices = sorted(set(df_scope["Province"]))
-    pick_prov = g2.multiselect("Province filter", prov_choices, key="dash_prov", placeholder="All provinces")
+    with st.expander("🎚️ Filters: status, region, province"):
+        pick_status = st.multiselect("Status filter", list(STATUS_RANK), key="dash_status", placeholder="All statuses")
+        pick_region = st.multiselect("Region filter", [r for r in REGIONS if r in set(df_scope["Region"])],
+                                     key="dash_region", placeholder="All regions")
+        pick_prov = st.multiselect("Province filter", sorted(set(df_scope["Province"])), key="dash_prov",
+                                   placeholder="All provinces")
 
     df_view = df_scope
     if pick_region:
@@ -2334,34 +2795,39 @@ def _dashboard_body():
     if not cases_found:
         st.caption(f"ℹ️ No column '{JOURNAL_CASES_HEADER}' found in the journal, so ordered cases are empty. "
                    "Change JOURNAL_CASES_HEADER at the top of the file if your header is different.")
-    if can_edit:
-        st.caption("👆 Click a row to update it (who prepared, packing cases, who delivered, verify cases).")
     if st.session_state.pop("clear_sel", False):
         st.session_state.pop("dash_table", None)
 
-    cfg = {
-        "🔥": st.column_config.TextColumn("🔥", width="small"),
-        "Customer": st.column_config.TextColumn("Customer", width="large"),
-        "Area": st.column_config.TextColumn("Area", width="medium"),
-        "Province": st.column_config.TextColumn("Province", width="medium"),
-        "Region": st.column_config.TextColumn("Region", width="medium"),
-        "Invoice": st.column_config.TextColumn("Invoice", width="medium"),
-        "Status": st.column_config.TextColumn("Status", width="medium"),
-    }
+    event = None
+    table_mode = display.endswith("Table")
     if df_view.empty:
         st.info("No customers match your search / filter.")
-        event = None
+    elif table_mode:
+        all_cols = st.checkbox("Show all columns", key="dash_allcols")
+        if can_edit:
+            st.caption("👆 Click a row to update it (who prepared, packing cases, who delivered, verify cases).")
+        cfg = {
+            "🔥": st.column_config.TextColumn("🔥", width="small"),
+            "Customer": st.column_config.TextColumn("Customer", width="large"),
+            "Area": st.column_config.TextColumn("Area", width="medium"),
+            "Province": st.column_config.TextColumn("Province", width="medium"),
+            "Region": st.column_config.TextColumn("Region", width="medium"),
+            "Invoice": st.column_config.TextColumn("Invoice", width="medium"),
+            "Status": st.column_config.TextColumn("Status", width="medium"),
+        }
+        cols = DASH_COLUMNS if all_cols else COMPACT_COLUMNS
+        event = show_df(df_view[cols], height=430, key="dash_table", selectable=can_edit, column_config=cfg)
     else:
-        event = show_df(df_view, height=430, key="dash_table", selectable=can_edit, column_config=cfg)
+        render_cards(df_view)
 
     if not can_edit:
         return
-    if event is None:
-        if not df_view.empty:
-            st.caption("Your Streamlit cannot click rows. Run: pip install -U streamlit  (use the list for now)")
-        pick_old = st.selectbox("Choose customer to update:", ["--"] + df_report["Customer"].tolist(), key="pick_old")
-        if pick_old != "--":
-            st.session_state["sel_cust"] = pick_old
+    if event is None:                                   # cards view (or an old Streamlit): pick from a list
+        status_of = dict(zip(df_view["Customer"], df_view["Status"]))
+        pick = st.selectbox("✏️ Update a customer (type to search)", ["--"] + df_view["Customer"].tolist()[:400],
+                            format_func=lambda c: c if c == "--" else f"{status_of.get(c, '')}  {c}", key="pick_old")
+        if pick != "--":
+            st.session_state["sel_cust"] = pick
         else:
             st.session_state.pop("sel_cust", None)
     else:
@@ -2389,8 +2855,8 @@ def _dashboard_body():
     ordered_n = int(p_row["កេស"]) if pd.notna(p_row["កេស"]) else None
     packed_n, sent_n = int(p_row["Packed Cases"]), int(p_row["Sent Cases"])
     target_n = packed_n if packed_n > 0 else (ordered_n or 0)
-    st.info(f"📍 {p_row['Area']} - {p_row['Province']} ({p_row['Region']})  |  Status: **{p_row['Status']}**  |  Invoice: {p_row['Invoice']}  |  "
-            f"កេស ordered: {ordered_n if ordered_n is not None else '-'}  |  "
+    st.info(f"📍 {p_row['Area']} - {p_row['Province']} ({p_row['Region']})  |  Status: **{p_row['Status']}**  |  "
+            f"Invoice: {p_row['Invoice']}  |  កេស ordered: {ordered_n if ordered_n is not None else '-'}  |  "
             f"Packed: {packed_n} (by {p_row['Prepared By']})  |  Sent: {sent_n} (by {p_row['Handled By']}, "
             f"verified by {p_row['Verified By']})")
     if p_row["Journal Note"] not in ("-", ""):
