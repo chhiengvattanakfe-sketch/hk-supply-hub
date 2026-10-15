@@ -2700,11 +2700,96 @@ def _expense_tab(me):
             st.error(f"❌ {err}")
 
 
+# ---- Journal fill sheet: expenses/driver in the same order as the Sale Journal ----
+DRIVER_CODE = {"ងិន វុទ្ធា": "VUTHEA", "អួន តួ": "TOU"}      # name in this app -> code typed in journal column អ្នកដឹក
+JF_COLS = ["Date", "Customer", "Invoice", "អ្នកដឹក", "សេវាដឹក (ចំណាយ)", "សេវាតាក់ស៊ី (ចំណាយ)", "Taxi station", "Note"]
+
+
+def build_journal_fill(d_from, d_to):
+    """(fill_df, unmatched_df) for deliveries between two dates.
+    One row per journal invoice, in journal order. A customer's expenses for one day go on its FIRST invoice
+    of that day (0 on the others) so nothing is counted twice - the same way the journal is filled by hand."""
+    snap, _, _, err = current_snapshot()
+    if not snap:
+        return None, None, err or "Journal not found"
+    disp = read_raw(DATA_FILE, DISPATCH_COLS)
+    if disp.empty or "_dt" not in disp.columns:
+        return None, None, "No deliveries saved yet"
+    disp = disp[(disp["_dt"].dt.normalize() >= pd.Timestamp(d_from)) & (disp["_dt"].dt.normalize() <= pd.Timestamp(d_to))].copy()
+    if disp.empty:
+        return None, None, "No deliveries between these dates"
+    disp["_day"] = disp["_dt"].dt.date
+    disp["_cust"] = disp["Customer"].astype(str).map(lambda x: re.sub(r"\s+", " ", x).strip())
+    agg = {}
+    for (day, cust), g in disp.groupby(["_day", "_cust"], sort=False):
+        drv = [DRIVER_CODE.get(str(x).strip(), "") for x in g["Local_Driver"]]
+        drv = [x for x in drv if x]
+        st_ = [str(x).strip() for x in g["Taxi_Station"] if str(x).strip() not in ("", "-")]
+        notes = [str(x).strip() for x in g["Note"] if str(x).strip() not in ("", "-")]
+        agg[(day, cust)] = {"drv": drv[-1] if drv else "", "pp": int(g["Phnom_Penh_Expense"].sum()),
+                            "taxi": int(g["Taxi_Expense"].sum()), "station": " / ".join(dict.fromkeys(st_)),
+                            "note": " / ".join(dict.fromkeys(notes))}
+    jr = snap["journal"]
+    jr = jr[(jr["Date"] >= d_from) & (jr["Date"] <= d_to)]
+    rows, used = [], set()
+    for _, r in jr.iterrows():
+        key = (r["Date"], r["Customer"])
+        a = agg.get(key)
+        first = a is not None and key not in used
+        if a is not None:
+            used.add(key)
+        rows.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": r["Invoice"],
+                     "អ្នកដឹក": a["drv"] if a else "",
+                     "សេវាដឹក (ចំណាយ)": (a["pp"] if first else (0 if a else None)),
+                     "សេវាតាក់ស៊ី (ចំណាយ)": (a["taxi"] if first else (0 if a and a["taxi"] else None)),
+                     "Taxi station": a["station"] if first else "", "Note": a["note"] if first else ""})
+    fill = pd.DataFrame(rows, columns=JF_COLS)
+    miss = [{"Date": k[0], "Customer": k[1], "អ្នកដឹក": v["drv"], "សេវាដឹក (ចំណាយ)": v["pp"],
+             "សេវាតាក់ស៊ី (ចំណាយ)": v["taxi"], "Taxi station": v["station"], "Note": v["note"]}
+            for k, v in agg.items() if k not in used]
+    return fill, pd.DataFrame(miss), None
+
+
+def _journal_fill_panel():
+    with st.expander("📋 Journal fill sheet - driver & expenses for the Sale Journal"):
+        st.caption("Gives អ្នកដឹក, សេវាដឹក (ចំណាយ) and សេវាតាក់ស៊ី (ចំណាយ) in the same order as your journal, "
+                   "matched by date + customer. Copy the 3 columns into the journal (or look them up by Invoice).")
+        c1, c2 = st.columns(2)
+        d_from = c1.date_input("From", value=today_kh().replace(day=1), key="jf_from")
+        d_to = c2.date_input("To", value=today_kh(), key="jf_to")
+        if st.button("Build journal fill sheet", key="jf_go"):
+            fill, miss, err = build_journal_fill(d_from, d_to)
+            if err:
+                st.warning(err)
+                return
+            st.session_state["jf_result"] = (fill, miss)
+        res = st.session_state.get("jf_result")
+        if not res:
+            return
+        fill, miss = res
+        has = fill[(fill["អ្នកដឹក"] != "") | fill["សេវាដឹក (ចំណាយ)"].notna() | fill["សេវាតាក់ស៊ី (ចំណាយ)"].notna()]
+        st.success(f"{len(has)} journal rows have delivery data (of {len(fill)} rows in range). "
+                   f"Pending expenses are 0 until you fill them in the Delivery tab.")
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            fill.to_excel(w, index=False, sheet_name="Journal_Fill")
+            if not miss.empty:
+                miss.to_excel(w, index=False, sheet_name="Not_in_journal")
+        st.download_button("📥 Download journal fill sheet (Excel)", data=buf.getvalue(),
+                           file_name=f"Journal_Fill_{d_from}_{d_to}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        show_df(has)
+        if not miss.empty:
+            st.warning(f"{len(miss)} delivery(ies) were not found in the journal (name or date differs):")
+            show_df(miss)
+
+
 def _delivery_log():
     with st.expander("🛠️ Admin: Fix or Edit Today's Dispatches"):
         admin_editor(DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, key="disp",
                      label_cols=["Customer", "Cases"])
 
+    _journal_fill_panel()
     st.subheader("📊 Today's Operations Log")
     df_today = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), today_kh())
     total_expense = int(df_today["Phnom_Penh_Expense"].sum() + df_today["Taxi_Expense"].sum()) if not df_today.empty else 0
