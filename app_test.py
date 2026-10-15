@@ -1783,6 +1783,16 @@ def safe_render(fn, label):
     try:
         fn()
     except Exception as e:
+        # Step 1 - self-heal: stale widget state (a ticked row of an old list, a closed panel...) is the usual cause.
+        # Reset it and redraw once, silently. Max once per 20 s per person, so it can never loop.
+        flag0 = f"autoheal_{label}"
+        if time.time() - st.session_state.get(flag0, 0) > 20:
+            st.session_state[flag0] = time.time()
+            for k in list(st.session_state.keys()):
+                if str(k).startswith(("dash_table", "sel_cust", "clear_sel", "dash_sig", "pick_old", "card_limit")):
+                    st.session_state.pop(k, None)
+            bot_log("fixed", label, f"{type(e).__name__}: {e}", "reset the screen state and redrew automatically")
+            st.rerun()
         bot_log("error", label, f"{type(e).__name__}: {e}", "auto-repair started")
         if current_role() == "admin":
             st.error(f"⚠️ Problem in {label}: {e}")
@@ -3216,6 +3226,11 @@ def _dashboard_body():
     if not cases_found:
         st.caption(f"ℹ️ No column '{JOURNAL_CASES_HEADER}' found in the journal, so ordered cases are empty. "
                    "Change JOURNAL_CASES_HEADER at the top of the file if your header is different.")
+    # a different list (new filter / search / date) must not keep the row that was ticked in the old list
+    sig = (str(selected_date), view, pick_one, q.strip(), tuple(pick_region), tuple(pick_prov), display, len(df_view))
+    if st.session_state.get("dash_sig") != sig:
+        st.session_state["dash_sig"] = sig
+        st.session_state["clear_sel"] = True
     if st.session_state.pop("clear_sel", False):
         st.session_state.pop("dash_table", None)
 
@@ -3254,7 +3269,7 @@ def _dashboard_body():
         else:
             st.session_state.pop("sel_cust", None)
     else:
-        rows_sel = event.selection.rows
+        rows_sel = [i for i in event.selection.rows if 0 <= i < len(df_view)]   # old selection can be longer than the new list
         if rows_sel:
             st.session_state["sel_cust"] = df_view.iloc[rows_sel[0]]["Customer"]
 
