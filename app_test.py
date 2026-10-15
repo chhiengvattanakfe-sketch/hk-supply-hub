@@ -13,6 +13,8 @@ then sign in as admin and change it. There is no shared starter password.
 Ambiguous text dates follow DAYFIRST (True = day/month/year); prefer ISO dates.
 The Health Bot runs with an active app session, not as an unattended service.
 It preserves damaged records and uncertain duplicates for manual review.
+Customer Map includes the supplied NPHK leads as separate location records.
+Map corrections are stored in customer_map_registry.json, including Dropbox mode.
 """
 import streamlit as st
 import pandas as pd
@@ -39,6 +41,8 @@ import unicodedata
 import hashlib
 import math
 import logging
+import urllib.parse
+import urllib.request
 from collections import Counter
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -85,6 +89,7 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit_log.csv")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")          # accounts (passwords are stored hashed, never as text)
 ASSIGN_FILE = os.path.join(DATA_DIR, "delivery_assignments.csv")   # who will deliver which customer today
 HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers moved to tomorrow / cancelled
+MAP_REGISTRY_FILE = os.path.join(DATA_DIR, "customer_map_registry.json")
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache_" + _APP_SCOPE)       # outside Dropbox = faster
@@ -1339,7 +1344,7 @@ def daily_backup_once(day_str):
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, USERS_FILE, LOCATIONS_FILE)
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE)
         if USE_DROPBOX:
             try:
                 _dbx().files_create_folder_v2(_remote_backup_dir())
@@ -1751,9 +1756,16 @@ def current_snapshot():
 
 def get_customer_list():
     snap, _, _, err = current_snapshot()
-    if snap and snap["customers"]:
-        return snap["customers"]
-    return [f"⚠️ Error: {err or 'Master List is empty'}"]
+    names = list(snap["customers"]) if snap else []
+    seen = {norm_name(name) for name in names}
+    try:
+        for rec in load_map_registry()["records"].values():
+            if norm_name(rec["customer"]) not in seen:
+                names.append(rec["customer"])
+                seen.add(norm_name(rec["customer"]))
+    except Exception as e:
+        bot_log("warn", "Customer maps", str(e)[:180], "using Master List customer names")
+    return sorted(names, key=str.casefold) if names else [f"⚠️ Error: {err or 'Customer lists are empty'}"]
 
 
 # ==========================================
@@ -1920,6 +1932,25 @@ def run_health_check(auto_fix=True):
                 add("info", "Locations", f"{n_unk} customers of the last 7 days have no known province", "admin can set them in the Admin tab")
     except Exception as e:
         add("warn", "Locations", f"Location check could not complete: {str(e)[:160]}", "review location data")
+
+    try:
+        registry = load_map_registry()
+        location_frame = map_registry_frame(registry)
+        status_counts = location_frame["Map status"].value_counts()
+        add("info", "Customer maps", f"{len(location_frame)} location records; {int(status_counts.get('Ready pin', 0))} ready pins", "locations imported independently of order counts")
+        for status, count in status_counts.items():
+            if status != "Ready pin":
+                level = "error" if status in ("Invalid map link", "Outside Cambodia area — review", "Multiple pins — review") else "warn"
+                add(level, "Customer maps", f"{int(count)} records: {status}", "review in the Customer Map tab; uncertain pins are excluded")
+        name_counts = Counter(norm_name(rec["customer"]) for rec in registry["records"].values())
+        ambiguous = sum(count > 1 and name not in registry["bindings"] for name, count in name_counts.items())
+        if ambiguous:
+            add("warn", "Customer map matching", f"{ambiguous} repeated customer names need explicit matching for delivery use", "Admin can match a delivery customer to a specific location ID")
+        invalid_bindings = [key for key, rid in registry["bindings"].items() if rid not in registry["records"]]
+        if invalid_bindings:
+            add("error", "Customer map matching", f"{len(invalid_bindings)} saved matches refer to unavailable locations", "correct saved matches")
+    except Exception as map_error:
+        add("error", "Customer maps", str(map_error)[:200], "review the map registry; delivery records are preserved")
 
     # --- CSV files ---
     for key in FILES:
@@ -3279,10 +3310,14 @@ def _join_unique(series, sep=", ", limit=3):
 
 
 DASH_COLUMNS = ["🔥", "Customer", "In Master", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Packed Note", "Prepared By",
-                "Assigned To", "Sent Cases", "Left to send", "Sent Note", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Moved/Cancel Reason", "Note", "Time", "Source"]
+                "Assigned To", "Sent Cases", "Left to send", "Sent Note", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Moved/Cancel Reason", "Note", "Time", "Source", "Map status", "Map link", "Directions", "Location ID"]
 
 
 def build_report(selected_date):
+    try:
+        report_map_registry = load_map_registry()
+    except Exception:
+        report_map_registry = None
     snap, _, _, err = current_snapshot()
     scheduled, cases_found = {}, False
     if snap:
@@ -3340,6 +3375,12 @@ def build_report(selected_date):
     for cust in set(scheduled) | set(pack_info) | set(sent_info) | set(finals) | set(finals_p):
         p, s, info = pack_info.get(cust), sent_info.get(cust), scheduled.get(cust)
         area, province, region, _how = resolve_location(cust, areas.get(norm_name(cust)), overrides.get(norm_name(cust)))
+        if province in ("Unknown", "Unknown province") and report_map_registry is not None:
+            imported_province = mapped_customer_province(cust, report_map_registry)
+            if imported_province in PROVINCES:
+                province = imported_province
+                area = PP if province == PP else "Province"
+                region = region_of(province)
         finp = finals_p.get(cust)
         sys_packed = p["cases"] if p else 0
         packed = finp["cases"] if finp else sys_packed          # a hand-set FINAL packed number replaces the packing logs
@@ -3381,6 +3422,12 @@ def build_report(selected_date):
     if not rows:
         return pd.DataFrame(), cases_found, err
     df = pd.DataFrame(rows)
+    try:
+        df = attach_customer_maps(df, report_map_registry)
+    except Exception as map_error:
+        bot_log("error", "Customer maps", str(map_error)[:180], "delivery records remain available")
+        for col in ("Map status", "Map link", "Directions", "Location ID"):
+            df[col] = "Map registry unavailable" if col == "Map status" else ""
     df["កេស"] = pd.array(df["កេស"].tolist(), dtype="Int64")
     df["_a"] = df["Area"].map(AREA_RANK)
     df["_r"] = df["Status"].map(STATUS_RANK)
@@ -3484,7 +3531,7 @@ STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Part sent": ("#1565c0"
                 "🟡 Ready for Delivery": ("#f9a825", "#222222"), "🟠 Packing": ("#ef6c00", "#ffffff"),
                 "⏳ Pending": ("#757575", "#ffffff"), "📅 Moved to tomorrow": ("#6a1b9a", "#ffffff"),
                 "❌ Cancelled": ("#b71c1c", "#ffffff")}
-COMPACT_COLUMNS = ["🔥", "Customer", "In Master", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Left to send", "Verified By", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
+COMPACT_COLUMNS = ["🔥", "Customer", "In Master", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Left to send", "Verified By", "Taxi Station", "Taxi No.", "Assigned To", "Invoice", "Map link", "Directions", "Map status"]
 _REGION_ORDER = {r: i for i, r in enumerate(REGIONS)}
 
 
@@ -3518,6 +3565,11 @@ def card_html(r):
                 f" · ✅ {_e(r['Verified By'])}</div>")
         if r.get("Taxi No.") not in ("", "-", None):
             sent += f"<div class='hk-note'>🚕 Taxi no.: <b>{_e(r['Taxi No.'])}</b></div>"
+    location_link = r.get("Directions") or r.get("Map link")
+    if trusted_map_url(location_link):
+        sent += f"<div class='hk-note'><a href='{_e(location_link)}' target='_blank' rel='noopener noreferrer'>📍 Open customer map / directions</a></div>"
+    elif r.get("Map status") == "Repeated name — choose location":
+        sent += "<div class='hk-note'>📍 Repeated name: Admin must choose the correct location.</div>"
     prep = f" · 👷 {_e(r['Prepared By'])}" if r["Prepared By"] not in ("-", "") else ""
     asg = f"<span>👤 {_e(r['Assigned To'])}</span>" if r.get("Assigned To") not in ("-", "", None) else ""
     return (f"<div class='hk-card' style='border-left:6px solid {bg}'>"
@@ -3755,6 +3807,8 @@ def _dashboard_body():
             "Status": st.column_config.TextColumn("Status", width="medium"),
             "Taxi Station": st.column_config.TextColumn("Taxi Station", width="medium"),
             "Taxi No.": st.column_config.TextColumn("Taxi No. (phone/plate)", width="medium"),
+            "Map link": st.column_config.LinkColumn("Open map", display_text="Open map"),
+            "Directions": st.column_config.LinkColumn("Directions", display_text="Directions"),
         }
         cols = DASH_COLUMNS if all_cols else COMPACT_COLUMNS
         event = show_df(df_view[cols], height=430, key="dash_table", selectable=can_edit, column_config=cfg)
@@ -3809,6 +3863,11 @@ def _update_panel(selected, df_report, selected_date):
             f"Invoice: {p_row['Invoice']}  |  កេស ordered: {ordered_n if ordered_n is not None else '-'}  |  "
             f"Packed: {packed_n} (by {p_row['Prepared By']})  |  Sent: {sent_n} (by {p_row['Handled By']}, "
             f"verified by {p_row['Verified By']})")
+    map_link = p_row.get("Directions") or p_row.get("Map link")
+    if trusted_map_url(map_link):
+        st.link_button("Open customer map / directions", map_link)
+    else:
+        st.caption("Customer location: " + str(p_row.get("Map status", "not matched")))
     if p_row["Journal Note"] not in ("-", ""):
         st.warning(f"📌 Journal note: {p_row['Journal Note']}")
     pack_default = max((ordered_n or 0) - packed_n, 0) or 1
@@ -4539,6 +4598,1036 @@ def tab_bot():
     safe_render(_bot_body, "Bot tab")
 
 
+
+_MAP_SEED_JSON = r"""[
+{"id": "nphk-20261015-0001", "customer": "CHHIM SAYORN ទួលគោក", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 3, "lead_no": 1},
+{"id": "nphk-20261015-0002", "customer": "MO", "province": "", "url": "https://maps.google.com/maps?q=11.518901,104.876871&ll=11.518901,104.876871&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 4, "lead_no": 2},
+{"id": "nphk-20261015-0003", "customer": "ស្រីលីន ក្រចេះ", "province": "ក្រចេះ", "url": "https://maps.app.goo.gl/fmUAVum6c6joAkR36", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 5, "lead_no": 3, "resolved_url": "https://www.google.com/maps/place/12%C2%B029'29.9%22N+106%C2%B003'55.5%22E/@12.491629,106.065429,1302m/data=!3m1!1e3!4m4!3m3!8m2!3d12.491629!4d106.065429?entry=tts&g_ep=EgoyMDI2MTAxMS4wIPu8ASoASAFQAw%3D%3D&skid=1e0918d0-4a09-4bb6-8f0f-94836d11cbc9", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0004", "customer": "LY MEY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.528484,104.957959&ll=11.528484,104.957959&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 6, "lead_no": 4},
+{"id": "nphk-20261015-0005", "customer": "SEANG HAI ផ្សារព្រែកថ្មី កៀនស្វាយ", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/PDtGo2oRZGsm7acz7", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 7, "lead_no": 5, "resolved_url": "https://www.google.com/maps/place/11%C2%B017'10.1%22N+105%C2%B008'22.8%22E/@11.286135,105.139678,1336m/data=!3m1!1e3!4m4!3m3!8m2!3d11.286135!4d105.139678?entry=tts&g_ep=EgoyMDI2MTAwNS4wIPu8ASoASAFQAw%3D%3D&skid=471f9c7b-a880-4720-86ad-18b986c57d7e", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0006", "customer": "ម៉ៅ ចន្ធី ក្រុងស្វាយរៀង", "province": "ស្វាយរៀង", "url": "https://goo.gl/maps/qDgJr3DkWZx5Adxk8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 8, "lead_no": 6, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.045241,105.817289&entry=gps&g_ep=CAESBzI2LjM4LjEYACDXggMqvQEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksMTAwODA4NjU0LDk0Mjc1MTY4LDk0Mjc5NjE5LDEwMDgzNTcwNCwxMDA4MjUwMjUsMTAwODIwMjM3LDEwMDgyMjQ5NCwxMDA4Mjc5NzVCAktI&skid=f4dac2ed-dd5f-44b5-a5f6-2eed44ffbb83&shorturl=1"},
+{"id": "nphk-20261015-0007", "customer": "SREY TUCH", "province": "កំពង់ធំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 9, "lead_no": 7},
+{"id": "nphk-20261015-0008", "customer": "MAO SREYNICH វិទ្យាល័យជាតិ បាត់ដំបង", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 10, "lead_no": 8},
+{"id": "nphk-20261015-0009", "customer": "SAIFONG កប់ស្រូវ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 11, "lead_no": 9},
+{"id": "nphk-20261015-0010", "customer": "UNG RAKSMEY ជិតព្តលានថ្មី", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/GmRUA4t1Ur12HmBL8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 12, "lead_no": 10, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0011", "customer": "SUO SORPHOIN បារាយណ៍ កំពង់ធំ", "province": "កំពង់ធំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 13, "lead_no": 11},
+{"id": "nphk-20261015-0012", "customer": "SREYDIN KEO", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.503340,103.611797&ll=13.503340,103.611797&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 14, "lead_no": 12},
+{"id": "nphk-20261015-0013", "customer": "HAPPY DAILY MART គួរស្រូវ2", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 15, "lead_no": 13},
+{"id": "nphk-20261015-0014", "customer": "KHEANG SIRONG ឡែម", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.084906,102.458952&ll=13.084906,102.458952&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 16, "lead_no": 14},
+{"id": "nphk-20261015-0015", "customer": "KANNITHA កំពង់ធំ", "province": "កំពង់ធំ", "url": "https://maps.google.com/maps?q=12.636423,104.984085&ll=12.636423,104.984085&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 17, "lead_no": 15},
+{"id": "nphk-20261015-0016", "customer": "UDOM ចោមចៅ 2", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.512740,104.832276&ll=11.512740,104.832276&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 18, "lead_no": 16},
+{"id": "nphk-20261015-0017", "customer": "KA A HAA  ប៉ោយប៉ែត", "province": "ប៉ោយប៉ែត", "url": "https://maps.app.goo.gl/Uxi5KWEpv66pXFA88?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 19, "lead_no": 17, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.6678058,102.5769887&entry=gps&shh=CAE&lucs=,94297699,100795621,94231188,94280568,47071704,94218641,100808654,94282134,94286869,100820247,100822504&g_ep=CAISEjI2LjM2LjMuOTczNTQ4ODUxMBgAIIgnKmcsOTQyOTc2OTksMTAwNzk1NjIxLDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDEwMDgwODY1NCw5NDI4MjEzNCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=a31a787a-77bd-449e-be40-54093ba48748&g_st=ic"},
+{"id": "nphk-20261015-0018", "customer": "GO MART បឹងត្របែក ផ្លូវ99", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.535772,104.922233&ll=11.535772,104.922233&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 20, "lead_no": 18},
+{"id": "nphk-20261015-0019", "customer": "បញ្ញា កេង ភូមិល្ងើន ព្រៃវែង", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.690391,105.438458&ll=11.690391,105.438458&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 21, "lead_no": 19},
+{"id": "nphk-20261015-0020", "customer": "PHUONG KUNTHEARY ព្រែកព្នៅ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/LJ74DCFMqnvFXP9UA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 22, "lead_no": 20, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0021", "customer": "NICH NICH តាខ្មៅ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.465950,104.957160&ll=11.465950,104.957160&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 23, "lead_no": 21},
+{"id": "nphk-20261015-0022", "customer": "MR ONEDAY បុរៅមហាសែនសុខ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.576133,104.836465&ll=11.576133,104.836465&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 24, "lead_no": 22},
+{"id": "nphk-20261015-0023", "customer": "YI MALUX កំពង៉ធំ", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/2nMtvtDqXFVukG4L7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 25, "lead_no": 23, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.7915973,104.8399923&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,100821555,47071704,94218641,94282134,100835699,94286869,100820247,100822504&g_ep=CAISEjI2LjM4LjEuOTgwODE1NDQ1MBgAINeCAypnLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDEwMDgyMTU1NSw0NzA3MTcwNCw5NDIxODY0MSw5NDI4MjEzNCwxMDA4MzU2OTksOTQyODY4NjksMTAwODIwMjQ3LDEwMDgyMjUwNEICS0g%3D&skid=8df3a248-85c2-4840-a679-81d16bec1236&g_st=it"},
+{"id": "nphk-20261015-0024", "customer": "ROMDOUL SAM ផ្សារឈូក", "province": "", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 26, "lead_no": 24},
+{"id": "nphk-20261015-0025", "customer": "JEE LEANG ព្រះវិហារ", "province": "ព្រះវិហារ", "url": "https://maps.google.com/maps?q=14.238279,104.731919&ll=14.238279,104.731919&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 27, "lead_no": 25},
+{"id": "nphk-20261015-0026", "customer": "SOK NITA MACH ឈូកវ៉ា2", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 28, "lead_no": 26},
+{"id": "nphk-20261015-0027", "customer": "SOKAN THUCH កំរៀង បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.085018,102.484079&ll=13.085018,102.484079&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 29, "lead_no": 27},
+{"id": "nphk-20261015-0028", "customer": "Mey ព្រែកព្នៅ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 30, "lead_no": 28},
+{"id": "nphk-20261015-0029", "customer": "DALIN KE តាំងគោក កំពង់ធំ", "province": "", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 31, "lead_no": 29},
+{"id": "nphk-20261015-0030", "customer": "ទ្រី ផារី កំបូល3", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.476493,104.787410&ll=11.476493,104.787410&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 32, "lead_no": 30},
+{"id": "nphk-20261015-0031", "customer": "JEE LANG", "province": "ព្រះវិហារ", "url": "https://maps.google.com/maps?q=14.238279,104.731919&ll=14.238279,104.731919&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 33, "lead_no": 31},
+{"id": "nphk-20261015-0032", "customer": "KIT KHUNNY ផ្សារសៃវ៉ា តាកែវ", "province": "តាកែវ", "url": "https://goo.gl/maps/gbvYaR8rvmEdhRfZ7?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 34, "lead_no": 32, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.162750,104.875431&entry=gps&g_ep=CAESBzI2LjMxLjIYACCdtwgqlQEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksMTAwODE1NjQwLDEwMDgyMDIzN0ICS0g%3D&skid=d96271f7-d43f-4f33-9d71-07cf20c3a6db&shorturl=1"},
+{"id": "nphk-20261015-0033", "customer": "CHHIM SAYORN ឈូកមាស", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/WQ64GazKVkia1Exp7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 35, "lead_no": 33, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0034", "customer": "THING បុរីសុខសាន្ដ ព្រែកឯក", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.502566,105.007372&ll=11.502566,105.007372&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 36, "lead_no": 34},
+{"id": "nphk-20261015-0035", "customer": "SOTHEANY", "province": "ភ្នំពេញ", "url": "https://mapshttps://maps.google.com/maps?q=11.575709,104.878839&ll=11.575709,104.878839&z=16.google.com/maps?q=11.575709,104.878839&ll=11.575709,104.878839&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 37, "lead_no": 35},
+{"id": "nphk-20261015-0036", "customer": "SOTHEANY", "province": "", "url": "https://maps.google.com/maps?q=11.575709,104.878839&ll=11.575709,104.878839&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 38, "lead_no": 36},
+{"id": "nphk-20261015-0037", "customer": "Neang leasmy ផ្សារកាបី ក្រចេះ", "province": "ក្រចេះ", "url": "https://maps.google.com/maps?q=12.136423,106.724029&ll=12.136423,106.724029&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 39, "lead_no": 37},
+{"id": "nphk-20261015-0038", "customer": "VIN CHHAY", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/TXhEBGjgrrLcCqBw9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 40, "lead_no": 38, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0039", "customer": "OAM RATHANA ពោធិចិនតុង", "province": "បន្ទាយមានជ័យ", "url": "https://maps.app.goo.gl/gzZoTR5wCD66J1dN7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 41, "lead_no": 39, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0040", "customer": "LY KA ព្រែកលាប", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.639355,104.913023&ll=11.639355,104.913023&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 42, "lead_no": 40},
+{"id": "nphk-20261015-0041", "customer": "SOVANN ផ្សារឈូកមាស", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/jhGjeq9rWcimk3oLA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 43, "lead_no": 41, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0042", "customer": "សៀន ម៉ាណារី ស្រុកគិរីសាគ", "province": "កោះកុង", "url": "https://maps.google.com/maps?q=10.992248,103.209119&ll=10.992248,103.209119&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 44, "lead_no": 42},
+{"id": "nphk-20261015-0043", "customer": "MAO SREYNICH សកលវិទ្យាល័យបាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/4HG2iRYneSnRYfXj7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 45, "lead_no": 43, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0044", "customer": "VIN CHHAY កំពង់ចាម", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/TXhEBGjgrrLcCqBw9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 46, "lead_no": 44, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0045", "customer": "MENG ពោធិចិនតុង", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/gzwEf5gT6t4KKCk8A", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 47, "lead_no": 45, "resolved_url": "https://www.google.com/maps/place/Baksey+Sur+Coffee,+Street+105K,+Phnom+Penh+12411/data=!4m6!3m5!1s0x31094f15d4c93275:0x23695e4d2b611f3d!7e2!8m2!3d11.5805894!4d104.8413159!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI2LjM0LjQYACCenQoqqQEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksMTAwODE1NjQwLDEwMDgyMDIzNywxMDA4MjI0OTQsMTAwODI3OTcxQgJLSA%3D%3D&skid=2ac11cf9-1253-4a1c-8785-3fcc1d430f34", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0046", "customer": "OURN SAMBARTH  ពោធិចិនតុង", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.540697,104.828358&ll=11.540697,104.828358&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 48, "lead_no": 46},
+{"id": "nphk-20261015-0047", "customer": "CHENDA ល្វាឯម", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/x6iKxNbJZAqTX7kt8?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 49, "lead_no": 47, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0048", "customer": "THOURNG SREYNIN ព្រែកអញ្ចាញ", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/dBDZdmKtCWgfKu646?g_st=ac", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 50, "lead_no": 48, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0049", "customer": "HANG KY", "province": "ស្វាយរៀង", "url": "https://maps.google.com/maps?q=11.037891,106.010845&ll=11.037891,106.010845&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 51, "lead_no": 49},
+{"id": "nphk-20261015-0050", "customer": "CHHAY HENG ផ្លូវភ្លោះអូឬស្សី", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.558024,104.917652&ll=11.558024,104.917652&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 52, "lead_no": 50},
+{"id": "nphk-20261015-0051", "customer": "AU HANG ក្រាំងធ្នុងសែនសុខ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/mB9KagZxV7fV1R2Q9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 53, "lead_no": 51, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0052", "customer": "VANNAK", "province": "កែប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 54, "lead_no": 52},
+{"id": "nphk-20261015-0053", "customer": "GRACE SOTHEA ស្រុកស្ទឹងហាវ", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.724686,103.619956&ll=10.724686,103.619956&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 55, "lead_no": 53},
+{"id": "nphk-20261015-0054", "customer": "PHIM PHIM ស្រុកអង្គរជ័យ", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.893829,104.557942&ll=10.893829,104.557942&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 56, "lead_no": 54},
+{"id": "nphk-20261015-0055", "customer": "RACHANA ROUS ព្រែកព្នៅ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.700776,104.840686&ll=11.700776,104.840686&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 57, "lead_no": 55},
+{"id": "nphk-20261015-0056", "customer": "SREY DAV បុរីមរកត", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.506111,104.854668&ll=11.506111,104.854668&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 58, "lead_no": 56},
+{"id": "nphk-20261015-0057", "customer": "SOKON KHENG សៀមរាប", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.386937,103.818032&ll=13.386937,103.818032&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 59, "lead_no": 57},
+{"id": "nphk-20261015-0058", "customer": "ពន្លក សាលាគ្រួស សៀមរាប", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.373448,103.840442&ll=13.373448,103.840442&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 60, "lead_no": 58},
+{"id": "nphk-20261015-0059", "customer": "ដេប៉ូតេលា ស្រុកទ្រាំង តាកែវ", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=10.844594,104.793359&ll=10.844594,104.793359&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 61, "lead_no": 59},
+{"id": "nphk-20261015-0060", "customer": "ស្រីកែវ TK STORE ជម្ពូវ័ន", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.533179,104.821585&ll=11.533179,104.821585&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 62, "lead_no": 60},
+{"id": "nphk-20261015-0061", "customer": "YU PICH វត្ដពោធិវង្ស បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.117192,103.197449&ll=13.117192,103.197449&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 63, "lead_no": 61},
+{"id": "nphk-20261015-0062", "customer": "ដើប៉ូតេលា តំបន់ដូងកឹង ព្រៃវែង", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.574062,105.566996&ll=11.574062,105.566996&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 64, "lead_no": 62},
+{"id": "nphk-20261015-0063", "customer": "DIVERSE CAFÉ ព្រែកលាប", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.652636,104.915455&ll=11.652636,104.915455&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 65, "lead_no": 63},
+{"id": "nphk-20261015-0064", "customer": "MO NYMEAN ព្រះនេត្រព្រះ", "province": "បន្ទាយមានជ័យ", "url": "https://maps.google.com/maps?q=13.627369,103.184197&ll=13.627369,103.184197&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 66, "lead_no": 64},
+{"id": "nphk-20261015-0065", "customer": "SAVIMEX អង្គរជ័យ", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.769698,104.637231&ll=10.769698,104.637231&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 67, "lead_no": 65},
+{"id": "nphk-20261015-0066", "customer": "EII TY COFFEE កំពងចម្លងកំពង់គរ ឆ្លូង", "province": "ស្ទឹងត្រែង", "url": "https://maps.google.com/maps?q=12.274468,105.963532&ll=12.274468,105.963532&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 68, "lead_no": 66},
+{"id": "nphk-20261015-0067", "customer": "SO NITA ផ្សារស្វៃវ៉ា តាកែវ", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 69, "lead_no": 67},
+{"id": "nphk-20261015-0068", "customer": "RACHANA ចល័ចរ កាហ្វេ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/sjag1gLzbBWAMx5M9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 70, "lead_no": 68, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0069", "customer": "THEARA គូស្រូវ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/eEPLivNuFr8u1YJj7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 71, "lead_no": 69, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.4406193,104.8933391&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,100821559,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMzLjEuOTYxODkxNDMyMBgAINeCAypnLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDEwMDgyMTU1OSw0NzA3MTcwNCw5NDIxODY0MSw5NDI4MjEzNCwxMDA4MTM0NjQsOTQyODY4NjksMTAwODIwMjQ3LDEwMDgyMjUwNEICS0g%3D&skid=562076a0-e81b-4b3f-8dc7-4bb785a7780d&g_st=it"},
+{"id": "nphk-20261015-0070", "customer": "LONG KR", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 72, "lead_no": 70},
+{"id": "nphk-20261015-0071", "customer": "KHANN LINA ព្រែកក្ដាម កោះចិន", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.797184,104.824930&ll=11.797184,104.824930&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 73, "lead_no": 71},
+{"id": "nphk-20261015-0072", "customer": "កាហ្វេ ននោង គង់ពិសី កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/pxFHvDwi9G7Hs91R8?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 74, "lead_no": 72, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0073", "customer": "VA KHIM", "province": "កំពង់ស្ពឺ", "url": "https://maps.apple/p/HMUUc2MNszxsA9", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 75, "lead_no": 73, "resolved_url": "https://maps.apple.com/place?coordinate=11.808148,104.164605&name=My%20Location&map=h", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0074", "customer": "OUN MOEW", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.824266,104.740841&ll=11.824266,104.740841&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 76, "lead_no": 74},
+{"id": "nphk-20261015-0075", "customer": "LIM CHANDANIN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/PmW5CBFBoYRjd3Cf7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 77, "lead_no": 75, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0076", "customer": "ម៉ាក់ ភាលីង ព្រែកខ្វិត", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.637028,104.914454&ll=11.637028,104.914454&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 78, "lead_no": 76},
+{"id": "nphk-20261015-0077", "customer": "LIM LONG ចោមចៅ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.501629,104.805441&ll=11.501629,104.805441&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 79, "lead_no": 77},
+{"id": "nphk-20261015-0078", "customer": "SENG SOCHEATA", "province": "តាកែវ", "url": "https://maps.app.goo.gl/Lp78ajNn4dBvtVQV9", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 80, "lead_no": 78, "resolved_url": "https://www.google.com/maps/place/%E1%9E%80%E1%9E%B6%E1%9E%A0%E1%9F%92%E1%9E%9C%E1%9F%81%E1%9E%87%E1%9E%BE%E1%9E%84%E1%9E%97%E1%9F%92%E1%9E%93%E1%9F%86+(+Phnom+Chisor),+%E1%9E%97%E1%9E%BC%E1%9E%98%E1%9E%B7%E1%9E%85%E1%9E%93%E1%9F%92%E1%9E%9B%E1%9E%B6%E1%9E%8F%E1%9F%8B%E1%9E%8A%E1%9F%83/data=!4m6!3m5!1s0x31096fa4b8adf96b:0x6892c91ef0646c11!7e2!8m2!3d11.1938885!4d104.8197216!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI2LjMyLjYYACDXggMqqQEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksMTAwODE1NjM1LDEwMDgyMDIzNywxMDA4MjI0OTQsMTAwODI3OTc1QgJLSA%3D%3D&skid=3d0963c4-712f-43c5-8313-44f264849faf", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0079", "customer": "PTT សំរោងយ៉ោង", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 81, "lead_no": 79},
+{"id": "nphk-20261015-0080", "customer": "LAPU COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/UuuFFWmKT4z7rjVF9?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 82, "lead_no": 80, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0081", "customer": "LIYA YAYA", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.609303,103.516902&ll=10.609303,103.516902&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 83, "lead_no": 81},
+{"id": "nphk-20261015-0082", "customer": "SREY POV", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/z9WqBm1a11XAh56B7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 84, "lead_no": 82, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0083", "customer": "J.T WO.S MART ( VISAL CHAN )", "province": "បាក់ទូក", "url": "https://maps.google.com/maps?q=11.566293,104.911586&ll=11.566293,104.911586&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 85, "lead_no": 83},
+{"id": "nphk-20261015-0084", "customer": "SUON SODALIN បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.080248,103.204883&ll=13.080248,103.204883&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 86, "lead_no": 84},
+{"id": "nphk-20261015-0085", "customer": "SO CHEATA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/ZgGDSsJoBTydd8Xy5?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 87, "lead_no": 85, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0086", "customer": "MEY", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 88, "lead_no": 86},
+{"id": "nphk-20261015-0087", "customer": "អាង ឈឹម ត្រែងត្រយឹង កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.278807,104.206944&ll=11.278807,104.206944&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 89, "lead_no": 87},
+{"id": "nphk-20261015-0088", "customer": "ពុំ ស្រីនិត អូរពី កំពង់សោម", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=12.401523,105.435468&ll=12.401523,105.435468&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 90, "lead_no": 88},
+{"id": "nphk-20261015-0089", "customer": "SOK KHEA ពន្ធធានាគា សៀមរាប", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 91, "lead_no": 89},
+{"id": "nphk-20261015-0090", "customer": "HENG SINHUNSY វត្តភ្នំ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.575317,104.924417&ll=11.575317,104.924417&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 92, "lead_no": 90},
+{"id": "nphk-20261015-0091", "customer": "ផារី", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/zefjMLN3XkciapeJ8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 93, "lead_no": 91, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.0959807,103.1974225&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822499&g_ep=CAISEjI2LjMyLjUuOTU4MDQ3MzAzMBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNDk5QgJLSA%3D%3D&skid=84634bb2-1ebd-49be-8866-2e37e993cb01&g_st=ic"},
+{"id": "nphk-20261015-0092", "customer": "HAK KANHA តាកែវ", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.162067,104.952845&ll=11.162067,104.952845&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 94, "lead_no": 92},
+{"id": "nphk-20261015-0093", "customer": "SREY KHUOCH TEP ប៉ោយប៉ែត", "province": "ប៉ោយប៉ែត", "url": "https://maps.google.com/maps?q=13.668493,102.586271&ll=13.668493,102.586271&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 95, "lead_no": 93},
+{"id": "nphk-20261015-0094", "customer": "SENG SENG", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/jrAMs7zVAtUUdR7y7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 96, "lead_no": 94, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.1070474,103.2002063&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813469,94286869,100820247,100822504&g_ep=CAISEjI2LjMzLjEuOTYxODkxNDMyMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY5LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=b8d76539-ae41-4157-8433-bb843fba92e5&g_st=ic"},
+{"id": "nphk-20261015-0095", "customer": "AH NUCH", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.513692,104.855439&ll=11.513692,104.855439&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 97, "lead_no": 95},
+{"id": "nphk-20261015-0096", "customer": "PEOU SOKNY ស្រុកសំបូរ ក្រចេះ", "province": "ក្រចេះ", "url": "https://maps.app.goo.gl/vx3HamdRP5JEKWMR7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 98, "lead_no": 96, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0097", "customer": "SERM SOPI វង្វង់មូលតាពញាក្រែក", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/NfppBsyFiy2z7DDf6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 99, "lead_no": 97, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0098", "customer": "ផារី បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/wWvEN5N3MQ7DxLJYA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 100, "lead_no": 98, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0099", "customer": "PHANNA PHATH ស្វាយរៀង", "province": "ស្វាយរៀង", "url": "https://maps.app.goo.gl/zmqevLisEfN52oweA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 101, "lead_no": 99, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0100", "customer": "CROIS CAFÉ 271", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 102, "lead_no": 100},
+{"id": "nphk-20261015-0101", "customer": "SREY PICH ទួលពង្រ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/TWdw6Ka1RmUhoRg66?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 103, "lead_no": 101, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0102", "customer": "ង៉ែត ញាណ ថ្មបាំង ក្រចេះ", "province": "ក្រចេះ", "url": "https://maps.app.goo.gl/SS9GfTdZNtVAFr9P6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 104, "lead_no": 102, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0103", "customer": "HENG SONY", "province": "កំពត", "url": "https://maps.app.goo.gl/Lj7axsZME21ZYRFF8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 105, "lead_no": 103, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0104", "customer": "MONITA TANN សាលាកំរើក សៀមរាប", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 106, "lead_no": 104},
+{"id": "nphk-20261015-0105", "customer": "POV POV", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.833427,104.451803&ll=10.833427,104.451803&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 107, "lead_no": 105},
+{"id": "nphk-20261015-0106", "customer": "WAYU STEAM&SAUNA", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.619675,104.174688&ll=10.619675,104.174688&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 108, "lead_no": 106},
+{"id": "nphk-20261015-0107", "customer": "សុជាតា​ អ៊ុយ ផ្សារក្រគរ", "province": "ពោធិ៍សាត់", "url": "https://maps.google.com/maps?q=42.553084,0.000008&ll=42.553084,0.000008&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 109, "lead_no": 107},
+{"id": "nphk-20261015-0108", "customer": "NAMHENG CHEANG", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/i9nQMiwhVVT1TXrC6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 110, "lead_no": 108, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0109", "customer": "ម៉ីង ទៀង អូត្រេះ", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/Z6NP579sHZCEAh2T8?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 111, "lead_no": 109, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.5617710,103.5578800&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjUuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=bb1c7680-220a-4d5e-a17c-7cc7802a3b69&g_st=ifm"},
+{"id": "nphk-20261015-0110", "customer": "PHAN NA វត្តអង្គតាមិញ", "province": "ភ្នំពេញ", "url": "https://www.google.com/maps/place/11%C2%B032'45.3%22N+104%C2%B051'37.1%22E/@11.545903,104.860301,16z/data=!4m4!3m3!8m2!3d11.545903!4d104.860301?entry=ttu&g_ep=EgoyMDI2MDgwNS4xIKXMDSoASAFQAw%3D%3D", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 112, "lead_no": 110},
+{"id": "nphk-20261015-0111", "customer": "LY SOK", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.259908,105.274687&ll=11.259908,105.274687&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 113, "lead_no": 111},
+{"id": "nphk-20261015-0112", "customer": "ឌុល សុវណ្ណនិត ផ្សារស្ពឺ កំពង់ចាម", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 114, "lead_no": 112},
+{"id": "nphk-20261015-0113", "customer": "OUK PONLEU", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.455301,105.000743&ll=11.455301,105.000743&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 115, "lead_no": 113},
+{"id": "nphk-20261015-0114", "customer": "UTH SIEMHONG", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 116, "lead_no": 114},
+{"id": "nphk-20261015-0115", "customer": "CHUNGMEI LY", "province": "កំពង់ឆ្នាំង", "url": "https://maps.app.goo.gl/ZmrGSK5sVVtmgTEk6?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 117, "lead_no": 115, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0116", "customer": "CHHING GERRA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/K87quDujsBvqACYNA?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 118, "lead_no": 116, "resolved_url": "https://www.google.com/maps/place/11.530821,104.923610/data=!4m6!3m5!1s0!7e2!8m2!3d11.5308207!4d104.9236105!17m2!4m1!1e3!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBjI2LjcuNRgAIPrsDSqLASw5NDI2NzcyNyw5NDI5MjE5NSw5NDI5OTUzMiwxMDA3OTY0OTgsMTAwNzk3NzU3LDEwMDc5NjUzNSw5NDI4MDU3Niw5NDIwNzM5NCw5NDIwNzUwNiw5NDIwODUwNiw5NDIxODY1Myw5NDIyOTgzOSw5NDI3NTE2OCw5NDI3OTYxOSwxMDA3OTE0ODNCAktI&skid=db4e1f9c-e742-41e7-9dc2-f2ccbfdd7d81&g_st=afm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0117", "customer": "MAK NANA", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 119, "lead_no": 117},
+{"id": "nphk-20261015-0118", "customer": "ម៉ាក់ ម៉ីយ៉ីង", "province": "កំពង់ចាម", "url": "https://maps.google.com/maps?q=12.301544,105.568075&ll=12.301544,105.568075&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 120, "lead_no": 118},
+{"id": "nphk-20261015-0119", "customer": "NONG DAVY", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 121, "lead_no": 119},
+{"id": "nphk-20261015-0120", "customer": "VA KHIM", "province": "កំពង់ស្ពឺ", "url": "https://maps.apple/p/HMUUc2MNszxsA9", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 122, "lead_no": 120, "resolved_url": "https://maps.apple.com/place?coordinate=11.808148,104.164605&name=My%20Location&map=h", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0121", "customer": "KA ANGEL កៀនស្វាយ", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.511703,105.053247&ll=11.511703,105.053247&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 123, "lead_no": 121},
+{"id": "nphk-20261015-0122", "customer": "KET KIKO បឹងកេងកង", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/yJvqVu1YvTzH5C7V7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 124, "lead_no": 122, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0123", "customer": "SOU SARITH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 125, "lead_no": 123},
+{"id": "nphk-20261015-0124", "customer": "MTD ផ្សារថ្នល់បត់ផ្លូវលេខ 3", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/5QUa2mZBaYoGDYNN8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 126, "lead_no": 124, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0125", "customer": "នំបុ័ងភ្នំពេញ តាំងក្រសាំង", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 127, "lead_no": 125},
+{"id": "nphk-20261015-0126", "customer": "គីម លី បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.083099,102.999665&ll=13.083099,102.999665&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 128, "lead_no": 126},
+{"id": "nphk-20261015-0127", "customer": "SOK SOPAL", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.511290,104.948149&ll=11.511290,104.948149&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 129, "lead_no": 127},
+{"id": "nphk-20261015-0128", "customer": "EUNG PANHA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/W8PsRuJ5HxSBeVCJ8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 130, "lead_no": 128, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5829590,104.8961900&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b7b2efa2-9ad3-4950-8ee7-b55d8302f3f2&g_st=it"},
+{"id": "nphk-20261015-0129", "customer": "KIMSRIV ផ្សារសំរោងយ៉ោង តាកែវ", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.261598,104.823676&ll=11.261598,104.823676&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 131, "lead_no": 129},
+{"id": "nphk-20261015-0130", "customer": "NAK បុរីសន្និភាព2", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.498163,104.838022&ll=11.498163,104.838022&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 132, "lead_no": 130},
+{"id": "nphk-20261015-0131", "customer": "EM SOMANEA", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/91JPz7XRkFUJ3hZw6?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 133, "lead_no": 131, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0132", "customer": "ម៉ាក់ ចាងមី ត្រពាំងចក កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.239745,104.643002&ll=11.239745,104.643002&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 134, "lead_no": 132},
+{"id": "nphk-20261015-0133", "customer": "PICH CHENDA", "province": "ពោធិ៍សាត់", "url": "https://maps.app.goo.gl/757BEYZaDhipUhnJ9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 135, "lead_no": 133, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.5334662,104.2041783&entry=gps&shh=CAE&lucs=,94297699,100795625,94231188,94280568,47071704,94218641,94282134,100813469,94286869&g_ep=CAISEjI2LjI4LjAuOTQyOTUxNTM4MBgAINeCAypTLDk0Mjk3Njk5LDEwMDc5NTYyNSw5NDIzMTE4OCw5NDI4MDU2OCw0NzA3MTcwNCw5NDIxODY0MSw5NDI4MjEzNCwxMDA4MTM0NjksOTQyODY4NjlCAktI&skid=e49f29dc-569d-46b3-a0eb-d1b7a4351966&g_st=ic"},
+{"id": "nphk-20261015-0134", "customer": "នំបុ័ងភ្នំពេញ 271", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/KCXihY4Kx8eoncbEA", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 136, "lead_no": 134, "resolved_url": "https://www.google.com/maps/place/PP+BAKERY+271/@11.5332483,104.9071686,14.5z/data=!4m7!3m6!1s0x310950c20f9e82db:0xdc58f04469f5ce81!8m2!3d11.5277491!4d104.9160724!15sCknhnpPhn4bhnpThnrvhn5DhnoThnpfhn5LhnpPhn4bhnpbhn4Hhnokg4Z6P4Z624Z-G4Z6E4Z6A4Z-S4Z6a4Z6f4Z624Z-G4Z6EWk0iS-Gek-GfhuGelOGeu-GfkOGehCDhnpfhn5LhnpPhn4bhnpbhn4Hhnokg4Z6P4Z624Z-G4Z6EIOGegOGfkuGemuGen-GetuGfhuGehJIBBmJha2VyeeABAA!16s%2Fg%2F11c1n85lvk!18m1!1e1?entry=tts&g_ep=EgoyMDI2MDgwMy4wIPu8ASoASAFQAw%3D%3D&skid=4083d675-daef-4553-a1e9-f84454b3b35e", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0135", "customer": "NUN KUNTHEA", "province": "ស្វាយរៀង", "url": "https://maps.google.com/maps?q=11.132092,105.772899&ll=11.132092,105.772899&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 137, "lead_no": 135},
+{"id": "nphk-20261015-0136", "customer": "SOPHYA EM ព្រែកឯង", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Uqw8Z8jMZan7YipU7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 138, "lead_no": 136, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0137", "customer": "VUTHEA SOY ជម្ពូវ័ន", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.527918,104.812967&ll=11.527918,104.812967&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 139, "lead_no": 137},
+{"id": "nphk-20261015-0138", "customer": "SAM SY CHENDA ស្រុកបាកាន ពោធិសាត់", "province": "ពោធិ៍សាត់", "url": "https://maps.google.com/maps?q=12.619310,103.758999&ll=12.619310,103.758999&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 140, "lead_no": 138},
+{"id": "nphk-20261015-0139", "customer": "ហម វណ្ណា ស្តុបលំហែ កំពង់ចាម", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/i8QeKNF89QizTJqK8?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 141, "lead_no": 139, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0140", "customer": "PANG MARADY", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/ewGgY6QsLx6YZ35H9?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 142, "lead_no": 140, "resolved_url": "https://www.google.com/maps/place/11.358034,104.868378/data=!4m6!3m5!1s0!7e2!8m2!3d11.3580344!4d104.8683784!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI2LjIxLjEYACD67A0qiwEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksMTAwODE1NjM1QgJLSA%3D%3D&skid=d00a9381-d3bf-43a1-9146-3bd7450fe55b&g_st=atm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0141", "customer": "HEAN NAVOEUN កំពង់ធំ", "province": "កំពង់ធំ", "url": "https://maps.google.com/maps?q=12.707084,104.868824&ll=12.707084,104.868824&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 143, "lead_no": 141},
+{"id": "nphk-20261015-0142", "customer": "KIM GECH ការ៉ាសលាងឡាន ចំការស្ពៃ កំពង់សោម", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.617040,103.526751&ll=10.617040,103.526751&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 144, "lead_no": 142},
+{"id": "nphk-20261015-0143", "customer": "THIM SOVANNARY កាំកូ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.592292,104.896368&ll=11.592292,104.896368&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 145, "lead_no": 143},
+{"id": "nphk-20261015-0144", "customer": "THE STATION COFFEE សែនសុខ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/G7YGtvwJTWXvTcY87?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 146, "lead_no": 144, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0145", "customer": "AH THOEUN សំរោងអណ្ដែត", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.578700,104.858464&ll=11.578700,104.858464&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 147, "lead_no": 145},
+{"id": "nphk-20261015-0146", "customer": "ផ្ទះនំបញ្ខុក ឈូកមាស", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.575450,104.851054&ll=11.575450,104.851054&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 148, "lead_no": 146},
+{"id": "nphk-20261015-0147", "customer": "ចំរើន គីមរ៉ុង ក្រុងបានលុង", "province": "រតនគិរី", "url": "https://maps.google.com/maps?q=13.742653,107.006545&ll=13.742653,107.006545&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 149, "lead_no": 147},
+{"id": "nphk-20261015-0148", "customer": "LENG KANHA មេសាង ព្រៃវែង", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.327202,105.543926&ll=11.327202,105.543926&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 150, "lead_no": 148},
+{"id": "nphk-20261015-0149", "customer": "SU KIM កំពត", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.613714,104.181695&ll=10.613714,104.181695&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 151, "lead_no": 149},
+{"id": "nphk-20261015-0150", "customer": "SREY LEAK ក្រចេះ", "province": "ក្រចេះ", "url": "https://maps.google.com/maps?q=12.785226,106.277055&ll=12.785226,106.277055&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 152, "lead_no": 150},
+{"id": "nphk-20261015-0151", "customer": "អា ហន ពោធិ៍សាត់", "province": "ពោធិ៍សាត់", "url": "https://maps.google.com/maps?q=12.537006,103.916276&ll=12.537006,103.916276&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 153, "lead_no": 151},
+{"id": "nphk-20261015-0152", "customer": "DA NY ស្អាង", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.358377,104.983906&ll=11.358377,104.983906&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 154, "lead_no": 152},
+{"id": "nphk-20261015-0153", "customer": "វត្តី វត្តី សន្ទុក ស្អាង", "province": "កំពង់ធំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 155, "lead_no": 153},
+{"id": "nphk-20261015-0154", "customer": "THIDA LUCKY ច្បាអំពៅ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.512853,104.945805&ll=11.512853,104.945805&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 156, "lead_no": 154},
+{"id": "nphk-20261015-0155", "customer": "THEARY ស្រុកបាកាន ពោធិសាត់", "province": "ពោធិ៍សាត់", "url": "https://maps.google.com/maps?q=12.598427,103.791926&ll=12.598427,103.791926&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 157, "lead_no": 155},
+{"id": "nphk-20261015-0156", "customer": "DARY CHHORN កំពង់ចាម", "province": "កំពង់ចាម", "url": "https://maps.apple/p/cJ2dtuy-2EYT-d", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 158, "lead_no": 156, "resolved_url": "https://maps.apple.com/place?address=National%20Highway%207,%20Kampong%20Cham,%20Cambodia&coordinate=11.999801,105.445177&name=National%20Highway%207&map=explore", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0157", "customer": "ដានី កាហ្វេ ស្វាយរៀងទន្លេវៃគោ", "province": "ស្វាយរៀង", "url": "https://maps.app.goo.gl/cRvmWaXJPm8eLnzt5?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 159, "lead_no": 157, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0158", "customer": "ប៊ី យី ទម្លាប់តាកែវ", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=10.646703,104.870825&ll=10.646703,104.870825&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 160, "lead_no": 158},
+{"id": "nphk-20261015-0159", "customer": "SIVLANG LIM ឈូកមាស", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.568755,104.853572&ll=11.568755,104.853572&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 161, "lead_no": 159},
+{"id": "nphk-20261015-0160", "customer": "VILA LUY សៀមរាប", "province": "សៀមរាប", "url": "https://share.google/OiDS85CUqBuGJQyyZ", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 162, "lead_no": 160, "resolution_note": "Map link redirected outside the supported map providers."},
+{"id": "nphk-20261015-0161", "customer": "THE FRESS ទួលសង្កែ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/ThGiKiBBoPqxx1Ty5?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 163, "lead_no": 161, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5954700,104.9145390&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=cbc638e8-c340-46e0-8511-252b997b52ed&g_st=it"},
+{"id": "nphk-20261015-0162", "customer": "NK NK បឹងកង", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.582141,104.890701&ll=11.582141,104.890701&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 164, "lead_no": 162},
+{"id": "nphk-20261015-0163", "customer": "JAY UNG ស្ពានអាកាស 7មករា", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/d7ZWzt3xmSWDeRKZA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 165, "lead_no": 163, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5645881,104.8887910&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100799877,94286869&g_ep=CAISEjI2LjIxLjEuOTE3Mzg1NDY3MBgAINeCAypJLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDc5OTg3Nyw5NDI4Njg2OUICS0g%3D&skid=534d4e3e-ecbd-4e21-ab15-b7760b468a9a&g_st=ic"},
+{"id": "nphk-20261015-0164", "customer": "ជា ទិត្យ សូម៉ាតឿន(ABC ព្រៃស)", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 166, "lead_no": 164},
+{"id": "nphk-20261015-0165", "customer": "SENG WANDEAN ឬស្សីកែវ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/UPgiHG9jrx51SbVBA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 167, "lead_no": 165, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.6032710,104.9133091&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,100808659,94282134,94286869,100813014&g_ep=CAISEjI2LjIzLjQuOTI0MzY0MTg2MBgAINeCAypTLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDEwMDgwODY1OSw5NDI4MjEzNCw5NDI4Njg2OSwxMDA4MTMwMTRCAktI&skid=51c53ec1-1275-43e3-918a-5998ddf905de&g_st=it"},
+{"id": "nphk-20261015-0166", "customer": "LIM LONG កាន់ណាបាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/4vUfyVs638ZBPAvH6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 168, "lead_no": 166, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.8777222,103.3779722&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,100809209,94218641,94282134,100799872,94286869&g_ep=CAISEjI2LjIwLjQuOTEzODcwMjQ0MBgAINeCAypTLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDEwMDgwOTIwOSw5NDIxODY0MSw5NDI4MjEzNCwxMDA3OTk4NzIsOTQyODY4NjlCAktI&skid=eecf08ac-384f-46e5-abeb-31c6acb4f409&g_st=it"},
+{"id": "nphk-20261015-0167", "customer": "MR.DAD COFFEE ច្បារអំពៅ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/tHQQMgeftfR1LewGA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 169, "lead_no": 167, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5312136,104.9475468&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,100808654,94282134,100813469,94286869&g_ep=CAISEjI2LjIxLjEuOTE3Mzg1NDY3MBgAIIgnKlMsOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsMTAwODA4NjU0LDk0MjgyMTM0LDEwMDgxMzQ2OSw5NDI4Njg2OUICS0g%3D&skid=7e77bd63-1c15-4a81-a567-a593895bfadc&g_st=it"},
+{"id": "nphk-20261015-0168", "customer": "JING SMALL GIRL ផ្សារចំបក់ តាកែវ", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.240991,104.811197&ll=11.240991,104.811197&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 170, "lead_no": 168},
+{"id": "nphk-20261015-0169", "customer": "ពន្លឺ ជីវិតរីករាយ ផ្សារកន្ទួត កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/AGZamepQ3QjC9Lnd6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 171, "lead_no": 169, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0170", "customer": "KARONAK អូសោម", "province": "ពោធិ៍សាត់", "url": "https://maps.google.com/maps?q=12.078757,103.187278&ll=12.078757,103.187278&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 172, "lead_no": 170},
+{"id": "nphk-20261015-0171", "customer": "LEAP LEAP អូឡាំពីក", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/H7S5S75ECm5Ravjr7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 173, "lead_no": 171, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0172", "customer": "ING KIMLEANG ឬស្សីកែវ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.614956,104.911557&ll=11.614956,104.911557&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 174, "lead_no": 172},
+{"id": "nphk-20261015-0173", "customer": "VUOCHLY បឹងស្នោរ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.514152,104.966048&ll=11.514152,104.966048&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 175, "lead_no": 173},
+{"id": "nphk-20261015-0174", "customer": "MONUNEATH ទូលគោក", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/rAYhP91Sn5difDmCA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 176, "lead_no": 174, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0175", "customer": "VIN MART ទួលគោក", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Vribzjn6Hub5NTv98?g_st=ac", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 177, "lead_no": 175, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0176", "customer": "L MENG ផ្លូវជាសុភារា", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/xZ46JJPNjjsE4Nvf9?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 178, "lead_no": 176, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0177", "customer": "SREYLEAP SENG", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.500618,104.789379&ll=11.500618,104.789379&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 179, "lead_no": 177},
+{"id": "nphk-20261015-0178", "customer": "BUNNE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/CtujqdSPzu24JnJj7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 180, "lead_no": 178, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0179", "customer": "MAICHA CAFE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/cJVXK3zxfVpkEQKb8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 181, "lead_no": 179, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0180", "customer": "HAK NYTA", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.559623,104.855221&ll=11.559623,104.855221&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 182, "lead_no": 180},
+{"id": "nphk-20261015-0181", "customer": "មឿន ភារ៉ា", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.475030,104.749737&ll=11.475030,104.749737&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 183, "lead_no": 181},
+{"id": "nphk-20261015-0182", "customer": "CHANDOEUN MAO", "province": "មណ្ឌលគិរី", "url": "https://g.co/kgs/dWm9tK4", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 184, "lead_no": 182, "resolution_note": "Map link redirected outside the supported map providers."},
+{"id": "nphk-20261015-0183", "customer": "CHAN THY", "province": "ប៉ោយប៉ែត", "url": "https://www.google.com/maps/place/JHVG%2B964+Meguiar's+krong+poi+pet,+AH1,+Krong+Poi+Pet/@13.6433782,102.5755929,16z/data=!4m6!3m5!1s0x311b17cce72c87ab:0xab95aea274f14834!8m2!3d13.6433782!4d102.5755929!16s%2Fg%2F11mx5xnrv2?hl=en-KH&gl=kh", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 185, "lead_no": 183},
+{"id": "nphk-20261015-0184", "customer": "LY Ly", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.570794,104.919895&ll=11.570794,104.919895&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 186, "lead_no": 184},
+{"id": "nphk-20261015-0185", "customer": "YOEURN SOKYENG", "province": "ស្វាយរៀង", "url": "https://maps.app.goo.gl/QtjJ4HhUkfJmTzgx6?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 187, "lead_no": 185, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0186", "customer": "KE SOKHA", "province": "ត្បូងឃ្មុំ", "url": "https://maps.google.com/maps?q=12.020603,105.883518&ll=12.020603,105.883518&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 188, "lead_no": 186},
+{"id": "nphk-20261015-0187", "customer": "CHANBO VIBOL", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 189, "lead_no": 187},
+{"id": "nphk-20261015-0188", "customer": "LONG SOKHOM", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.235964,104.868356&ll=11.235964,104.868356&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 190, "lead_no": 188},
+{"id": "nphk-20261015-0189", "customer": "ងឿន វណ្ណរ៉េត", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.082886,103.206204&ll=13.082886,103.206204&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 191, "lead_no": 189},
+{"id": "nphk-20261015-0190", "customer": "ភឿន ចរិយា", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.565854,104.870867&ll=11.565854,104.870867&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 192, "lead_no": 190},
+{"id": "nphk-20261015-0191", "customer": "OLE CAFE", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.509263,104.855192&ll=11.509263,104.855192&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 193, "lead_no": 191},
+{"id": "nphk-20261015-0192", "customer": "LITTLE CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.522900,104.853346&ll=11.522900,104.853346&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 194, "lead_no": 192},
+{"id": "nphk-20261015-0193", "customer": "PHAI VITA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/wSo5jo2Y6LaLeuA36?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 195, "lead_no": 193, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0194", "customer": "វែង ភិរុណ", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=12.771600,102.876740&ll=12.771600,102.876740&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 196, "lead_no": 194},
+{"id": "nphk-20261015-0195", "customer": "SEY SEY", "province": "កោះកុង", "url": "https://maps.app.goo.gl/eDkZ8bE6yzyk1q8bA?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 197, "lead_no": 195, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0196", "customer": "ស្រីលក្ខ័", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/CcPzAFNUGe4AmbkG7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 198, "lead_no": 196, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.6907040,103.8113383&entry=gps&shh=CAE&lucs=,94297699,100808508,94284499,94231188,94280568,47071704,94218641,94282134,94286869&g_ep=CAISEjI2LjE2LjAuODk4OTU0MjE1MBgAINeCAypSLDk0Mjk3Njk5LDEwMDgwODUwOCw5NDI4NDQ5OSw5NDIzMTE4OCw5NDI4MDU2OCw0NzA3MTcwNCw5NDIxODY0MSw5NDI4MjEzNCw5NDI4Njg2OUICS0g%3D&skid=8e1b1a7f-5fa0-46a7-9d6d-cd6ab0ef4d31&g_st=ifm"},
+{"id": "nphk-20261015-0197", "customer": "MR.DAD COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/XkKG3YiCBxB4KRqN8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 199, "lead_no": 197, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0198", "customer": "សុខ វណ្ណី", "province": "កោះកុង", "url": "https://maps.google.com/maps?q=11.567670,102.955901&ll=11.567670,102.955901&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 200, "lead_no": 198},
+{"id": "nphk-20261015-0199", "customer": "H LYHACH", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/eWGPhu33W8jP7XLM8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 201, "lead_no": 199, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0200", "customer": "AH RY", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/hnbyFqekz2MCcdd39?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 202, "lead_no": 200, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0201", "customer": "TA KOY", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.432911,105.596452&ll=11.432911,105.596452&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 203, "lead_no": 201},
+{"id": "nphk-20261015-0202", "customer": "THEART TY", "province": "តាកែវ", "url": "https://maps.app.goo.gl/ERV3xXTYyAiAFcRXA?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 204, "lead_no": 202, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0203", "customer": "ស្រី ខេង", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/ELZom383UKzg3Fmc9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 205, "lead_no": 203, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.1060719,103.9186756&entry=gps&shh=CAE&lucs=,94297699,94284472,94231188,94280568,47071704,94218641,94282134,94286869&g_ep=CAISEjI1LjQ5LjkuODM4ODk5MTgzMBgAINeCAypILDk0Mjk3Njk5LDk0Mjg0NDcyLDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDk0Mjg2ODY5QgJLSA%3D%3D&skid=8c1cb931-3544-4290-8aa9-2235628aa63f&g_st=ifm"},
+{"id": "nphk-20261015-0204", "customer": "BLUEBIRD INTERNATIONL EDUCATION", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Z9LBqRyofxNzY8Qr5?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 206, "lead_no": 204, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0205", "customer": "MACH DARA ព្រែកហូរ", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.441557,104.927903&ll=11.441557,104.927903&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 207, "lead_no": 205},
+{"id": "nphk-20261015-0206", "customer": "VEN KIMHENG", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.573328,105.420544&ll=11.573328,105.420544&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 208, "lead_no": 206},
+{"id": "nphk-20261015-0207", "customer": "The one coffee", "province": "ស្វាយរៀង", "url": "https://maps.google.com/maps?q=11.091688,105.791785&ll=11.091688,105.791785&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 209, "lead_no": 207},
+{"id": "nphk-20261015-0208", "customer": "អមតៈម៉ាតនិងកាហ្វេ", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=10.919648,104.603997&ll=10.919648,104.603997&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 210, "lead_no": 208},
+{"id": "nphk-20261015-0209", "customer": "ជេង ដាណៃ", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.346004,103.841554&ll=13.346004,103.841554&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 211, "lead_no": 209},
+{"id": "nphk-20261015-0210", "customer": "KAN NHA សិរីសោភ័ណ បន្ទាយមានជ័យ", "province": "បន្ទាយមានជ័យ", "url": "https://maps.app.goo.gl/SRr8AEFtLo1MYCyh8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 212, "lead_no": 210, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0211", "customer": "រ័ត្ន មនោរិទ្ធ", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/iqsdUiyvoDj391qT9", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 213, "lead_no": 211, "resolved_url": "https://www.google.com/maps/place/12.395248,105.082778/data=!4m6!3m5!1s0!7e2!8m2!3d12.3952484!4d105.0827781?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESCjExLjEyOS4xMDMYACDXggMqGyw5NDIwNzUwNiw5NDIwODUwNiw5NDIxODY1M0ICS0g%3D&skid=3fe9ce11-f8c4-45f0-9f86-0399ea45993b", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0212", "customer": "ប៊ុនធេង", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.582224,104.849146&ll=11.582224,104.849146&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 214, "lead_no": 212},
+{"id": "nphk-20261015-0213", "customer": "牡丹花", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 215, "lead_no": 213},
+{"id": "nphk-20261015-0214", "customer": "ម៉ី ក្បាលស្ពាន", "province": "ប៉ោយប៉ែត", "url": "https://maps.google.com/maps?q=13.660573,102.551352&ll=13.660573,102.551352&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 216, "lead_no": 214},
+{"id": "nphk-20261015-0215", "customer": "LEANG", "province": "ត្បូងឃ្មុំ", "url": "https://maps.google.com/maps?q=11.826201,105.783795&ll=11.826201,105.783795&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 217, "lead_no": 215},
+{"id": "nphk-20261015-0216", "customer": "CHOUN CHEASEYHA", "province": "កំពង់ឆ្នាំង", "url": "https://maps.google.com/maps?q=12.253794,104.670043&ll=12.253794,104.670043&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 218, "lead_no": 216},
+{"id": "nphk-20261015-0217", "customer": "ទេពនិមន្ដ", "province": "កណ្តាល", "url": "https://goo.gl/maps/zDfGmNn5UzMqfPhG8?g_st=ac", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 219, "lead_no": 217, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.582924,104.970368&entry=gps&g_ep=CAESBzI2LjE2LjUYACCIJyqLASw5NDI2NzcyNyw5NDI5MjE5NSw5NDI5OTUzMiwxMDA3OTY0OTgsMTAwNzk3NzYxLDEwMDc5NjUzNSw5NDI4MDU3Niw5NDIwNzM5NCw5NDIwNzUwNiw5NDIwODUwNiw5NDIxODY1Myw5NDIyOTgzOSw5NDI3NTE2OCw5NDI3OTYxOSwxMDA4MTA0NThCAktI&skid=49a92ffc-f193-488e-9473-134b2e240b7d&shorturl=1"},
+{"id": "nphk-20261015-0218", "customer": "Caltex", "province": "ព្រៃវែង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 220, "lead_no": 218},
+{"id": "nphk-20261015-0219", "customer": "H LYHACH", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/cBTp18aLGUbMDFmB8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 221, "lead_no": 219, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0220", "customer": "SOMBO MANA", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.074360,104.496803&ll=11.074360,104.496803&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 222, "lead_no": 220},
+{"id": "nphk-20261015-0221", "customer": "MUY SOCHENDA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/2dLY1dJ6s2tJJbPDA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 223, "lead_no": 221, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0222", "customer": "សុគង់ ឡន កំបូល", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.487780,104.789880&ll=11.487780,104.789880&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 224, "lead_no": 222},
+{"id": "nphk-20261015-0223", "customer": "SEAVMEY", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.437672,104.967744&ll=11.437672,104.967744&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 225, "lead_no": 223},
+{"id": "nphk-20261015-0224", "customer": "VANNY THON", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.576389,103.565223&ll=10.576389,103.565223&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 226, "lead_no": 224},
+{"id": "nphk-20261015-0225", "customer": "CHHAY BOEY តាខ្មៅ", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.465906,104.966713&ll=11.465906,104.966713&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 227, "lead_no": 225},
+{"id": "nphk-20261015-0226", "customer": "SUM CHANNY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/YqonEUYv9wnoPM5y8?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 228, "lead_no": 226, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5772464,104.8330054&entry=gps&shh=CAE&lucs=,94297699,100808508,94284454,94231188,94280568,47071704,94218641,94282134,100799872,94286869&g_ep=CAISEjI2LjEzLjYuODg4MzU5NjE4MBgAINeCAypcLDk0Mjk3Njk5LDEwMDgwODUwOCw5NDI4NDQ1NCw5NDIzMTE4OCw5NDI4MDU2OCw0NzA3MTcwNCw5NDIxODY0MSw5NDI4MjEzNCwxMDA3OTk4NzIsOTQyODY4NjlCAktI&skid=3b427362-22a7-4ce4-83a7-2c9aa3fced1c&g_st=ifm"},
+{"id": "nphk-20261015-0227", "customer": "ឥន្រ្ទី បូព៌ា", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/LFmkkwGBtki4se9k9?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 229, "lead_no": 227, "resolved_url": "https://www.google.com/maps/place/GRRG%2B752+LH+Tattoo+%E1%9E%85%E1%9E%B6%E1%9E%80%E1%9F%8B%E1%9E%9F%E1%9E%B6%E1%9E%80%E1%9F%8B+24%E1%9E%98%E1%9F%89%E1%9F%84%E1%9E%84,+Phnom+Penh/data=!4m6!3m5!1s0x31094f0020c7adc1:0x97ff5caa72f80115!7e2!8m2!3d11.5406351!4d104.8253907!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI2LjE1LjEYACDXggMqlAEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODQ0NTcsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksMTAwNzk5MjUxQgJLSA%3D%3D&skid=c7d85147-475d-48ca-b034-07bbb3bf0c74&g_st=atm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0228", "customer": "GALLERY COFFE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Rq9syLtSX1RKtdyf9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 230, "lead_no": 228, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0229", "customer": "KAFE SOYA HOUSE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/BgFqJrRCSQjnbbSV9?g_st=ac", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 231, "lead_no": 229, "resolved_url": "https://www.google.com/maps/place/DSL+Apartment,+Street+2004,+Phnom+Penh/data=!4m6!3m5!1s0x310951e8c16ff2c5:0xb57a03ff150fd880!7e2!8m2!3d11.552963!4d104.86128049999999!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI2LjE1LjEYACCenQoqgQEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTlCAktI&skid=8ee825d6-cc3f-4334-9a16-a5cad5f992d8&g_st=ac", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0230", "customer": "SAK COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Xk49StYVdgK7m9cp9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 232, "lead_no": 230, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0231", "customer": "វណ្ណះ ចរិយា", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/m2HQMBsGgqoU3pSf6?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 233, "lead_no": 231, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0232", "customer": "HENG SAMNANG", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.257800,105.401289&ll=11.257800,105.401289&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 234, "lead_no": 232},
+{"id": "nphk-20261015-0233", "customer": "NY TANG CALTEX", "province": "កំពង់ឆ្នាំង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 235, "lead_no": 233},
+{"id": "nphk-20261015-0234", "customer": "OUNPOV", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.502077,104.809401&ll=11.502077,104.809401&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 236, "lead_no": 234},
+{"id": "nphk-20261015-0235", "customer": "CHENG DANET", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.367083,103.838365&ll=13.367083,103.838365&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 237, "lead_no": 235},
+{"id": "nphk-20261015-0236", "customer": "JEE DAEN", "province": "កំពង់ចាម", "url": "https://maps.google.com/maps?q=11.939365,105.167322&ll=11.939365,105.167322&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 238, "lead_no": 236},
+{"id": "nphk-20261015-0237", "customer": "MI NEA", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/CfQrSEwa7ah9esWQ7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 239, "lead_no": 237, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0238", "customer": "SAR KEOKANHA", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.478527,104.894221&ll=11.478527,104.894221&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 240, "lead_no": 238},
+{"id": "nphk-20261015-0239", "customer": "LEANG LEANG", "province": "ប៉ៃលិន", "url": "https://maps.google.com/maps?q=12.927933,102.497464&ll=12.927933,102.497464&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 241, "lead_no": 239},
+{"id": "nphk-20261015-0240", "customer": "PHENG AN AN", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.333880,104.719774&ll=11.333880,104.719774&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 242, "lead_no": 240},
+{"id": "nphk-20261015-0241", "customer": "YU MI", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.488753,104.813017&ll=11.488753,104.813017&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 243, "lead_no": 241},
+{"id": "nphk-20261015-0242", "customer": "Central Beach Resort Long Set Beach", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 244, "lead_no": 242},
+{"id": "nphk-20261015-0243", "customer": "MOLII COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/2Q7f3eShrBa1mFsu5?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 245, "lead_no": 243, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0244", "customer": "NONG DAVY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.514568,104.854154&ll=11.514568,104.854154&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 246, "lead_no": 244},
+{"id": "nphk-20261015-0245", "customer": "SREY NICH", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 247, "lead_no": 245},
+{"id": "nphk-20261015-0246", "customer": "KOEM SREYRATH", "province": "តាកែវ", "url": "https://maps.app.goo.gl/49L6KmGJf6SXJZRg6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 248, "lead_no": 246, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0247", "customer": "PHO MONICA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/iAC73XScurjxpswx7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 249, "lead_no": 247, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0248", "customer": "SOMALY", "province": "បន្ទាយមានជ័យ", "url": "https://maps.app.goo.gl/NUSnfMVEGJHArCsp6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 250, "lead_no": 248, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.4662464,103.0137777&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,94286869&g_ep=CAISEjI2LjEwLjIuODc3MzE3OTEwMBgAINeCAyo_LDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDk0Mjg2ODY5QgJLSA%3D%3D&skid=bef26b1e-a15c-48c5-84b1-b39a81a0b492&g_st=it"},
+{"id": "nphk-20261015-0249", "customer": "ម៉ាក់ លីម៉េង", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.068154,104.287818&ll=13.068154,104.287818&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 251, "lead_no": 249},
+{"id": "nphk-20261015-0250", "customer": "VIN PARY", "province": "កំពត", "url": "https://maps.app.goo.gl/NNSrDuf5DGMzpJbE9?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 252, "lead_no": 250, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0251", "customer": "DAVID", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/8wT1US3ZQFRDPwEk6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 253, "lead_no": 251, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0252", "customer": "សុធា សុថាវី", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/4nmZtSWCHSqZf4hD6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 254, "lead_no": 252, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0253", "customer": "SAROEURN", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/Rf6RMuG2Wj7DHRta9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 255, "lead_no": 253, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0254", "customer": "NANFA វត្ដអង្គពោធិ៍ញ្ញាណ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.526595,104.897529&ll=11.526595,104.897529&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 256, "lead_no": 254},
+{"id": "nphk-20261015-0255", "customer": "BilLY COFFEEស្អាង", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 257, "lead_no": 255},
+{"id": "nphk-20261015-0256", "customer": "THEA JULY", "province": "ពោធិ៍សាត់", "url": "https://maps.google.com/maps?q=12.552896,103.871537&ll=12.552896,103.871537&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 258, "lead_no": 256},
+{"id": "nphk-20261015-0257", "customer": "KANNITHA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/9qvYiqJCaypKNhJd9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 259, "lead_no": 257, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0258", "customer": "PISEY KO", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.675991,104.561729&ll=10.675991,104.561729&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 260, "lead_no": 258},
+{"id": "nphk-20261015-0259", "customer": "HAK SOPHAL", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.100332,103.207351&ll=13.100332,103.207351&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 261, "lead_no": 259},
+{"id": "nphk-20261015-0260", "customer": "ស្រីល័ក្ខ ភូមិត្រពាំងពោ", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.645619,104.667977&ll=10.645619,104.667977&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 262, "lead_no": 260},
+{"id": "nphk-20261015-0261", "customer": "MR.DAD CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/tVQYqp4mFrL8Gghp6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 263, "lead_no": 261, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0262", "customer": "PANHAPICH គួរស្រូវ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.441673,104.890393&ll=11.441673,104.890393&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 264, "lead_no": 262},
+{"id": "nphk-20261015-0263", "customer": "LV  Coffee", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/xurdeGGDyoCUxRAx5", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 265, "lead_no": 263, "resolved_url": "https://www.google.com/maps/place/%E1%9E%A2%E1%9E%B7%E1%9E%9B%26%E1%9E%9C%E1%9E%B8%E1%9E%80%E1%9E%B6%E1%9E%A0%E1%9F%92%E1%9E%9C%E1%9F%81/@11.5673177,104.9086733,20.75z/data=!4m6!3m5!1s0x3109510002b6629f:0x821de1bacf977552!8m2!3d11.5671125!4d104.9091186!16s%2Fg%2F11zjl6zdyq?entry=tts&g_ep=EgoyMDI2MDIyNS4wIPu8ASoASAFQAw%3D%3D&skid=a1886211-4d16-40f4-9495-c899247cd41c", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0264", "customer": "LIM NGEAN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/YPTkvLvFy3hpJk469?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 266, "lead_no": 264, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0265", "customer": "SOK LEAPHEA", "province": "បន្ទាយមានជ័យ", "url": "https://maps.google.com/maps?q=13.535348,103.022473&ll=13.535348,103.022473&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 267, "lead_no": 265},
+{"id": "nphk-20261015-0266", "customer": "AH LY MOLY", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/zV9ZNqL5R8prEsYSA?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 268, "lead_no": 266, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.6172998,103.5363740&entry=gps&shh=CAE&lucs=,94297699,100794546,94284454,94231188,94280568,47071704,94218641,94282134,100799877,94286869,100796593&g_ep=CAISEjI2LjA4LjIuODcwOTc4MTE2MBgAIIgnKmYsOTQyOTc2OTksMTAwNzk0NTQ2LDk0Mjg0NDU0LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDc5OTg3Nyw5NDI4Njg2OSwxMDA3OTY1OTNCAktI&skid=0e5bffe0-a880-4318-90fc-b1b8dd7d668d&g_st=ifm"},
+{"id": "nphk-20261015-0267", "customer": "GM PHEAK", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/22SwNJTdVYbpVtMa6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 269, "lead_no": 267, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0268", "customer": "NEANG POVDARAVONTEY", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.667173,104.561084&ll=10.667173,104.561084&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 270, "lead_no": 268},
+{"id": "nphk-20261015-0269", "customer": "MEAN RITHY", "province": "សៀមរាប", "url": "https://maps.apple.com/place?address=Sok%20San%20Road,%20Siem%20Reap,%20Cambodia&coordinate=13.354861,103.849467&name=The%20Night%20Mini%20Mart&place-id=I837E74F5413C7CD5&map=explore", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 271, "lead_no": 269},
+{"id": "nphk-20261015-0270", "customer": "SOK LA", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.161750,104.853254&ll=11.161750,104.853254&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 272, "lead_no": 270},
+{"id": "nphk-20261015-0271", "customer": "MART", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.621327,104.882739&ll=11.621327,104.882739&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 273, "lead_no": 271},
+{"id": "nphk-20261015-0272", "customer": "BO KAKNIKA", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.661829,104.798724&ll=11.661829,104.798724&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 274, "lead_no": 272},
+{"id": "nphk-20261015-0273", "customer": "SO NITA", "province": "កំពង់ធំ", "url": "https://maps.google.com/maps?q=12.901877,105.431184&ll=12.901877,105.431184&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 275, "lead_no": 273},
+{"id": "nphk-20261015-0274", "customer": "DY DARA", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.611208,104.914855&ll=11.611208,104.914855&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 276, "lead_no": 274},
+{"id": "nphk-20261015-0275", "customer": "HAY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Uxitnj8mXxYRzsLh8?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 277, "lead_no": 275, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0276", "customer": "LA BELLA COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.395932,104.801630&ll=11.395932,104.801630&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 278, "lead_no": 276},
+{"id": "nphk-20261015-0277", "customer": "MAICHEU", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/tVQYqp4mFrL8Gghp6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 279, "lead_no": 277, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0278", "customer": "CHIN HOK", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/EATNm5sagqoNsrmJ7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 280, "lead_no": 278, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5936063,104.9269022&entry=gps&lucs=,94297699,94275415,94284484,94231188,94280568,47071704,94218641,94282134,94286869,100796589&g_ep=CAISEjI1LjQ5LjkuODM4ODk5MTgzMBgAINeCAypbLDk0Mjk3Njk5LDk0Mjc1NDE1LDk0Mjg0NDg0LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDk0Mjg2ODY5LDEwMDc5NjU4OUICS0g%3D&skid=1fcf3255-c09b-4ebf-b442-2999ec5c9da0&g_st=it"},
+{"id": "nphk-20261015-0279", "customer": "HUNI LIN", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.443935,104.448453&ll=11.443935,104.448453&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 281, "lead_no": 279},
+{"id": "nphk-20261015-0280", "customer": "BUN LEANG កំពង់ចាម", "province": "កំពង់ធំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 282, "lead_no": 280},
+{"id": "nphk-20261015-0281", "customer": "SREY POV", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.518846,104.876302&ll=11.518846,104.876302&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 283, "lead_no": 281},
+{"id": "nphk-20261015-0282", "customer": "SITHA PHONESHOP", "province": "ក្រចេះ", "url": "https://maps.google.com/maps?q=12.417801,105.924494&ll=12.417801,105.924494&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 284, "lead_no": 282},
+{"id": "nphk-20261015-0283", "customer": "QM SERVICES", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/6wGQjozAM8RG5s9R9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 285, "lead_no": 283, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5028316,104.8800410&entry=gps&shh=CAE&lucs=,94286590,94297699,94275415,94284505,94231188,94280568,47071704,94218641,94282134,94292074,94286869&g_ep=CAISEjI2LjA0LjEuODU4MjY5MDE5MBgAINeCAypjLDk0Mjg2NTkwLDk0Mjk3Njk5LDk0Mjc1NDE1LDk0Mjg0NTA1LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDk0MjkyMDc0LDk0Mjg2ODY5QgJLSA%3D%3D&skid=92a33825-9e3b-4dfd-8ba7-e2083ad5d9ce&g_st=ic"},
+{"id": "nphk-20261015-0284", "customer": "KIM CHHENGHONG", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/gWBwa1XvEqGL9Mun6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 286, "lead_no": 284, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0285", "customer": "KIM BUNKORNG", "province": "កំពង់ចាម", "url": "https://maps.google.com/maps?q=12.017509,105.070127&ll=12.017509,105.070127&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 287, "lead_no": 285},
+{"id": "nphk-20261015-0286", "customer": "KIM CHHENGHONG", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/GuL48LH2WkUo3m4j6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 288, "lead_no": 286, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0287", "customer": "JUER JUER", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.519083,104.836966&ll=11.519083,104.836966&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 289, "lead_no": 287},
+{"id": "nphk-20261015-0288", "customer": "RY បុរីសុខសាន្ដ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.504997,104.857324&ll=11.504997,104.857324&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 290, "lead_no": 288},
+{"id": "nphk-20261015-0289", "customer": "SENGHEEANG SEAN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/qboNuqdjp1Zf9Grd7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 291, "lead_no": 289, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5448858,104.8328784&entry=gps&shh=CAE&lucs=,94297699,94275415,94284466,94231188,94280568,47071704,94218641,94282134,94286869&g_ep=CAISEjI2LjA0LjEuODU4MjY5MDE5MBgAINeCAypRLDk0Mjk3Njk5LDk0Mjc1NDE1LDk0Mjg0NDY2LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDk0Mjg2ODY5QgJLSA%3D%3D&skid=8f83239a-9366-4fa6-b224-99527d06491d&g_st=ic"},
+{"id": "nphk-20261015-0290", "customer": "RAVY SEANG", "province": "កោះកុង", "url": "https://maps.app.goo.gl/DCdZUKs93Av5gLdu7?g_st=com.google.maps.preview.copy", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 292, "lead_no": 290, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0291", "customer": "ម៉ាក់ អូនយ៉ា", "province": "ឧត្តរមានជ័យ", "url": "https://maps.app.goo.gl/tjxyr5iLP2Ud8ksn7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 293, "lead_no": 291, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0292", "customer": "សម្បត្ដិរក្សាតេលា", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 294, "lead_no": 292},
+{"id": "nphk-20261015-0293", "customer": "BUN LEANG", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 295, "lead_no": 293},
+{"id": "nphk-20261015-0294", "customer": "KIMSOUR SENG", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.520112,104.878930&ll=11.520112,104.878930&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 296, "lead_no": 294},
+{"id": "nphk-20261015-0295", "customer": "J KEOV", "province": "កោះកុង", "url": "https://maps.google.com/maps?q=11.604918,102.979726&ll=11.604918,102.979726&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 297, "lead_no": 295},
+{"id": "nphk-20261015-0296", "customer": "PHANNY TEAV", "province": "ស្វាយរៀង", "url": "https://maps.app.goo.gl/8Vo6NQX7awPH3HrCA?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 298, "lead_no": 296, "resolved_url": "https://www.google.com/maps/place/11.080524,105.806425/data=!4m6!3m5!1s0!7e2!8m2!3d11.0805235!4d105.80642499999999!17m2!4m1!1e3!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBjI2LjUuNBgAIPrsDSqcASw5NDI2NzcyNyw5NDI3NTQwNyw5NDI5MjE5NSw5NDI5OTUzMiwxMDA3OTY0OTIsMTAwNzk1NjI1LDk0Mjg0NDk5LDk0MjgwNTc2LDk0MjA3Mzk0LDk0MjA3NTA2LDk0MjA4NTA2LDk0MjE4NjUzLDk0MjI5ODM5LDk0Mjc1MTY4LDk0Mjc5NjE5LDk0MjYyNzMzLDEwMDc5MTQ4M0ICS0g%3D&skid=1551ff4d-2d96-44e5-b0c2-66d67a986cf0&g_st=atm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0297", "customer": "ចែ ហៀង", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=20.659324,-11.406255&ll=20.659324,-11.406255&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 299, "lead_no": 297},
+{"id": "nphk-20261015-0298", "customer": "ចេ តា", "province": "កោះកុង", "url": "https://maps.google.com/maps?q=11.105152,103.798648&ll=11.105152,103.798648&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 300, "lead_no": 298},
+{"id": "nphk-20261015-0299", "customer": "SOPHEAK LAY", "province": "កំពត", "url": "https://maps.app.goo.gl/s8AXyAGnRdN3JVMNA", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 301, "lead_no": 299, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0300", "customer": "CHANNA", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/d667LdM8FEu6wXSJ8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 302, "lead_no": 300, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0301", "customer": "AH RAVY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.550760,104.861911&ll=11.550760,104.861911&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 303, "lead_no": 301},
+{"id": "nphk-20261015-0302", "customer": "PHON SIHOUR", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.601656,104.906035&ll=11.601656,104.906035&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 304, "lead_no": 302},
+{"id": "nphk-20261015-0303", "customer": "LEAKHENA CHEANG", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.606413,104.173470&ll=10.606413,104.173470&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 305, "lead_no": 303},
+{"id": "nphk-20261015-0304", "customer": "CHENDA SREYLEAK", "province": "កែប", "url": "https://maps.google.com/maps?q=10.576536,104.390701&ll=10.576536,104.390701&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 306, "lead_no": 304},
+{"id": "nphk-20261015-0305", "customer": "KHIEV MINEA", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.698302,103.813333&ll=10.698302,103.813333&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 307, "lead_no": 305},
+{"id": "nphk-20261015-0306", "customer": "SIV YEE", "province": "កោះកុង", "url": "https://maps.app.goo.gl/66ReFFe3BGZY7vLn7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 308, "lead_no": 306, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0307", "customer": "CHHEM SOMALY", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.637327,103.538847&ll=10.637327,103.538847&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 309, "lead_no": 307},
+{"id": "nphk-20261015-0308", "customer": "BilLY COFFEE", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.363576,105.004077&ll=11.363576,105.004077&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 310, "lead_no": 308},
+{"id": "nphk-20261015-0309", "customer": "LY NA ​", "province": "កោះកុង", "url": "https://maps.google.com/maps?q=10.891951,103.407189&ll=10.891951,103.407189&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 311, "lead_no": 309},
+{"id": "nphk-20261015-0310", "customer": "SUGEK CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/5vLS1813D7UVns8a8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 312, "lead_no": 310, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0311", "customer": "EM LIMHEAR", "province": "ព្រៃវែង", "url": "https://maps.app.goo.gl/4C2JmkVAHYoXbf6R9?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 313, "lead_no": 311, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0312", "customer": "SREY NUCH", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.529477,104.944569&ll=11.529477,104.944569&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 314, "lead_no": 312},
+{"id": "nphk-20261015-0313", "customer": "អេតឌី", "province": "ប៉ៃលិន", "url": "https://goo.gl/maps/d35bwfyeiP95zzfP6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 315, "lead_no": 313, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.085273,102.452879&entry=gps&g_ep=CAESBzI1LjQ5LjYYACDXggMqbCw5NDI2NzcyNyw5NDI3NTQwNyw5NDI5MjE5NSw5NDI5OTUzMiw5NDI4MDU3Niw5NDIwNzM5NCw5NDIwNzUwNiw5NDIwODUwNiw5NDIxODY1Myw5NDIyOTgzOSw5NDI3NTE2OCw5NDI3OTYxOUICS0g%3D&skid=d16e8e94-d412-4016-a924-aba3f504b785&shorturl=1"},
+{"id": "nphk-20261015-0314", "customer": "សារិកា ​កាហ្វេ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 316, "lead_no": 314},
+{"id": "nphk-20261015-0315", "customer": "EANG BORA", "province": "ស្វាយរៀង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 317, "lead_no": 315},
+{"id": "nphk-20261015-0316", "customer": "BERRY", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.098559,103.203813&ll=13.098559,103.203813&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 318, "lead_no": 316},
+{"id": "nphk-20261015-0317", "customer": "CREAM COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/t7yLYEAgMUgC3fpb6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 319, "lead_no": 317, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0318", "customer": "KRIS", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.544433,104.916156&ll=11.544433,104.916156&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 320, "lead_no": 318},
+{"id": "nphk-20261015-0319", "customer": "HIM HOY", "province": "កំពត", "url": "https://maps.app.goo.gl/n7yV6HRA2Mt8RSj49?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 321, "lead_no": 319, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0320", "customer": "វិង ប៉ោយប៉ែត", "province": "ប៉ោយប៉ែត", "url": "https://maps.google.com/maps?q=13.645170,102.590579&ll=13.645170,102.590579&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 322, "lead_no": 320},
+{"id": "nphk-20261015-0321", "customer": "NA NANA", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.088059,103.186267&ll=13.088059,103.186267&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 323, "lead_no": 321},
+{"id": "nphk-20261015-0322", "customer": "THE FRESH", "province": "ភ្នំពេញ", "url": "https://goo.gl/maps/h4bWFjTLrXVaxGW99?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 324, "lead_no": 322, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.595177,104.914699&entry=gps&g_ep=CAESBzI1LjQ5LjYYACDXggMqiAEsOTQyNjc3MjcsOTQyNzU0MDcsOTQyOTIxOTUsOTQyOTk1MzIsOTQyODQ0OTMsOTQyODA1NzYsOTQyNjc3ODcsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksMTAwNzkxNDc5QgJLSA%3D%3D&skid=86adb0f2-2b2d-4258-bf94-ecf85a307270&shorturl=1"},
+{"id": "nphk-20261015-0323", "customer": "SOPHEAP Y", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.555639,104.933216&ll=11.555639,104.933216&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 325, "lead_no": 323},
+{"id": "nphk-20261015-0324", "customer": "SOENG LINGLING", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.524543,104.879560&ll=11.524543,104.879560&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 326, "lead_no": 324},
+{"id": "nphk-20261015-0325", "customer": "SITHA ស្គន់ (ម្លប់ ស្បូវផូមិខ្ញុំ)", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/G6sMbRUdK3RqcSev5?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 327, "lead_no": 325, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0326", "customer": "MOUYGUECH KONG", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/3zth8W81n7ibLsvDA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 328, "lead_no": 326, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0327", "customer": "ជិក រម្យនី", "province": "ក្រចេះ", "url": "https://maps.app.goo.gl/Jz5bqU4e426dXwx9A?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 329, "lead_no": 327, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0328", "customer": "ហេង​ សៀវម៉ី", "province": "កំពង់ចាម", "url": "https://maps.google.com/maps?q=12.077188,105.143820&ll=12.077188,105.143820&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 330, "lead_no": 328},
+{"id": "nphk-20261015-0329", "customer": "HENG SOTHON", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/JoMxExvSUFTHJ1Ua7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 331, "lead_no": 329, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.7010534,104.8920751&entry=gps&lucs=,94259549,94275411,94284457,94224825,94227247,94227248,94231188,94280568,47071704,47069508,94218641,94282134,94298698,94203019,47084304,94286869&g_ep=CAISEjI1LjQ3LjAuODMzNTQyOTMwMBgAINeCAyqQASw5NDI1OTU0OSw5NDI3NTQxMSw5NDI4NDQ1Nyw5NDIyNDgyNSw5NDIyNzI0Nyw5NDIyNzI0OCw5NDIzMTE4OCw5NDI4MDU2OCw0NzA3MTcwNCw0NzA2OTUwOCw5NDIxODY0MSw5NDI4MjEzNCw5NDI5ODY5OCw5NDIwMzAxOSw0NzA4NDMwNCw5NDI4Njg2OUICS0g%3D&skid=f2c81182-ad3e-45cb-877d-d344e52b7303&g_st=ifm"},
+{"id": "nphk-20261015-0330", "customer": "ធារី", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/LC5jWSeSbQemzfCx9?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 332, "lead_no": 330, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0331", "customer": "KIM SUN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.498970,104.884979&ll=11.498970,104.884979&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 333, "lead_no": 331},
+{"id": "nphk-20261015-0332", "customer": "HOUTLYCHHENG", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/gtxKrmoJ23f9JKWe7?g_st=com.google.maps.preview.copy", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 334, "lead_no": 332, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.6163593,103.5350768&entry=gps&lucs=,94242490,94224825,94227247,94227248,47071704,47069508,94218641,94203019,47084304,94208458,94208447&g_ep=CAISEjI0LjUwLjAuNzA0NDI3ODkxMBgAINeCAypjLDk0MjQyNDkwLDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjE4NjQxLDk0MjAzMDE5LDQ3MDg0MzA0LDk0MjA4NDU4LDk0MjA4NDQ3QgJLSA%3D%3D&g_st=com.google.maps.preview.copy"},
+{"id": "nphk-20261015-0333", "customer": "TY OUN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.628588,104.896136&ll=11.628588,104.896136&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 335, "lead_no": 333},
+{"id": "nphk-20261015-0334", "customer": "ទឹម លីហេង", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/CoES6KY1LHoGqycg7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 336, "lead_no": 334, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0335", "customer": "THY THY PICK", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/3gr36YQBwJ4TjB7x5?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 337, "lead_no": 335, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0336", "customer": "ណារិន ចន្ធធារ៉ា", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.614740,104.907892&ll=11.614740,104.907892&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 338, "lead_no": 336},
+{"id": "nphk-20261015-0337", "customer": "លុយ ផារី", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.545738,104.894174&ll=11.545738,104.894174&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 339, "lead_no": 337},
+{"id": "nphk-20261015-0338", "customer": "35 COFFEE 371", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.525707,104.888114&ll=11.525707,104.888114&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 340, "lead_no": 338},
+{"id": "nphk-20261015-0339", "customer": "HOUN BUNNY", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.584458,103.747336&ll=10.584458,103.747336&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 341, "lead_no": 339},
+{"id": "nphk-20261015-0340", "customer": "PHEM THIDA", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.570520,104.134605&ll=10.570520,104.134605&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 342, "lead_no": 340},
+{"id": "nphk-20261015-0341", "customer": "HEANG SREY NUOCH", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.606081,104.929618&ll=11.606081,104.929618&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 343, "lead_no": 341},
+{"id": "nphk-20261015-0342", "customer": "SOVAN PANHA", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.497437,104.863061&ll=11.497437,104.863061&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 344, "lead_no": 342},
+{"id": "nphk-20261015-0343", "customer": "DANETTOUCH JINGJUNG", "province": "ក្រចេះ", "url": "https://maps.app.goo.gl/8DvaHEUaEJMBykuT8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 345, "lead_no": 343, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0344", "customer": "AH HOUY", "province": "កំពង់ឆ្នាំង", "url": "https://maps.app.goo.gl/QrBtFHaXnWSxH7HKA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 346, "lead_no": 344, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0345", "customer": "CHIN HOK", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 347, "lead_no": 345},
+{"id": "nphk-20261015-0346", "customer": "LEV SOKUN", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/SbfsM3LLsa6VYZmr8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 348, "lead_no": 346, "resolved_url": "https://www.google.com/maps/place/11.769701,104.782439/data=!4m6!3m5!1s0!7e2!8m2!3d11.7697007!4d104.78243909999999!17m2!4m1!1e3!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI1LjQ3LjgYACD67A0qqwEsOTQyNjc3MjcsOTQyNzU0MDcsOTQyOTIxOTUsOTQyODQ0OTksOTQyMjMyOTksOTQyMTY0MTMsOTQyODA1NzYsOTQyMTI0OTYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTc1MjMsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksOTQyOTU1MDQsNDcwODQzOTMsOTQyMTMyMDBCAktI&skid=a9d890ed-23b3-49e8-8a2c-74f84e23fa6c&g_st=afm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0347", "customer": "ខ្មែរម៉ាត ស្គន់ កំពង់ចាម", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/w9tdjbatw1kstuxd6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 349, "lead_no": 347, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.0544820,105.0642078&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=cd9bac3e-37ad-4220-8943-e5c3c221ff76&g_st=it"},
+{"id": "nphk-20261015-0348", "customer": "QM SERVICES", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/tZ9ke66oeRGnqjBW6?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 350, "lead_no": 348, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5393579,104.9251836&entry=gps&lucs=,94286590,94275415,94284505,94224825,94227247,94227248,94231188,94280568,47071704,47069508,94218641,94282134,94292074,94203019,47084304,94286869&g_ep=CAISEjI1LjQ2LjEuODMwNDc0Nzc1MBgAINeCAyqQASw5NDI4NjU5MCw5NDI3NTQxNSw5NDI4NDUwNSw5NDIyNDgyNSw5NDIyNzI0Nyw5NDIyNzI0OCw5NDIzMTE4OCw5NDI4MDU2OCw0NzA3MTcwNCw0NzA2OTUwOCw5NDIxODY0MSw5NDI4MjEzNCw5NDI5MjA3NCw5NDIwMzAxOSw0NzA4NDMwNCw5NDI4Njg2OUICS0g%3D&skid=6154530c-e97f-4076-b720-bda10f968843&g_st=ipc"},
+{"id": "nphk-20261015-0349", "customer": "PHEA SREYMOM", "province": "កំពង់ឆ្នាំង", "url": "https://maps.google.com/maps?q=11.767792,104.667610&ll=11.767792,104.667610&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 351, "lead_no": 349},
+{"id": "nphk-20261015-0350", "customer": "STUDY CAFÉ", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/hn1oEPzpucdmk9YM9?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 352, "lead_no": 350, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0351", "customer": "HONG HENG", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/ZnjDfoVdPbWm9ecM6?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 353, "lead_no": 351, "resolved_url": "https://www.google.com/maps/place/Koh+Teav+Market/data=!3m5!1e2!3m3!1sCIHM0ogKEICAgIDEwomVLw!2e10!6shttps:%2F%2Fgz0.googleusercontent.com%2Fgrass-cs%2FACke6TiWKsnAK4_7xB7lJbj8cqF-2lU1yDs3VBFIgITaH9X5aY0VSdCFfYfUQa47fjoauzgvil9_kUaJIQiMveXpjLsUGPu6Zq2YgiDL499V2jJtEWfcl3eiODq6KlK79se6w5AWPKj-%3Dw800-h450-k-no!4m10!3m9!1s0x310bd5beffdf71c5:0xfca601ddbcf916cb!8m2!3d11.0262842!4d105.05877059999999!10e5!13m2!1skoh+tao!2e5!16s%2Fg%2F11cnc58mlz?g_ep=CAESBzI1LjQ3LjgYACDmiAsqqwEsOTQyNjc3MjcsOTQyNzU0MDcsOTQyOTIxOTUsOTQyOTk1MzIsOTQyODQ0NjMsOTQyMjMyOTksOTQyMTY0MTMsOTQyODA1NzYsOTQyMTI0OTYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTc1MjMsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksNDcwODQzOTMsOTQyMTMyMDBCAktI&skid=99dbd6f7-709c-492b-9c0c-9af6f6ccde9d&g_st=afm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0352", "customer": "ហាប់ គឹមហ៊រ", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.362298,103.876997&ll=13.362298,103.876997&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 354, "lead_no": 352},
+{"id": "nphk-20261015-0353", "customer": "HEANG CHANDA", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.499135,104.665048&ll=11.499135,104.665048&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 355, "lead_no": 353},
+{"id": "nphk-20261015-0354", "customer": "SOPHORS VETH", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.587520,104.813162&ll=11.587520,104.813162&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 356, "lead_no": 354},
+{"id": "nphk-20261015-0355", "customer": "SUN POVNEARY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.576364,104.841325&ll=11.576364,104.841325&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 357, "lead_no": 355},
+{"id": "nphk-20261015-0356", "customer": "PANHCHAKRITHD", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.560271,104.929453&ll=11.560271,104.929453&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 358, "lead_no": 356},
+{"id": "nphk-20261015-0357", "customer": "HOR SAMBATH", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/65tyyWE8XXphQzCx9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 359, "lead_no": 357, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0358", "customer": "CHANTHA", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.445640,104.580222&ll=11.445640,104.580222&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 360, "lead_no": 358},
+{"id": "nphk-20261015-0359", "customer": "BUN LEANG", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 361, "lead_no": 359},
+{"id": "nphk-20261015-0360", "customer": "CHANRA CHOUN", "province": "ប៉ោយប៉ែត", "url": "https://maps.app.goo.gl/FSRuZJnuePNkqrxN9?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 362, "lead_no": 360, "resolved_url": "https://www.google.com/maps/place/13.668564,102.583785/data=!4m6!3m5!1s0!7e2!8m2!3d13.668563899999999!4d102.5837851?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI1LjQ2LjUYACD67A0qogEsOTQyNjc3MjcsOTQyNzU0MDMsOTQyOTIxOTUsOTQyODQ0OTMsOTQyMjMyOTksOTQyMTY0MTMsOTQyODA1NzYsOTQyMTI0OTYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTc1MjMsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksNDcwODQzOTMsOTQyMTMyMDBCAktI&skid=a09d04b1-8306-40b5-9ecd-a8f6cf4e943c&g_st=atm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0361", "customer": "ម៉ាក់ លីស៊ីង", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.512440,104.462513&ll=10.512440,104.462513&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 363, "lead_no": 361},
+{"id": "nphk-20261015-0362", "customer": "LY SAUREN", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.459375,104.936814&ll=11.459375,104.936814&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 364, "lead_no": 362},
+{"id": "nphk-20261015-0363", "customer": "SENG KAVEN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/VMsWrCoYPKG4Xway7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 365, "lead_no": 363, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0364", "customer": "BUN LEANG", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 366, "lead_no": 364},
+{"id": "nphk-20261015-0365", "customer": "អ៊ុត សេរី", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.477924,104.951568&ll=11.477924,104.951568&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 367, "lead_no": 365},
+{"id": "nphk-20261015-0366", "customer": "NA RAKSMEY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=10.576389,103.565223&ll=10.576389,103.565223&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 368, "lead_no": 366},
+{"id": "nphk-20261015-0367", "customer": "TAN MOUY HENG", "province": "តាកែវ", "url": "https://maps.app.goo.gl/cidJcbURLsUfJGza8?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 369, "lead_no": 367, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.9888502,104.7779068&entry=gps&lucs=,94284463,94224825,94227247,94227248,94231188,47071704,47069508,94218641,94282134,94203019,47084304&g_ep=CAISEjI1LjE5LjEuNzU0OTg3NTEyMBgAIIgnKmMsOTQyODQ0NjMsOTQyMjQ4MjUsOTQyMjcyNDcsOTQyMjcyNDgsOTQyMzExODgsNDcwNzE3MDQsNDcwNjk1MDgsOTQyMTg2NDEsOTQyODIxMzQsOTQyMDMwMTksNDcwODQzMDRCAktI&skid=14cb7e8d-3bd1-4492-9b7b-0d1ba27ad4a3&g_st=ifm"},
+{"id": "nphk-20261015-0368", "customer": "RAK", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.650500,104.914458&ll=11.650500,104.914458&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 370, "lead_no": 368},
+{"id": "nphk-20261015-0369", "customer": "LEAKHENA", "province": "បន្ទាយមានជ័យ", "url": "https://maps.app.goo.gl/N8wYcBP2RZJ6eBXV7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 371, "lead_no": 369, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0370", "customer": "មរតក", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=10.923831,104.612717&ll=10.923831,104.612717&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 372, "lead_no": 370},
+{"id": "nphk-20261015-0371", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.695593,102.652428&ll=13.695593,102.652428&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 373, "lead_no": 371},
+{"id": "nphk-20261015-0372", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.695593,102.652428&ll=13.695593,102.652428&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 374, "lead_no": 372},
+{"id": "nphk-20261015-0373", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.695593,102.652428&ll=13.695593,102.652428&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 375, "lead_no": 373},
+{"id": "nphk-20261015-0374", "customer": "OUN VY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/fUo56rTG1ejgjYPv7?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 376, "lead_no": 374, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0375", "customer": "NA RY", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/Br5PJpNPS9zyHESs6?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 377, "lead_no": 375, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0376", "customer": "ខ្មែរ ម៉ាត", "province": "រតនគិរី", "url": "https://maps.google.com/maps?q=13.739884,106.982289&ll=13.739884,106.982289&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 378, "lead_no": 376},
+{"id": "nphk-20261015-0377", "customer": "YOY COFFEE", "province": "ឧត្តរមានជ័យ", "url": "https://maps.app.goo.gl/AKTGmd1rft2Skg6s5?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 379, "lead_no": 377, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0378", "customer": "ម៉ៃ", "province": "ប៉ោយប៉ែត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 380, "lead_no": 378},
+{"id": "nphk-20261015-0379", "customer": "VICHARA", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.458049,104.923536&ll=11.458049,104.923536&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 381, "lead_no": 379},
+{"id": "nphk-20261015-0380", "customer": "ចន្នី", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 382, "lead_no": 380},
+{"id": "nphk-20261015-0381", "customer": "LY THAIING", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.576684,104.925812&ll=11.576684,104.925812&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 383, "lead_no": 381},
+{"id": "nphk-20261015-0382", "customer": "JOHN MENGHAK", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.587049,104.938251&ll=11.587049,104.938251&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 384, "lead_no": 382},
+{"id": "nphk-20261015-0383", "customer": "NOK NOI CAFÉ", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/yQoqyywPPjpTckzU7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 385, "lead_no": 383, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.4640374,104.9582579&entry=gps&lucs=,94284508,94224825,94227247,94227248,94231188,94280568,47071704,47069508,94218641,94282134,94203019,47084304,94286869&g_ep=CAISEjI1LjM4LjAuODA3MzYwMDM5MBgAINeCAyp1LDk0Mjg0NTA4LDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjE4NjQxLDk0MjgyMTM0LDk0MjAzMDE5LDQ3MDg0MzA0LDk0Mjg2ODY5QgJLSA%3D%3D&skid=783090d8-0306-4150-bb67-a9e954e968ea&g_st=it"},
+{"id": "nphk-20261015-0384", "customer": "MANETH", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/7uELtHj4sKsZ3TKfA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 386, "lead_no": 384, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0385", "customer": "សុវី", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.359494,105.014323&ll=11.359494,105.014323&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 387, "lead_no": 385},
+{"id": "nphk-20261015-0386", "customer": "LEAK SEY", "province": "ត្បូងឃ្មុំ", "url": "https://maps.google.com/maps?q=12.096334,105.549159&ll=12.096334,105.549159&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 388, "lead_no": 386},
+{"id": "nphk-20261015-0387", "customer": "DOWNTOWN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.484951,104.715381&ll=11.484951,104.715381&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 389, "lead_no": 387},
+{"id": "nphk-20261015-0388", "customer": "DOWNTOWN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.484951,104.715381&ll=11.484951,104.715381&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 390, "lead_no": 388},
+{"id": "nphk-20261015-0389", "customer": "SREY POV", "province": "ស្វាយរៀង", "url": "https://maps.google.com/maps?q=11.426621,105.803057&ll=11.426621,105.803057&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 391, "lead_no": 389},
+{"id": "nphk-20261015-0390", "customer": "VANNIN OAK", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.564837,104.828407&ll=11.564837,104.828407&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 392, "lead_no": 390},
+{"id": "nphk-20261015-0391", "customer": "RAKSMEY NANO", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.525483,104.936747&ll=11.525483,104.936747&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 393, "lead_no": 391},
+{"id": "nphk-20261015-0392", "customer": "ស្រៀន ស្រីកា", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/a8qDD7C2sZvMW12a6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 394, "lead_no": 392, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5076677,104.9132089&entry=gps&lucs=,94284460,94224825,94227247,94227248,94231188,94280568,47071704,47069508,94218641,94282134,94203019,47084304&g_ep=CAISEjI1LjM5LjMuODEwMTI3MDQ4MBgAINeCAypsLDk0Mjg0NDYwLDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjE4NjQxLDk0MjgyMTM0LDk0MjAzMDE5LDQ3MDg0MzA0QgJLSA%3D%3D&skid=b4a8b714-cc7a-44a4-a270-b99ab8ed2dfc&g_st=ic"},
+{"id": "nphk-20261015-0393", "customer": "KHAM CHISOPHEAK", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/hDLiqZzgUCS8wK9g6?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 395, "lead_no": 393, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5634999,104.9007497&entry=gps&lucs=,94284454,94224825,94227247,94227248,94231188,94280564,47071704,47069508,94273883,94218641,94282134,94203019,47084304&g_ep=CAISEjI1LjQwLjIuODEyNjUyMzQwMBgAINeCAyp1LDk0Mjg0NDU0LDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDk0MjMxMTg4LDk0MjgwNTY0LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjczODgzLDk0MjE4NjQxLDk0MjgyMTM0LDk0MjAzMDE5LDQ3MDg0MzA0QgJLSA%3D%3D&skid=b8f87cb8-80e3-493b-a2e8-a48c12b9b88e&g_st=ipc"},
+{"id": "nphk-20261015-0394", "customer": "សារី មង្គល", "province": "តាកែវ", "url": "https://maps.app.goo.gl/1Eu5TP3sqB9bsVWc9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 396, "lead_no": 394, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0395", "customer": "CHANKHOEUN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.552884,104.861309&ll=11.552884,104.861309&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 397, "lead_no": 395},
+{"id": "nphk-20261015-0396", "customer": "PISETH POV", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.536635,104.909500&ll=11.536635,104.909500&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 398, "lead_no": 396},
+{"id": "nphk-20261015-0397", "customer": "LIN MET", "province": "ប៉ោយប៉ែត", "url": "https://maps.google.com/maps?q=13.677613,102.565034&ll=13.677613,102.565034&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 399, "lead_no": 397},
+{"id": "nphk-20261015-0398", "customer": "AUREA STELLA COFFEE", "province": "ប៉ោយប៉ែត", "url": "https://maps.google.com/maps?q=13.680484,102.563680&ll=13.680484,102.563680&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 400, "lead_no": 398},
+{"id": "nphk-20261015-0399", "customer": "SORA VY", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/ZKX8ohRDVx4YutHs6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 401, "lead_no": 399, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0400", "customer": "AH POV HD", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/H63XSCBJDswwVSWk8?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 402, "lead_no": 400, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0401", "customer": "ស្រីឡៃ សម្រស់ធម្មជាតិ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/q5wNQTnsiFKr1xL57?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 403, "lead_no": 401, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0402", "customer": "ស្រី នាត", "province": "ត្បូងឃ្មុំ", "url": "https://maps.google.com/maps?q=12.264966,105.561502&ll=12.264966,105.561502&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 404, "lead_no": 402},
+{"id": "nphk-20261015-0403", "customer": "LAY BUNNAWATH", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.355995,103.875112&ll=13.355995,103.875112&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 405, "lead_no": 403},
+{"id": "nphk-20261015-0404", "customer": "MEN CHAMNAN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.582287,104.890793&ll=11.582287,104.890793&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 406, "lead_no": 404},
+{"id": "nphk-20261015-0405", "customer": "CHANKHOEUN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.550462,104.883266&ll=11.550462,104.883266&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 407, "lead_no": 405},
+{"id": "nphk-20261015-0406", "customer": "HOUR KUNTHEA", "province": "ស្វាយរៀង", "url": "https://maps.app.goo.gl/V8dhKE5UpPYHzN3b6?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 408, "lead_no": 406, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0407", "customer": "BUN LEANG", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 409, "lead_no": 407},
+{"id": "nphk-20261015-0408", "customer": "KHUN BELLA", "province": "បន្ទាយមានជ័យ", "url": "https://maps.app.goo.gl/MroQLB66pkYAyviJ6?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 410, "lead_no": 408, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=14.4165058,103.6951504&entry=gps&lucs=,94284499,94224825,94227247,94227248,94231188,47071704,47069508,94218641,94282134,94203019,47084304&g_ep=CAISEjI1LjIyLjAuNzYzNTE5NzAyMBgAINeCAypjLDk0Mjg0NDk5LDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDk0MjMxMTg4LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjE4NjQxLDk0MjgyMTM0LDk0MjAzMDE5LDQ3MDg0MzA0QgJLSA%3D%3D&skid=36a61137-5d5c-4aa4-b98b-19d86423b168&g_st=ifm"},
+{"id": "nphk-20261015-0409", "customer": "មករា​", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.407472,104.865920&ll=11.407472,104.865920&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 411, "lead_no": 409},
+{"id": "nphk-20261015-0410", "customer": "FLOWER", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.580222,104.900801&ll=11.580222,104.900801&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 412, "lead_no": 410},
+{"id": "nphk-20261015-0411", "customer": "សោ ភា", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/74oa632xYXMNaPCJ9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 413, "lead_no": 411, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5748733,104.8897452&entry=gps&lucs=,94284463,94224825,94227247,94227248,94231188,94280568,47071704,47069508,94218641,94282134,94203019,47084304&g_ep=CAISEjI1LjM5LjIuODEwMTI3MDQ4MBgAINeCAypsLDk0Mjg0NDYzLDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjE4NjQxLDk0MjgyMTM0LDk0MjAzMDE5LDQ3MDg0MzA0QgJLSA%3D%3D&skid=1446eda7-1879-4560-84a5-c970123e8eaa&g_st=ifm"},
+{"id": "nphk-20261015-0412", "customer": "ឡឹង បញ្ញា", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.510606,104.746121&ll=11.510606,104.746121&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 414, "lead_no": 412},
+{"id": "nphk-20261015-0413", "customer": "ឈាង លីដា", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/JjSCJwtD5Q7CVVSS8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 415, "lead_no": 413, "resolved_url": "https://www.google.com/maps/place/13.287168,103.820569/data=!4m6!3m5!1s0!7e2!8m2!3d13.287168399999999!4d103.82056879999999?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI1LjE5LjYYACD4wA0qhwEsOTQyNjc3MjcsOTQyODQ0OTAsOTQyMjMyOTksOTQyMTY0MTMsOTQyODA1NzYsOTQyMTI0OTYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTc1MjMsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsNDcwODQzOTMsOTQyMTMyMDBCAktI&skid=83d207e7-267d-4564-8f1e-3a060c83d526&g_st=afm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0414", "customer": "បាយស្រូប", "province": "កោះពេជ្រ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 416, "lead_no": 414},
+{"id": "nphk-20261015-0415", "customer": "SAM MST", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.608234,103.537815&ll=10.608234,103.537815&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 417, "lead_no": 415},
+{"id": "nphk-20261015-0416", "customer": "PANHCHAKRITHD", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.564029,104.923772&ll=11.564029,104.923772&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 418, "lead_no": 416},
+{"id": "nphk-20261015-0417", "customer": "VOLEAK TAING", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/NsG7MaRtvwoNKSUM9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 419, "lead_no": 417, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0418", "customer": "AH NA", "province": "ត្បូងឃ្មុំ", "url": "https://maps.google.com/maps?q=11.936937,105.570604&ll=11.936937,105.570604&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 420, "lead_no": 418},
+{"id": "nphk-20261015-0419", "customer": "CHUU MI", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.629696,104.877727&ll=11.629696,104.877727&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 421, "lead_no": 419},
+{"id": "nphk-20261015-0420", "customer": "KIM CHHORN CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/NfPfxcR3yFgu6pcW6?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 422, "lead_no": 420, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0421", "customer": "មុំ ចន្ទ័រតនា", "province": "តាកែវ", "url": "https://maps.app.goo.gl/8162EMUAySg6SKnH7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 423, "lead_no": 421, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.9794480,104.7747130&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=3e61c282-c5af-4c39-8fba-f8e76d626bf3&g_st=it"},
+{"id": "nphk-20261015-0422", "customer": "VIE VIE", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/32Cutrb1Mpsrgaba9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 424, "lead_no": 422, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.4795560,104.9482220&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=428b0758-077b-41a5-871f-86e9ed46849b&g_st=it"},
+{"id": "nphk-20261015-0423", "customer": "ឈាន រស្មី", "province": "មណ្ឌលគិរី", "url": "https://maps.google.com/maps?q=12.441636,107.198472&ll=12.441636,107.198472&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 425, "lead_no": 423},
+{"id": "nphk-20261015-0424", "customer": "HENG THIDA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/YfAcFVppjHudWCqW8?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 426, "lead_no": 424, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0425", "customer": "SOPHAL FREEMAN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/ii7EG7PooU7u7h3YA?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 427, "lead_no": 425, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0426", "customer": "RA CHANBORMEY", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 428, "lead_no": 426},
+{"id": "nphk-20261015-0427", "customer": "CHENG HOUR", "province": "កំពង់ធំ", "url": "https://maps.google.com/maps?q=12.733231,104.896563&ll=12.733231,104.896563&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 429, "lead_no": 427},
+{"id": "nphk-20261015-0428", "customer": "LIDA JOLIE MART", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.462188,104.949840&ll=11.462188,104.949840&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 430, "lead_no": 428},
+{"id": "nphk-20261015-0429", "customer": "SROS SAING", "province": "កំពត", "url": "https://maps.app.goo.gl/n9crDHY5d9VG5CdR6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 431, "lead_no": 429, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0430", "customer": "LIM LONG", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Bva2ppmK7HjW1k7C7?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 432, "lead_no": 430, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0431", "customer": "ម៉ាក់ណា", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 433, "lead_no": 431},
+{"id": "nphk-20261015-0432", "customer": "HOUY NITA", "province": "តាកែវ", "url": "https://maps.app.goo.gl/Vo7WPXKe8BoBUJcg6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 434, "lead_no": 432, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0433", "customer": "HENG SO PHEAP", "province": "កំពត", "url": "https://maps.app.goo.gl/N7jDeTmWvZmVWBcg6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 435, "lead_no": 433, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0434", "customer": "TELA RITHY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.591583,104.894529&ll=11.591583,104.894529&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 436, "lead_no": 434},
+{"id": "nphk-20261015-0435", "customer": "SUGEK CHIN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/y6AXgKdAR3b7xWyq7?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 437, "lead_no": 435, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5982007,104.8857243&entry=gps&lucs=,94284481,94224825,94227247,94227248,94231188,47071704,47069508,94218641,94282134,94203019,47084304,94286863&g_ep=CAISEjI1LjM1LjAuNzk5MDg4MzU1MBgAIIgnKmwsOTQyODQ0ODEsOTQyMjQ4MjUsOTQyMjcyNDcsOTQyMjcyNDgsOTQyMzExODgsNDcwNzE3MDQsNDcwNjk1MDgsOTQyMTg2NDEsOTQyODIxMzQsOTQyMDMwMTksNDcwODQzMDQsOTQyODY4NjNCAktI&skid=a6810765-363b-48c9-a215-354a5241935b&g_st=ipc"},
+{"id": "nphk-20261015-0436", "customer": "SANG SOPHARA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Kszr2R1CH15SpFAH7?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 438, "lead_no": 436, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5386165,104.8202566&entry=gps&lucs=,94284484,94224825,94227247,94227248,94231188,47071704,47069508,94218641,94282134,94203019,47084304&g_ep=CAISEjI1LjMxLjAuNzg4MTIyNzc1MBgAINeCAypjLDk0Mjg0NDg0LDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDk0MjMxMTg4LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjE4NjQxLDk0MjgyMTM0LDk0MjAzMDE5LDQ3MDg0MzA0QgJLSA%3D%3D&skid=43d64e84-4808-4999-a575-04cda3756276&g_st=ifm"},
+{"id": "nphk-20261015-0437", "customer": "SVAY LY CHANTHA", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/8GXmhCq4FS6eUVbW8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 439, "lead_no": 437, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0438", "customer": "THEA RA", "province": "សៀមរាប", "url": "https://www.google.com/maps/place//@11.5913471,104.8943921,18.5z/data=!4m6!1m5!3m4!2zMTHCsDM1JzI5LjciTiAxMDTCsDUzJzQwLjMiRQ!8m2!3d11.591583!4d104.894529!5m1!1e1?entry=ttu&g_ep=EgoyMDI1MDkwMy4wIKXMDSoASAFQAw%3D%3D", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 440, "lead_no": 438},
+{"id": "nphk-20261015-0439", "customer": "LEANG HUN", "province": "ស្វាយរៀង", "url": "https://maps.google.com/maps?q=11.081084,105.847270&ll=11.081084,105.847270&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 441, "lead_no": 439},
+{"id": "nphk-20261015-0440", "customer": "ចែ ណែត", "province": "ប៉ោយប៉ែត", "url": "https://maps.app.goo.gl/sW6et5CiYK854gqT6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 442, "lead_no": 440, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.6717180,102.5675520&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=2f9c0926-4030-4131-9505-b1a573f3d2d7&g_st=it"},
+{"id": "nphk-20261015-0441", "customer": "TIK TOK CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/JPhYwtCPFv6zQfpN6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 443, "lead_no": 441, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0442", "customer": "ចន្ថា ប៉ុណ្ណាការ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 444, "lead_no": 442},
+{"id": "nphk-20261015-0443", "customer": "SREY KHOUCH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 445, "lead_no": 443},
+{"id": "nphk-20261015-0444", "customer": "MORNIKA VAYOUK", "province": "ពោធិ៍សាត់", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 446, "lead_no": 444},
+{"id": "nphk-20261015-0445", "customer": "OUNKHIM LOVE", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/Yg69EwJQAeJnNsqU7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 447, "lead_no": 445, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0446", "customer": "ម៉ុង បរមី", "province": "", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 448, "lead_no": 446},
+{"id": "nphk-20261015-0447", "customer": "TON CHANNY", "province": "កោះកុង", "url": "https://maps.app.goo.gl/3pyXDbYCkTiyZCyGA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 449, "lead_no": 447, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0448", "customer": "ROTH NARAK", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 450, "lead_no": 448},
+{"id": "nphk-20261015-0449", "customer": "NA NA", "province": "ស្វាយរៀង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 451, "lead_no": 449},
+{"id": "nphk-20261015-0450", "customer": "CHHEA PISEY", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 452, "lead_no": 450},
+{"id": "nphk-20261015-0451", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 453, "lead_no": 451},
+{"id": "nphk-20261015-0452", "customer": "ម៉ុង បរមី", "province": "", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 454, "lead_no": 452},
+{"id": "nphk-20261015-0453", "customer": "សួរ ឧស្សាហ៍", "province": "បន្ទាយមានជ័យ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 455, "lead_no": 453},
+{"id": "nphk-20261015-0454", "customer": "BARANG KTH", "province": "កំពត", "url": "https://maps.app.goo.gl/jZfSv5DgZDP97hTm9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 456, "lead_no": 454, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0455", "customer": "THIDA CHHOUN", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 457, "lead_no": 455},
+{"id": "nphk-20261015-0456", "customer": "LEONG KUNTHEA", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.183393,104.780581&ll=11.183393,104.780581&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 458, "lead_no": 456},
+{"id": "nphk-20261015-0457", "customer": "RASY HR", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/16niAUFaiU2GdJYN7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 459, "lead_no": 457, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.4439860,104.8838930&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b9120834-9311-4f8c-8026-86d7a99b7e79&g_st=it"},
+{"id": "nphk-20261015-0458", "customer": "ROS SARADANY", "province": "ឧត្តរមានជ័យ", "url": "https://maps.app.goo.gl/3LeWNWXj2c6pMKmS7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 460, "lead_no": 458, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0459", "customer": "CALTEX", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 461, "lead_no": 459},
+{"id": "nphk-20261015-0460", "customer": "អ៊ុក កញ្ញា", "province": "កោះកុង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 462, "lead_no": 460},
+{"id": "nphk-20261015-0461", "customer": "MS NA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 463, "lead_no": 461},
+{"id": "nphk-20261015-0462", "customer": "សៀក នី", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/u6qQkKy9wUf2FS1L9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 464, "lead_no": 462, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.2110680,104.5835330&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b8c863db-6d37-4ffb-a264-a75298a4b2ec&g_st=it"},
+{"id": "nphk-20261015-0463", "customer": "ROTHA សំបុកត្រចៀកកាំ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 465, "lead_no": 463},
+{"id": "nphk-20261015-0464", "customer": "DARA PICH", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=13.645170,102.590579&ll=13.645170,102.590579&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 466, "lead_no": 464},
+{"id": "nphk-20261015-0465", "customer": "អ៊ុក មឿន", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 467, "lead_no": 465},
+{"id": "nphk-20261015-0466", "customer": "BE STRONG", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 468, "lead_no": 466},
+{"id": "nphk-20261015-0467", "customer": "BELLA SMITT", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/SgaLfpMkbU5goa3KA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 469, "lead_no": 467, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0468", "customer": "អ៊ីង អ៊ីង", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 470, "lead_no": 468},
+{"id": "nphk-20261015-0469", "customer": "VOREAKTEY", "province": "ប៉ោយប៉ែត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 471, "lead_no": 469},
+{"id": "nphk-20261015-0470", "customer": "ចាន់ ថន", "province": "ព្រៃវែង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 472, "lead_no": 470},
+{"id": "nphk-20261015-0471", "customer": "ម៉ាក់អូន ឈីញ", "province": "ព្រះវិហារ", "url": "https://maps.app.goo.gl/LGwFe8YMrQisKQLC9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 473, "lead_no": 471, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0472", "customer": "PISEY CHHEA", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 474, "lead_no": 472},
+{"id": "nphk-20261015-0473", "customer": "អា នី", "province": "ត្បូងឃ្មុំ", "url": "https://maps.app.goo.gl/WVmaXBosd8HPrjut8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 475, "lead_no": 473, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7610000,106.3343890&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=d4ebf53f-e308-4cd3-9169-e6b6fcddf316&g_st=it"},
+{"id": "nphk-20261015-0474", "customer": "SN79 MART & TOYS", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 476, "lead_no": 474},
+{"id": "nphk-20261015-0475", "customer": "SREYPICH THAI", "province": "ត្បូងឃ្មុំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 477, "lead_no": 475},
+{"id": "nphk-20261015-0476", "customer": "ចិ ភា លក់គ្រឿងក្រអូប ក្នុងផ្សារកំពង់ត្រាច", "province": "កំពត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 478, "lead_no": 476},
+{"id": "nphk-20261015-0477", "customer": "CHEA MOLIVANN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/9xqAkdZRKyogKbQ57?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 479, "lead_no": 477, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0478", "customer": "កង់ទីនសាលា BRIGHT LINE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Hq9d89aF7kn1356CA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 480, "lead_no": 478, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0479", "customer": "JEE DA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/VRHK5ono4srsGgaC9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 481, "lead_no": 479, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5121940,104.9300002&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b2d141e1-bb9b-46eb-8b85-5e66cd816145&g_st=it"},
+{"id": "nphk-20261015-0480", "customer": "MALAY MALAY", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/AEgveS7ThaQzveEY9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 482, "lead_no": 480, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.8717070,105.0431690&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=78cf2575-4095-49d0-8d80-61fadb58adb0&g_st=it"},
+{"id": "nphk-20261015-0481", "customer": "PHAL LA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 483, "lead_no": 481},
+{"id": "nphk-20261015-0482", "customer": "OUK CHENDA", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/FYnAD4G6vc94jEAA8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 484, "lead_no": 482, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0483", "customer": "AM SANG HOUY", "province": "ពោធិ៍សាត់", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 485, "lead_no": 483},
+{"id": "nphk-20261015-0484", "customer": "RAINBO", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/HizthsHTMDdR15N8A?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 486, "lead_no": 484, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0485", "customer": "MASY MASY", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 487, "lead_no": 485},
+{"id": "nphk-20261015-0486", "customer": "MITHONA PEN", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 488, "lead_no": 486},
+{"id": "nphk-20261015-0487", "customer": "AH TOCH KH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 489, "lead_no": 487},
+{"id": "nphk-20261015-0488", "customer": "MAK VISAL", "province": "ពោធិ៍សាត់", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 490, "lead_no": 488},
+{"id": "nphk-20261015-0489", "customer": "MO LIKA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 491, "lead_no": 489},
+{"id": "nphk-20261015-0490", "customer": "PHAI VITA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/pHMXdVTRx5neeMkNA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 492, "lead_no": 490, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0491", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 493, "lead_no": 491},
+{"id": "nphk-20261015-0492", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 494, "lead_no": 492},
+{"id": "nphk-20261015-0493", "customer": "CHANRA CHOUN", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 495, "lead_no": 493},
+{"id": "nphk-20261015-0494", "customer": "LY HONG", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 496, "lead_no": 494},
+{"id": "nphk-20261015-0495", "customer": "FAML NU", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 497, "lead_no": 495},
+{"id": "nphk-20261015-0496", "customer": "SREYDET KHOUN", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 498, "lead_no": 496},
+{"id": "nphk-20261015-0497", "customer": "SOULINH HEANG", "province": "ព្រះវិហារ", "url": "https://maps.app.goo.gl/Jks3wPbS1y16y6pw6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 499, "lead_no": 497, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.3046450,105.0021700&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=5860543d-97b8-4eb4-9798-b5c31595bc40&g_st=it"},
+{"id": "nphk-20261015-0498", "customer": "ING MUOYSIM", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/wY6HYxzDmgRSDMb96?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 500, "lead_no": 498, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0499", "customer": "X CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/e5YhmG8cefwxksZK9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 501, "lead_no": 499, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0500", "customer": "PHOK SOMALY", "province": "តាកែវ", "url": "https://maps.app.goo.gl/4ojBjtjKafwmkGVLA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 502, "lead_no": 500, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.3848580,104.8635680&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=77683e8e-d5b1-453f-b28e-32378c4496ec&g_st=it"},
+{"id": "nphk-20261015-0501", "customer": "NOREAK 168 SHOP", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/89ph66quWaDvfXUb7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 503, "lead_no": 501, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5616650,104.8413820&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=7d6bded9-a600-44d4-b80d-2948ad7bedd1&g_st=it"},
+{"id": "nphk-20261015-0502", "customer": "MOUYCHHENG GOV", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.684197,104.700838&ll=11.684197,104.700838&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 504, "lead_no": 502},
+{"id": "nphk-20261015-0503", "customer": "ស៊ុន រតនៈ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/J7AeM9SRk25FKwiQA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 505, "lead_no": 503, "resolution_note": "<urlopen error timed out>"},
+{"id": "nphk-20261015-0504", "customer": "LY SOK IM", "province": "ព្រះវិហារ", "url": "https://maps.google.com/maps?q=13.304640,105.002195&ll=13.304640,105.002195&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 506, "lead_no": 504},
+{"id": "nphk-20261015-0505", "customer": "TANGIM COSMETIC", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/KATyHNN34rXurtzA6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 507, "lead_no": 505, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.2116670,104.5766390&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=49e6635d-f657-4dc2-9ed9-edc792adf148&g_st=it"},
+{"id": "nphk-20261015-0506", "customer": "SOKHEA NEANG", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/F52hXU154g9nnRMb7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 508, "lead_no": 506, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5970670,104.8025270&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=c7e016c3-689b-4b2f-b81d-50cad96662f9&g_st=it"},
+{"id": "nphk-20261015-0507", "customer": "តេលា", "province": "កំពង់ឆ្នាំង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 509, "lead_no": 507},
+{"id": "nphk-20261015-0508", "customer": "ដើមកាហ្វេ អ៊ិចស្រ្ពេស", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 510, "lead_no": 508},
+{"id": "nphk-20261015-0509", "customer": "PICH COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/NS6rxYzRAHRPnS5D6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 511, "lead_no": 509, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5318309,104.9296739&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=9cca0c1c-bb8e-4c08-b09b-30d4daf2be8c&g_st=it"},
+{"id": "nphk-20261015-0510", "customer": "ស្រី ពៅ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 512, "lead_no": 510},
+{"id": "nphk-20261015-0511", "customer": "SREY PHEAK", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 513, "lead_no": 511},
+{"id": "nphk-20261015-0512", "customer": "ពៅ លីហុង", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 514, "lead_no": 512},
+{"id": "nphk-20261015-0513", "customer": "THEARY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/fCyvZSzrEx2Mc8u56?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 515, "lead_no": 513, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5141191,104.9024659&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=4d59d915-2af7-462b-9fc2-9a16214896ca&g_st=it"},
+{"id": "nphk-20261015-0514", "customer": "មុំ ចន្ទ័រតនា", "province": "តាកែវ", "url": "https://maps.app.goo.gl/m2wRWPwMwYbHedGB7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 516, "lead_no": 514, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.9794480,104.7747130&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=f4e2a8d6-a20f-4d99-a704-4187c4b5bedc&g_st=it"},
+{"id": "nphk-20261015-0515", "customer": "និនិកាហ្វេ- NINI CAFÉ", "province": "កំពង់ធំ", "url": "https://maps.google.com/maps?q=13.036699,104.513791&ll=13.036699,104.513791&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 517, "lead_no": 515},
+{"id": "nphk-20261015-0516", "customer": "SOEURNG SREY NEANG", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/oaWKqDxFCaxQnCyJ7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 518, "lead_no": 516, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.6128550,105.0031460&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=8929b6f1-adde-4fdc-a46f-afa4d2004a74&g_st=it"},
+{"id": "nphk-20261015-0517", "customer": "SON CHANDY", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/38LexCPMCQExx1TM9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 519, "lead_no": 517, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0518", "customer": "TEB CHOMNO", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 520, "lead_no": 518},
+{"id": "nphk-20261015-0519", "customer": "ROTH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 521, "lead_no": 519},
+{"id": "nphk-20261015-0520", "customer": "MALIKA YURI", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/fkka935UGb9iAkLF7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 522, "lead_no": 520, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0521", "customer": "SAMNEANG LUN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.583637,104.841023&ll=11.583637,104.841023&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 523, "lead_no": 521},
+{"id": "nphk-20261015-0522", "customer": "DIAMOND BICYCLE", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 524, "lead_no": 522},
+{"id": "nphk-20261015-0523", "customer": "ដេប៉ូតេលាគីឡូម៉ែត្រ65", "province": "កំពង់ឆ្នាំង", "url": "https://maps.app.goo.gl/MUMtHk5JzN65nqg88?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 525, "lead_no": 523, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0524", "customer": "SREYPICH THAI", "province": "ត្បូងឃ្មុំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 526, "lead_no": 524},
+{"id": "nphk-20261015-0525", "customer": "MONI VANN", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 527, "lead_no": 525},
+{"id": "nphk-20261015-0526", "customer": "SOPHEAROM MEN", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 528, "lead_no": 526},
+{"id": "nphk-20261015-0527", "customer": "MOUY YIM", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 529, "lead_no": 527},
+{"id": "nphk-20261015-0528", "customer": "LIKA MECH", "province": "កំពត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 530, "lead_no": 528},
+{"id": "nphk-20261015-0529", "customer": "BELLA SMITT", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.395932,104.801630&ll=11.395932,104.801630&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 531, "lead_no": 529},
+{"id": "nphk-20261015-0530", "customer": "HORN SIVNAI", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 532, "lead_no": 530},
+{"id": "nphk-20261015-0531", "customer": "POP CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/YVHnyEySsoBitf4f7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 533, "lead_no": 531, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0532", "customer": "ទួនហ្វា", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 534, "lead_no": 532},
+{"id": "nphk-20261015-0533", "customer": "PTT", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 535, "lead_no": 533},
+{"id": "nphk-20261015-0534", "customer": "ចណ្ណា កាហ្វេ", "province": "តាកែវ", "url": "https://maps.app.goo.gl/wURSFi2aqQRxotLKA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 536, "lead_no": 534, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0535", "customer": "PTT", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 537, "lead_no": 535},
+{"id": "nphk-20261015-0536", "customer": "PTT", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 538, "lead_no": 536},
+{"id": "nphk-20261015-0537", "customer": "PTT", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 539, "lead_no": 537},
+{"id": "nphk-20261015-0538", "customer": "ហួត លៀងទុយ", "province": "កោះកុង", "url": "https://maps.google.com/maps?q=11.139767,103.768197&ll=11.139767,103.768197&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 540, "lead_no": 538},
+{"id": "nphk-20261015-0539", "customer": "KATI YA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 541, "lead_no": 539},
+{"id": "nphk-20261015-0540", "customer": "LEEYA SUON", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 542, "lead_no": 540},
+{"id": "nphk-20261015-0541", "customer": "លាស់ គីមលាង", "province": "ប៉ោយប៉ែត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 543, "lead_no": 541},
+{"id": "nphk-20261015-0542", "customer": "NIMOL VOEUN", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 544, "lead_no": 542},
+{"id": "nphk-20261015-0543", "customer": "LAY KONG RETAIL", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/8tzE4c8pDT5kFAm7A?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 545, "lead_no": 543, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0544", "customer": "លីមដា កាហ្វេ", "province": "កោះកុង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 546, "lead_no": 544},
+{"id": "nphk-20261015-0545", "customer": "HENG CHHUNIM", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.530185,104.864197&ll=11.530185,104.864197&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 547, "lead_no": 545},
+{"id": "nphk-20261015-0546", "customer": "តុប ណៃអេង", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 548, "lead_no": 546},
+{"id": "nphk-20261015-0547", "customer": "ប៉ុក វ៉ាត", "province": "រតនគិរី", "url": "https://maps.app.goo.gl/jr1FMhFTVrpzXqfdA?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 549, "lead_no": 547, "resolved_url": "https://www.google.com/maps/place/13.685918,107.216926/data=!4m6!3m5!1s0!7e2!8m2!3d13.6859176!4d107.2169263?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI1LjEzLjYYACDj7Q0qYyw5NDIyMzI5OSw5NDIxNjQxMyw5NDIxMjQ5Niw5NDIwNzM5NCw5NDIwNzUwNiw5NDIwODUwNiw5NDIxNzUyMyw5NDIxODY1Myw5NDIyOTgzOSw0NzA4NDM5Myw5NDIxMzIwMEICS0g%3D&skid=648cd766-2ce9-4479-823b-f383d4f044c7&g_st=atm", "resolution_note": "Expanded from supplied map link"},
+{"id": "nphk-20261015-0548", "customer": "KONG SIMALA", "province": "ប៉ៃលិន", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 550, "lead_no": 548},
+{"id": "nphk-20261015-0549", "customer": "សឿន ប៊ុនឆៃ បុរីសូនី", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/k3penyvvMnXeUpSn6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 551, "lead_no": 549, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5275120,104.8807430&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b525be45-d9cb-4ce9-9240-272f9257a9a0&g_st=it"},
+{"id": "nphk-20261015-0550", "customer": "MA DY", "province": "ព្រៃវែង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 552, "lead_no": 550},
+{"id": "nphk-20261015-0551", "customer": "ចាន​ ថន", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 553, "lead_no": 551},
+{"id": "nphk-20261015-0552", "customer": "ដើមកាហ្វេ អ៊ិចស្រ្ពេស", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 554, "lead_no": 552},
+{"id": "nphk-20261015-0553", "customer": "SOMA LY", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.620510,103.542128&ll=10.620510,103.542128&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 555, "lead_no": 553},
+{"id": "nphk-20261015-0554", "customer": "BTA WATCH", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/SPjvFBGQkcD5o2nT7", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 556, "lead_no": 554, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0555", "customer": "DY KIMSA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 557, "lead_no": 555},
+{"id": "nphk-20261015-0556", "customer": "នំបុ័ងភ្នំពេញ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 558, "lead_no": 556},
+{"id": "nphk-20261015-0557", "customer": "AH HEAK", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 559, "lead_no": 557},
+{"id": "nphk-20261015-0558", "customer": "ជាងពុម្ភ ជាងដែក", "province": "កោះកុង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 560, "lead_no": 558},
+{"id": "nphk-20261015-0559", "customer": "KIM SEU LY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/1aNgLMuepZNhrQXk7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 561, "lead_no": 559, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5237610,104.9075820&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b35e3b10-1f9c-4374-b435-68abc3a3b458&g_st=it"},
+{"id": "nphk-20261015-0560", "customer": "ចេ ស្រស់", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.278135,104.210464&ll=11.278135,104.210464&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 562, "lead_no": 560},
+{"id": "nphk-20261015-0561", "customer": "EI SOK MENG", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.389148,104.378740&ll=11.389148,104.378740&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 563, "lead_no": 561},
+{"id": "nphk-20261015-0562", "customer": "SOU SARITH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 564, "lead_no": 562},
+{"id": "nphk-20261015-0563", "customer": "THEARYNA SENG", "province": "មណ្ឌលគិរី", "url": "https://maps.google.com/maps?q=12.460194,107.185893&ll=12.460194,107.185893&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 565, "lead_no": 563},
+{"id": "nphk-20261015-0564", "customer": "ម៉ាក់ កូនវិ", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/dwtmMviNLSTYdSNW7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 566, "lead_no": 564, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5008200,104.7504870&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=31fa9195-cfcd-4d90-b258-6ee98f2267b6&g_st=it"},
+{"id": "nphk-20261015-0565", "customer": "NIN NOCH", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 567, "lead_no": 565},
+{"id": "nphk-20261015-0566", "customer": "THY CHOURY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/yYPf4eriKD3qvbF6A?g_st=com.google.maps.preview.copy", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 568, "lead_no": 566, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7587270,104.9232300&entry=gps&lucs=,94259550,94242520,94224825,94227247,94227248,94231188,47071704,94259573,47069508,94218641,94203019,47084304,94208458,94208447&g_ep=CAISEjI1LjA4LjAuNzI3OTM5NzI3MBgAIIgnKn4sOTQyNTk1NTAsOTQyNDI1MjAsOTQyMjQ4MjUsOTQyMjcyNDcsOTQyMjcyNDgsOTQyMzExODgsNDcwNzE3MDQsOTQyNTk1NzMsNDcwNjk1MDgsOTQyMTg2NDEsOTQyMDMwMTksNDcwODQzMDQsOTQyMDg0NTgsOTQyMDg0NDdCAktI&g_st=com.google.maps.preview.copy"},
+{"id": "nphk-20261015-0567", "customer": "SREY LIN", "province": "កំពត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 569, "lead_no": 567},
+{"id": "nphk-20261015-0568", "customer": "MORIKO KREE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/oVxQR1sv3GSBVCi78?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 570, "lead_no": 568, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7293560,104.5577810&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=af70c0b9-cab8-4b4c-aaa1-9d7b32839142&g_st=ic"},
+{"id": "nphk-20261015-0569", "customer": "ស្រី នាត", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 571, "lead_no": 569},
+{"id": "nphk-20261015-0570", "customer": "កោះកាហ្វេ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/18SoQZcfJb72jGqV8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 572, "lead_no": 570, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
+{"id": "nphk-20261015-0571", "customer": "RADET JASPER", "province": "ភ្នំពេញ", "url": "https://nphk-pos.balancikaapps.com/login", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 573, "lead_no": 571},
+{"id": "nphk-20261015-0572", "customer": "DYSON KLEN COFFEE", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 574, "lead_no": 572},
+{"id": "nphk-20261015-0573", "customer": "VOUCH CHHENG", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.126683,104.336279&ll=13.126683,104.336279&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 575, "lead_no": 573},
+{"id": "nphk-20261015-0574", "customer": "SOK HENG", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 576, "lead_no": 574},
+{"id": "nphk-20261015-0575", "customer": "THIDA RITH", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 577, "lead_no": 575},
+{"id": "nphk-20261015-0576", "customer": "ជឹមជ័យសិរីមុន្និន", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/VTeN9fhx6P3hCadZ8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 578, "lead_no": 576, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5513240,104.9396820&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=aede89dd-bf1b-4c7e-8fff-fc5f7f543902&g_st=ic"},
+{"id": "nphk-20261015-0577", "customer": "ជា សុភ័ក្រ្ត", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/BPoYiJgLGyzeANsw8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 579, "lead_no": 577, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5389860,104.9028930&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=1baf7668-37c7-4c70-ad93-9e562cbd05c7&g_st=ic"},
+{"id": "nphk-20261015-0578", "customer": "PK CAFÉ & MINI MART", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 580, "lead_no": 578},
+{"id": "nphk-20261015-0579", "customer": "RA SREYNA", "province": "ព្រៃវែង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 581, "lead_no": 579},
+{"id": "nphk-20261015-0580", "customer": "LITA OUDOM", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 582, "lead_no": 580},
+{"id": "nphk-20261015-0581", "customer": "SEAV AY", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 583, "lead_no": 581},
+{"id": "nphk-20261015-0582", "customer": "FA NG", "province": "ស្វាយរៀង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 584, "lead_no": 582},
+{"id": "nphk-20261015-0583", "customer": "AH LEAK", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 585, "lead_no": 583},
+{"id": "nphk-20261015-0584", "customer": "NITA KNP", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 586, "lead_no": 584},
+{"id": "nphk-20261015-0585", "customer": "ចែ ទៀង", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 587, "lead_no": 585},
+{"id": "nphk-20261015-0586", "customer": "JEE NEATH", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 588, "lead_no": 586},
+{"id": "nphk-20261015-0587", "customer": "SPATA CAFÉ KOH NOREA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 589, "lead_no": 587},
+{"id": "nphk-20261015-0588", "customer": "PREMIUM LAND COFFEE", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 590, "lead_no": 588},
+{"id": "nphk-20261015-0589", "customer": "KON LYHOR", "province": "កំពង់ធំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 591, "lead_no": 589},
+{"id": "nphk-20261015-0590", "customer": "LAY LYCHING SOK SOTHEAVORN", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/oVxQR1sv3GSBVCi78?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 592, "lead_no": 590, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7293560,104.5577810&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=af70c0b9-cab8-4b4c-aaa1-9d7b32839142&g_st=ic"},
+{"id": "nphk-20261015-0591", "customer": "ROTH KIMHONG", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 593, "lead_no": 591},
+{"id": "nphk-20261015-0592", "customer": "PIN SAVAT", "province": "ត្បូងឃ្មុំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 594, "lead_no": 592},
+{"id": "nphk-20261015-0593", "customer": "SOK ENG PUY", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 595, "lead_no": 593},
+{"id": "nphk-20261015-0594", "customer": "AH GECH CORNER", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 596, "lead_no": 594},
+{"id": "nphk-20261015-0595", "customer": "LAK KHA", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 597, "lead_no": 595}
+]"""
+
+# ==========================================
+# CUSTOMER MAP REGISTRY — independent of delivery quantities and journal rows
+# ==========================================
+MAP_ALLOWED_HOSTS = frozenset({"maps.google.com", "www.google.com", "google.com",
+    "maps.app.goo.gl", "goo.gl", "g.co", "share.google", "maps.apple", "maps.apple.com"})
+MAP_SHORT_HOSTS = frozenset({"maps.app.goo.gl", "goo.gl", "g.co", "share.google", "maps.apple"})
+
+
+def trusted_map_url(value):
+    """Allow only HTTPS map providers, including at every redirect hop."""
+    value = str(value or "").strip()
+    if not value or len(value) > 6000 or any(ord(c) < 32 for c in value):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme != "https" or parsed.hostname not in MAP_ALLOWED_HOSTS
+                or parsed.username is not None or parsed.password is not None
+                or parsed.port not in (None, 443)):
+            return ""
+        if parsed.hostname in {"google.com", "www.google.com", "maps.google.com"}:
+            allowed_root = parsed.hostname == "maps.google.com" and parsed.path in ("", "/")
+            if not allowed_root and parsed.path != "/maps" and not parsed.path.startswith("/maps/"):
+                return ""
+        return value
+    except (ValueError, TypeError):
+        return ""
+
+
+def analyse_map_link(value):
+    """Only destination coordinates become pins; viewport centers are never pins."""
+    result = {"Map status": "Missing link", "Latitude": None, "Longitude": None,
+              "Map link": "", "Directions": ""}
+    if not str(value or "").strip():
+        return result
+    url = trusted_map_url(value)
+    if not url:
+        result["Map status"] = "Invalid map link"
+        return result
+    result["Map link"] = url
+    parsed = urllib.parse.urlsplit(url)
+    decoded = urllib.parse.unquote(url)
+    pairs = [(float(a), float(b)) for a, b in re.findall(
+        r"!3d([-+]?\d+(?:\.\d+)?)!4d([-+]?\d+(?:\.\d+)?)", decoded)]
+    query = urllib.parse.parse_qs(parsed.query)
+    for key in ("q", "query", "destination", "coordinate"):
+        for item in query.get(key, []):
+            match = re.fullmatch(r"\s*(?:loc:)?\s*([-+]?\d+(?:\.\d+)?)\s*,\s*([-+]?\d+(?:\.\d+)?)\s*", item)
+            if match:
+                pairs.append(tuple(map(float, match.groups())))
+    unique = {(round(a, 6), round(b, 6)) for a, b in pairs}
+    if len(unique) > 1:
+        result["Map status"] = "Multiple pins — review"
+    elif unique:
+        lat, lon = next(iter(unique))
+        if not (math.isfinite(lat) and math.isfinite(lon) and 10 <= lat <= 15 and 102 <= lon <= 108):
+            result["Map status"] = "Outside Cambodia area — review"
+        else:
+            result.update({"Map status": "Ready pin", "Latitude": lat, "Longitude": lon,
+                           "Directions": f"https://www.google.com/maps/dir/?api=1&destination={lat},{lon}&travelmode=driving"})
+    elif parsed.hostname in MAP_SHORT_HOSTS:
+        result["Map status"] = "Needs link expansion"
+    else:
+        result["Map status"] = "Link has no destination coordinates"
+    return result
+
+
+def _read_map_overlay():
+    if not os.path.exists(MAP_REGISTRY_FILE):
+        return {"version": 1, "records": {}, "bindings": {}}
+    try:
+        with open(MAP_REGISTRY_FILE, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if (not isinstance(data, dict) or data.get("version") != 1
+                or not isinstance(data.get("records"), dict) or not isinstance(data.get("bindings"), dict)):
+            raise ValueError("unsupported registry structure")
+        for key, rec in data["records"].items():
+            if (not isinstance(rec, dict) or rec.get("id") != key
+                    or not isinstance(rec.get("customer"), str) or not rec["customer"].strip()
+                    or not isinstance(rec.get("url", ""), str)):
+                raise ValueError("invalid customer location record")
+        if any(not isinstance(k, str) or not isinstance(v, str) for k, v in data["bindings"].items()):
+            raise ValueError("invalid customer binding")
+        return data
+    except (OSError, ValueError, TypeError) as e:
+        raise RuntimeError("Customer map registry cannot be read safely. Original records were preserved; restore a verified backup.") from e
+
+
+def load_map_registry(force=False):
+    with _sync_state()["lock"]:
+        if USE_DROPBOX:
+            pull(MAP_REGISTRY_FILE, force=force)
+        overlay = _read_map_overlay()
+        records = {r["id"]: dict(r) for r in json.loads(_MAP_SEED_JSON)}
+        records.update({key: dict(rec) for key, rec in overlay["records"].items()})
+        return {"records": records, "bindings": dict(overlay["bindings"])}
+
+
+def modify_map_registry(fn):
+    """Admin-only, atomic read/change/save with revision conflict retries."""
+    if current_role() != "admin" or not has_permission("edit"):
+        raise PermissionError("Only Admin can change customer map locations.")
+    for attempt in range(6):
+        try:
+            with _sync_state()["lock"], file_lock(MAP_REGISTRY_FILE):
+                if USE_DROPBOX:
+                    pull(MAP_REGISTRY_FILE, force=True)
+                overlay = _read_map_overlay()
+                fn(overlay)
+                if os.path.exists(MAP_REGISTRY_FILE) and not backup_file(MAP_REGISTRY_FILE, "before-map-edit"):
+                    raise RuntimeError("Cannot save customer maps because a backup could not be made.")
+                _write_atomic(MAP_REGISTRY_FILE, json.dumps(overlay, ensure_ascii=False, indent=2).encode("utf-8"))
+                if USE_DROPBOX:
+                    push(MAP_REGISTRY_FILE)
+            auto_bot.clear()
+            return
+        except ConflictError:
+            if attempt == 5:
+                raise RuntimeError("Customer maps changed in another session. Reload and try again.")
+            time.sleep(0.2 * (attempt + 1))
+
+
+def map_record_analysis(record):
+    analysis = analyse_map_link(record.get("resolved_url") or record.get("url", ""))
+    if (analysis["Map status"] == "Needs link expansion"
+            and "no usable destination coordinates" in record.get("resolution_note", "")):
+        analysis["Map status"] = "Needs full pin link"
+    return analysis
+
+
+def map_registry_frame(registry=None):
+    registry = registry if registry is not None else load_map_registry()
+    rows = []
+    for rec in registry["records"].values():
+        analysis = map_record_analysis(rec)
+        rows.append({"Location ID": rec["id"], "Customer": rec["customer"],
+                     "Province (source)": rec.get("province", ""), "Source row": rec.get("source_row", ""),
+                     "Original link": rec.get("url", ""), "Resolution note": rec.get("resolution_note", ""), **analysis})
+    frame = pd.DataFrame(rows, columns=["Location ID", "Customer", "Province (source)", "Source row", "Map status",
+        "Latitude", "Longitude", "Map link", "Directions", "Original link", "Resolution note"])
+    frame["Source row"] = pd.to_numeric(frame["Source row"], errors="coerce").astype("Int64")
+    return frame
+
+
+def customer_map_match(customer, registry):
+    """No fuzzy identity matching and no merging separate leads with the same name."""
+    key = norm_name(customer)
+    bound = registry["bindings"].get(key)
+    if bound:
+        rec = registry["records"].get(bound)
+        if not rec:
+            return {"Map status": "Saved match needs review", "Map link": "", "Directions": "", "Location ID": ""}
+        candidates = [rec]
+    else:
+        candidates = [rec for rec in registry["records"].values() if norm_name(rec["customer"]) == key]
+    if not candidates:
+        return {"Map status": "No location match", "Map link": "", "Directions": "", "Location ID": ""}
+    # Any duplicate identity requires Admin's explicit choice, even when a pin is shared.
+    if len(candidates) != 1:
+        return {"Map status": "Repeated name — choose location", "Map link": "", "Directions": "", "Location ID": ""}
+    rec = candidates[0]
+    return {**map_record_analysis(rec), "Location ID": rec["id"]}
+
+
+def mapped_customer_province(customer, registry):
+    matched = customer_map_match(customer, registry)
+    rec = registry["records"].get(matched.get("Location ID", ""), {})
+    province_text = rec.get("province", "")
+    if not province_text:
+        return None
+    english = {norm_name(name): name for name in PROVINCES}.get(norm_name(province_text))
+    return english or detect_province(province_text)[0]
+
+
+def attach_customer_maps(frame, registry=None):
+    result = frame.copy()
+    registry = registry if registry is not None else load_map_registry()
+    matches = [customer_map_match(str(name), registry) for name in result["Customer"]]
+    for col in ("Map status", "Map link", "Directions", "Location ID", "Latitude", "Longitude"):
+        result[col] = [match.get(col) for match in matches]
+    return result
+
+
+class _ResolvedMapPin(Exception):
+    def __init__(self, url):
+        super().__init__("Destination coordinates found")
+        self.url = url
+
+
+class _MapRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not trusted_map_url(newurl):
+            if fp is not None:
+                fp.close()
+            raise ValueError("Map link redirected outside the supported map providers.")
+        if analyse_map_link(newurl)["Map status"] == "Ready pin":
+            if fp is not None:
+                fp.close()
+            raise _ResolvedMapPin(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def resolve_map_link(url):
+    """Network-only worker: no Streamlit/session access and no coordinates guessed from HTML."""
+    if not trusted_map_url(url):
+        raise ValueError("Unsupported map link")
+    if analyse_map_link(url)["Map status"] == "Ready pin":
+        return url
+    opener = urllib.request.build_opener(_MapRedirectHandler())
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; CustomerMap/1.0)"})
+    try:
+        with opener.open(request, timeout=10) as response:
+            final_url = response.geturl()
+            if not trusted_map_url(final_url):
+                raise ValueError("Unsupported map destination")
+            if analyse_map_link(final_url)["Map status"] != "Ready pin":
+                raise ValueError("Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead.")
+            return final_url
+    except _ResolvedMapPin as found:
+        return found.url
+
+
+def _draw_customer_pins(frame):
+    pins = frame[frame["Map status"] == "Ready pin"].copy()
+    if pins.empty:
+        st.info("No usable customer pins in this selection. Open a saved map link or ask Admin to add one.")
+        return
+    st.caption(f"{len(pins)} location records have usable coordinates. Pins come from supplied links; confirm the destination before delivery.")
+    try:
+        import pydeck as pdk
+        pins["Label"] = pins["Customer"].astype(str)
+        pins["Pin_ID"] = pins["Location ID"]
+        layer = pdk.Layer("ScatterplotLayer", data=pins, get_position="[Longitude, Latitude]",
+                          get_radius=60, radius_min_pixels=5, radius_max_pixels=12,
+                          get_fill_color=[225, 70, 65, 220], get_line_color=[255, 255, 255],
+                          stroked=True, line_width_min_pixels=1, pickable=True)
+        center = pdk.ViewState(latitude=float(pins["Latitude"].median()), longitude=float(pins["Longitude"].median()),
+                               zoom=11 if len(pins) == 1 else 6, pitch=0)
+        deck = pdk.Deck(layers=[layer], map_provider="carto", map_style="light", initial_view_state=center,
+                       tooltip={"text": "{Label}\nLocation ID: {Pin_ID}"})
+        try:
+            st.pydeck_chart(deck, width="stretch")
+        except TypeError:
+            st.pydeck_chart(deck, use_container_width=True)
+    except Exception as e:
+        bot_log("warn", "Customer map", str(e)[:160], "showing location list; pins may need internet access")
+        st.info("The map could not load. Saved Google Maps links and directions are available in the list below.")
+
+
+def _map_admin_panel(registry, locations):
+    if current_role() != "admin" or not has_permission("edit"):
+        return
+    st.markdown("#### Manage customer locations")
+    with st.expander("Add a new customer location"):
+        with st.form("map_add_customer"):
+            new_name = st.text_input("New customer name", max_chars=MAX_TEXT, key="map_new_name")
+            new_province = st.text_input("New customer's province / area", max_chars=MAX_TEXT, key="map_new_province")
+            new_url = st.text_input("New customer's map pin link", max_chars=6000, key="map_new_url")
+            if st.form_submit_button("Add customer location"):
+                if not new_name.strip():
+                    st.error("Enter a customer name.")
+                elif new_url.strip() and not trusted_map_url(new_url):
+                    st.error("Use a valid HTTPS Google Maps or Apple Maps link.")
+                else:
+                    rid = "manual-" + pysecrets.token_hex(8)
+                    added = {"id": rid, "customer": new_name.strip(), "province": new_province.strip(),
+                             "url": new_url.strip(), "source": "Admin", "source_row": "", "lead_no": ""}
+                    try:
+                        modify_map_registry(lambda overlay: overlay["records"].update({rid: added}))
+                        audit("customer_map_add", rid)
+                        flash_and_refresh("Customer location added")
+                    except Exception as e:
+                        st.error(f"Could not add this customer: {e}")
+    all_ids = list(registry["records"])
+    labels = {rid: f"{r['customer']} | {r.get('province', '')} | {rid}" for rid, r in registry["records"].items()}
+    selected_id = st.selectbox("Select a location to correct", all_ids, format_func=labels.get, key="map_admin_record")
+    if not selected_id:
+        return
+    rec = registry["records"][selected_id]
+    edit_signature = hashlib.sha256(json.dumps(rec, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
+    with st.form("map_location_edit"):
+        customer = st.text_input("Customer name", value=rec["customer"], max_chars=MAX_TEXT, key=f"map_name_{selected_id}_{edit_signature}")
+        province = st.text_input("Province / area", value=rec.get("province", ""), max_chars=MAX_TEXT, key=f"map_prov_{selected_id}_{edit_signature}")
+        url = st.text_input("Google Maps or Apple Maps pin link", value=rec.get("resolved_url") or rec.get("url", ""),
+                            max_chars=6000, key=f"map_url_{selected_id}_{edit_signature}")
+        if st.form_submit_button("Save this customer location"):
+            if not customer.strip():
+                st.error("Enter a customer name.")
+            elif url.strip() and not trusted_map_url(url):
+                st.error("Use a valid HTTPS Google Maps or Apple Maps link.")
+            else:
+                changed = {**rec, "customer": customer.strip(), "province": province.strip(),
+                           "url": url.strip(), "resolved_url": "", "resolution_note": "Updated by Admin " + now_str()}
+                try:
+                    def save_location(overlay):
+                        latest = overlay["records"].get(selected_id, rec)
+                        if latest != rec:
+                            raise RuntimeError("This location changed in another session. Reload before saving.")
+                        overlay["records"][selected_id] = changed
+                    modify_map_registry(save_location)
+                    audit("customer_map_edit", selected_id)
+                    flash_and_refresh("Customer location saved")
+                except Exception as e:
+                    st.error(f"Could not save this location: {e}")
+    with st.expander("Match a delivery customer to a saved location"):
+        st.caption("Use this for different spellings or repeated names. This match does not rename customers or change order quantities.")
+        snap, _, _, _ = current_snapshot()
+        system_names = sorted(set(snap["customers"]) | set(snap["journal"]["Customer"])) if snap else []
+        if system_names:
+            system_customer = st.selectbox("Customer in your delivery system", system_names, key="map_bind_customer")
+        else:
+            system_customer = st.text_input("Exact customer name in your delivery system", key="map_bind_customer_text")
+        target = st.selectbox("Correct saved location", all_ids, format_func=labels.get, key="map_bind_location")
+        if st.button("Save customer match", key="map_bind_save"):
+            if system_customer.strip():
+                try:
+                    modify_map_registry(lambda overlay: overlay["bindings"].update({norm_name(system_customer): target}))
+                    audit("customer_map_match", f"{system_customer} -> {target}")
+                    flash_and_refresh("Customer map match saved")
+                except Exception as e:
+                    st.error(f"Could not save this match: {e}")
+        current_binding = registry["bindings"].get(norm_name(system_customer))
+        if current_binding:
+            st.caption("Current location: " + labels.get(current_binding, current_binding))
+            if st.button("Remove this saved match", key="map_bind_remove"):
+                try:
+                    modify_map_registry(lambda overlay: overlay["bindings"].pop(norm_name(system_customer), None))
+                    flash_and_refresh("Customer map match removed")
+                except Exception as e:
+                    st.error(f"Could not remove this match: {e}")
+    with st.expander("Expand shortened map links"):
+        pending = locations[locations["Map status"] == "Needs link expansion"]
+        st.caption(f"{len(pending)} links need expansion. The app opens up to 20 links at a time. Your server needs access to Google / Apple Maps.")
+        if st.button("Resolve next 20 map links", key="map_resolve", disabled=pending.empty):
+            selected = pending.sort_values("Resolution note", kind="stable").head(20)
+            updates, failed = {}, []
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with st.spinner("Checking saved map links…"):
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    jobs = {pool.submit(resolve_map_link, r["Original link"]): r["Location ID"] for r in selected.to_dict("records")}
+                    for future in as_completed(jobs):
+                        rid = jobs[future]
+                        updated = dict(registry["records"][rid])
+                        try:
+                            updated["resolved_url"] = future.result()
+                            updated["resolution_note"] = "Expanded " + now_str()
+                        except Exception as e:
+                            updated["resolution_note"] = str(e)[:220]
+                            failed.append(rid)
+                        updates[rid] = updated
+            # Prevent an expansion result overwriting an Admin's newer location correction.
+            def apply_expansions(overlay):
+                for rid, updated in updates.items():
+                    latest = overlay["records"].get(rid, registry["records"][rid])
+                    original = registry["records"][rid]
+                    if latest.get("url") == original.get("url") and latest.get("resolved_url", "") == original.get("resolved_url", ""):
+                        overlay["records"][rid] = {**latest, "resolved_url": updated.get("resolved_url", ""),
+                                                   "resolution_note": updated["resolution_note"]}
+            try:
+                modify_map_registry(apply_expansions)
+                audit("customer_map_expand", f"{len(updates) - len(failed)} resolved; {len(failed)} need review")
+                flash_and_refresh(f"Resolved {len(updates) - len(failed)} links. {len(failed)} need review; see Resolution note.")
+            except Exception as e:
+                st.error(f"Could not save expansion results: {e}")
+
+
+def _customer_map_body():
+    if not has_permission("view"):
+        st.error("Customer map viewing is disabled for your account.")
+        return
+    st.subheader("Customer locations")
+    st.caption("Imported sales records stay separate from daily delivery orders. Repeated names keep separate location IDs.")
+    registry = load_map_registry()
+    locations = map_registry_frame(registry)
+    cols = st.columns(4)
+    for col, title, value in zip(cols, ("Location records", "Ready for pins", "Need link expansion", "Need review / missing"),
+            (len(locations), int((locations["Map status"] == "Ready pin").sum()),
+             int((locations["Map status"] == "Needs link expansion").sum()),
+             int((~locations["Map status"].isin(["Ready pin", "Needs link expansion"])).sum()))):
+        col.metric(title, value)
+    search = st.text_input("Search customer, province or location ID", key="customer_map_search", max_chars=MAX_TEXT)
+    statuses = ["All"] + sorted(locations["Map status"].unique())
+    status = st.selectbox("Location status", statuses, key="customer_map_filter")
+    scope = st.radio("Map selection", ["All imported locations", "Today's delivery customers"], horizontal=True, key="customer_map_scope")
+    view = locations
+    if scope == "Today's delivery customers":
+        report, _, error = build_report(today_kh())
+        if error:
+            st.warning("Journal unavailable. Delivery-only map may be incomplete.")
+        if report.empty:
+            view = locations.iloc[0:0]
+        else:
+            matched = attach_customer_maps(report, registry)
+            st.caption(f"{int(matched['Location ID'].fillna('').ne('').sum())} of {len(matched)} delivery customers matched; Admin can confirm missing or repeated names.")
+            view = locations[locations["Location ID"].isin(matched["Location ID"].dropna())]
+    if search.strip():
+        hay = view[["Customer", "Province (source)", "Location ID"]].astype(str).agg(" ".join, axis=1)
+        view = view[hay.str.contains(search.strip(), case=False, regex=False)]
+    if status != "All":
+        view = view[view["Map status"] == status]
+    _draw_customer_pins(view)
+    st.caption(f"Showing {len(view)} records. Missing or suspicious coordinates are excluded from the pin map.")
+    table_config = {"Map link": st.column_config.LinkColumn("Open map", display_text="Open map"),
+                       "Directions": st.column_config.LinkColumn("Directions", display_text="Directions"),
+                       "Latitude": st.column_config.NumberColumn(format="%.6f"),
+                       "Longitude": st.column_config.NumberColumn(format="%.6f")}
+    try:
+        st.dataframe(view.drop(columns=["Original link"]), hide_index=True, width="stretch", column_config=table_config)
+    except TypeError:
+        st.dataframe(view.drop(columns=["Original link"]), hide_index=True, use_container_width=True, column_config=table_config)
+    visible_ids = view["Location ID"].tolist()
+    if visible_ids:
+        labels = {r["Location ID"]: f"{r['Customer']} — {r['Location ID']}" for r in view.to_dict("records")}
+        chosen = st.selectbox("Open a customer's location", visible_ids, format_func=labels.get, key="customer_map_open")
+        row = view.set_index("Location ID").loc[chosen]
+        if row["Map link"]:
+            st.link_button("Open in Maps", row["Map link"])
+        if row["Directions"]:
+            st.link_button("Google Maps directions", row["Directions"])
+    if has_permission("reports"):
+        st.download_button("Download location list", data=view.apply(lambda col: col.map(lambda v: safe_text(v, 6000) if isinstance(v, str) else v)).to_csv(index=False).encode("utf-8-sig"),
+                           file_name="customer_map_locations.csv", mime="text/csv", key="map_export")
+    if current_role() == "admin":
+        with st.expander("Admin: add locations, correct links and match customers"):
+            _map_admin_panel(registry, locations)
+
+
+@st.fragment
+def tab_customer_map():
+    safe_render(_customer_map_body, "Customer map")
+
+
 # ==========================================
 # APP LAYOUT
 # ==========================================
@@ -4597,7 +5686,8 @@ with st.expander("Quick guide — start here"):
     st.markdown("1. **Packing:** choose your name, customer and cases, then save.\n"
                 "2. **Delivery:** claim your customers, record sent cases, and add expenses now or later.\n"
                 "3. **Dashboard:** search customers and check what is packed, sent or still pending.\n"
-                "4. If a save fails, keep your entries and read the message before trying again. "
+                "4. **Customer Map:** search imported customer locations and open directions. Admin can correct links and match names.\n"
+                "5. If a save fails, keep your entries and read the message before trying again. "
                 "Ask Admin to review Health Bot warnings.")
 
 _backup_errors = daily_backup_once(today_kh().strftime("%Y-%m-%d"))
@@ -4623,6 +5713,7 @@ if _perms.get("tasks"):
     labels.extend(["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)"])
 if _perms.get("view"):
     labels.append("📊 Live Dashboard (Sales)")
+    labels.append("📍 Customer Map")
 elif _perms.get("reports"):
     labels.append("📑 Reports")
 if ROLE == "admin":
@@ -4643,5 +5734,7 @@ for _label, _tab in _tabs.items():
             tab_dashboard(_live)
         elif _label.startswith("📑"):
             tab_dashboard(False)
+        elif _label.startswith("📍"):
+            tab_customer_map()
         else:
             tab_bot()
