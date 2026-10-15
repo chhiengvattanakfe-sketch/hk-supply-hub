@@ -1,7 +1,19 @@
 # ============================================================
 #  នំប៉ាវហុងកុង Supply Chain Hub  -  v3: fast, secure, self-healing
-#  Run with:  py watchdog_bot.py      (or:  py -m streamlit run app.py)
+#  Run: python -m streamlit run app_reviewed_custom_permissions.py
+#  Reviewed: deterministic dates, strict data checks, atomic saves, safer health bot.
 # ============================================================
+"""Delivery Operations — reviewed reliability update.
+
+Run: python -m streamlit run app_reviewed_custom_permissions.py
+Dependencies: streamlit>=1.37, pandas, openpyxl, xlsxwriter; dropbox for online mode.
+Existing users.json accounts remain valid. For a NEW installation, configure a
+unique INITIAL_ADMIN_PASSWORD in Streamlit secrets or the server environment,
+then sign in as admin and change it. There is no shared starter password.
+Ambiguous text dates follow DAYFIRST (True = day/month/year); prefer ISO dates.
+The Health Bot runs with an active app session, not as an unattended service.
+It preserves damaged records and uncertain duplicates for manual review.
+"""
 import streamlit as st
 import pandas as pd
 import os
@@ -25,6 +37,8 @@ import json
 import html
 import unicodedata
 import hashlib
+import math
+import logging
 from collections import Counter
 from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -60,7 +74,8 @@ DROPBOX_FOLDER = "/" + (_secret("DROPBOX_FOLDER") or "/dropbox/4- Sale Jounal").
 # CONFIGURATION
 # ==========================================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_data") if USE_DROPBOX else CURRENT_DIR
+_APP_SCOPE = hashlib.sha256((CURRENT_DIR + "|" + DROPBOX_FOLDER).encode()).hexdigest()[:16]
+DATA_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_data_" + _APP_SCOPE) if USE_DROPBOX else CURRENT_DIR
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "daily_delivery_expenses.csv")
 PACKING_FILE = os.path.join(DATA_DIR, "daily_packing_progress.csv")
@@ -72,7 +87,7 @@ ASSIGN_FILE = os.path.join(DATA_DIR, "delivery_assignments.csv")   # who will de
 HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers moved to tomorrow / cancelled
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache")       # outside Dropbox = faster
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache_" + _APP_SCOPE)       # outside Dropbox = faster
 
 # Excel journal. The bot tries EXCEL_PATTERN first; if nothing matches it switches to
 # EXCEL_FALLBACK_PATTERN by itself. To force one exact file: EXCEL_OVERRIDE = "name.xlsx"
@@ -124,7 +139,7 @@ ST_MOVED, ST_CANCEL = "📅 Moved to tomorrow", "❌ Cancelled"
 IGNORE_NEW = ["STAFF", "GENERAL"]            # names that are not real customers: never reported as "new"
 NOT_TO_SEND = ("✅ Sent", ST_MOVED, ST_CANCEL)
 PACKING_NUM_COLS = ["Cases_Packed"]
-NUM_COLS_ALL = set(DISPATCH_NUM_COLS + PACKING_NUM_COLS)
+NUM_COLS_ALL = set(DISPATCH_NUM_COLS + PACKING_NUM_COLS + HOLD_NUM_COLS)
 FILES = {
     "dispatch": (DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, "Dispatch CSV"),
     "packing": (PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, "Packing CSV"),
@@ -226,35 +241,29 @@ def _try_parse(s, dayfirst):
 
 
 def parse_dt(v):
-    """One CSV date value. ISO is read as written; ambiguous text dates (10/12/2026)
-    pick the reading that is closest to today."""
-    if isinstance(v, (datetime, pd.Timestamp)):
-        return pd.Timestamp(v)
-    s = str(v).strip()
-    if not s or s.lower() in ("nan", "nat", "-", "none"):
+    """Parse consistently; ambiguous text follows DAYFIRST, never today's date.
+    Offset-aware timestamps are converted to Cambodia local wall time for CSV filters.
+    """
+    if v is None or (not isinstance(v, (str, date, datetime)) and pd.isna(v)):
         return pd.NaT
-    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", s):
-        t = _try_parse(s, False)
-        return pd.NaT if t is None else t
-    us, eu = _try_parse(s, False), _try_parse(s, True)
-    if us is None and eu is None:
+    if isinstance(v, (datetime, pd.Timestamp, date)):
+        t = pd.Timestamp(v)
+    else:
+        text = str(v).strip()
+        if not text or text.lower() in ("nan", "nat", "-", "none"):
+            return pd.NaT
+        iso = bool(re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}", text))
+        t = _try_parse(text, False if iso else DAYFIRST)
+        if t is None:
+            return pd.NaT
+    if pd.isna(t):
         return pd.NaT
-    if us is None:
-        return eu
-    if eu is None or us == eu:
-        return us
-    today = pd.Timestamp(today_kh())
-    return us if abs((us - today).days) <= abs((eu - today).days) else eu
+    return t.tz_convert(TZ).tz_localize(None) if t.tzinfo is not None else t
 
 
 def parse_dates(series):
-    """Fast path for ISO rows, slow path only for the odd hand-typed ones."""
-    s = series.astype(str).str.strip()
-    out = pd.to_datetime(s, format="%Y-%m-%d %H:%M:%S", errors="coerce")
-    bad = out.isna()
-    if bad.any():
-        out.loc[bad] = pd.to_datetime(s[bad].map(parse_dt), errors="coerce")
-    return out
+    """Use one stable parser for mixed timestamps, including timezone offsets."""
+    return pd.to_datetime(series.map(parse_dt), errors="coerce")
 
 
 def cell_to_date(v, dominant=None):
@@ -430,10 +439,15 @@ def resolve_location(name, area_master, override=None):
 
 
 def _read_loc_df():
-    try:
-        return pd.read_csv(LOCATIONS_FILE, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-    except Exception:
+    if not os.path.exists(LOCATIONS_FILE):
         return pd.DataFrame(columns=["Customer", "Province"])
+    try:
+        frame = _read_csv_strict(LOCATIONS_FILE)
+        if not {"Customer", "Province"} <= set(frame.columns):
+            raise ValueError("missing Customer or Province column")
+        return frame
+    except Exception as e:
+        raise RuntimeError("Customer locations cannot be read safely; original file preserved.") from e
 
 
 def load_location_overrides():
@@ -457,7 +471,7 @@ def modify_locations(fn):
     last = None
     for attempt in range(6):
         try:
-            with _sync_state()["lock"]:
+            with _sync_state()["lock"], file_lock(LOCATIONS_FILE):
                 if USE_DROPBOX:
                     pull(LOCATIONS_FILE, force=True)
                 df = _read_loc_df()
@@ -466,10 +480,7 @@ def modify_locations(fn):
                     cur = {str(c).strip(): str(p).strip() for c, p in zip(df["Customer"], df["Province"]) if str(c).strip()}
                 new = fn(cur)
                 out = pd.DataFrame(sorted(new.items()), columns=["Customer", "Province"])
-                tmp = LOCATIONS_FILE + ".tmp"
-                with file_lock(LOCATIONS_FILE):
-                    out.to_csv(tmp, index=False, encoding="utf-8-sig")
-                    os.replace(tmp, LOCATIONS_FILE)
+                _write_atomic(LOCATIONS_FILE, out.to_csv(index=False).encode("utf-8-sig"))
                 if USE_DROPBOX:
                     push(LOCATIONS_FILE)
             return
@@ -505,21 +516,25 @@ def _append_log(path, cols, row, max_bytes=300_000, keep=300):
     try:
         if USE_DROPBOX:
             _log_pull_once(path)
-        new = (not os.path.exists(path)) or os.path.getsize(path) == 0
-        with open(path, "a", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(cols)
-            w.writerow(row)
-        if os.path.getsize(path) > max_bytes:
-            with open(path, "r", encoding="utf-8-sig") as f:
-                lines = f.readlines()
-            with open(path, "w", encoding="utf-8-sig", newline="") as f:
-                f.writelines([lines[0]] + lines[-keep:])
+        with file_lock(path):
+            existing = os.path.exists(path) and os.path.getsize(path) > 0
+            with open(path, "a", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                if not existing:
+                    writer.writerow(cols)
+                writer.writerow([safe_text(v, 2000) for v in row])
+            if os.path.getsize(path) > max_bytes:
+                with open(path, "r", newline="", encoding="utf-8-sig") as f:
+                    entries = list(csv.reader(f))
+                buffer = io.StringIO(newline="")
+                writer = csv.writer(buffer)
+                writer.writerow(cols)
+                writer.writerows(entries[1:][-keep:])
+                _write_atomic(path, buffer.getvalue().encode("utf-8-sig"))
         if USE_DROPBOX:
             _schedule_log_push(path)
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("Could not persist application log %s", os.path.basename(path))
 
 
 BOT_LOG_COLS = ["Time", "Level", "Check", "Message", "Action"]
@@ -561,7 +576,7 @@ def audit(event, detail=""):
 # ---------- accounts (users.json) ----------
 PBKDF2_ITER = 200_000
 DEFAULT_ADMIN_USER = "admin"
-DEFAULT_ADMIN_PW = "Hk-Admin-7Q4mW2"          # starter password: the app forces a change at the first login
+DEFAULT_ADMIN_PW = ""  # New installations must supply INITIAL_ADMIN_PASSWORD in secrets/environment.
 USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,30}$")
 COMMON_PW = {"password", "password1", "12345678", "123456789", "qwerty123", "admin123", "hk2026", "staff2026",
              "hk-admin-7q4mw2", "hk-staff-3rn8zp", "change-me-admin-9x", "11111111", "abcd1234"}
@@ -656,31 +671,49 @@ def _new_user(role, password, must_change):
 
 
 def _default_users():
-    pw = _secret("INITIAL_ADMIN_PASSWORD") or DEFAULT_ADMIN_PW
+    pw = _secret("INITIAL_ADMIN_PASSWORD")
+    if not pw or password_problem(pw, DEFAULT_ADMIN_USER):
+        raise RuntimeError("First-time setup: set INITIAL_ADMIN_PASSWORD in the server secrets or environment "
+                           "to a unique password with at least 8 characters, letters and numbers. "
+                           "Then sign in as admin. Existing accounts are not affected.")
     return {DEFAULT_ADMIN_USER: _new_user("admin", pw, must_change=True)}
 
 
 def _read_users_file():
+    """Only an absent file means first run. Damaged accounts must never be reset."""
+    if not os.path.exists(USERS_FILE):
+        return None
     try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
+        with open(USERS_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
         users = data.get("users") if isinstance(data, dict) else None
-        return users if isinstance(users, dict) and users else None
-    except (OSError, ValueError):
-        return None
+        if not isinstance(users, dict) or not users:
+            raise ValueError("the accounts list is empty or invalid")
+        for username, rec in users.items():
+            if not isinstance(rec, dict) or rec.get("role") not in ROLES:
+                raise ValueError(f"invalid account record: {username}")
+            if not isinstance(rec.get("active", True), bool):
+                raise ValueError(f"invalid active flag: {username}")
+            permissions = rec.get("permissions", {})
+            if not isinstance(permissions, dict) or any(not isinstance(v, bool) for v in permissions.values()):
+                raise ValueError(f"invalid permissions: {username}")
+            if not (isinstance(rec.get("salt"), str) and isinstance(rec.get("hash"), str)):
+                raise ValueError(f"missing password hash: {username}")
+            if len(bytes.fromhex(rec["salt"])) < 16 or len(bytes.fromhex(rec["hash"])) != 32:
+                raise ValueError(f"invalid password hash: {username}")
+            if not 100_000 <= int(rec.get("iter", 0)) <= 2_000_000:
+                raise ValueError(f"invalid password settings: {username}")
+        return users
+    except (OSError, ValueError, TypeError) as e:
+        raise RuntimeError("Accounts file cannot be read safely. Ask Admin to restore a verified backup; "
+                           "existing accounts have been preserved.") from e
 
 
 def save_users(users):
-    tmp = USERS_FILE + ".tmp"
-
-    def _do():
-        with file_lock(USERS_FILE):
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"users": users}, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, USERS_FILE)
-    _retry(_do)
-    if USE_DROPBOX:
-        push(USERS_FILE)
+    with _sync_state()["lock"], file_lock(USERS_FILE):
+        _write_atomic(USERS_FILE, json.dumps({"users": users}, ensure_ascii=False, indent=1).encode("utf-8"))
+        if USE_DROPBOX:
+            push(USERS_FILE)
 
 
 def load_users():
@@ -701,8 +734,14 @@ def load_users():
             users = _read_users_file()
             if users:
                 return users
-            users = _default_users()
-            save_users(users)
+            with _sync_state()["lock"], file_lock(USERS_FILE):
+                if USE_DROPBOX:
+                    pull(USERS_FILE, force=True)
+                users = _read_users_file()
+                if users:
+                    return users
+                users = _default_users()
+                save_users(users)
             bot_log("info", "Security", "First start: created the starter admin account", "created")
             return users
         except ConflictError:
@@ -715,7 +754,7 @@ def modify_users(fn):
     last = None
     for attempt in range(6):
         try:
-            with _sync_state()["lock"]:
+            with _sync_state()["lock"], file_lock(USERS_FILE):
                 if USE_DROPBOX:
                     pull(USERS_FILE, force=True)
                 users = _read_users_file() or _default_users()
@@ -753,7 +792,8 @@ def session_ok():
     try:
         rec = load_users().get(user)
     except Exception:
-        return True                                        # storage hiccup: keep working people logged in
+        st.error("Cannot verify account access. Please retry when account storage is available.")
+        return False
     if not rec or not rec.get("active", True) or rec.get("role") != role:
         logout("account removed or changed")
         return False
@@ -904,34 +944,73 @@ def failed_logins(hours=24):
 # ==========================================
 # SAFE FILE HELPERS (lock, atomic write, backup)
 # ==========================================
+@st.cache_resource(show_spinner=False)
+def _file_lock_state():
+    return {"guard": threading.Lock(), "locks": {}, "local": threading.local()}
+
+
 @contextlib.contextmanager
 def file_lock(path, timeout=6.0):
-    lock, fd, start = path + ".lock", None, time.time()
-    while True:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(lock) > 15:     # stale lock -> remove
-                    os.remove(lock)
-                    continue
-            except OSError:
-                pass
-            if time.time() - start > timeout:                     # never block the staff
-                break
-            time.sleep(0.05)
-        except OSError:
-            break
+    """Reentrant thread/process lock. Timeout always refuses the write.
+    Lock files remain in place: OS locks are automatically released on process exit.
+    """
+    path = os.path.abspath(os.fspath(path))
+    state = _file_lock_state()
+    with state["guard"]:
+        mutex = state["locks"].setdefault(path, threading.RLock())
+    deadline = time.monotonic() + timeout
+    if not mutex.acquire(timeout=max(0.0, timeout)):
+        raise RuntimeError("Another save is in progress. Wait a moment and try again.")
+    held = state["local"]
+    depths = getattr(held, "depths", None)
+    if depths is None:
+        held.depths = depths = {}
+    handle = None
+    acquired = False
     try:
-        yield
-    finally:
-        if fd is not None:
+        if depths.get(path, 0):
+            depths[path] += 1
             try:
-                os.close(fd)
-                os.remove(lock)
-            except OSError:
-                pass
+                yield
+            finally:
+                depths[path] -= 1
+            return
+        handle = open(path + ".lock", "a+b")
+        if os.name == "nt":
+            import msvcrt
+            if os.path.getsize(path + ".lock") == 0:
+                handle.write(b"0")
+                handle.flush()
+        else:
+            import fcntl
+        while True:
+            try:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError) as e:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Another save is in progress. No changes were written; try again.") from e
+                time.sleep(0.05)
+        depths[path] = 1
+        try:
+            yield
+        finally:
+            depths.pop(path, None)
+    finally:
+        if handle is not None:
+            if acquired:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+        mutex.release()
 
 
 def _retry(fn, tries=6, delay=0.4):
@@ -1001,11 +1080,19 @@ def remote_meta(name):
 
 
 def _write_atomic(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".dl"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    """A failed write leaves the previous complete file intact."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".hub-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _retry(lambda: os.replace(tmp, path))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def pull(path, force=False, max_age=5.0):
@@ -1020,12 +1107,16 @@ def pull(path, force=False, max_age=5.0):
         S["last_pull"][path] = time.time()
         if md is None:
             S["rev"].pop(path, None)
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                S["last_pull"].pop(path, None)
+                raise RuntimeError(f"{name} is missing from Dropbox but a local copy exists. "
+                                   "Ask Admin to restore the remote file; the local copy was preserved.")
             return
         if S["rev"].get(path) == md.rev and os.path.exists(path):
             return
-        _, res = _dbx().files_download(_rpath(name))
+        downloaded, res = _dbx().files_download(_rpath(name))
         _write_atomic(path, res.content)
-        S["rev"][path] = md.rev
+        S["rev"][path] = downloaded.rev
 
 
 def push(path):
@@ -1169,7 +1260,7 @@ def backup_file(path, tag):
         if not os.path.exists(path):
             return None
         stamp = now_kh().strftime("%Y-%m-%d_%H%M%S")
-        name = f"{stamp}_{tag}_{os.path.basename(path)}"
+        name = f"{stamp}_{tag}-{pysecrets.token_hex(3)}_{os.path.basename(path)}"
         if USE_DROPBOX:
             import dropbox
             with open(path, "rb") as f:
@@ -1239,55 +1330,105 @@ def prune_backups():
     return removed
 
 
-@st.cache_resource(show_spinner=False)
 def daily_backup_once(day_str):
-    """One copy of each CSV per day (cached, so it costs nothing on later runs)."""
-    try:
+    """Retry failed backups, cache only success, and protect accounts/locations too."""
+    state = _sync_state()
+    failures = []
+    with state["lock"]:
+        if state.get("backup_day") != day_str:
+            state["backup_day"] = day_str
+            state["backup_done"] = set()
+        done = state.setdefault("backup_done", set())
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, USERS_FILE, LOCATIONS_FILE)
         if USE_DROPBOX:
-            dbx = _dbx()
             try:
-                dbx.files_create_folder_v2(_remote_backup_dir())
-            except Exception:
-                pass                                        # already exists
-            for f in (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE):
-                base = os.path.basename(f)
-                dest = f"{_remote_backup_dir()}/{day_str}_{base}"
-                try:
+                _dbx().files_create_folder_v2(_remote_backup_dir())
+            except Exception as e:
+                if not _is_conflict(e):
+                    return [f"Cannot access backup folder: {str(e)[:120]}"]
+        else:
+            try:
+                os.makedirs(BACKUP_DIR, exist_ok=True)
+            except OSError as e:
+                return [f"Cannot access backup folder: {str(e)[:120]}"]
+        for path in files:
+            if path in done:
+                continue
+            base = os.path.basename(path)
+            try:
+                if USE_DROPBOX:
                     if remote_meta(base) is None:
                         continue
+                    dest = f"{_remote_backup_dir()}/{day_str}_{base}"
                     try:
-                        dbx.files_get_metadata(dest)
+                        _dbx().files_get_metadata(dest)
                     except Exception as e:
-                        if _is_not_found(e):
-                            dbx.files_copy_v2(_rpath(base), dest)
-                except Exception:
-                    pass
-        else:
-            os.makedirs(BACKUP_DIR, exist_ok=True)
-            for f in (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE):
-                dest = os.path.join(BACKUP_DIR, f"{day_str}_{os.path.basename(f)}")
-                if os.path.exists(f) and not os.path.exists(dest):
-                    shutil.copy2(f, dest)
-        prune_backups()
-    except Exception:
-        pass
-    return True
+                        if not _is_not_found(e):
+                            raise
+                        _dbx().files_copy_v2(_rpath(base), dest)
+                else:
+                    if not os.path.exists(path):
+                        continue
+                    dest = os.path.join(BACKUP_DIR, f"{day_str}_{base}")
+                    if not os.path.exists(dest):
+                        with file_lock(path):
+                            with open(path, "rb") as f:
+                                _write_atomic(dest, f.read())
+                done.add(path)
+            except Exception as e:
+                failures.append(f"{base}: {str(e)[:160]}")
+        if not failures and state.get("pruned_day") != day_str:
+            prune_backups()
+            state["pruned_day"] = day_str
+    return failures
 
 
 # ==========================================
 # CSV READ (cached by file change) / WRITE
 # ==========================================
+def _read_csv_strict(path):
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
+        records = csv.reader(f, strict=True)
+        header = next(records, None)
+        if not header or len(header) != len(set(header)) or any(not c.strip() for c in header):
+            raise ValueError("CSV headers are empty or duplicated")
+        rows = []
+        for row in records:
+            if not row:
+                continue
+            if len(row) != len(header):
+                raise ValueError(f"CSV line {records.line_num}: expected {len(header)} fields, found {len(row)}")
+            rows.append(row)
+    return pd.DataFrame(rows, columns=header)
+
+
+def _numeric_issues(raw, columns):
+    issues = []
+    for col in columns:
+        if col not in raw:
+            continue
+        cap = MAX_CASES if "Cases" in col else MAX_RIEL
+        values = pd.to_numeric(raw[col], errors="coerce")
+        bad = values.isna() | ~values.map(lambda v: math.isfinite(v)) | (values < 0) | (values > cap) | (values % 1 != 0)
+        if bad.any():
+            lines = ", ".join(str(int(i) + 2) for i in raw.index[bad][:8])
+            issues.append(f"{col}: {int(bad.sum())} invalid values (rows {lines}); use whole numbers from 0 to {cap}")
+    return issues
+
+
 def _csv_read(path, cols):
     df = pd.DataFrame()
-    if os.path.exists(path) and os.path.getsize(path) > 0:
+    if os.path.exists(path):
         try:
-            df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-        except Exception:
-            try:
-                df = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig",
-                                 engine="python", on_bad_lines="skip")
-            except Exception:
-                df = pd.DataFrame()
+            df = _read_csv_strict(path)
+            required = {"Date", "Customer"} | {c for c in cols if c in NUM_COLS_ALL}
+            if required - set(df.columns):
+                raise ValueError("missing required columns: " + ", ".join(sorted(required - set(df.columns))))
+            issues = _numeric_issues(df, [c for c in cols if c in NUM_COLS_ALL])
+            if issues:
+                raise ValueError("; ".join(issues))
+        except Exception as e:
+            raise RuntimeError(f"{os.path.basename(path)} needs review: {e}. Original data was preserved.") from e
     for c in cols:
         if c not in df.columns:
             df[c] = "0" if c in NUM_COLS_ALL else "-"
@@ -1297,7 +1438,7 @@ def _csv_read(path, cols):
         if c == "Date":
             continue
         if c in NUM_COLS_ALL:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).round().astype(int)
+            df[c] = pd.to_numeric(df[c], errors="raise").astype("int64")
         else:
             df[c] = df[c].replace({"": "-", "nan": "-", "NaN": "-", "None": "-"})
             if c == "Customer":
@@ -1328,38 +1469,27 @@ def read_raw(path, cols):
 
 def save_csv(path, df):
     out = df.drop(columns=[c for c in ("_dt",) if c in df.columns])
-    tmp = path + ".tmp"
-
-    def _do():
-        with file_lock(path):
-            out.to_csv(tmp, index=False, encoding="utf-8-sig")
-            os.replace(tmp, path)
-    _retry(_do)
-    if USE_DROPBOX:
-        push(path)
+    spec = next((spec for spec in FILES.values() if spec[0] == path), None)
+    if spec:
+        issues = _numeric_issues(out, spec[2])
+        if issues:
+            raise RuntimeError("Cannot save: " + "; ".join(issues))
+    with _sync_state()["lock"], file_lock(path):
+        _write_atomic(path, out.to_csv(index=False).encode("utf-8-sig"))
+        if USE_DROPBOX:
+            push(path)
 
 
 def _append_local_many(path, rows):
-    """Appends rows to the local file, keeping the column order of the existing file."""
+    """Commit an entire batch atomically, preserving text and unknown columns."""
     with file_lock(path):
-        exists = os.path.exists(path) and os.path.getsize(path) > 0
-        if not exists:
-            pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
-            return
-        header = list(pd.read_csv(path, nrows=0, encoding="utf-8-sig").columns)
-        if all(set(r) <= set(header) for r in rows):
-            with open(path, "rb") as fh:                       # file must end with a newline
-                fh.seek(-1, os.SEEK_END)
-                needs_nl = fh.read(1) not in (b"\n", b"\r")
-            if needs_nl:
-                with open(path, "ab") as fh:
-                    fh.write(b"\r\n")
-            ordered = [{c: r.get(c, "-") for c in header} for r in rows]
-            pd.DataFrame(ordered).to_csv(path, mode="a", header=False, index=False, encoding="utf-8-sig")
-        else:                                                  # file lacks some columns -> rewrite once
-            df = pd.read_csv(path, encoding="utf-8-sig")
-            df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
-            df.to_csv(path, index=False, encoding="utf-8-sig")
+        if os.path.exists(path):
+            old = _read_csv_strict(path)
+            out = pd.concat([old, pd.DataFrame(rows)], ignore_index=True).astype(object)
+            out = out.where(out.notna(), "-")
+        else:
+            out = pd.DataFrame(rows)
+        _write_atomic(path, out.to_csv(index=False).encode("utf-8-sig"))
 
 
 def append_rows(path, rows):
@@ -1367,6 +1497,19 @@ def append_rows(path, rows):
     rows = [{k: (v if k == "Date" or not isinstance(v, str) else safe_text(v)) for k, v in r.items()} for r in rows]
     if not rows:
         return
+    spec = next((spec for spec in FILES.values() if spec[0] == path), None)
+    if spec:
+        raw = pd.DataFrame(rows)
+        missing = set(spec[1]) - set(raw.columns)
+        if missing:
+            raise RuntimeError(f"Cannot save: missing fields {', '.join(sorted(missing))}")
+        problems = _numeric_issues(raw, spec[2])
+        if problems:
+            raise RuntimeError("Cannot save: " + "; ".join(problems))
+        if raw["Date"].map(parse_dt).isna().any():
+            raise RuntimeError("Cannot save: invalid date. Use YYYY-MM-DD HH:MM:SS.")
+        if raw["Customer"].astype(str).str.strip().isin(["", "-", "None", "nan"]).any():
+            raise RuntimeError("Cannot save: choose a customer for every row.")
     if not USE_DROPBOX:
         _retry(lambda: _append_local_many(path, rows))
         return
@@ -1394,7 +1537,7 @@ def modify_csv(path, cols, fn):
     last = None
     for attempt in range(6):
         try:
-            with _sync_state()["lock"]:
+            with _sync_state()["lock"], file_lock(path):
                 pull(path, force=True)
                 df = _csv_read(path, cols)
                 save_csv(path, fn(df))
@@ -1565,7 +1708,7 @@ def load_snapshot(path, mtime_ns, size):
     """Returns (data, source). source = 'disk' | 'fresh' | 'stale' (last good copy used)."""
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_file = os.path.join(CACHE_DIR, "excel_snapshot.pkl")
-    key = (SNAPSHOT_VERSION, os.path.basename(path), mtime_ns, size)
+    key = (SNAPSHOT_VERSION, os.path.abspath(path), mtime_ns, size)
     obj = None
     try:
         with open(cache_file, "rb") as f:
@@ -1577,15 +1720,12 @@ def load_snapshot(path, mtime_ns, size):
     try:
         data = _read_excel_snapshot(path)
     except Exception as e:
-        if obj and obj.get("data") and obj.get("key", (0,))[0] == SNAPSHOT_VERSION:
+        if obj and obj.get("data") and tuple(obj.get("key", ())[:2]) == key[:2]:
             bot_log("fixed", "Excel", f"Could not read journal ({str(e)[:120]}); using last good copy", "used saved copy")
             return obj["data"], "stale"
         raise
     try:
-        tmp = cache_file + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump({"key": key, "data": data}, f)
-        os.replace(tmp, cache_file)
+        _write_atomic(cache_file, pickle.dumps({"key": key, "data": data}))
     except Exception:
         pass
     return data, "fresh"
@@ -1630,123 +1770,95 @@ def canonical_map(master):
 
 
 def _check_csv(add, key, master, auto_fix):
+    """Diagnose original values first. Never discard rows or guess corrections."""
     path, cols, nums, label = FILES[key]
     base = os.path.basename(path)
     suggestions = []
-
-    if USE_DROPBOX:                                  # never "repair" because of a network problem
+    if USE_DROPBOX:
         try:
             pull(path, force=True)
         except Exception as e:
-            add("error", label, f"Cannot reach Dropbox for {base}: {str(e)[:100]}", "will retry at the next check")
+            add("error", label, f"Cannot refresh {base}: {str(e)[:100]}", "retry when storage is available; no repair attempted")
             return suggestions
-
-    # 1) missing / empty file
-    if (not os.path.exists(path)) or os.path.getsize(path) == 0:
+    if not os.path.exists(path):
         if auto_fix:
-            pd.DataFrame(columns=cols).to_csv(path, index=False, encoding="utf-8-sig")
-            if USE_DROPBOX:
-                push(path)
-            add("fixed", label, f"{base} was missing or empty", "created a new file with headers")
+            save_csv(path, pd.DataFrame(columns=cols))
+            add("fixed", label, f"Created missing {base}", "created headers only")
         else:
-            add("warn", label, f"{base} is missing or empty", "would create a new file")
+            add("warn", label, f"{base} does not exist", "create an empty file with headers")
         return suggestions
-
-    # 2) corrupted file (broken lines, bad encoding)
     try:
-        raw = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+        raw = _read_csv_strict(path)
     except Exception as e:
-        reason = str(e).splitlines()[0] if str(e) else type(e).__name__
-        if not auto_fix:
-            add("error", label, f"{base} cannot be read: {reason}", "would repair")
-            return suggestions
-        backup_file(path, "corrupt")
-        repaired = None
-        try:
-            repaired = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig",
-                                   engine="python", on_bad_lines="skip")
-        except Exception:
-            pass
-        if repaired is not None and len(repaired) > 0:
-            save_csv(path, repaired)
-            add("fixed", label, f"{base} had broken lines ({reason})", "kept good rows; original saved in backups")
-        else:
-            good = latest_good_backup(path)
-            if good:
-                shutil.copy2(good, path)
-                if USE_DROPBOX:
-                    push(path)
-                add("fixed", label, f"{base} was unreadable", f"restored from backup {os.path.basename(good)}")
-            else:
-                add("error", label, f"{base} is unreadable and there is no backup", "needs manual help")
-                return suggestions
-        raw = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-
+        add("error", label, f"{base}: {str(e)[:240]}", "original preserved; restore a verified backup or correct the source file")
+        return suggestions
+    missing = [c for c in cols if c not in raw]
+    required = {"Date", "Customer", *nums}
+    if required.intersection(missing):
+        add("error", label, f"{base}: missing required columns {sorted(required.intersection(missing))}", "review the file headers; no values guessed")
+        return suggestions
+    issues = _numeric_issues(raw, nums)
+    for issue in issues:
+        add("error", label, f"{base}: {issue}", "correct original values; no numbers were replaced with zero")
+    if issues:
+        return suggestions
     df = _csv_read(path, cols)
     fixed = df.copy()
     notes = []
-
-    missing = [c for c in cols if c not in raw.columns]
     if missing:
-        notes.append(f"added missing columns {missing}")
-
-    n_nan = int(raw.isin(["nan", "NaN", "None"]).sum().sum())
-    if n_nan:
-        notes.append(f"cleaned {n_nan} 'nan' texts")
-
-    n_name = 0
-    if master and "Customer" in fixed.columns:
+        notes.append("added optional columns: " + ", ".join(missing))
+    if master:
         canon = canonical_map(master)
-        master_set = set(master)
-
-        def _fix_name(n):
-            if n in master_set:
-                return n
-            return canon.get(norm_name(n), n)
-        new_names = fixed["Customer"].map(_fix_name)
-        n_name = int((new_names != fixed["Customer"]).sum())
-        fixed["Customer"] = new_names
-    if n_name:
-        notes.append(f"corrected {n_name} customer names (spaces/capitals)")
-
-    dup = fixed.duplicated(subset=cols, keep="first")
-    n_dup = int(dup.sum())
-    if n_dup:
-        fixed = fixed[~dup]
-        notes.append(f"removed {n_dup} double-click duplicates")
-
+        corrected = fixed["Customer"].map(lambda n: canon.get(norm_name(n), n))
+        count = int((corrected != fixed["Customer"]).sum())
+        fixed["Customer"] = corrected
+        if count:
+            notes.append(f"normalized spacing/capitalization for {count} customer names")
+    duplicate_count = int(raw.duplicated(subset=[c for c in cols if c in raw]).sum())
+    if duplicate_count:
+        add("warn", label, f"{base}: {duplicate_count} exact repeated records", "review possible duplicates; all records retained")
     if notes:
         if auto_fix:
-            backup_file(path, "before-fix")
-            save_csv(path, fixed)
-            add("fixed", label, f"{base}: " + "; ".join(notes), "saved clean file (backup kept)")
-        else:
-            add("warn", label, f"{base}: " + "; ".join(notes), "would fix automatically")
-
-    bad_dates = fixed.index[fixed["_dt"].isna()].tolist()
-    if bad_dates:
-        lines = ", ".join(str(i + 2) for i in bad_dates[:8])
-        add("warn", label, f"{base}: {len(bad_dates)} rows have an unreadable Date (file lines {lines})",
-            "fix them in the Admin tool")
-    for c in nums:
-        if c in fixed.columns and (fixed[c] < 0).any():
-            add("warn", label, f"{base}: negative numbers in {c}", "check them in the Admin tool")
-
-    if master and "Customer" in fixed.columns:
-        master_set = set(master)
-        unknown = sorted({n for n in fixed["Customer"].unique() if n not in master_set and n != "-"})
-        no_match = []
-        for n in unknown[:60]:
-            close = difflib.get_close_matches(n, master, n=1, cutoff=0.9)
-            if close:
-                suggestions.append((key, n, close[0]))
+            if not backup_file(path, "before-fix"):
+                add("error", label, "Could not back up " + base, "repair skipped; check storage permissions")
             else:
-                no_match.append(n)
+                save_csv(path, fixed)
+                add("fixed", label, f"{base}: " + "; ".join(notes), "saved with backup; all rows retained")
+        else:
+            add("warn", label, f"{base}: " + "; ".join(notes), "safe normalization available")
+    bad_dates = fixed["_dt"].isna()
+    if bad_dates.any():
+        lines = ", ".join(str(int(i) + 2) for i in fixed.index[bad_dates][:8])
+        add("error", label, f"{base}: {int(bad_dates.sum())} unreadable dates (rows {lines})", "correct dates as YYYY-MM-DD HH:MM:SS")
+    future = fixed["_dt"] > pd.Timestamp(now_kh().replace(tzinfo=None)) + pd.Timedelta(minutes=5)
+    if future.any():
+        add("warn", label, f"{base}: {int(future.sum())} records have future timestamps", "check the date and device clock")
+    blanks = fixed["Customer"].isin(["", "-", "None", "nan"])
+    if blanks.any():
+        add("error", label, f"{base}: {int(blanks.sum())} records have no customer", "set a valid customer; records retained")
+    allowed = {
+        "packing": ("Status", {"In Progress (កំពុងធ្វើ)", "Completed (រួចរាល់)"}),
+        "assign": ("Action", {"Assign", "Release"}),
+        "holds": ("Action", {"Tomorrow", "Cancel", "Restore", "FinalPacked", "FinalPackedReset", "FinalSent", "FinalReset"}),
+    }
+    if key in allowed:
+        column, values = allowed[key]
+        invalid = ~fixed[column].isin(values)
+        if invalid.any():
+            add("warn", label, f"{base}: {int(invalid.sum())} unknown {column} values", "review status/action spelling")
+    if master:
+        unknown = sorted(set(fixed["Customer"]) - set(master) - {"-"})
+        no_match = []
+        for name in unknown[:60]:
+            close = difflib.get_close_matches(name, master, n=1, cutoff=0.9)
+            if close:
+                suggestions.append((key, name, close[0]))
+            else:
+                no_match.append(name)
         if suggestions:
-            add("warn", label, f"{base}: {len(suggestions)} customer names look like typos", "see suggestions below")
+            add("warn", label, f"{len(suggestions)} possible customer typos", "review each suggested replacement before applying")
         if no_match:
-            add("info", label, f"{base}: names not in Master List: {', '.join(no_match[:4])}"
-                + (" ..." if len(no_match) > 4 else ""), "-")
+            add("info", label, "Customers absent from Master List: " + ", ".join(no_match[:4]), "review new customers")
     return suggestions
 
 
@@ -1806,31 +1918,26 @@ def run_health_check(auto_fix=True):
                         in ("Unknown province", "Unknown"))
             if n_unk:
                 add("info", "Locations", f"{n_unk} customers of the last 7 days have no known province", "admin can set them in the Admin tab")
-    except Exception:
-        pass
+    except Exception as e:
+        add("warn", "Locations", f"Location check could not complete: {str(e)[:160]}", "review location data")
 
     # --- CSV files ---
     for key in FILES:
         try:
-            suggestions += _check_csv(add, key, master, auto_fix)
+            with _sync_state()["lock"], file_lock(FILES[key][0]):
+                suggestions += _check_csv(add, key, master, auto_fix)
         except Exception as e:
             add("error", FILES[key][3], f"Check failed: {e}", "-")
 
     # --- backups, locks, disk ---
     if auto_fix:
-        daily_backup_once(today_kh().strftime("%Y-%m-%d"))
+        backup_failures = daily_backup_once(today_kh().strftime("%Y-%m-%d"))
+        for failure in backup_failures:
+            add("error", "Backup", failure, "check backup access; failed backups will be retried")
+        if not backup_failures:
+            add("info", "Backup", "Daily backups completed for available data, accounts and locations", "-")
     elif not glob.glob(os.path.join(BACKUP_DIR, f"{today_kh():%Y-%m-%d}_*")):
         add("warn", "Backup", "No backup made today yet", "would create one")
-    for lk in glob.glob(os.path.join(DATA_DIR, "*.lock")):
-        try:
-            if time.time() - os.path.getmtime(lk) > 30:
-                if auto_fix:
-                    os.remove(lk)
-                    add("fixed", "Locks", f"Removed stuck lock {os.path.basename(lk)}", "deleted")
-                else:
-                    add("warn", "Locks", f"Stuck lock {os.path.basename(lk)}", "would delete")
-        except OSError:
-            pass
     try:
         free_gb = shutil.disk_usage(CURRENT_DIR).free / 1e9
         if free_gb < 1:
@@ -1840,9 +1947,9 @@ def run_health_check(auto_fix=True):
 
     # --- security ---
     try:
-        users = load_users()
+        users = (_read_users_file() if not auto_fix else load_users()) or {}
         if not [u for u, r in users.items() if r.get("role") == "admin" and r.get("active", True)]:
-            add("error", "Security", "There is no active admin account", "delete users.json to restart with the starter admin")
+            add("error", "Security", "There is no active admin account", "restore a verified accounts backup; keep the current file for review")
         starters = [u for u, r in users.items() if r.get("must_change")]
         if starters:
             add("warn", "Security", f"Still on a starter password: {', '.join(sorted(starters))}",
@@ -1850,8 +1957,8 @@ def run_health_check(auto_fix=True):
         n_fail = failed_logins(1)
         if n_fail >= 15:
             add("warn", "Security", f"{n_fail} wrong-password attempts in the last hour", "see the Audit log; consider changing passwords")
-    except Exception:
-        pass
+    except Exception as e:
+        add("error", "Security", str(e)[:240], "ask Admin to verify the accounts file")
     try:
         major, minor = [int(x) for x in st.__version__.split(".")[:2]]
         if (major, minor) < (1, 37):
@@ -1859,8 +1966,38 @@ def run_health_check(auto_fix=True):
     except Exception:
         pass
 
-    if not findings:
-        add("ok", "All checks", "No problems found", "-")
+    try:
+        import importlib.util
+        for package in ("openpyxl", "xlsxwriter") + (("dropbox",) if USE_DROPBOX else ()):
+            if importlib.util.find_spec(package) is None:
+                add("warn", "Dependencies", f"Missing package: {package}", f"install with python -m pip install {package}")
+        for directory in {DATA_DIR, CACHE_DIR}:
+            os.makedirs(directory, exist_ok=True)
+            fd, probe = tempfile.mkstemp(prefix=".hub-probe-", dir=directory)
+            os.close(fd)
+            os.remove(probe)
+    except Exception as e:
+        add("error", "Storage", f"Storage check failed: {str(e)[:180]}", "check free space and folder permissions")
+    try:
+        report, _, report_error = build_report(today_kh())
+        if report_error:
+            add("warn", "Operations", "Order checks limited: journal unavailable", "restore journal access for complete validation")
+        if not report.empty:
+            ordered = pd.to_numeric(report["កេស"], errors="coerce")
+            sent = pd.to_numeric(report["Sent Cases"], errors="coerce")
+            packed = pd.to_numeric(report["Packed Cases"], errors="coerce")
+            for mask, message in ((ordered.notna() & (sent > ordered), "sent cases exceed ordered cases"),
+                                  (ordered.notna() & (packed > ordered), "packed cases exceed ordered cases"),
+                                  ((packed > 0) & (sent > packed), "sent cases exceed packed cases")):
+                if mask.any():
+                    names = ", ".join(report.loc[mask, "Customer"].astype(str).head(5))
+                    add("warn", "Operations", f"{int(mask.sum())} customers: {message} ({names})", "review counts; bot does not change quantities")
+    except Exception as e:
+        add("error", "Operations", f"Cross-file checks could not complete: {str(e)[:180]}", "resolve source-data errors first")
+    if not any(f["Level"] in (LEVEL_ICON["error"], LEVEL_ICON["warn"]) for f in findings):
+        add("ok", "All checks", "No unresolved problems found in completed checks", "-")
+    ranks = {LEVEL_ICON[k]: i for i, k in enumerate(("error", "warn", "fixed", "ok", "info"))}
+    findings.sort(key=lambda f: ranks.get(f["Level"], 9))
     return findings, suggestions
 
 
@@ -1868,8 +2005,11 @@ def run_health_check(auto_fix=True):
 def auto_bot(_token=0):
     """Runs by itself at start-up and then every BOT_INTERVAL_MIN minutes."""
     try:
-        return run_health_check(auto_fix=True)
+        result = run_health_check(auto_fix=True)
+        _sync_state()["last_health_check"] = now_str()
+        return result
     except Exception as e:
+        _sync_state()["last_health_check"] = now_str() + " (failed)"
         bot_log("error", "Bot", f"Health check crashed: {e}", "-")
         return [{"Level": LEVEL_ICON["error"], "Check": "Bot", "Message": str(e), "Action": "-"}], []
 
@@ -1880,7 +2020,8 @@ def apply_name_fixes(suggestions):
         by_file.setdefault(key, {})[bad] = good
     for key, mapping in by_file.items():
         path, cols, _, label = FILES[key]
-        backup_file(path, "before-name-fix")
+        if not backup_file(path, "before-name-fix"):
+            raise RuntimeError("Name correction cancelled because the backup could not be saved.")
 
         def _rename(frame, mapping=mapping):
             frame["Customer"] = frame["Customer"].replace(mapping)
@@ -1903,9 +2044,9 @@ def safe_render(fn, label):
             for k in list(st.session_state.keys()):
                 if str(k).startswith(("dash_table", "sel_cust", "clear_sel", "dash_sig", "pick_old", "card_limit")):
                     st.session_state.pop(k, None)
-            bot_log("fixed", label, f"{type(e).__name__}: {e}", "reset the screen state and redrew automatically")
+            bot_log("warn", label, f"{type(e).__name__}: {e}", "retrying screen once after clearing selection state")
             st.rerun()
-        bot_log("error", label, f"{type(e).__name__}: {e}", "auto-repair started")
+        bot_log("error", label, f"{type(e).__name__}: {e}", "diagnostics started")
         if current_role() == "admin":
             st.error(f"⚠️ Problem in {label}: {e}")
         else:
@@ -1914,9 +2055,9 @@ def safe_render(fn, label):
         if time.time() - st.session_state.get(flag, 0) > 60:
             st.session_state[flag] = time.time()
             try:
-                run_health_check(auto_fix=True)
+                run_health_check(auto_fix=False)
                 st.cache_data.clear()
-                st.info("🤖 The bot checked and repaired the data files. Press Retry.")
+                st.info("🤖 Diagnostics complete. Admin can review the Health Bot results. Press Retry.")
             except Exception:
                 pass
         if current_role() == "admin":
@@ -2007,7 +2148,9 @@ def kpi(container, label, value):
         container.metric(label, value)
 
 
-def flash_and_refresh(msg):
+def flash_and_refresh(msg, reset_prefix=None):
+    if reset_prefix:
+        st.session_state["reset_form_prefix"] = reset_prefix + "_"
     st.session_state["flash"] = msg
     st.session_state["clear_sel"] = True
     st.rerun()
@@ -2051,7 +2194,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
         st.warning("Editing delivery tasks is disabled for your account.")
         return
     k = form_key
-    with st.form(form_key, clear_on_submit=True):
+    with st.form(form_key, clear_on_submit=False):
         st.markdown("#### Order Details")
         dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + DELIVERY_HANDLERS, key=f"{k}_by")
         if fixed_customer is None:
@@ -2116,7 +2259,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
                     })
                     audit("dispatch", f"{customer_name} | {cases} cases | by {dispatched_by}")
                     nj = "" if (fixed_customer is not None or customer_name in jset) else "  ⚠️ not in today's sale journal"
-                    flash_and_refresh(f"Dispatched by {dispatched_by}: {customer_name} | {cases} កេស{nj}")
+                    flash_and_refresh(f"Dispatched by {dispatched_by}: {customer_name} | {cases} កេស{nj}", reset_prefix=k)
                 except Exception as save_err:
                     bot_log("error", "Save dispatch", str(save_err), "-")
                     st.error(f"⚠️ Could not save: {save_err}")
@@ -2127,7 +2270,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
         st.warning("Editing packing tasks is disabled for your account.")
         return
     k = form_key
-    with st.form(form_key, clear_on_submit=True):
+    with st.form(form_key, clear_on_submit=False):
         if fixed_customer is None:
             opts, lab, jset = customer_choices()
             customer = st.selectbox(f"Customer Name / ID (Type to search) - 🧾 = has an order in today's sale journal ({len(jset)}):",
@@ -2164,7 +2307,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
                     })
                     audit("packing", f"{customer} | {cases_packed} cases | by {prepared_by}")
                     nj = "" if (fixed_customer is not None or customer in jset) else "  ⚠️ not in today's sale journal"
-                    flash_and_refresh(f"Packing logged: {customer} | {cases_packed} cases | {pack_status}{nj}")
+                    flash_and_refresh(f"Packing logged: {customer} | {cases_packed} cases | {pack_status}{nj}", reset_prefix=k)
                 except Exception as err:
                     bot_log("error", "Save packing", str(err), "-")
                     st.error(f"⚠️ Could not save: {err}")
@@ -2200,7 +2343,7 @@ def admin_editor(path, cols, num_cols, key, label_cols):
                     step = 500 if c.endswith("Expense") else 1
                     cap = MAX_CASES if "Cases" in c else MAX_RIEL
                     new_vals[c] = st.number_input(f"Edit {c}:", min_value=0, max_value=cap,
-                                                  value=min(int(current[c]), cap), step=step, key=wkey)
+                                                  value=max(0, min(int(current[c]), cap)), step=step, key=wkey)
                 else:
                     new_vals[c] = st.text_input(f"Edit {c}:", value=str(current[c]), max_chars=MAX_TEXT, key=wkey)
             col_upd, col_del = st.columns(2)
@@ -2472,7 +2615,7 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None):
             "Status": st.column_config.SelectboxColumn("Status", options=["Done", "Not yet", "Skip"]),
             "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1)})
     n_pick = int(edited[check_col].sum())
-    st.caption(f"{n_pick} row(s) ticked. 'Cases' = how many to record now (the app never adds more than what is still missing).")
+    st.caption(f"{n_pick} row(s) ticked. 'Cases' = how many to record now. Review the remaining quantity before saving.")
     if st.button(f"💾 Save {n_pick} packing record(s)", key=f"{key}_save", type="primary"):
         if prepared_by == "-- Select Staff --":
             st.error("❌ Please choose who prepared these orders.")
@@ -2810,7 +2953,12 @@ def _send_tab(me, ctx):
         try:
             append_rows(DATA_FILE, out)
             if take:
-                append_rows(ASSIGN_FILE, take)
+                try:
+                    append_rows(ASSIGN_FILE, take)
+                except Exception as assignment_error:
+                    bot_log("warn", "Delivery assignments", str(assignment_error),
+                            "deliveries saved successfully; assignments need review")
+                    st.session_state["assignment_warning"] = "Deliveries were saved. Assignment updates failed; ask Admin to review. Do not resend these deliveries."
             waiting = sum(1 for o in out if o["Expense_Status"] == "Pending")
             audit("dispatch_bulk", f"{len(out)} customers, {total} cases, by {me}")
             st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
@@ -4295,15 +4443,15 @@ def _bot_body():
         st.info("🔒 Admin only.")
         return
     st.markdown("### 🤖 Health Bot")
-    st.caption(f"The bot checks files, names, backups and the Excel journal by itself every {BOT_INTERVAL_MIN} minutes "
-               "and repairs what is safe to repair. Every repair is written to the log and a backup is kept.")
+    st.caption(f"Checks files, numeric values, dates, accounts and order totals every {BOT_INTERVAL_MIN} minutes "
+               "while this app is open. Safe repairs keep backups. Damaged rows, uncertain duplicates and quantities require review.")
 
     st.info(("☁️ Online mode: data is stored in Dropbox folder " + DROPBOX_FOLDER) if USE_DROPBOX
             else "💻 Local mode: data is stored in the app folder on this computer")
     c1, c2, c3 = st.columns(3)
     if c1.button("🔧 Check & fix now", key="bot_fix"):
         auto_bot.clear()
-    only_check = c2.button("👀 Check only (change nothing)", key="bot_check")
+    only_check = c2.button("👀 Diagnose records only", key="bot_check")
     if c3.button("🧹 Clear cache & re-sync Dropbox", key="bot_cache"):
         resync_now()
         try:
@@ -4314,17 +4462,44 @@ def _bot_body():
 
     if only_check:
         findings, suggestions = run_health_check(auto_fix=False)
-        st.markdown("**Result (nothing was changed):**")
+        st.markdown("**Diagnostic result (business records preserved):**")
     else:
         findings, suggestions = auto_bot()
-        st.markdown("**Latest automatic check:**")
-    show_df(pd.DataFrame(findings))
+        st.markdown("**Health check result:**")
+    if only_check:
+        st.session_state["health_diagnostic_result"] = (findings, suggestions, now_str())
+    elif "health_diagnostic_result" in st.session_state and not st.session_state.get("bot_fix"):
+        findings, suggestions, checked = st.session_state["health_diagnostic_result"]
+        st.caption(f"Showing diagnostic result from {checked}. Use Check & fix now for a fresh repair check.")
+    else:
+        st.session_state.pop("health_diagnostic_result", None)
+    counts = [sum(f["Level"] == LEVEL_ICON[level] for f in findings) for level in ("error", "warn", "fixed")]
+    for column, title, value in zip(st.columns(3), ("Errors", "Warnings", "Safely fixed"), counts):
+        column.metric(title, value)
+    st.caption("Last automatic check: " + _sync_state().get("last_health_check", "not completed"))
+    attention_only = st.checkbox("Show errors and warnings only", value=True, key="health_attention")
+    visible = [f for f in findings if f["Level"] in (LEVEL_ICON["error"], LEVEL_ICON["warn"])] if attention_only else findings
+    if visible:
+        show_df(pd.DataFrame(visible))
+    else:
+        st.success("No unresolved warnings or errors in this result.")
+    st.download_button("Download health report", data=json.dumps({"exported_at": now_str(), "findings": findings},
+                       ensure_ascii=False, indent=2), file_name="health_report.json", mime="application/json")
 
     if suggestions:
         st.markdown("**Names that look like typos (the bot suggests the Master List name):**")
         show_df(pd.DataFrame(suggestions, columns=["File", "Name in file", "Suggested name"]))
-        if st.button("✨ Apply all suggested names", key="bot_apply"):
-            apply_name_fixes(suggestions)
+        selected_fixes = st.data_editor(
+            pd.DataFrame([{"Apply?": False, "File": key, "Name in file": bad, "Suggested name": good}
+                          for key, bad, good in suggestions]), hide_index=True,
+            disabled=["File", "Name in file", "Suggested name"], key="name_fix_review")
+        if st.button("Apply selected name corrections", key="bot_apply"):
+            chosen = [(r["File"], r["Name in file"], r["Suggested name"])
+                      for r in selected_fixes.to_dict("records") if r["Apply?"]]
+            if not chosen:
+                st.warning("Select the corrections you have reviewed first.")
+                return
+            apply_name_fixes(chosen)
             auto_bot.clear()
             flash_and_refresh("Customer names corrected")
 
@@ -4367,15 +4542,34 @@ def tab_bot():
 # ==========================================
 # APP LAYOUT
 # ==========================================
+@st.fragment(run_every=60)
+def health_status():
+    findings, _ = auto_bot()
+    errors = sum(f["Level"] == LEVEL_ICON["error"] for f in findings)
+    warnings_count = sum(f["Level"] == LEVEL_ICON["warn"] for f in findings)
+    if errors:
+        st.warning(f"Health Bot: {errors} errors and {warnings_count} warnings. Ask Admin to review Health Bot.")
+    elif warnings_count:
+        st.caption(f"Health Bot: {warnings_count} warnings for Admin to review.")
+
+
 st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="wide",
                    initial_sidebar_state="collapsed")
 st.markdown(CSS, unsafe_allow_html=True)
+_reset_prefix = st.session_state.pop("reset_form_prefix", None)
+if _reset_prefix:
+    for _key in list(st.session_state):
+        if str(_key).startswith(_reset_prefix):
+            st.session_state.pop(_key, None)
 
 ROLE = require_login()                     # nothing below runs until the person is logged in
 
 _flash = st.session_state.pop("flash", None)
 if _flash:
     st.toast(_flash, icon="✅")
+_assignment_warning = st.session_state.pop("assignment_warning", None)
+if _assignment_warning:
+    st.warning(_assignment_warning)
 
 USER = current_user()
 with st.sidebar:
@@ -4399,8 +4593,16 @@ with st.sidebar:
         st.rerun()
 
 st.title("🚚 នំប៉ាវហុងកុង Supply Chain Hub")
+with st.expander("Quick guide — start here"):
+    st.markdown("1. **Packing:** choose your name, customer and cases, then save.\n"
+                "2. **Delivery:** claim your customers, record sent cases, and add expenses now or later.\n"
+                "3. **Dashboard:** search customers and check what is packed, sent or still pending.\n"
+                "4. If a save fails, keep your entries and read the message before trying again. "
+                "Ask Admin to review Health Bot warnings.")
 
-daily_backup_once(today_kh().strftime("%Y-%m-%d"))
+_backup_errors = daily_backup_once(today_kh().strftime("%Y-%m-%d"))
+if _backup_errors and ROLE == "admin":
+    st.warning("Backup needs attention: " + "; ".join(_backup_errors))
 _snap, _src, _xl, _err = current_snapshot()
 _file_text = f"📄 {os.path.basename(_xl)}" if (_xl and not _err) else "📄 journal problem"
 _chips = f"{'☁️ Dropbox' if USE_DROPBOX else '💻 Local'}  |  {_file_text}  |  🕒 {now_kh():%Y-%m-%d %I:%M %p}"
@@ -4412,6 +4614,8 @@ if ROLE in ("staff", "admin"):
         _chips += "  |  " + ("🤖 Bot: all good" if (_fixed == 0 and _bad == 0)
                              else f"🤖 Bot: {_fixed} fixed, {_bad} need a look (see Bot tab)")
 st.caption(_chips)
+if ROLE in ("staff", "admin"):
+    health_status()
 
 _perms = effective_permissions(current_user())
 labels = []
