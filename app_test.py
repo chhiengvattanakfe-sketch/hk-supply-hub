@@ -135,6 +135,68 @@ FILES = {
 STATUS_RANK = {"✅ Sent": 1, "🔵 Part sent": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5,
                "📅 Moved to tomorrow": 6, "❌ Cancelled": 7}
 ROLE_LABEL = {"admin": "Admin", "staff": "Staff", "sales": "Sales (dashboard/report)", "viewer": "Viewer (read-only)"}
+PERMISSION_LABELS = {
+    "tasks": "Task access (Packing + Delivery)",
+    "view": "View dashboard and task details",
+    "edit": "Create, edit, and submit changes",
+    "reports": "Reports, summaries, and report exports",
+}
+DEFAULT_PERMISSIONS_BY_ROLE = {
+    "admin": {"tasks": True, "view": True, "edit": True, "reports": True},
+    "staff": {"tasks": True, "view": True, "edit": True, "reports": True},
+    "sales": {"tasks": False, "view": True, "edit": False, "reports": True},
+    "viewer": {"tasks": False, "view": True, "edit": False, "reports": True},
+}
+PERMISSION_KEYS = tuple(PERMISSION_LABELS)
+
+
+def default_permissions(role):
+    """Copy the baseline capabilities for a role; per-user choices can override them."""
+    return dict(DEFAULT_PERMISSIONS_BY_ROLE.get(role, DEFAULT_PERMISSIONS_BY_ROLE["viewer"]))
+
+
+def effective_permissions(username=None, rec=None):
+    """Return saved permissions overlaid on role defaults. Admin accounts always retain full access."""
+    who = username or current_user()
+    if rec is None:
+        try:
+            rec = load_users().get(who, {}) if who else {}
+        except Exception:
+            rec = {}
+    role = str((rec or {}).get("role") or (current_role() if who == current_user() else "viewer"))
+    if role == "admin":
+        return {k: True for k in PERMISSION_KEYS}
+    result = default_permissions(role)
+    saved = (rec or {}).get("permissions", {})
+    if isinstance(saved, dict):
+        for key in PERMISSION_KEYS:
+            if key in saved:
+                result[key] = bool(saved[key])
+    return result
+
+
+def has_permission(permission, username=None):
+    """Check an individual capability. Unknown permissions fail closed."""
+    if permission not in PERMISSION_KEYS:
+        return False
+    who = username or current_user()
+    if not who:
+        return False
+    if who == current_user():
+        role = current_role()
+        if role == "admin":
+            return True
+        saved = st.session_state.get("user_permissions", {})
+        if isinstance(saved, dict):
+            result = default_permissions(role)
+            for key in PERMISSION_KEYS:
+                if key in saved:
+                    result[key] = bool(saved[key])
+            return bool(result.get(permission, False))
+    try:
+        return bool(effective_permissions(who).get(permission, False))
+    except Exception:
+        return False
 
 
 # ==========================================
@@ -590,7 +652,7 @@ def staff_name_for_user(username=None):
 
 def _new_user(role, password, must_change):
     return {"role": role, "active": True, "must_change": bool(must_change), "created": now_str(),
-            "last_login": "", **_hash_pw(password)}
+            "last_login": "", "permissions": default_permissions(role), **_hash_pw(password)}
 
 
 def _default_users():
@@ -671,7 +733,7 @@ def _login_guard():
 
 
 def _clear_session():
-    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff"):
+    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions"):
         st.session_state.pop(k, None)
 
 
@@ -696,6 +758,7 @@ def session_ok():
         logout("account removed or changed")
         return False
     st.session_state["must_change"] = bool(rec.get("must_change"))
+    st.session_state["user_permissions"] = rec.get("permissions", {}) if isinstance(rec.get("permissions", {}), dict) else {}
     return True
 
 
@@ -1984,6 +2047,9 @@ def current_assignments(day=None):
 
 
 def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
+    if not has_permission("edit") or not has_permission("tasks"):
+        st.warning("Editing delivery tasks is disabled for your account.")
+        return
     k = form_key
     with st.form(form_key, clear_on_submit=True):
         st.markdown("#### Order Details")
@@ -2057,6 +2123,9 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
 
 
 def packing_form(form_key, fixed_customer=None, default_cases=1):
+    if not has_permission("edit") or not has_permission("tasks"):
+        st.warning("Editing packing tasks is disabled for your account.")
+        return
     k = form_key
     with st.form(form_key, clear_on_submit=True):
         if fixed_customer is None:
@@ -2102,7 +2171,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
 
 
 def admin_editor(path, cols, num_cols, key, label_cols):
-    if current_role() != "admin":
+    if current_role() != "admin" or not has_permission("edit"):
         st.info("🔒 Admin only. Log in with the admin access code to fix or delete entries.")
         return
     try:
@@ -2383,6 +2452,9 @@ def _int(v, default=0):
 
 def bulk_editor(df, ctx, key, check_col="Save?", column_order=None):
     """Editable preview + save button. Saves ALL chosen rows in one go."""
+    if not has_permission("edit") or not has_permission("tasks"):
+        st.warning("Editing packing tasks is disabled for your account.")
+        return
     if df.empty:
         st.info("Nothing to show.")
         return
@@ -2543,6 +2615,19 @@ def _upload_tab():
 
 def _packing_body():
     st.markdown("### 📦 Bun Preparation & Packing")
+    if not has_permission("edit"):
+        if not has_permission("view"):
+            st.warning("View is turned off. Enable View to allow read-only access to the packing log, or enable Editing to work on tasks.")
+            return
+        st.caption("🔒 Read-only packing view — Editing is turned off for your account.")
+        df_today = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), today_kh())
+        if df_today.empty:
+            st.info("No packing progress logged today yet.")
+            return
+        show_df(df_today[PACKING_COLS])
+        st.markdown("**👷 Cases packed per staff (today)**")
+        show_df(df_today.groupby("Prepared_By")["Cases_Packed"].sum().reset_index())
+        return
     t_tick, t_up, t_one = st.tabs(["📋 Quick tick list", "📤 Upload a file", "✍️ One customer"])
     with t_tick:
         _ticklist_tab()
@@ -2568,6 +2653,9 @@ def _packing_body():
 
 @st.fragment
 def tab_packing():
+    if not has_permission("tasks"):
+        st.error("Task access is turned off for your account. Ask Admin to enable it.")
+        return
     safe_render(_packing_body, "Packing tab")
 
 
@@ -2586,6 +2674,9 @@ def delivery_context():
 
 
 def _claim_tab(me, ctx):
+    if not has_permission("edit") or not has_permission("tasks"):
+        st.warning("Editing delivery tasks is disabled for your account.")
+        return
     st.caption("Choose the customers **you** will deliver today, before you start. Other staff will see they are taken. "
                "You can release a customer again if you cannot go.")
     recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND]
@@ -2653,6 +2744,9 @@ def _claim_tab(me, ctx):
 
 
 def _send_tab(me, ctx):
+    if not has_permission("edit") or not has_permission("tasks"):
+        st.warning("Editing delivery tasks is disabled for your account.")
+        return
     st.caption("Tick the customers whose buns you have **sent**. Choose **My own delivery** when you deliver it yourself; no transport expense is required unless a taxi station is also recorded. Expenses can be filled later in step 3.")
     include_free = st.checkbox("Also show customers nobody has taken yet", key="send_free")
     assigned = ctx["assigned"]
@@ -2740,6 +2834,9 @@ def pending_expense_df(who, scope):
 
 
 def _expense_tab(me):
+    if not has_permission("edit") or not has_permission("tasks"):
+        st.warning("Editing delivery expenses is disabled for your account.")
+        return
     is_admin = current_role() == "admin"
     st.caption("Fill in expenses for deliveries you already sent. Self-delivered orders need no transport expense unless a taxi station is recorded. Tick **Done** for each row you finish, then save.")
     c1, c2 = st.columns(2)
@@ -2896,69 +2993,83 @@ def _journal_fill_panel():
 
 
 def _delivery_log():
-    with st.expander("🛠️ Admin: Fix or Edit Today's Dispatches"):
-        admin_editor(DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, key="disp",
-                     label_cols=["Customer", "Cases"])
+    """Today's operation records, with detail and report features controlled per user."""
+    can_view = has_permission("view")
+    can_reports = has_permission("reports")
+    if current_role() == "admin" and has_permission("edit"):
+        with st.expander("🛠️ Admin: Fix or Edit Today's Dispatches"):
+            admin_editor(DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, key="disp",
+                         label_cols=["Customer", "Cases"])
 
-    _journal_fill_panel()
+    if can_reports:
+        _journal_fill_panel()
+    elif can_view:
+        st.caption("Journal fill report is disabled for your account.")
+
     st.subheader("📊 Today's Operations Log")
     df_today = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), today_kh())
     total_expense = int(df_today["Phnom_Penh_Expense"].sum() + df_today["Taxi_Expense"].sum()) if not df_today.empty else 0
     waiting = int((df_today["Expense_Status"] == "Pending").sum()) if not df_today.empty else 0
-    m1, m2, m3, m4 = st.columns(4)
-    kpi(m1, "Total Slips Today", len(df_today))
-    kpi(m2, "Total Cases Dispatched (សរុបចំនួនកេស)", int(df_today["Cases"].sum()) if not df_today.empty else 0)
-    kpi(m3, "Total Expenses Today (៛)", f"{total_expense:,}")
-    kpi(m4, "⏳ Expenses still to fill", waiting)
+    if can_reports:
+        m1, m2, m3, m4 = st.columns(4)
+        kpi(m1, "Total Slips Today", len(df_today))
+        kpi(m2, "Total Cases Dispatched (សរុបចំនួនកេស)", int(df_today["Cases"].sum()) if not df_today.empty else 0)
+        kpi(m3, "Total Expenses Today (៛)", f"{total_expense:,}")
+        kpi(m4, "⏳ Expenses still to fill", waiting)
     if df_today.empty:
         st.info("No deliveries logged today yet.")
         return
 
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_today[DISPATCH_COLS].to_excel(writer, index=False, sheet_name="Ops_Log")
-    st.download_button("📥 Download Today's Expenses Log (Excel)", data=buf.getvalue(),
-                       file_name=f"Operations_Expenses_{today_kh()}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    show_df(df_today[["Handled_By", "Customer", "Cases", "Note", "Local_Driver", "Taxi_Station",
-                      "Phnom_Penh_Expense", "Taxi_Expense", "Expense_Status", "Verified_By"]])
-    st.markdown("**👷 Dispatch summary per staff (today)**")
-    per_staff = df_today.groupby("Handled_By").agg(
-        Slips=("Customer", "count"), Cases=("Cases", "sum"),
-        Expenses=("Phnom_Penh_Expense", "sum"), Taxi=("Taxi_Expense", "sum"),
-        Waiting=("Expense_Status", lambda x: int((x == "Pending").sum()))).reset_index()
-    show_df(per_staff)
+    if can_reports:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            df_today[DISPATCH_COLS].to_excel(writer, index=False, sheet_name="Ops_Log")
+        st.download_button("📥 Download Today's Expenses Log (Excel)", data=buf.getvalue(),
+                           file_name=f"Operations_Expenses_{today_kh()}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if can_view:
+        show_df(df_today[["Handled_By", "Customer", "Cases", "Note", "Local_Driver", "Taxi_Station",
+                          "Phnom_Penh_Expense", "Taxi_Expense", "Expense_Status", "Verified_By"]])
+    if can_reports:
+        st.markdown("**👷 Dispatch summary per staff (today)**")
+        per_staff = df_today.groupby("Handled_By").agg(
+            Slips=("Customer", "count"), Cases=("Cases", "sum"),
+            Expenses=("Phnom_Penh_Expense", "sum"), Taxi=("Taxi_Expense", "sum"),
+            Waiting=("Expense_Status", lambda x: int((x == "Pending").sum()))).reset_index()
+        show_df(per_staff)
 
-    # Pick a staff member to inspect the delivery tasks they completed today.
-    st.markdown("**🔎 Check completed delivery tasks by staff**")
-    recorded_staff = [str(x).strip() for x in df_today["Handled_By"].dropna().tolist()
-                      if str(x).strip() and str(x).strip() not in ("-", "nan", "None")]
-    staff_options = ["-- Select Staff --"] + sorted(set(DELIVERY_HANDLERS).union(recorded_staff))
-    selected_staff = st.selectbox(
-        "Select staff name to see their completed tasks",
-        staff_options,
-        key="dispatch_completed_staff",
-    )
-    if selected_staff == "-- Select Staff --":
-        st.caption("Choose a staff member to see the customers and cases they dispatched today.")
-    else:
-        staff_tasks = df_today[df_today["Handled_By"].astype(str).str.strip() == selected_staff].copy()
-        if staff_tasks.empty:
-            st.info(f"No delivery tasks recorded for {selected_staff} today.")
+    if can_view:
+        st.markdown("**🔎 Check completed delivery tasks by staff**")
+        recorded_staff = [str(x).strip() for x in df_today["Handled_By"].dropna().tolist()
+                          if str(x).strip() and str(x).strip() not in ("-", "nan", "None")]
+        staff_options = ["-- Select Staff --"] + sorted(set(DELIVERY_HANDLERS).union(recorded_staff))
+        selected_staff = st.selectbox(
+            "Select staff name to see their completed tasks",
+            staff_options,
+            key="dispatch_completed_staff",
+        )
+        if selected_staff == "-- Select Staff --":
+            st.caption("Choose a staff member to see the customers and cases they dispatched today.")
         else:
-            cases_done = int(pd.to_numeric(staff_tasks["Cases"], errors="coerce").fillna(0).sum())
-            expense_waiting = int((staff_tasks["Expense_Status"] == "Pending").sum())
-            k1, k2, k3 = st.columns(3)
-            kpi(k1, "Completed delivery slips", len(staff_tasks))
-            kpi(k2, "Cases dispatched", cases_done)
-            kpi(k3, "Expenses still pending", expense_waiting)
-            task_cols = [c for c in ["Time", "Customer", "Cases", "Note", "Local_Driver", "Taxi_Station",
-                                     "Phnom_Penh_Expense", "Taxi_Expense", "Expense_Status", "Verified_By"]
-                         if c in staff_tasks.columns]
-            show_df(staff_tasks[task_cols])
-
+            staff_tasks = df_today[df_today["Handled_By"].astype(str).str.strip() == selected_staff].copy()
+            if staff_tasks.empty:
+                st.info(f"No delivery tasks recorded for {selected_staff} today.")
+            else:
+                cases_done = int(pd.to_numeric(staff_tasks["Cases"], errors="coerce").fillna(0).sum())
+                expense_waiting = int((staff_tasks["Expense_Status"] == "Pending").sum())
+                k1, k2, k3 = st.columns(3)
+                kpi(k1, "Completed delivery slips", len(staff_tasks))
+                kpi(k2, "Cases dispatched", cases_done)
+                kpi(k3, "Expenses still pending", expense_waiting)
+                task_cols = [c for c in ["Time", "Customer", "Cases", "Note", "Local_Driver", "Taxi_Station",
+                                         "Phnom_Penh_Expense", "Taxi_Expense", "Expense_Status", "Verified_By"]
+                             if c in staff_tasks.columns]
+                show_df(staff_tasks[task_cols])
 
 def _dispatch_body():
+    if not has_permission("tasks") or not has_permission("edit"):
+        st.warning("Delivery task editing is disabled for your account.")
+        return
     st.markdown("### 🚚 Delivery")
     linked_staff = staff_name_for_user()
     default_staff_index = DELIVERY_HANDLERS.index(linked_staff) + 1 if linked_staff in DELIVERY_HANDLERS else 0
@@ -2995,6 +3106,15 @@ def _dispatch_body():
 
 @st.fragment
 def tab_dispatch():
+    if not has_permission("tasks"):
+        st.error("Task access is turned off for your account. Ask Admin to enable it.")
+        return
+    if not has_permission("edit"):
+        if not has_permission("view") and not has_permission("reports"):
+            st.warning("Task access is enabled, but View, Editing, and Reports are all turned off.")
+            return
+        safe_render(_delivery_log, "Delivery read-only log")
+        return
     safe_render(_dispatch_body, "Delivery tab")
 
 
@@ -3313,8 +3433,43 @@ def render_cards(df, editable=False, df_report=None, selected_date=None):
     return drawn
 
 
+def _reports_only_body():
+    """For users allowed to see reports but not the general customer dashboard."""
+    st.markdown("### 📑 Reports")
+    selected_date = st.date_input("Select Report Date:", value=today_kh(), key="reports_only_date")
+    df_report, cases_found, err = build_report(selected_date)
+    if err:
+        st.warning(f"Excel problem: {err}")
+    if df_report.empty:
+        st.info(f"No orders scheduled or found in the journal for {selected_date}.")
+        return
+    counts = df_report["Status"].value_counts()
+    rows = [{"Metric": "Customers", "Value": len(df_report)},
+            {"Metric": "Cases ordered", "Value": int(df_report["កេស"].fillna(0).sum())},
+            {"Metric": "Cases packed", "Value": int(df_report["Packed Cases"].sum())},
+            {"Metric": "Cases sent", "Value": int(df_report["Sent Cases"].sum())}]
+    rows.extend({"Metric": status, "Value": int(counts.get(status, 0))} for status in STATUS_RANK)
+    show_df(pd.DataFrame(rows))
+    if not has_permission("reports"):
+        return
+    try:
+        st.download_button("📥 Download detailed report (Excel)", data=build_report_excel(df_report, selected_date),
+                           file_name=f"Master_Report_{selected_date}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception as e:
+        st.warning(f"Could not build Excel report: {e}")
+
+
 def _dashboard_body():
-    can_edit = current_role() in ("staff", "admin")
+    if not has_permission("view"):
+        if has_permission("reports"):
+            _reports_only_body()
+        else:
+            st.info("Dashboard viewing is turned off for your account. Ask Admin to enable View or Reports.")
+        return
+    # Dashboard customer-update panels change packing/delivery status, so require both Tasks and Editing.
+    can_edit = has_permission("edit") and has_permission("tasks")
+    can_reports = has_permission("reports")
     mobile = is_mobile()
     st.markdown("### 📊 Master Status Board")
     selected_date = st.date_input("Select Report Date:", value=today_kh(), key="dash_date")
@@ -3358,20 +3513,22 @@ def _dashboard_body():
     except TypeError:
         st.progress(n_sent / total)
 
-    with st.expander("📊 Summary: Phnom Penh vs Province, regions and provinces", expanded=not mobile):
-        t_area, t_region, t_prov = st.tabs(["By area", "By delivery region", "By province"])
-        with t_area:
-            show_df(summarize(df_report, "Area"))
-        with t_region:
-            show_df(summarize(df_scope, "Region"))
-        with t_prov:
-            show_df(summarize(df_scope, "Province"))
+    if can_reports:
+        with st.expander("📊 Summary: Phnom Penh vs Province, regions and provinces", expanded=not mobile):
+            t_area, t_region, t_prov = st.tabs(["By area", "By delivery region", "By province"])
+            with t_area:
+                show_df(summarize(df_report, "Area"))
+            with t_region:
+                show_df(summarize(df_scope, "Region"))
+            with t_prov:
+                show_df(summarize(df_scope, "Province"))
     with st.expander("🗺️ Map of Cambodia", expanded=not mobile):
         metric = st.radio("Circle size shows", ["Customers", "Customers still waiting", "Cases ordered (កេស)", "Cases sent"],
                           horizontal=True, key="map_metric")
         render_cambodia_map(df_scope, metric)
 
-    _new_customers_panel(df_report, selected_date)
+    if has_permission("edit"):
+        _new_customers_panel(df_report, selected_date)
 
     # ---- search + display style ----
     c1, c2, c3 = st.columns([3, 2, 2])
@@ -3380,12 +3537,15 @@ def _dashboard_body():
     display = c2.radio("Display", ["📱 Cards", "🖥️ Table"], horizontal=True, index=0 if mobile else 1, key="dash_display")
     with c3:
         st.write("")
-        try:
-            st.download_button("📥 Download detailed report (Excel)", data=build_report_excel(df_report, selected_date),
-                               file_name=f"Master_Report_{selected_date}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        except Exception as e:
-            st.warning(f"Could not build Excel report: {e}")
+        if can_reports:
+            try:
+                st.download_button("📥 Download detailed report (Excel)", data=build_report_excel(df_report, selected_date),
+                                   file_name=f"Master_Report_{selected_date}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            except Exception as e:
+                st.warning(f"Could not build Excel report: {e}")
+        else:
+            st.caption("Report download disabled")
 
     with st.expander("🎚️ Filters: region, province, verifier"):
         pick_status = [] if pick_one == "All" else [pick_one]
@@ -3477,6 +3637,9 @@ def _dashboard_body():
 
 def _update_panel(selected, df_report, selected_date):
     """Check / edit one customer: packing, sending, move to tomorrow / cancel."""
+    if not has_permission("edit") or not has_permission("view") or not has_permission("tasks"):
+        st.info("Editing this customer is disabled for your account or Task access is turned off.")
+        return
 
     st.markdown("---")
     h1, h2 = st.columns([5, 1])
@@ -3572,6 +3735,8 @@ def build_master_upload(rows, start_no):
 
 def _new_customers_panel(df_report, selected_date):
     """Alert for names that sales typed in the journal but that are not in the Master List yet."""
+    if not has_permission("edit"):
+        return
     snap, _, _, _ = current_snapshot()
     if not snap:
         return
@@ -4002,9 +4167,47 @@ def _users_panel():
     show_df(pd.DataFrame([{
         "Staff name": r.get("staff_name", ""), "Username": u, "Role": r.get("role"),
         "Active": "yes" if r.get("active", True) else "NO",
+        "Tasks": "ON" if effective_permissions(u, r).get("tasks") else "OFF",
+        "View": "ON" if effective_permissions(u, r).get("view") else "OFF",
+        "Edit": "ON" if effective_permissions(u, r).get("edit") else "OFF",
+        "Reports": "ON" if effective_permissions(u, r).get("reports") else "OFF",
         "Starter password": "yes" if r.get("must_change") else "",
         "Last login": r.get("last_login", ""), "Password changed": r.get("pw_changed", "")}
         for u, r in sorted(users.items())]))
+
+    with st.expander("🔐 Turn each user's permissions ON / OFF", expanded=True):
+        st.caption("Choose a username, tick only the abilities they need, then save. Changes take effect when their app refreshes. Admin accounts always keep all permissions to prevent locking out the business owner.")
+        perm_user = st.selectbox("Select user to customize", sorted(users), key="perm_user_select")
+        perm_rec = users.get(perm_user, {})
+        perm_values = effective_permissions(perm_user, perm_rec)
+        is_admin_target = perm_rec.get("role") == "admin"
+        if is_admin_target:
+            st.info("Admin permissions are always ON for security and account recovery.")
+        with st.form(f"permissions_form_{perm_user}"):
+            p_tasks = st.checkbox(PERMISSION_LABELS["tasks"], value=perm_values["tasks"], key=f"perm_tasks_{perm_user}", disabled=is_admin_target)
+            p_view = st.checkbox(PERMISSION_LABELS["view"], value=perm_values["view"], key=f"perm_view_{perm_user}", disabled=is_admin_target)
+            p_edit = st.checkbox(PERMISSION_LABELS["edit"], value=perm_values["edit"], key=f"perm_edit_{perm_user}", disabled=is_admin_target)
+            p_reports = st.checkbox(PERMISSION_LABELS["reports"], value=perm_values["reports"], key=f"perm_reports_{perm_user}", disabled=is_admin_target)
+            save_perms = st.form_submit_button("💾 Save permissions", type="primary")
+        if save_perms:
+            if is_admin_target:
+                st.info("Admin access remains fully enabled.")
+            else:
+                new_perms = {"tasks": p_tasks, "view": p_view, "edit": p_edit, "reports": p_reports}
+                def _save_perms(u):
+                    if perm_user not in u:
+                        raise ValueError("That user no longer exists. Refresh and try again.")
+                    if u[perm_user].get("role") == "admin":
+                        u[perm_user]["permissions"] = {k: True for k in PERMISSION_KEYS}
+                    else:
+                        u[perm_user]["permissions"] = dict(new_perms)
+                    return u
+                try:
+                    modify_users(_save_perms)
+                    audit("user_permissions_changed", f"{perm_user}: " + ", ".join(f"{k}={'ON' if v else 'OFF'}" for k, v in new_perms.items()))
+                    flash_and_refresh(f"Permissions saved for {perm_user}")
+                except (ValueError, RuntimeError, ConflictError) as err:
+                    st.error(f"❌ Could not save permissions: {err}")
 
     with st.expander("➕ Add a user"):
         with st.form("add_user_form", clear_on_submit=True):
@@ -4210,13 +4413,19 @@ if ROLE in ("staff", "admin"):
                              else f"🤖 Bot: {_fixed} fixed, {_bad} need a look (see Bot tab)")
 st.caption(_chips)
 
-if ROLE in ("viewer", "sales"):
-    labels = ["📊 Live Dashboard (Sales)"]
-elif ROLE == "staff":
-    labels = ["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)", "📊 3. Live Dashboard (Sales)"]
-else:
-    labels = ["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)", "📊 3. Live Dashboard (Sales)",
-              "🤖 4. Admin: Bot, Users & Security"]
+_perms = effective_permissions(current_user())
+labels = []
+if _perms.get("tasks"):
+    labels.extend(["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)"])
+if _perms.get("view"):
+    labels.append("📊 Live Dashboard (Sales)")
+elif _perms.get("reports"):
+    labels.append("📑 Reports")
+if ROLE == "admin":
+    labels.append("🤖 4. Admin: Bot, Users & Security")
+if not labels:
+    st.warning("No app sections are enabled for your account. Ask Admin to turn on Tasks, View, or Reports.")
+    st.stop()
 _tabs = dict(zip(labels, st.tabs(labels)))
 
 for _label, _tab in _tabs.items():
@@ -4228,5 +4437,7 @@ for _label, _tab in _tabs.items():
         elif _label.startswith("📊"):
             _live = st.checkbox(f"🔄 Live mode (refresh every {LIVE_REFRESH_SECONDS}s)", value=False, key="live_mode")
             tab_dashboard(_live)
+        elif _label.startswith("📑"):
+            tab_dashboard(False)
         else:
             tab_bot()
