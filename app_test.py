@@ -3889,29 +3889,42 @@ def _users_panel():
                    "They must choose their own password at the first login. This message appears only once.")
 
     st.markdown("#### 👥 Quick setup for all staff")
-    st.caption("Creates accounts for 8 operations staff, 2 delivery drivers, and 4 sales staff using the short English usernames selected by you. "
-               "Operations staff and delivery drivers can use Packing, Delivery, and Dashboard; Sales staff can view Dashboard and reports. "
-               "If an older account is linked to the same staff name, setup renames it and keeps its existing password and role.")
-    if st.button("✅ Create / update staff usernames", key="create_all_staff_accounts", type="primary"):
-        outcome = {"created": [], "renamed": [], "skipped": []}
-        # Prevent a stale temporary-credentials table from showing after a rename-only run.
+    st.caption("Creates or updates all 14 staff accounts with your chosen English usernames. "
+               "Temporary password for every staff member: 12345. Everyone must choose a stronger personal password on first login. "
+               "Clicking the setup button again resets these 14 matching staff accounts back to the temporary password.")
+    if st.button("✅ Create / reset all 14 staff logins (temporary password: 12345)",
+                 key="create_all_staff_accounts", type="primary"):
+        outcome = {"created": [], "updated": [], "renamed": [], "skipped": [], "credentials": []}
         st.session_state.pop("staff_account_setup_credentials", None)
 
         def _create_team_accounts(u):
-            created, renamed, skipped = [], [], []
+            created, updated, renamed, skipped, credentials = [], [], [], [], []
+            temp_pw = "12345"
             for spec in STAFF_ACCOUNT_SPECS:
                 uname = spec["username"]
                 if uname in u:
                     rec = u.get(uname, {})
-                    same_person = str(rec.get("staff_name") or "").strip() == spec["name"]
+                    stored_staff_name = str(rec.get("staff_name") or "").strip()
+                    # These 14 usernames were explicitly chosen by the owner for these staff.
+                    # If an account was manually created earlier and has no staff_name metadata,
+                    # attach it to the requested staff entry rather than leaving a duplicate/conflict.
+                    same_person = (stored_staff_name == spec["name"] or not stored_staff_name)
                     if same_person:
-                        skipped.append({"Staff name": spec["name"], "Username": uname, "Reason": "Name-based username already exists"})
+                        # Known staff account: reset its temporary password and enforce a change at login.
+                        rec.update(_hash_pw(temp_pw))
+                        rec.update({"role": spec["role"], "active": rec.get("active", True),
+                                    "must_change": True, "staff_name": spec["name"]})
+                        u[uname] = rec
+                        updated.append({"Staff name": spec["name"], "Username": uname})
+                        credentials.append({"Staff name": spec["name"], "Username": uname,
+                                            "Role": ROLE_LABEL.get(spec["role"], spec["role"]),
+                                            "Temporary password": temp_pw})
                     else:
-                        skipped.append({"Staff name": spec["name"], "Username": uname, "Reason": "Username is already used by another account"})
+                        skipped.append({"Staff name": spec["name"], "Username": uname,
+                                        "Reason": "Username is already used by another account; left unchanged"})
                     continue
 
-                # Check each earlier username, but migrate only an account whose saved
-                # staff name and role both match this person. Never take over an unrelated account.
+                # Only migrate an older account when its saved staff name and role match this person.
                 aliases = spec.get("legacy_usernames") or ([spec["legacy_username"]] if spec.get("legacy_username") else [])
                 legacy = None
                 for alias in aliases:
@@ -3923,40 +3936,50 @@ def _users_panel():
                         legacy = alias
                         break
                 if legacy:
-                    # Preserve the full existing account record and password hash; only change its login ID.
-                    u[uname] = u.pop(legacy)
+                    rec = u.pop(legacy)
+                    rec.update(_hash_pw(temp_pw))
+                    rec.update({"role": spec["role"], "active": rec.get("active", True),
+                                "must_change": True, "staff_name": spec["name"]})
+                    u[uname] = rec
                     renamed.append({"Staff name": spec["name"], "Old username": legacy, "New username": uname})
-                    continue
+                else:
+                    rec = _new_user(spec["role"], temp_pw, must_change=True)
+                    rec["staff_name"] = spec["name"]
+                    u[uname] = rec
+                    created.append({"Staff name": spec["name"], "Username": uname})
+                credentials.append({"Staff name": spec["name"], "Username": uname,
+                                    "Role": ROLE_LABEL.get(spec["role"], spec["role"]),
+                                    "Temporary password": temp_pw})
 
-                pw = generate_easy_password(uname)
-                rec = _new_user(spec["role"], pw, must_change=True)
-                rec["staff_name"] = spec["name"]
-                u[uname] = rec
-                created.append({"Staff name": spec["name"], "Username": uname, "Role": ROLE_LABEL.get(spec["role"], spec["role"]),
-                                "Temporary password": pw})
             outcome["created"] = created
+            outcome["updated"] = updated
             outcome["renamed"] = renamed
             outcome["skipped"] = skipped
+            outcome["credentials"] = credentials
             return u
 
         try:
             modify_users(_create_team_accounts)
             st.session_state["staff_account_setup_result"] = {
                 "created_count": len(outcome["created"]),
+                "updated_count": len(outcome["updated"]) + len(outcome["renamed"]),
                 "renamed": outcome["renamed"],
                 "skipped": outcome["skipped"],
             }
-            if outcome["created"]:
-                st.session_state["staff_account_setup_credentials"] = outcome["created"]
-            audit("staff_accounts_bulk_created", f"created={len(outcome['created'])}, renamed={len(outcome['renamed'])}, skipped={len(outcome['skipped'])}")
+            if outcome["credentials"]:
+                st.session_state["staff_account_setup_credentials"] = outcome["credentials"]
+            audit("staff_accounts_bulk_created_or_reset",
+                  f"created={len(outcome['created'])}, updated={len(outcome['updated'])}, "
+                  f"renamed={len(outcome['renamed'])}, skipped={len(outcome['skipped'])}")
             st.rerun()
         except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
-            st.error(f"❌ Could not create staff accounts: {err}")
+            st.error(f"❌ Could not create/reset staff accounts: {err}")
 
     setup_result = st.session_state.get("staff_account_setup_result")
     if setup_result:
-        st.info(f"Created {setup_result['created_count']} new account(s), renamed {len(setup_result.get('renamed', []))} old username(s), "
-                f"and skipped {len(setup_result['skipped'])} existing username(s). Renamed accounts keep their existing password.")
+        st.info(f"Created {setup_result['created_count']} new account(s), reset {setup_result.get('updated_count', 0)} existing staff account(s), "
+                f"renamed {len(setup_result.get('renamed', []))} old username(s), and skipped {len(setup_result['skipped'])} username conflict(s). "
+                "Every account changed by this setup must change its password at first login.")
         if setup_result.get("renamed"):
             with st.expander("View renamed staff usernames"):
                 show_df(pd.DataFrame(setup_result["renamed"]))
@@ -3965,9 +3988,9 @@ def _users_panel():
                 show_df(pd.DataFrame(setup_result["skipped"]))
     credentials = st.session_state.get("staff_account_setup_credentials")
     if credentials:
-        st.warning("Copy or download these temporary passwords now and give each one only to that staff member. "
-                   "Passwords are not saved in readable form in the accounts file; each user must change their password at first login. "
-                   "This list stays visible only in this Admin session until you hide it.")
+        st.warning("Temporary password for the listed staff accounts is 12345. Give each username only to its owner. "
+                   "This password is intentionally temporary and each person is forced to set a stronger personal password before using the app. "
+                   "Clicking the setup button again will reset the listed matching accounts to 12345.")
         cred_df = pd.DataFrame(credentials)
         st.dataframe(cred_df, hide_index=True, use_container_width=True)
         st.download_button("⬇️ Download staff login list (CSV)", data=cred_df.to_csv(index=False).encode("utf-8-sig"),
@@ -3987,14 +4010,13 @@ def _users_panel():
         with st.form("add_user_form", clear_on_submit=True):
             nu = st.text_input("Username (3-30 letters/numbers, for example: sokha)", max_chars=30)
             nr = st.selectbox("Role", ROLES, help="staff = packing + delivery + dashboard | sales = dashboard/reports only; delivery staff record the chosen verifier | viewer = dashboard only | admin = everything")
-            npw = st.text_input("Temporary password (leave empty to generate one)", max_chars=100)
+            npw = st.text_input("Temporary password (default: 12345; user must change it at first login)",
+                                value="12345", max_chars=100)
             if st.form_submit_button("Create user", type="primary"):
                 uname = nu.strip().lower()
-                pw = npw.strip() or generate_password()
+                pw = npw.strip() or "12345"
                 if not USERNAME_RE.match(uname):
                     st.error("❌ Username: 3-30 characters, only a-z, 0-9, dot, dash, underscore.")
-                elif npw.strip() and password_problem(pw, uname):
-                    st.error(f"❌ {password_problem(pw, uname)}")
                 else:
                     def _add(u):
                         if uname in u:
@@ -4012,7 +4034,8 @@ def _users_panel():
     with st.expander("🔁 Reset password / disable / delete a user"):
         names = sorted(users)
         who = st.selectbox("User", names, key="mng_user")
-        tpw = st.text_input("New temporary password (leave empty to generate one)", max_chars=100, key="mng_pw")
+        tpw = st.text_input("New temporary password (default: 12345; user must change it at first login)",
+                            value="12345", max_chars=100, key="mng_pw")
         c1, c2, c3 = st.columns(3)
         act = None
         if c1.button("🔁 Reset password", key="mng_reset"):
@@ -4035,10 +4058,8 @@ def _users_panel():
                         and not _others_have_admin(u):
                     raise ValueError("At least one active admin must remain.")
                 if act == "reset":
-                    pw = tpw.strip() or generate_password()
-                    prob = password_problem(pw, who) if tpw.strip() else None
-                    if prob:
-                        raise ValueError(prob)
+                    # Temporary password may be simple because login is blocked until the user replaces it.
+                    pw = tpw.strip() or "12345"
                     u[who].update(_hash_pw(pw))
                     u[who]["must_change"] = True
                     st.session_state["show_pw"] = (who, pw)
@@ -4057,7 +4078,8 @@ def _users_panel():
     show_df(pd.DataFrame([
         ("Login", "username + password for everyone"),
         ("Password storage", "scrambled (PBKDF2-SHA256) in users.json - nobody can read them, not even you"),
-        ("Password rule", "at least 8 characters, letters and numbers"),
+        ("Temporary staff password", "12345; each staff account must change it at first login"),
+        ("Personal password rule", "at least 8 characters with letters and numbers"),
         ("Wrong-password attempts (24h)", str(failed_logins(24))),
         ("Lock-out", f"{MAX_FAILS} wrong attempts -> locked {LOCKOUT_MIN} minutes"),
         ("Auto log-out", f"after {LOGIN_TTL_HOURS} hours"),
