@@ -116,6 +116,7 @@ ASSIGN_COLS = ["Date", "Handler", "Customer", "Action"]
 HOLD_COLS = ["Date", "Customer", "Action", "Cases", "Reason", "By"]   # Action: Tomorrow | Cancel | Restore
 HOLD_NUM_COLS = ["Cases"]
 ST_MOVED, ST_CANCEL = "📅 Moved to tomorrow", "❌ Cancelled"
+IGNORE_NEW = ["STAFF", "GENERAL"]            # names that are not real customers: never reported as "new"
 NOT_TO_SEND = ("✅ Sent", ST_MOVED, ST_CANCEL)
 PACKING_NUM_COLS = ["Cases_Packed"]
 NUM_COLS_ALL = set(DISPATCH_NUM_COLS + PACKING_NUM_COLS)
@@ -2884,7 +2885,7 @@ def _join_unique(series, sep=", ", limit=3):
     return sep.join(vals)
 
 
-DASH_COLUMNS = ["🔥", "Customer", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Prepared By",
+DASH_COLUMNS = ["🔥", "Customer", "In Master", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Prepared By",
                 "Assigned To", "Sent Cases", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Moved/Cancel Reason", "Note", "Time", "Source"]
 
 
@@ -2935,6 +2936,8 @@ def build_report(selected_date):
     areas = areas_lookup(snap)
     overrides = load_location_overrides()
     assigned = current_assignments(selected_date)
+    master_names = {norm_name(n) for n in snap["customers"]} if snap else set()
+    ignore = {norm_name(n) for n in IGNORE_NEW}
     rows = []
     for cust in set(scheduled) | set(pack_info) | set(sent_info):
         p, s, info = pack_info.get(cust), sent_info.get(cust), scheduled.get(cust)
@@ -2955,7 +2958,9 @@ def build_report(selected_date):
             status = ST_MOVED if h["action"] == "Tomorrow" else ST_CANCEL
         urgent = any(w.upper() in remark.upper() for w in URGENT_WORDS)
         rows.append({
-            "🔥": "🔥" if urgent else "", "Customer": cust, "Area": AREA_LABEL[area], "Province": province,
+            "🔥": "🔥" if urgent else "", "Customer": cust,
+            "In Master": "🆕 NEW" if (master_names and norm_name(cust) not in master_names and norm_name(cust) not in ignore) else "✅",
+            "Area": AREA_LABEL[area], "Province": province,
             "Region": region, "Invoice": info["invoice"] if info else "-",
             "Status": status, "កេស": ordered,
             "Packed Cases": packed, "Prepared By": p["by"] if p else "-", "Assigned To": assigned.get(cust, "-"),
@@ -3062,7 +3067,7 @@ STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Partial": ("#1565c0", 
                 "🟡 Ready for Delivery": ("#f9a825", "#222222"), "🟠 Packing": ("#ef6c00", "#ffffff"),
                 "⏳ Pending": ("#757575", "#ffffff"), "📅 Moved to tomorrow": ("#6a1b9a", "#ffffff"),
                 "❌ Cancelled": ("#b71c1c", "#ffffff")}
-COMPACT_COLUMNS = ["🔥", "Customer", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
+COMPACT_COLUMNS = ["🔥", "Customer", "In Master", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
 _REGION_ORDER = {r: i for i, r in enumerate(REGIONS)}
 
 
@@ -3101,7 +3106,7 @@ def card_html(r):
     return (f"<div class='hk-card' style='border-left:6px solid {bg}'>"
             f"<div class='hk-top'><span class='hk-name'>{'🔥 ' if r['🔥'] else ''}{_e(r['Customer'])}</span>"
             f"<span class='hk-badge' style='background:{bg};color:{fg}'>{_e(r['Status'])}</span></div>"
-            f"<div class='hk-sub'>{_e(r['Area'])} · {_e(r['Province'])}{inv}</div>"
+            f"<div class='hk-sub'>{_e(r['Area'])} · {_e(r['Province'])}{inv}{' · 🆕 NEW customer (not in master)' if r.get('In Master') == '🆕 NEW' else ''}</div>"
             f"<div class='hk-nums'><span>កេស <b>{ordered}</b></span><span>📦 <b>{int(r['Packed Cases'])}</b>{prep}</span>"
             f"<span>🚚 <b>{int(r['Sent Cases'])}</b></span>{asg}</div>{note}{sent}</div>")
 
@@ -3119,7 +3124,9 @@ def cards_html(df):
     return "".join(parts)
 
 
-def render_cards(df):
+def render_cards(df, editable=False, df_report=None, selected_date=None):
+    """Cards. With editable=True every card has a 'Check / Edit' button and the panel opens right under that card.
+    Returns True when the open panel was drawn inside a card."""
     page = 30
     limit = st.session_state.get("card_limit", page)
     d = df.copy()
@@ -3127,7 +3134,26 @@ def render_cards(df):
     d["_g"] = d["Region"].map(_REGION_ORDER).fillna(99)
     d["_s"] = d["Status"].map(STATUS_RANK)
     d = d.sort_values(["_a", "_g", "Province", "_s", "Customer"]).drop(columns=["_a", "_g", "_s"])
-    st.markdown(cards_html(d.head(limit)), unsafe_allow_html=True)
+    shown = d.head(limit)
+    drawn = False
+    if not editable:
+        st.markdown(cards_html(shown), unsafe_allow_html=True)
+    else:
+        counts, last = shown.groupby(["Area", "Province"]).size().to_dict(), None
+        for r in shown.to_dict("records"):
+            key = (r["Area"], r["Province"])
+            if key != last:
+                last = key
+                title = r["Area"] if r["Province"] == PP else f"{r['Area']} · {r['Province']}"
+                st.markdown(f"<div class='hk-group'>{_e(title)} ({counts[key]})</div>", unsafe_allow_html=True)
+            st.markdown(card_html(r), unsafe_allow_html=True)
+            cust = r["Customer"]
+            if st.button("✏️ Check / Edit", key=f"cardedit_{cust}"):
+                st.session_state["sel_cust"] = cust
+            if st.session_state.get("sel_cust") == cust:
+                with st.container(border=True):
+                    _update_panel(cust, df_report, selected_date)
+                drawn = True
     st.caption(f"Showing {min(limit, len(d))} of {len(d)} customers")
     if len(d) > limit and st.button(f"⬇️ Show {page} more", key="card_more"):
         st.session_state["card_limit"] = limit + page
@@ -3135,6 +3161,7 @@ def render_cards(df):
             st.rerun(scope="fragment")
         except TypeError:
             st.rerun()
+    return drawn
 
 
 def _dashboard_body():
@@ -3184,6 +3211,8 @@ def _dashboard_body():
         metric = st.radio("Circle size shows", ["Customers", "Customers still waiting", "Cases ordered (កេស)", "Cases sent"],
                           horizontal=True, key="map_metric")
         render_cambodia_map(df_scope, metric)
+
+    _new_customers_panel(df_report, selected_date)
 
     # ---- search + display style ----
     c1, c2, c3 = st.columns([3, 2, 2])
@@ -3235,6 +3264,7 @@ def _dashboard_body():
         st.session_state.pop("dash_table", None)
 
     event = None
+    shown_inline = False
     table_mode = display.endswith("Table")
     if df_view.empty:
         st.info("No customers match your search / filter.")
@@ -3256,11 +3286,13 @@ def _dashboard_body():
         cols = DASH_COLUMNS if all_cols else COMPACT_COLUMNS
         event = show_df(df_view[cols], height=430, key="dash_table", selectable=can_edit, column_config=cfg)
     else:
-        render_cards(df_view)
+        shown_inline = render_cards(df_view, editable=can_edit, df_report=df_report, selected_date=selected_date)
 
     if not can_edit:
         return
-    if event is None:                                   # cards view (or an old Streamlit): pick from a list
+    if event is None and not table_mode:
+        pass                                            # cards view: every card has its own Check / Edit button
+    elif event is None:                                 # old Streamlit without row-click: pick from a list
         status_of = dict(zip(df_view["Customer"], df_view["Status"]))
         pick = st.selectbox("✏️ Update a customer (type to search)", ["--"] + df_view["Customer"].tolist()[:400],
                             format_func=lambda c: c if c == "--" else f"{status_of.get(c, '')}  {c}", key="pick_old")
@@ -3274,13 +3306,17 @@ def _dashboard_body():
             st.session_state["sel_cust"] = df_view.iloc[rows_sel[0]]["Customer"]
 
     selected = st.session_state.get("sel_cust")
-    if selected not in set(df_report["Customer"]):
-        return
+    if selected in set(df_report["Customer"]) and not shown_inline:
+        _update_panel(selected, df_report, selected_date)
+
+
+def _update_panel(selected, df_report, selected_date):
+    """Check / edit one customer: packing, sending, move to tomorrow / cancel."""
 
     st.markdown("---")
     h1, h2 = st.columns([5, 1])
     h1.subheader(f"✏️ Update: {selected}")
-    if h2.button("✖ Close", key="close_panel"):
+    if h2.button("✖ Close", key=f"close_panel_{selected}"):
         st.session_state.pop("sel_cust", None)
         st.session_state["clear_sel"] = True
         st.rerun()
@@ -3313,6 +3349,97 @@ def _dashboard_body():
                       default_cases=send_default, verify=True)
     with t_hold:
         _hold_panel(selected, p_row, target_n - sent_n)
+
+
+IMPORT_HEADERS = ["Prefix ID", "Customer ID", "Customer Name", "Customer Name (Second Language)", "Currency Code",
+                  "Receivable Account", "Price Code", "Customer Group Code", "Payment Term Code", "Payment Method Code",
+                  "Customer Zone Code", "Credit Limit", "Contact Name", "Telephone 1", "Telephone 2", "Email", "Fax", "Website",
+                  "Note", "Tax Number", "Profile Picture", "Invoice to Address", "House No", "Street", "Village", "Commune",
+                  "District / City", "Province / Capital", "Country / Region",
+                  "Quotation / Sales Order picks up price from latest order", "Sales Invoicing picks up price from latest invoice",
+                  "Allow issuing invoice over credit limit", "Allow issuing invoice over due date", "Inactive"]
+TYPE_GENERAL, TYPE_DEALER = "General customer", "Dealer"
+
+
+def new_customer_names(snap, day=None):
+    """Names typed in the journal that are not in the Master List (optionally only one day). Sorted, no repeats."""
+    if not snap:
+        return []
+    master = {norm_name(n) for n in snap["customers"]}
+    ignore = {norm_name(n) for n in IGNORE_NEW}
+    j = snap["journal"]
+    if day is not None:
+        j = j[j["Date"] == day]
+    out = {}
+    for n in j["Customer"]:
+        k = norm_name(n)
+        if k and k not in master and k not in ignore:
+            out.setdefault(k, n)
+    return sorted(out.values(), key=str.casefold)
+
+
+def build_master_upload(rows, start_no):
+    """rows = [(name, type, phone)]. Excel in the same layout as your customer import sheet."""
+    recs = []
+    for i, (name, typ, phone) in enumerate(rows):
+        r = {h: None for h in IMPORT_HEADERS}
+        r.update({"Prefix ID": "DEFAULT", "Customer ID": f"C-{start_no + i:05d}", "Customer Name": name,
+                  "Customer Name (Second Language)": name, "Currency Code": "KHR", "Receivable Account": "105010",
+                  "Price Code": "DEALER", "Customer Group Code": "DEALER" if typ == TYPE_DEALER else "GEN_KHR",
+                  "Payment Term Code": "1D", "Payment Method Code": "BANK", "Credit Limit": 0,
+                  "Telephone 1": phone or None,
+                  "Quotation / Sales Order picks up price from latest order": 0,
+                  "Sales Invoicing picks up price from latest invoice": 0,
+                  "Allow issuing invoice over credit limit": 0, "Allow issuing invoice over due date": 0, "Inactive": 0})
+        recs.append(r)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame(recs, columns=IMPORT_HEADERS).to_excel(w, index=False, sheet_name="SHEET1")
+    return buf.getvalue()
+
+
+def _new_customers_panel(df_report, selected_date):
+    """Alert for names that sales typed in the journal but that are not in the Master List yet."""
+    snap, _, _, _ = current_snapshot()
+    if not snap:
+        return
+    whole = st.session_state.get("new_all", False)
+    names = new_customer_names(snap, None if whole else selected_date)
+    if not names and not whole:
+        return
+    n_txt = f"{len(names)} customer name(s) in the journal {'(all dates)' if whole else f'for {selected_date}'} are NOT in the Master List"
+    if names:
+        st.warning(f"🆕 {n_txt}. Sales must add them to the master data as **General customer** or **Dealer** "
+                   "(open the box below, choose the type, download the upload file).")
+    with st.expander(f"🆕 New customers to add to master data ({len(names)})", expanded=bool(names)):
+        st.checkbox("Check the whole journal (all dates), not only the selected day", key="new_all")
+        if not names:
+            st.success("Every customer in the journal is already in the Master List. ✅")
+            return
+        master_list = list(snap["customers"])
+        rows = []
+        for n in names:
+            sim = difflib.get_close_matches(n, master_list, n=1, cutoff=0.85)
+            rows.append({"Add": not sim, "Customer name": n, "Type": TYPE_GENERAL, "Phone (optional)": "",
+                         "⚠️ Looks like (already in master?)": sim[0] if sim else ""})
+        edited = st.data_editor(
+            pd.DataFrame(rows), hide_index=True, height=min(80 + 36 * len(rows), 420), key=f"new_cust_{len(rows)}_{whole}",
+            disabled=["Customer name", "⚠️ Looks like (already in master?)"],
+            column_config={"Type": st.column_config.SelectboxColumn("Type", options=[TYPE_GENERAL, TYPE_DEALER], required=True),
+                           "Add": st.column_config.CheckboxColumn("Add", help="Untick if it is only a spelling mistake")})
+        st.caption("⚠️ If a name 'looks like' one already in the master, it is probably a spelling mistake in the journal - "
+                   "fix the journal name instead of adding a duplicate (those rows start unticked).")
+        start = st.number_input("Next customer number (C-xxxxx) in your accounting system", min_value=1, max_value=999999,
+                                value=1315, step=1, key="new_cust_start")
+        pick = edited[edited["Add"]]
+        if pick.empty:
+            st.info("Tick at least one customer to make the upload file.")
+        else:
+            data = build_master_upload([(r["Customer name"], r["Type"], r["Phone (optional)"]) for _, r in pick.iterrows()],
+                                       int(start))
+            st.download_button(f"📥 Download upload file for master data ({len(pick)} customers)", data=data,
+                               file_name=f"New_Customers_{selected_date}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="new_cust_dl")
 
 
 def _hold_panel(selected, p_row, left):
