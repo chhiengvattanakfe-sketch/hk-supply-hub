@@ -68,6 +68,7 @@ BACKUP_DIR = os.path.join(CURRENT_DIR, "backups")                 # local mode o
 BOT_LOG_FILE = os.path.join(DATA_DIR, "bot_log.csv")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit_log.csv")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")          # accounts (passwords are stored hashed, never as text)
+ASSIGN_FILE = os.path.join(DATA_DIR, "delivery_assignments.csv")   # who will deliver which customer today
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache")       # outside Dropbox = faster
@@ -107,14 +108,16 @@ LOCAL_DRIVERS = ["ងិន វុទ្ធា", "អួន តួ"]
 OPS_STAFF = ["ឆែម សំណុក", "សាយ ប៊ុនលី", "ប៉ៅ រីណា", "ពេជ រដ្ឋា", "រ៉ូ សុវណ្ណាឌែន", "ហេង រតនា", "កង សៀន", "ណាត ផានិត"]
 
 DISPATCH_COLS = ["Date", "Handled_By", "Customer", "Cases", "Local_Driver",
-                 "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By"]
+                 "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By", "Expense_Status"]
 DISPATCH_NUM_COLS = ["Cases", "Phnom_Penh_Expense", "Taxi_Expense"]
 PACKING_COLS = ["Date", "Prepared_By", "Customer", "Cases_Packed", "Status"]
+ASSIGN_COLS = ["Date", "Handler", "Customer", "Action"]
 PACKING_NUM_COLS = ["Cases_Packed"]
 NUM_COLS_ALL = set(DISPATCH_NUM_COLS + PACKING_NUM_COLS)
 FILES = {
     "dispatch": (DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, "Dispatch CSV"),
     "packing": (PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, "Packing CSV"),
+    "assign": (ASSIGN_FILE, ASSIGN_COLS, [], "Assignments CSV"),
 }
 
 STATUS_RANK = {"✅ Sent": 1, "🔵 Partial": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5}
@@ -1127,7 +1130,7 @@ def daily_backup_once(day_str):
                 dbx.files_create_folder_v2(_remote_backup_dir())
             except Exception:
                 pass                                        # already exists
-            for f in (DATA_FILE, PACKING_FILE):
+            for f in (DATA_FILE, PACKING_FILE, ASSIGN_FILE):
                 base = os.path.basename(f)
                 dest = f"{_remote_backup_dir()}/{day_str}_{base}"
                 try:
@@ -1142,7 +1145,7 @@ def daily_backup_once(day_str):
                     pass
         else:
             os.makedirs(BACKUP_DIR, exist_ok=True)
-            for f in (DATA_FILE, PACKING_FILE):
+            for f in (DATA_FILE, PACKING_FILE, ASSIGN_FILE):
                 dest = os.path.join(BACKUP_DIR, f"{day_str}_{os.path.basename(f)}")
                 if os.path.exists(f) and not os.path.exists(dest):
                     shutil.copy2(f, dest)
@@ -1861,6 +1864,33 @@ def flash_and_refresh(msg):
 # ==========================================
 # FORMS
 # ==========================================
+BASE_VIA = "Grab/TukTuk"
+
+
+def via_options():
+    return [BASE_VIA] + LOCAL_DRIVERS
+
+
+def expense_status(via, station, pp, taxi):
+    """'Pending' while a needed expense (Grab/TukTuk or a taxi station) has no amount yet, otherwise 'Done'."""
+    station = (station or "").strip()
+    need_pp = via == BASE_VIA
+    need_taxi = station not in ("", "-")
+    return "Done" if ((not need_pp or _int(pp) > 0) and (not need_taxi or _int(taxi) > 0)) else "Pending"
+
+
+def current_assignments(day=None):
+    """{customer: handler} for a day (the last Assign / Release of each customer wins)."""
+    df = rows_for_day(read_raw(ASSIGN_FILE, ASSIGN_COLS), day or today_kh())
+    out = {}
+    for r in df.to_dict("records"):
+        if r["Action"] == "Assign":
+            out[r["Customer"]] = r["Handler"]
+        elif r["Action"] == "Release":
+            out.pop(r["Customer"], None)
+    return out
+
+
 def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
     k = form_key
     with st.form(form_key, clear_on_submit=True):
@@ -1889,13 +1919,13 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
         delivery_note = st.text_input("📝 Note (Optional: Taxi phone number, plate, or instructions):",
                                       max_chars=MAX_TEXT, key=f"{k}_note")
 
-        st.markdown("#### Expenses (៛ Riel)")
+        st.markdown("#### Expenses (៛ Riel) - optional now, you can fill them later in the Delivery tab")
         pp_expense = st.number_input("1. Phnom Penh Expense (៛) - Enter 0 if using own driver:",
                                      min_value=0, max_value=MAX_RIEL, step=500, key=f"{k}_pp")
         taxi_expense = st.number_input("2. Taxi Expense (៛) - Enter 0 if local delivery:",
                                        min_value=0, max_value=MAX_RIEL, step=500, key=f"{k}_te")
 
-        submitted = st.form_submit_button("💾 Save Dispatch & Expenses", type="primary")
+        submitted = st.form_submit_button("💾 Save Delivery", type="primary")
 
         if submitted:
             if dispatched_by == "-- Select Staff --":
@@ -1906,13 +1936,9 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
                 st.error("❌ Number of cases must be at least 1.")
             elif verify and verified_by == "-- Select Staff --":
                 st.error("❌ Please select who verified the number of cases.")
-            elif local_driver == "None (Grab/TukTuk)" and pp_expense == 0:
-                st.error("❌ Please enter the Phnom Penh Expense for the Grab/TukTuk.")
-            elif taxi_station.strip() != "" and taxi_expense == 0:
-                st.error("❌ Please enter the Taxi Expense paid to the provincial taxi/bus.")
             else:
                 try:
-                    handler_local = local_driver if local_driver != "None (Grab/TukTuk)" else "Grab/TukTuk"
+                    handler_local = local_driver if local_driver != "None (Grab/TukTuk)" else BASE_VIA
                     append_row(DATA_FILE, {
                         "Date": now_str(),
                         "Handled_By": dispatched_by,
@@ -1924,6 +1950,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
                         "Taxi_Expense": taxi_expense,
                         "Note": delivery_note.strip() or "-",
                         "Verified_By": verified_by,
+                        "Expense_Status": expense_status(handler_local, taxi_station, pp_expense, taxi_expense),
                     })
                     audit("dispatch", f"{customer_name} | {cases} cases | by {dispatched_by}")
                     flash_and_refresh(f"Dispatched by {dispatched_by}: {customer_name} | {cases} កេស")
@@ -2448,23 +2475,245 @@ def tab_packing():
 # ==========================================
 # TAB: DELIVERY
 # ==========================================
-def _dispatch_body():
-    st.markdown("### 🚚 Log Delivery Slip")
-    dispatch_form("expense_form")
+def _sorted_records(recs):
+    return sorted(recs, key=lambda r: (AREA_RANK.get(r["Area"], 9), _REGION_ORDER.get(r["Region"], 99), r["Province"], r["Customer"]))
 
-    st.markdown("---")
+
+def delivery_context():
+    ctx = packing_context()
+    ctx["recs"] = _sorted_records(ctx["df"].to_dict("records")) if not ctx["df"].empty else []
+    ctx["assigned"] = current_assignments()
+    return ctx
+
+
+def _claim_tab(me, ctx):
+    st.caption("Choose the customers **you** will deliver today, before you start. Other staff will see they are taken. "
+               "You can release a customer again if you cannot go.")
+    recs = [r for r in ctx["recs"] if r["Status"] != "✅ Sent"]
+    f1, f2 = st.columns(2)
+    area = f1.radio("Show", ["All", AREA_LABEL[PP], AREA_LABEL["Province"]], horizontal=True, key="claim_area")
+    q = f2.text_input("🔎 Search customer", key="claim_q", max_chars=60)
+    if area != "All":
+        recs = [r for r in recs if r["Area"] == area]
+    if q.strip():
+        recs = [r for r in recs if q.strip().lower() in r["Customer"].lower()]
+    if not recs:
+        st.info("No customers to choose right now.")
+    else:
+        assigned = ctx["assigned"]
+        rows = [{"Take ✅": False, "Customer": r["Customer"], "Province": r["Province"], "Status": r["Status"],
+                 "Packed": int(r["Packed Cases"]), "Ordered": None if pd.isna(r["កេស"]) else int(r["កេស"]),
+                 "Taken by": assigned.get(r["Customer"], "-")} for r in recs]
+        d = pd.DataFrame(rows)
+        sig = hashlib.md5("|".join(d["Customer"] + d["Taken by"]).encode("utf-8")).hexdigest()[:8]
+        edited = st.data_editor(d, hide_index=True, height=min(460, 60 + 36 * len(d)),
+                                key=f"claim_ed_{sig}_{st.session_state.get('bulk_key', 0)}",
+                                disabled=[c for c in d.columns if c != "Take ✅"],
+                                column_config={"Take ✅": st.column_config.CheckboxColumn("Take ✅")})
+        n = int(edited["Take ✅"].sum())
+        if st.button(f"✅ I will deliver these {n} customer(s)", key="claim_save", type="primary"):
+            new, blocked = [], []
+            for r in edited.to_dict("records"):
+                if not r["Take ✅"]:
+                    continue
+                owner = assigned.get(r["Customer"])
+                if owner == me:
+                    continue
+                if owner and current_role() != "admin":
+                    blocked.append(f"{r['Customer']} (taken by {owner})")
+                    continue
+                new.append({"Date": now_str(), "Handler": me, "Customer": r["Customer"], "Action": "Assign"})
+            if blocked:
+                st.warning("Already taken by someone else, skipped: " + "; ".join(blocked[:6]))
+            if not new:
+                if not blocked:
+                    st.warning("Tick at least one customer first.")
+            else:
+                try:
+                    append_rows(ASSIGN_FILE, new)
+                    audit("assign", f"{me}: {len(new)} customers")
+                    st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
+                    flash_and_refresh(f"{me} will deliver {len(new)} customers")
+                except (RuntimeError, ConflictError, PermissionError) as err:
+                    st.error(f"⚠️ Could not save: {err}")
+
+    mine = [r["Customer"] for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] != "✅ Sent"]
+    pool = mine if current_role() != "admin" else [c for c in ctx["assigned"] if c in {r["Customer"] for r in ctx["recs"]}]
+    with st.expander(f"↩️ Release customers ({len(mine)} are mine)"):
+        rel = st.multiselect("Customers I will NOT deliver after all", pool, key="claim_release")
+        if st.button("↩️ Release selected", key="claim_release_btn") and rel:
+            try:
+                append_rows(ASSIGN_FILE, [{"Date": now_str(), "Handler": me, "Customer": c, "Action": "Release"} for c in rel])
+                audit("assign_release", f"{me}: {len(rel)} customers")
+                flash_and_refresh(f"Released {len(rel)} customers")
+            except (RuntimeError, ConflictError, PermissionError) as err:
+                st.error(f"⚠️ Could not save: {err}")
+
+
+def _send_tab(me, ctx):
+    st.caption("Tick the customers whose buns you have **sent**. Expenses can be filled later in step 3.")
+    include_free = st.checkbox("Also show customers nobody has taken yet", key="send_free")
+    assigned = ctx["assigned"]
+    recs = [r for r in ctx["recs"] if r["Status"] != "✅ Sent"
+            and (assigned.get(r["Customer"]) == me or (include_free and r["Customer"] not in assigned))]
+    if not recs:
+        st.info("You have no customers to send. Choose your customers in step 1 first.")
+        return
+    c1, c2 = st.columns(2)
+    default_via = c1.selectbox("Sent with (default)", via_options(), key="send_via")
+    verified_by = c2.selectbox("✅ Cases checked by", ["-- Select Staff --"] + OPS_STAFF, key="send_vby")
+    rows = []
+    for r in recs:
+        ordered = None if pd.isna(r["កេស"]) else int(r["កេស"])
+        packed, sent = int(r["Packed Cases"]), int(r["Sent Cases"])
+        left = (packed - sent) if packed > sent else ((ordered - sent) if (ordered and ordered > sent) else 1)
+        rows.append({"Sent ✅": False, "Customer": r["Customer"], "Cases": int(left), "Via": default_via, "Taxi station": "",
+                     "Note": "", "Status": r["Status"], "Province": r["Province"]})
+    d = pd.DataFrame(rows)
+    sig = hashlib.md5(("|".join(d["Customer"]) + default_via).encode("utf-8")).hexdigest()[:8]
+    edited = st.data_editor(
+        d, hide_index=True, height=min(480, 60 + 36 * len(d)), key=f"send_ed_{sig}_{st.session_state.get('bulk_key', 0)}",
+        column_order=["Sent ✅", "Customer", "Cases", "Via", "Taxi station", "Note", "Status"],
+        disabled=["Customer", "Status", "Province"],
+        column_config={"Sent ✅": st.column_config.CheckboxColumn("Sent ✅"),
+                       "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1),
+                       "Via": st.column_config.SelectboxColumn("Via", options=via_options()),
+                       "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT, help="Only for provincial taxi / bus"),
+                       "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT)})
+    n = int(edited["Sent ✅"].sum())
+    st.caption("Cases are filled in from what is packed. Change them if you sent a different number.")
+    if st.button(f"🚚 Save {n} delivery(ies) as sent", key="send_save", type="primary"):
+        if verified_by == "-- Select Staff --":
+            st.error("❌ Please choose who checked the number of cases.")
+            return
+        out, take, total = [], [], 0
+        for r in edited.to_dict("records"):
+            cust, cases, via = r["Customer"], _int(r["Cases"]), r["Via"]
+            if not r["Sent ✅"] or cases <= 0 or cases > MAX_CASES or via not in via_options():
+                continue
+            station = safe_text(r["Taxi station"] or "")
+            out.append({"Date": now_str(), "Handled_By": me, "Customer": cust, "Cases": cases, "Local_Driver": via,
+                        "Taxi_Station": station or "-", "Phnom_Penh_Expense": 0, "Taxi_Expense": 0,
+                        "Note": safe_text(r["Note"] or "") or "-", "Verified_By": verified_by,
+                        "Expense_Status": expense_status(via, station, 0, 0)})
+            total += cases
+            if cust not in assigned:
+                take.append({"Date": now_str(), "Handler": me, "Customer": cust, "Action": "Assign"})
+        if not out:
+            st.warning("Tick at least one customer with cases above 0.")
+            return
+        try:
+            append_rows(DATA_FILE, out)
+            if take:
+                append_rows(ASSIGN_FILE, take)
+            waiting = sum(1 for o in out if o["Expense_Status"] == "Pending")
+            audit("dispatch_bulk", f"{len(out)} customers, {total} cases, by {me}")
+            st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
+            flash_and_refresh(f"Saved {len(out)} deliveries ({total} cases). {waiting} need expenses - fill them in step 3")
+        except (RuntimeError, ConflictError, PermissionError) as err:
+            bot_log("error", "Save dispatch (bulk)", str(err), "-")
+            st.error(f"⚠️ Could not save: {err}")
+
+
+def pending_expense_df(who, scope):
+    """Deliveries still waiting for expenses. who = staff name or None (everyone); scope = Today | Last 7 days | All waiting."""
+    df = read_raw(DATA_FILE, DISPATCH_COLS)
+    df = df[df["Expense_Status"] == "Pending"]
+    if who:
+        df = df[df["Handled_By"] == who]
+    if scope == "Today":
+        df = df[df["_dt"].dt.normalize() == pd.Timestamp(today_kh())]
+    elif scope == "Last 7 days":
+        df = df[df["_dt"] >= pd.Timestamp(today_kh() - timedelta(days=7))]
+    return df.reset_index(drop=True)
+
+
+def _expense_tab(me):
+    is_admin = current_role() == "admin"
+    st.caption("Fill in what you spent for the deliveries you already sent. Tick **Done** for each row you finish, then save.")
+    c1, c2 = st.columns(2)
+    scope = c1.radio("Show", ["Today", "Last 7 days", "All waiting"], horizontal=True, key="exp_scope")
+    who = me
+    if is_admin:
+        pick = c2.selectbox("Handler", ["(everyone)"] + OPS_STAFF, key="exp_who")
+        who = None if pick == "(everyone)" else pick
+    elif me == "-- Select Staff --":
+        st.info("Choose your name at the top first.")
+        return
+    df = pending_expense_df(who, scope)
+    if df.empty:
+        st.success("Nothing is waiting for expenses. 🎉")
+        return
+    st.info(f"⏳ {len(df)} deliveries are waiting for expenses.")
+    rows = [{"Done ✅": False, "Customer": r["Customer"], "When": str(r["Date"])[5:16], "Via": r["Local_Driver"],
+             "Taxi station": "" if r["Taxi_Station"] in ("-", "") else r["Taxi_Station"],
+             "Phnom Penh ៛": int(r["Phnom_Penh_Expense"]), "Taxi ៛": int(r["Taxi_Expense"]),
+             "By": r["Handled_By"], "Date": r["Date"]} for r in df.to_dict("records")]
+    d = pd.DataFrame(rows)
+    order = ["Done ✅", "Customer", "When", "Via", "Taxi station", "Phnom Penh ៛", "Taxi ៛"] + (["By"] if who is None else [])
+    sig = hashlib.md5("|".join(d["Date"] + d["Customer"]).encode("utf-8")).hexdigest()[:8]
+    edited = st.data_editor(
+        d, hide_index=True, height=min(480, 60 + 36 * len(d)), key=f"exp_ed_{sig}_{st.session_state.get('bulk_key', 0)}",
+        column_order=order, disabled=["Customer", "When", "Via", "By", "Date"],
+        column_config={"Done ✅": st.column_config.CheckboxColumn("Done ✅"),
+                       "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
+                       "Phnom Penh ៛": st.column_config.NumberColumn("Phnom Penh ៛", min_value=0, max_value=MAX_RIEL, step=500),
+                       "Taxi ៛": st.column_config.NumberColumn("Taxi ៛", min_value=0, max_value=MAX_RIEL, step=500)})
+    n = int(edited["Done ✅"].sum())
+    if st.button(f"💾 Save expenses for {n} delivery(ies)", key="exp_save", type="primary"):
+        updates, problems, total = {}, [], 0
+        for r in edited.to_dict("records"):
+            if not r["Done ✅"]:
+                continue
+            station, pp, tx = safe_text(r["Taxi station"] or ""), _int(r["Phnom Penh ៛"]), _int(r["Taxi ៛"])
+            if r["Via"] == BASE_VIA and pp <= 0:
+                problems.append(f"{r['Customer']}: enter the Phnom Penh ៛ (Grab/TukTuk)")
+            elif station and tx <= 0:
+                problems.append(f"{r['Customer']}: enter the Taxi ៛ for {station}")
+            else:
+                updates[(str(r["Date"]), r["Customer"], r["By"])] = (station or "-", pp, tx)
+                total += pp + tx
+        if problems:
+            st.error("❌ Not saved yet:\n\n" + "\n".join(f"- {p}" for p in problems[:8]))
+            return
+        if not updates:
+            st.warning("Tick **Done** on the rows you have finished first.")
+            return
+
+        def _apply(frame):
+            for (dt, cust, by), (station, pp, tx) in updates.items():
+                m = (frame["Date"].astype(str) == dt) & (frame["Customer"] == cust) & (frame["Handled_By"] == by)
+                if not m.any():
+                    raise ValueError(f"The delivery of {cust} was changed by someone else. Reload and try again.")
+                i = frame.index[m][0]
+                frame.loc[i, "Taxi_Station"] = station
+                frame.loc[i, "Phnom_Penh_Expense"] = pp
+                frame.loc[i, "Taxi_Expense"] = tx
+                frame.loc[i, "Expense_Status"] = "Done"
+            return frame
+        try:
+            modify_csv(DATA_FILE, DISPATCH_COLS, _apply)
+            audit("expenses_filled", f"{len(updates)} deliveries, {total} riel, by {me}")
+            st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
+            flash_and_refresh(f"Saved expenses for {len(updates)} deliveries (៛{total:,})")
+        except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
+            st.error(f"❌ {err}")
+
+
+def _delivery_log():
     with st.expander("🛠️ Admin: Fix or Edit Today's Dispatches"):
         admin_editor(DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, key="disp",
                      label_cols=["Customer", "Cases"])
 
-    st.markdown("---")
     st.subheader("📊 Today's Operations Log")
     df_today = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), today_kh())
     total_expense = int(df_today["Phnom_Penh_Expense"].sum() + df_today["Taxi_Expense"].sum()) if not df_today.empty else 0
-    m1, m2, m3 = st.columns(3)
+    waiting = int((df_today["Expense_Status"] == "Pending").sum()) if not df_today.empty else 0
+    m1, m2, m3, m4 = st.columns(4)
     kpi(m1, "Total Slips Today", len(df_today))
     kpi(m2, "Total Cases Dispatched (សរុបចំនួនកេស)", int(df_today["Cases"].sum()) if not df_today.empty else 0)
     kpi(m3, "Total Expenses Today (៛)", f"{total_expense:,}")
+    kpi(m4, "⏳ Expenses still to fill", waiting)
     if df_today.empty:
         st.info("No deliveries logged today yet.")
         return
@@ -2475,13 +2724,45 @@ def _dispatch_body():
     st.download_button("📥 Download Today's Expenses Log (Excel)", data=buf.getvalue(),
                        file_name=f"Operations_Expenses_{today_kh()}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    show_df(df_today[["Handled_By", "Customer", "Cases", "Note", "Local_Driver",
-                      "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Verified_By"]])
+    show_df(df_today[["Handled_By", "Customer", "Cases", "Note", "Local_Driver", "Taxi_Station",
+                      "Phnom_Penh_Expense", "Taxi_Expense", "Expense_Status", "Verified_By"]])
     st.markdown("**👷 Dispatch summary per staff (today)**")
     per_staff = df_today.groupby("Handled_By").agg(
         Slips=("Customer", "count"), Cases=("Cases", "sum"),
-        Expenses=("Phnom_Penh_Expense", "sum"), Taxi=("Taxi_Expense", "sum")).reset_index()
+        Expenses=("Phnom_Penh_Expense", "sum"), Taxi=("Taxi_Expense", "sum"),
+        Waiting=("Expense_Status", lambda x: int((x == "Pending").sum()))).reset_index()
     show_df(per_staff)
+
+
+def _dispatch_body():
+    st.markdown("### 🚚 Delivery")
+    me = st.selectbox("👷 I am (choose your name once)", ["-- Select Staff --"] + OPS_STAFF, key="me_staff")
+    ctx = delivery_context()
+    mine = [r for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] != "✅ Sent"]
+    n_wait = len(pending_expense_df(me, "All waiting")) if me != "-- Select Staff --" else 0
+    if me != "-- Select Staff --":
+        st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📌 To send <b>{len(mine)}</b></span>"
+                    f"<span class='hk-pill'>⏳ Expenses to fill <b>{n_wait}</b></span></div>", unsafe_allow_html=True)
+    t1, t2, t3, t4, t5 = st.tabs(["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Fill my expenses",
+                                  "✍️ One customer", "📊 Today's log"])
+    need_name = me == "-- Select Staff --"
+    with t1:
+        if need_name:
+            st.info("Choose your name at the top first.")
+        else:
+            _claim_tab(me, ctx)
+    with t2:
+        if need_name:
+            st.info("Choose your name at the top first.")
+        else:
+            _send_tab(me, ctx)
+    with t3:
+        _expense_tab(me)
+    with t4:
+        st.caption("The full form for a single customer. Expenses are optional - leave them empty to fill them later.")
+        dispatch_form("expense_form")
+    with t5:
+        _delivery_log()
 
 
 @st.fragment
@@ -2502,7 +2783,7 @@ def _join_unique(series, sep=", ", limit=3):
 
 
 DASH_COLUMNS = ["🔥", "Customer", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Prepared By",
-                "Sent Cases", "Handled By", "Verified By", "Driver/Station", "Journal Note", "Note", "Time", "Source"]
+                "Assigned To", "Sent Cases", "Handled By", "Verified By", "Driver/Station", "Journal Note", "Note", "Time", "Source"]
 
 
 def build_report(selected_date):
@@ -2535,6 +2816,7 @@ def build_report(selected_date):
 
     areas = areas_lookup(snap)
     overrides = load_location_overrides()
+    assigned = current_assignments(selected_date)
     rows = []
     for cust in set(scheduled) | set(pack_info) | set(sent_info):
         p, s, info = pack_info.get(cust), sent_info.get(cust), scheduled.get(cust)
@@ -2555,7 +2837,7 @@ def build_report(selected_date):
             "🔥": "🔥" if urgent else "", "Customer": cust, "Area": AREA_LABEL[area], "Province": province,
             "Region": region, "Invoice": info["invoice"] if info else "-",
             "Status": status, "កេស": ordered,
-            "Packed Cases": packed, "Prepared By": p["by"] if p else "-",
+            "Packed Cases": packed, "Prepared By": p["by"] if p else "-", "Assigned To": assigned.get(cust, "-"),
             "Sent Cases": sent, "Handled By": s["by"] if s else "-",
             "Verified By": s["verified"] if s else "-",
             "Driver/Station": s["driver"] if s else "-", "Journal Note": remark,
@@ -2640,7 +2922,7 @@ def render_cambodia_map(df, metric):
 STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Partial": ("#1565c0", "#ffffff"),
                 "🟡 Ready for Delivery": ("#f9a825", "#222222"), "🟠 Packing": ("#ef6c00", "#ffffff"),
                 "⏳ Pending": ("#757575", "#ffffff")}
-COMPACT_COLUMNS = ["🔥", "Customer", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Invoice"]
+COMPACT_COLUMNS = ["🔥", "Customer", "Province", "Status", "កេស", "Packed Cases", "Assigned To", "Sent Cases", "Invoice"]
 _REGION_ORDER = {r: i for i, r in enumerate(REGIONS)}
 
 
@@ -2673,12 +2955,13 @@ def card_html(r):
         sent = (f"<div class='hk-note'>🚚 {_e(r['Handled By'])} · {_e(r['Time'])} · {_e(r['Driver/Station'])}"
                 f" · ✅ {_e(r['Verified By'])}</div>")
     prep = f" · 👷 {_e(r['Prepared By'])}" if r["Prepared By"] not in ("-", "") else ""
+    asg = f"<span>👤 {_e(r['Assigned To'])}</span>" if r.get("Assigned To") not in ("-", "", None) else ""
     return (f"<div class='hk-card' style='border-left:6px solid {bg}'>"
             f"<div class='hk-top'><span class='hk-name'>{'🔥 ' if r['🔥'] else ''}{_e(r['Customer'])}</span>"
             f"<span class='hk-badge' style='background:{bg};color:{fg}'>{_e(r['Status'])}</span></div>"
             f"<div class='hk-sub'>{_e(r['Area'])} · {_e(r['Province'])}{inv}</div>"
             f"<div class='hk-nums'><span>កេស <b>{ordered}</b></span><span>📦 <b>{int(r['Packed Cases'])}</b>{prep}</span>"
-            f"<span>🚚 <b>{int(r['Sent Cases'])}</b></span></div>{note}{sent}</div>")
+            f"<span>🚚 <b>{int(r['Sent Cases'])}</b></span>{asg}</div>{note}{sent}</div>")
 
 
 def cards_html(df):
