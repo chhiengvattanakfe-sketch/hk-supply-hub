@@ -505,6 +505,25 @@ COMMON_PW = {"password", "password1", "12345678", "123456789", "qwerty123", "adm
              "hk-admin-7q4mw2", "hk-staff-3rn8zp", "change-me-admin-9x", "11111111", "abcd1234"}
 ROLES = ["staff", "sales", "viewer", "admin"]
 
+# Short, English usernames supplied by the business owner. Aliases allow Admin
+# to rename earlier account IDs safely while preserving password hashes/roles.
+STAFF_ACCOUNT_SPECS = (
+    {"username": "somnok", "legacy_usernames": ["samnuk", "ops01"], "name": "ឆែម សំណុក", "role": "staff"},
+    {"username": "bunly", "legacy_usernames": ["ops02"], "name": "សាយ ប៊ុនលី", "role": "staff"},
+    {"username": "rina", "legacy_usernames": ["ops03"], "name": "ប៉ៅ រីណា", "role": "staff"},
+    {"username": "rotha", "legacy_usernames": ["ratha", "ops04"], "name": "ពេជ រដ្ឋា", "role": "staff"},
+    {"username": "den", "legacy_usernames": ["sovann", "ops05"], "name": "រ៉ូ សុវណ្ណាឌែន", "role": "staff"},
+    {"username": "ratana", "legacy_usernames": ["ops06"], "name": "ហេង រតនា", "role": "staff"},
+    {"username": "sien", "legacy_usernames": ["ops07"], "name": "កង សៀន", "role": "staff"},
+    {"username": "nith", "legacy_usernames": ["panit", "ops08"], "name": "ណាត ផានិត", "role": "staff"},
+    {"username": "vuthea", "legacy_usernames": ["vutha", "delivery1"], "name": "ងិន វុទ្ធា", "role": "staff"},
+    {"username": "tuo", "legacy_usernames": ["tou", "delivery2"], "name": "អួន តួ", "role": "staff"},
+    {"username": "sary", "legacy_usernames": ["sales01"], "name": "ចែម សារី", "role": "sales"},
+    {"username": "lisa", "legacy_usernames": ["solisa", "sales02"], "name": "ឃួន សុលីសា", "role": "sales"},
+    {"username": "sokmeng", "legacy_usernames": ["sales03"], "name": "ថា សុខម៉េង", "role": "sales"},
+    {"username": "panha", "legacy_usernames": ["sopanha", "sales04"], "name": "ណាង សុបញ្ញា", "role": "sales"},
+)
+
 
 def _hash_pw(password, salt=None, iters=PBKDF2_ITER):
     salt = salt or os.urandom(16)
@@ -543,6 +562,30 @@ def generate_password():
         pw = "".join(pysecrets.choice(alphabet) for _ in range(10))
         if any(c.isdigit() for c in pw) and any(c.isalpha() for c in pw):
             return pw
+
+
+def generate_easy_password(username=""):
+    """Create a reasonably memorable, unique temporary password for first login."""
+    words = ("Mango", "River", "Lotus", "Tiger", "Coffee", "Orange", "Bamboo", "Dragon",
+             "Panda", "Coconut", "Silver", "Forest", "Golden", "Rocket", "Cedar", "Happy",
+             "Market", "Sunrise", "Velvet", "Lucky", "Jasmine", "Sunset", "Temple", "Bluebird")
+    for _ in range(100):
+        pw = pysecrets.choice(words) + str(pysecrets.randbelow(9000) + 1000)
+        if not password_problem(pw, username):
+            return pw
+    return generate_password()
+
+
+def staff_name_for_user(username=None):
+    """Return the linked Khmer staff name for this login, if a bulk-created account has one."""
+    uname = username or current_user()
+    if not uname:
+        return ""
+    try:
+        rec = load_users().get(uname, {})
+        return str(rec.get("staff_name") or "").strip()
+    except Exception:
+        return ""
 
 
 def _new_user(role, password, must_change):
@@ -628,7 +671,7 @@ def _login_guard():
 
 
 def _clear_session():
-    for k in ("role", "user", "login_time", "must_change", "sel_cust"):
+    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff"):
         st.session_state.pop(k, None)
 
 
@@ -2917,7 +2960,10 @@ def _delivery_log():
 
 def _dispatch_body():
     st.markdown("### 🚚 Delivery")
-    me = st.selectbox("👷 I am (choose your name once — office staff or delivery driver)", ["-- Select Staff --"] + DELIVERY_HANDLERS, key="me_staff")
+    linked_staff = staff_name_for_user()
+    default_staff_index = DELIVERY_HANDLERS.index(linked_staff) + 1 if linked_staff in DELIVERY_HANDLERS else 0
+    me = st.selectbox("👷 I am (choose your name once — office staff or delivery driver)",
+                      ["-- Select Staff --"] + DELIVERY_HANDLERS, index=default_staff_index, key="me_staff")
     st.caption("Both delivery drivers can select their own names here, choose customers, mark deliveries as sent, and check any expenses under their names.")
     ctx = delivery_context()
     mine = [r for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
@@ -3841,8 +3887,98 @@ def _users_panel():
     if shown:
         st.success(f"Temporary password for **{shown[0]}**: `{shown[1]}`  - give it to the person. "
                    "They must choose their own password at the first login. This message appears only once.")
+
+    st.markdown("#### 👥 Quick setup for all staff")
+    st.caption("Creates accounts for 8 operations staff, 2 delivery drivers, and 4 sales staff using the short English usernames selected by you. "
+               "Operations staff and delivery drivers can use Packing, Delivery, and Dashboard; Sales staff can view Dashboard and reports. "
+               "If an older account is linked to the same staff name, setup renames it and keeps its existing password and role.")
+    if st.button("✅ Create / update staff usernames", key="create_all_staff_accounts", type="primary"):
+        outcome = {"created": [], "renamed": [], "skipped": []}
+        # Prevent a stale temporary-credentials table from showing after a rename-only run.
+        st.session_state.pop("staff_account_setup_credentials", None)
+
+        def _create_team_accounts(u):
+            created, renamed, skipped = [], [], []
+            for spec in STAFF_ACCOUNT_SPECS:
+                uname = spec["username"]
+                if uname in u:
+                    rec = u.get(uname, {})
+                    same_person = str(rec.get("staff_name") or "").strip() == spec["name"]
+                    if same_person:
+                        skipped.append({"Staff name": spec["name"], "Username": uname, "Reason": "Name-based username already exists"})
+                    else:
+                        skipped.append({"Staff name": spec["name"], "Username": uname, "Reason": "Username is already used by another account"})
+                    continue
+
+                # Check each earlier username, but migrate only an account whose saved
+                # staff name and role both match this person. Never take over an unrelated account.
+                aliases = spec.get("legacy_usernames") or ([spec["legacy_username"]] if spec.get("legacy_username") else [])
+                legacy = None
+                for alias in aliases:
+                    if alias == uname or alias not in u:
+                        continue
+                    legacy_rec = u.get(alias, {})
+                    if (str(legacy_rec.get("staff_name") or "").strip() == spec["name"] and
+                            legacy_rec.get("role") == spec["role"]):
+                        legacy = alias
+                        break
+                if legacy:
+                    # Preserve the full existing account record and password hash; only change its login ID.
+                    u[uname] = u.pop(legacy)
+                    renamed.append({"Staff name": spec["name"], "Old username": legacy, "New username": uname})
+                    continue
+
+                pw = generate_easy_password(uname)
+                rec = _new_user(spec["role"], pw, must_change=True)
+                rec["staff_name"] = spec["name"]
+                u[uname] = rec
+                created.append({"Staff name": spec["name"], "Username": uname, "Role": ROLE_LABEL.get(spec["role"], spec["role"]),
+                                "Temporary password": pw})
+            outcome["created"] = created
+            outcome["renamed"] = renamed
+            outcome["skipped"] = skipped
+            return u
+
+        try:
+            modify_users(_create_team_accounts)
+            st.session_state["staff_account_setup_result"] = {
+                "created_count": len(outcome["created"]),
+                "renamed": outcome["renamed"],
+                "skipped": outcome["skipped"],
+            }
+            if outcome["created"]:
+                st.session_state["staff_account_setup_credentials"] = outcome["created"]
+            audit("staff_accounts_bulk_created", f"created={len(outcome['created'])}, renamed={len(outcome['renamed'])}, skipped={len(outcome['skipped'])}")
+            st.rerun()
+        except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
+            st.error(f"❌ Could not create staff accounts: {err}")
+
+    setup_result = st.session_state.get("staff_account_setup_result")
+    if setup_result:
+        st.info(f"Created {setup_result['created_count']} new account(s), renamed {len(setup_result.get('renamed', []))} old username(s), "
+                f"and skipped {len(setup_result['skipped'])} existing username(s). Renamed accounts keep their existing password.")
+        if setup_result.get("renamed"):
+            with st.expander("View renamed staff usernames"):
+                show_df(pd.DataFrame(setup_result["renamed"]))
+        if setup_result["skipped"]:
+            with st.expander("View skipped accounts"):
+                show_df(pd.DataFrame(setup_result["skipped"]))
+    credentials = st.session_state.get("staff_account_setup_credentials")
+    if credentials:
+        st.warning("Copy or download these temporary passwords now and give each one only to that staff member. "
+                   "Passwords are not saved in readable form in the accounts file; each user must change their password at first login. "
+                   "This list stays visible only in this Admin session until you hide it.")
+        cred_df = pd.DataFrame(credentials)
+        st.dataframe(cred_df, hide_index=True, use_container_width=True)
+        st.download_button("⬇️ Download staff login list (CSV)", data=cred_df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="staff_initial_logins.csv", mime="text/csv", key="download_staff_initial_logins")
+        if st.button("🙈 Hide temporary passwords", key="hide_staff_initial_logins"):
+            st.session_state.pop("staff_account_setup_credentials", None)
+            st.rerun()
+
     show_df(pd.DataFrame([{
-        "Username": u, "Role": r.get("role"), "Active": "yes" if r.get("active", True) else "NO",
+        "Staff name": r.get("staff_name", ""), "Username": u, "Role": r.get("role"),
+        "Active": "yes" if r.get("active", True) else "NO",
         "Starter password": "yes" if r.get("must_change") else "",
         "Last login": r.get("last_login", ""), "Password changed": r.get("pw_changed", "")}
         for u, r in sorted(users.items())]))
