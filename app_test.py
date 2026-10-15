@@ -1906,11 +1906,13 @@ def flash_and_refresh(msg):
 # FORMS
 # ==========================================
 BASE_VIA = "Grab/TukTuk"
+SELF_DELIVERY = "My own delivery (self-delivered)"
 PICKUP_VIA = "Customer pick-up (មកយកខ្លួនឯង)"      # not our delivery: the customer collects the buns
 
 
 def via_options():
-    return [BASE_VIA] + LOCAL_DRIVERS + [PICKUP_VIA]
+    # Self-delivery is a real delivery task, but it does not require a transport expense.
+    return [BASE_VIA, SELF_DELIVERY] + LOCAL_DRIVERS + [PICKUP_VIA]
 
 
 def expense_status(via, station, pp, taxi):
@@ -1956,15 +1958,17 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
 
         st.markdown("---")
         st.markdown("#### Transportation Details")
-        local_driver = st.selectbox("Local Driver (Phnom Penh) - choose Customer pick-up if the customer collects it themselves:",
-                                    ["None (Grab/TukTuk)"] + LOCAL_DRIVERS + [PICKUP_VIA], key=f"{k}_drv")
+        local_driver = st.selectbox(
+            "Delivery method - choose My own delivery if the selected staff member delivers it themselves:",
+            ["None (Grab/TukTuk)", SELF_DELIVERY] + LOCAL_DRIVERS + [PICKUP_VIA], key=f"{k}_drv")
         taxi_station = st.text_input("Taxi Station Name (Leave blank if purely local Phnom Penh delivery):",
                                      max_chars=MAX_TEXT, key=f"{k}_taxi")
         delivery_note = st.text_input("📝 Note (Optional: Taxi phone number, plate, or instructions):",
                                       max_chars=MAX_TEXT, key=f"{k}_note")
 
         st.markdown("#### Expenses (៛ Riel) - optional now, you can fill them later in the Delivery tab")
-        pp_expense = st.number_input("1. Phnom Penh Expense (៛) - Enter 0 if using own driver:",
+        st.caption("For My own delivery or a named local driver, leave Phnom Penh transport expense at 0 unless you actually paid a transport fee.")
+        pp_expense = st.number_input("1. Phnom Penh Expense (៛) - Enter 0 if using own delivery / local driver:",
                                      min_value=0, max_value=MAX_RIEL, step=500, key=f"{k}_pp")
         taxi_expense = st.number_input("2. Taxi Expense (៛) - Enter 0 if local delivery:",
                                        min_value=0, max_value=MAX_RIEL, step=500, key=f"{k}_te")
@@ -2601,7 +2605,7 @@ def _claim_tab(me, ctx):
 
 
 def _send_tab(me, ctx):
-    st.caption("Tick the customers whose buns you have **sent**. Expenses can be filled later in step 3.")
+    st.caption("Tick the customers whose buns you have **sent**. Choose **My own delivery** when you deliver it yourself; no transport expense is required unless a taxi station is also recorded. Expenses can be filled later in step 3.")
     include_free = st.checkbox("Also show customers nobody has taken yet", key="send_free")
     assigned = ctx["assigned"]
     recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND
@@ -2689,7 +2693,7 @@ def pending_expense_df(who, scope):
 
 def _expense_tab(me):
     is_admin = current_role() == "admin"
-    st.caption("Fill in what you spent for the deliveries you already sent. Tick **Done** for each row you finish, then save.")
+    st.caption("Fill in expenses for deliveries you already sent. Self-delivered orders need no transport expense unless a taxi station is recorded. Tick **Done** for each row you finish, then save.")
     c1, c2 = st.columns(2)
     scope = c1.radio("Show", ["Today", "Last 7 days", "All waiting"], horizontal=True, key="exp_scope")
     who = me
