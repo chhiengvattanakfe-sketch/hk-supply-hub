@@ -69,6 +69,7 @@ BOT_LOG_FILE = os.path.join(DATA_DIR, "bot_log.csv")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit_log.csv")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")          # accounts (passwords are stored hashed, never as text)
 ASSIGN_FILE = os.path.join(DATA_DIR, "delivery_assignments.csv")   # who will deliver which customer today
+HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers moved to tomorrow / cancelled
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache")       # outside Dropbox = faster
@@ -112,15 +113,21 @@ DISPATCH_COLS = ["Date", "Handled_By", "Customer", "Cases", "Local_Driver",
 DISPATCH_NUM_COLS = ["Cases", "Phnom_Penh_Expense", "Taxi_Expense"]
 PACKING_COLS = ["Date", "Prepared_By", "Customer", "Cases_Packed", "Status"]
 ASSIGN_COLS = ["Date", "Handler", "Customer", "Action"]
+HOLD_COLS = ["Date", "Customer", "Action", "Cases", "Reason", "By"]   # Action: Tomorrow | Cancel | Restore
+HOLD_NUM_COLS = ["Cases"]
+ST_MOVED, ST_CANCEL = "📅 Moved to tomorrow", "❌ Cancelled"
+NOT_TO_SEND = ("✅ Sent", ST_MOVED, ST_CANCEL)
 PACKING_NUM_COLS = ["Cases_Packed"]
 NUM_COLS_ALL = set(DISPATCH_NUM_COLS + PACKING_NUM_COLS)
 FILES = {
     "dispatch": (DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, "Dispatch CSV"),
     "packing": (PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, "Packing CSV"),
     "assign": (ASSIGN_FILE, ASSIGN_COLS, [], "Assignments CSV"),
+    "holds": (HOLD_FILE, HOLD_COLS, HOLD_NUM_COLS, "Moved / cancelled CSV"),
 }
 
-STATUS_RANK = {"✅ Sent": 1, "🔵 Partial": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5}
+STATUS_RANK = {"✅ Sent": 1, "🔵 Partial": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5,
+               "📅 Moved to tomorrow": 6, "❌ Cancelled": 7}
 ROLE_LABEL = {"admin": "Admin", "staff": "Staff", "viewer": "Viewer (read-only)"}
 
 
@@ -1130,7 +1137,7 @@ def daily_backup_once(day_str):
                 dbx.files_create_folder_v2(_remote_backup_dir())
             except Exception:
                 pass                                        # already exists
-            for f in (DATA_FILE, PACKING_FILE, ASSIGN_FILE):
+            for f in (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE):
                 base = os.path.basename(f)
                 dest = f"{_remote_backup_dir()}/{day_str}_{base}"
                 try:
@@ -1145,7 +1152,7 @@ def daily_backup_once(day_str):
                     pass
         else:
             os.makedirs(BACKUP_DIR, exist_ok=True)
-            for f in (DATA_FILE, PACKING_FILE, ASSIGN_FILE):
+            for f in (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE):
                 dest = os.path.join(BACKUP_DIR, f"{day_str}_{os.path.basename(f)}")
                 if os.path.exists(f) and not os.path.exists(dest):
                     shutil.copy2(f, dest)
@@ -2489,7 +2496,7 @@ def delivery_context():
 def _claim_tab(me, ctx):
     st.caption("Choose the customers **you** will deliver today, before you start. Other staff will see they are taken. "
                "You can release a customer again if you cannot go.")
-    recs = [r for r in ctx["recs"] if r["Status"] != "✅ Sent"]
+    recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND]
     f1, f2 = st.columns(2)
     area = f1.radio("Show", ["All", AREA_LABEL[PP], AREA_LABEL["Province"]], horizontal=True, key="claim_area")
     q = f2.text_input("🔎 Search customer", key="claim_q", max_chars=60)
@@ -2537,7 +2544,7 @@ def _claim_tab(me, ctx):
                 except (RuntimeError, ConflictError, PermissionError) as err:
                     st.error(f"⚠️ Could not save: {err}")
 
-    mine = [r["Customer"] for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] != "✅ Sent"]
+    mine = [r["Customer"] for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
     pool = mine if current_role() != "admin" else [c for c in ctx["assigned"] if c in {r["Customer"] for r in ctx["recs"]}]
     with st.expander(f"↩️ Release customers ({len(mine)} are mine)"):
         rel = st.multiselect("Customers I will NOT deliver after all", pool, key="claim_release")
@@ -2554,7 +2561,7 @@ def _send_tab(me, ctx):
     st.caption("Tick the customers whose buns you have **sent**. Expenses can be filled later in step 3.")
     include_free = st.checkbox("Also show customers nobody has taken yet", key="send_free")
     assigned = ctx["assigned"]
-    recs = [r for r in ctx["recs"] if r["Status"] != "✅ Sent"
+    recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND
             and (assigned.get(r["Customer"]) == me or (include_free and r["Customer"] not in assigned))]
     if not recs:
         st.info("You have no customers to send. Choose your customers in step 1 first.")
@@ -2823,7 +2830,7 @@ def _dispatch_body():
     st.markdown("### 🚚 Delivery")
     me = st.selectbox("👷 I am (choose your name once)", ["-- Select Staff --"] + OPS_STAFF, key="me_staff")
     ctx = delivery_context()
-    mine = [r for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] != "✅ Sent"]
+    mine = [r for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
     n_wait = len(pending_expense_df(me, "All waiting")) if me != "-- Select Staff --" else 0
     if me != "-- Select Staff --":
         st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📌 To send <b>{len(mine)}</b></span>"
@@ -2868,7 +2875,7 @@ def _join_unique(series, sep=", ", limit=3):
 
 
 DASH_COLUMNS = ["🔥", "Customer", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Prepared By",
-                "Assigned To", "Sent Cases", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Note", "Time", "Source"]
+                "Assigned To", "Sent Cases", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Moved/Cancel Reason", "Note", "Time", "Source"]
 
 
 def build_report(selected_date):
@@ -2883,6 +2890,19 @@ def build_report(selected_date):
             scheduled[name] = {"cases": int(tot) if pd.notna(tot) else None,
                                "invoice": _join_unique(g["Invoice"]),
                                "remark": _join_unique(g["Remark"], sep=" / ")}
+
+    # customers moved here from yesterday (they may not be in today's journal)
+    holds = current_holds(selected_date)
+    for cust, h in current_holds(selected_date - timedelta(days=1)).items():
+        if h["action"] != "Tomorrow":
+            continue
+        prev = f"📅 Moved from {selected_date - timedelta(days=1)}" + (f" ({h['reason']})" if h["reason"] not in ("", "-") else "")
+        if cust in scheduled:
+            scheduled[cust]["remark"] = _join_unique([scheduled[cust]["remark"], prev], sep=" / ")
+            if h["cases"] > 0:
+                scheduled[cust]["cases"] = (scheduled[cust]["cases"] or 0) + h["cases"]
+        else:
+            scheduled[cust] = {"cases": h["cases"] or None, "invoice": "-", "remark": prev}
 
     pack_info = {}
     df_pack = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), selected_date)
@@ -2920,6 +2940,9 @@ def build_report(selected_date):
             status = "🟠 Packing" if "In Progress" in p["status"] else "🟡 Ready for Delivery"
         else:
             status = "⏳ Pending"
+        h = holds.get(cust)
+        if h:
+            status = ST_MOVED if h["action"] == "Tomorrow" else ST_CANCEL
         urgent = any(w.upper() in remark.upper() for w in URGENT_WORDS)
         rows.append({
             "🔥": "🔥" if urgent else "", "Customer": cust, "Area": AREA_LABEL[area], "Province": province,
@@ -2932,6 +2955,7 @@ def build_report(selected_date):
             "Taxi Station": (s["station"] if s else "") if area == "Province" else "",
             "Taxi No.": (s["taxi_no"] if s else "") if area == "Province" else "",
             "Journal Note": remark,
+            "Moved/Cancel Reason": (f"{h['reason']} (by {h['by']})" if h else ""),
             "Note": s["note"] if s else "-", "Time": s["time"] if s else "-",
             "Source": "Journal" if info else "⚠️ Not in journal",
         })
@@ -2956,7 +2980,8 @@ def summarize(df, by):
                 Partial=("Status", lambda x: int((x == "🔵 Partial").sum())),
                 Ordered=("កេស", lambda x: int(x.fillna(0).sum())),
                 Packed=("Packed Cases", "sum"), Sent=("Sent Cases", "sum")).reset_index()
-    out["Waiting"] = out["Customers"] - out["Delivered"]
+    held = g["Status"].apply(lambda x: int(x.isin([ST_MOVED, ST_CANCEL]).sum())).values
+    out["Waiting"] = out["Customers"] - out["Delivered"] - held
     out["% delivered"] = (out["Delivered"] * 100 // out["Customers"].clip(lower=1)).astype(int).astype(str) + "%"
     return out.sort_values("Customers", ascending=False).reset_index(drop=True)
 
@@ -2968,7 +2993,8 @@ def map_data(df, metric):
         part = df[df["Province"].isin(PROVINCES)]
         for prov, g in part.groupby("Province"):
             delivered = int((g["Status"] == "✅ Sent").sum())
-            agg[prov] = {"customers": len(g), "waiting": len(g) - delivered, "ordered": int(g["កេស"].fillna(0).sum()),
+            held = int(g["Status"].isin([ST_MOVED, ST_CANCEL]).sum())
+            agg[prov] = {"customers": len(g), "waiting": len(g) - delivered - held, "ordered": int(g["កេស"].fillna(0).sum()),
                          "sent": int(g["Sent Cases"].sum())}
     rows = []
     for prov, (lat, lon, region, _) in PROVINCES.items():
@@ -3010,9 +3036,22 @@ def render_cambodia_map(df, metric):
             st.bar_chart(dm.set_index("province")["value"])
 
 
+def current_holds(day):
+    """{customer: {"action","cases","reason","by"}} for a day. The last Tomorrow / Cancel / Restore of each customer wins."""
+    df = rows_for_day(read_raw(HOLD_FILE, HOLD_COLS), day)
+    out = {}
+    for r in df.to_dict("records"):
+        if r["Action"] in ("Tomorrow", "Cancel"):
+            out[r["Customer"]] = {"action": r["Action"], "cases": _int(r["Cases"]), "reason": str(r["Reason"]), "by": str(r["By"])}
+        elif r["Action"] == "Restore":
+            out.pop(r["Customer"], None)
+    return out
+
+
 STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Partial": ("#1565c0", "#ffffff"),
                 "🟡 Ready for Delivery": ("#f9a825", "#222222"), "🟠 Packing": ("#ef6c00", "#ffffff"),
-                "⏳ Pending": ("#757575", "#ffffff")}
+                "⏳ Pending": ("#757575", "#ffffff"), "📅 Moved to tomorrow": ("#6a1b9a", "#ffffff"),
+                "❌ Cancelled": ("#b71c1c", "#ffffff")}
 COMPACT_COLUMNS = ["🔥", "Customer", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
 _REGION_ORDER = {r: i for i, r in enumerate(REGIONS)}
 
@@ -3031,7 +3070,7 @@ def _e(x):
 
 def kpi_strip(counts, total):
     items = [("⏳ Pending", "⏳ Pending"), ("🟠 Packing", "🟠 Packing"), ("🟡 Ready", "🟡 Ready for Delivery"),
-             ("🔵 Partial", "🔵 Partial"), ("✅ Sent", "✅ Sent")]
+             ("🔵 Partial", "🔵 Partial"), ("✅ Sent", "✅ Sent"), ("📅 Moved", ST_MOVED), ("❌ Cancelled", ST_CANCEL)]
     pills = "".join(f"<span class='hk-pill'>{lab} <b>{int(counts.get(key, 0))}</b></span>" for lab, key in items)
     return f"<div class='hk-kpis'>{pills}<span class='hk-pill'>👥 Total <b>{total}</b></span></div>"
 
@@ -3111,7 +3150,8 @@ def _dashboard_body():
         return
 
     counts = df_scope["Status"].value_counts()
-    total, n_sent = len(df_scope), int(counts.get("✅ Sent", 0))
+    total, n_sent = len(df_scope) - int(counts.get(ST_CANCEL, 0)), int(counts.get("✅ Sent", 0))
+    total = max(total, 1)
     st.markdown(kpi_strip(counts, total), unsafe_allow_html=True)
     st_keys = [k for k in STATUS_RANK if int(counts.get(k, 0)) > 0]
     pick_one = st.radio("👆 Click a status to see its customers in the table", ["All"] + st_keys, horizontal=True,
@@ -3143,10 +3183,7 @@ def _dashboard_body():
     with c3:
         st.write("")
         try:
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df_report.to_excel(writer, index=False, sheet_name="Master_Status")
-            st.download_button("📥 Download report (Excel)", data=buf.getvalue(),
+            st.download_button("📥 Download detailed report (Excel)", data=build_report_excel(df_report, selected_date),
                                file_name=f"Master_Report_{selected_date}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except Exception as e:
@@ -3250,14 +3287,138 @@ def _dashboard_body():
     pack_default = max((ordered_n or 0) - packed_n, 0) or 1
     send_default = (target_n - sent_n) if (target_n - sent_n) > 0 else 1
 
-    t_pack, t_send = st.tabs(["📦 Step 1: Packing (who prepared the buns)",
-                              "🚚 Step 2: Send (who delivered + verify កេស)"])
+    t_pack, t_send, t_hold = st.tabs(["📦 Step 1: Packing (who prepared the buns)",
+                                      "🚚 Step 2: Send (who delivered + verify កេស)",
+                                      "📅 Move to tomorrow / ❌ Cancel"])
     with t_pack:
         packing_form(f"dash_pack_{selected}_{pack_default}", fixed_customer=selected, default_cases=pack_default)
     with t_send:
         st.caption("Check the កេស number (you can edit it), choose who verified it, then save.")
         dispatch_form(f"dash_send_{selected}_{send_default}", fixed_customer=selected,
                       default_cases=send_default, verify=True)
+    with t_hold:
+        _hold_panel(selected, p_row, target_n - sent_n)
+
+
+def _hold_panel(selected, p_row, left):
+    """Move a customer to tomorrow, cancel the order, or bring it back."""
+    status = p_row["Status"]
+    if status in (ST_MOVED, ST_CANCEL):
+        st.warning(f"This customer is now **{status}** - {p_row['Moved/Cancel Reason'] or 'no reason written'}")
+        c1, c2 = st.columns(2)
+        who = c1.selectbox("Who is doing this?", ["-- Select Staff --"] + OPS_STAFF, key=f"hold_who_{selected}")
+        if c2.button("↩ Put back as normal (today)", key=f"hold_back_{selected}"):
+            if who.startswith("--"):
+                st.error("Choose your name first.")
+            else:
+                try:
+                    append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "Restore", "Cases": 0,
+                                           "Reason": "-", "By": who})
+                    audit("hold_restore", f"{who}: {selected}")
+                    flash_and_refresh(f"{selected} is back on today's list")
+                except (RuntimeError, ConflictError) as e:
+                    st.error(f"❌ {e}")
+        return
+    if status == "✅ Sent":
+        st.success("This customer is already fully sent - nothing to move or cancel.")
+        return
+    st.caption("📅 **Tomorrow**: the customer leaves today's to-send lists and appears automatically on tomorrow's board "
+               "with the remaining កេស.  ❌ **Cancel**: the order is closed and not counted as waiting.  "
+               "Everything stays in the report with your reason, so you can see it later.")
+    action = st.radio("What do you want to do?", ["📅 Move to tomorrow", "❌ Cancel the order"], horizontal=True,
+                      key=f"hold_act_{selected}")
+    c1, c2 = st.columns(2)
+    reason = c1.selectbox("Reason", ["Customer asked to wait", "Not enough stock", "Cannot reach customer",
+                                     "Transport problem", "Customer cancelled", "Other"], key=f"hold_reason_{selected}")
+    extra = c2.text_input("Extra note (optional)", max_chars=80, key=f"hold_note_{selected}")
+    cases = st.number_input("កេស to carry to tomorrow", min_value=0, max_value=MAX_CASES, step=1,
+                            value=max(int(left), 0), key=f"hold_cases_{selected}") if action.startswith("📅") else 0
+    who = st.selectbox("Who is doing this?", ["-- Select Staff --"] + OPS_STAFF, key=f"hold_who2_{selected}")
+    if st.button("💾 Save", type="primary", key=f"hold_save_{selected}"):
+        if who.startswith("--"):
+            st.error("Choose your name first.")
+            return
+        act = "Tomorrow" if action.startswith("📅") else "Cancel"
+        why = reason + (f" - {extra.strip()}" if extra.strip() else "")
+        try:
+            append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": act, "Cases": int(cases),
+                                   "Reason": why, "By": who})
+            audit("hold_" + act.lower(), f"{who}: {selected} ({why})")
+            st.session_state.pop("sel_cust", None)
+            st.session_state["clear_sel"] = True
+            flash_and_refresh(f"{selected}: {'moved to tomorrow' if act == 'Tomorrow' else 'cancelled'}")
+        except (RuntimeError, ConflictError) as e:
+            st.error(f"❌ {e}")
+
+
+def build_report_excel(df, day):
+    """Nicely formatted multi-sheet Excel: Summary, All customers, one sheet per status, Province taxi, Deliveries & expenses."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    disp = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), day)
+    disp = disp[DISPATCH_COLS + ["Time"]] if not disp.empty else pd.DataFrame(columns=DISPATCH_COLS + ["Time"])
+    clean = df.drop(columns=[c for c in ("🔥",) if c in df.columns]).copy()
+    clean.insert(0, "🔥", df["🔥"])
+    total = len(df)
+    n = lambda stt: int((df["Status"] == stt).sum())
+    summary = [["Report date", str(day)], ["Customers", total]]
+    summary += [[k, n(k)] for k in STATUS_RANK]
+    summary += [["Cases ordered (កេស)", int(df["កេស"].fillna(0).sum())], ["Cases packed", int(df["Packed Cases"].sum())],
+                ["Cases sent", int(df["Sent Cases"].sum())],
+                ["Phnom Penh expense (៛)", int(disp["Phnom_Penh_Expense"].sum()) if not disp.empty else 0],
+                ["Taxi expense (៛)", int(disp["Taxi_Expense"].sum()) if not disp.empty else 0],
+                ["Expenses still to fill", int((disp["Expense_Status"] == "Pending").sum()) if not disp.empty else 0]]
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame(summary, columns=["Item", "Value"]).to_excel(w, index=False, sheet_name="Summary", startrow=0)
+        r0 = len(summary) + 3
+        for title, by in (("By area", "Area"), ("By region", "Region"), ("By province", "Province")):
+            t = summarize(df, by)
+            t.to_excel(w, index=False, sheet_name="Summary", startrow=r0)
+            w.sheets["Summary"].cell(row=r0, column=1).value = by
+            r0 += len(t) + 3
+        clean.to_excel(w, index=False, sheet_name="All customers")
+        for stt, short in ((ST_MOVED, "Moved tomorrow"), (ST_CANCEL, "Cancelled"), ("⏳ Pending", "Pending"),
+                           ("🟡 Ready for Delivery", "Ready"), ("🔵 Partial", "Partial"), ("✅ Sent", "Sent")):
+            part = clean[clean["Status"] == stt]
+            if not part.empty:
+                part.to_excel(w, index=False, sheet_name=short)
+        prov = clean[clean["Area"] == AREA_LABEL["Province"]][["Customer", "Province", "Region", "Status", "កេស", "Sent Cases",
+                                                              "Taxi Station", "Taxi No.", "Driver/Station", "Invoice"]]
+        if not prov.empty:
+            prov.to_excel(w, index=False, sheet_name="Province taxi")
+        if not disp.empty:
+            disp.to_excel(w, index=False, sheet_name="Deliveries & expenses")
+        colors = {k: v[0].lstrip("#") for k, v in STATUS_STYLE.items()}
+        thin = Side(style="thin", color="DDDDDD")
+        for ws in w.book.worksheets:
+            hdr_fill = PatternFill("solid", fgColor="1F3864")
+            for c in ws[1]:
+                c.font, c.fill = Font(bold=True, color="FFFFFF"), hdr_fill
+                c.alignment = Alignment(wrap_text=True, vertical="center")
+            ws.freeze_panes = "A2"
+            if ws.title != "Summary":
+                ws.auto_filter.ref = ws.dimensions
+            for i, col in enumerate(ws.columns, 1):
+                width = max((len(str(c.value)) for c in list(col)[:200] if c.value is not None), default=8)
+                ws.column_dimensions[get_column_letter(i)].width = min(max(width + 2, 8), 45)
+            heads = [c.value for c in ws[1]]
+            if "Status" in heads:
+                si = heads.index("Status") + 1
+                for row in ws.iter_rows(min_row=2):
+                    cell = row[si - 1]
+                    if cell.value in colors:
+                        cell.fill = PatternFill("solid", fgColor=colors[cell.value])
+                        cell.font = Font(bold=True, color="222222" if cell.value == "🟡 Ready for Delivery" else "FFFFFF")
+                    for c in row:
+                        c.border = Border(bottom=thin)
+            for h_name in ("Phnom_Penh_Expense", "Taxi_Expense"):
+                if h_name in heads:
+                    for row in ws.iter_rows(min_row=2, min_col=heads.index(h_name) + 1, max_col=heads.index(h_name) + 1):
+                        row[0].number_format = "#,##0"
+        ws = w.book["Summary"]
+        ws.column_dimensions["A"].width = 30
+    return buf.getvalue()
 
 
 def tab_dashboard(live):
