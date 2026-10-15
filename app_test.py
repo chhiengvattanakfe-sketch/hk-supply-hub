@@ -1816,6 +1816,29 @@ def safe_render(fn, label):
             st.rerun()
 
 
+def customer_choices(day=None):
+    """(options, label_fn, journal_set) for the customer pickers.
+    Customers that have an order in the sale journal for the day come first (🧾); every other customer of the master list
+    can still be chosen (marked 'not in journal'), so a delivery is never blocked."""
+    snap, _, _, err = current_snapshot()
+    day = day or today_kh()
+    first, jset = [], set()
+    if snap:
+        j = snap["journal"]
+        first = sorted({n for n in j[j["Date"] == day]["Customer"]}, key=str.casefold)
+        jset = set(first)
+    rest = [c for c in get_customer_list() if c not in jset]
+    options = ["-- Select a Customer --"] + first + rest
+
+    def label(c):
+        if c in jset:
+            return f"🧾 {c}"
+        if c.startswith("--") or c.startswith("⚠️"):
+            return c
+        return f"{c}   (not in today's journal)"
+    return options, label, jset
+
+
 # ==========================================
 # UI HELPERS
 # ==========================================
@@ -1915,8 +1938,9 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
         st.markdown("#### Order Details")
         dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
         if fixed_customer is None:
-            customer_name = st.selectbox("Customer Name / ID (Type to search):",
-                                         ["-- Select a Customer --"] + get_customer_list(), key=f"{k}_cust")
+            opts, lab, jset = customer_choices()
+            customer_name = st.selectbox(f"Customer Name / ID (Type to search) - 🧾 = has an order in today's sale journal ({len(jset)}):",
+                                         opts, format_func=lab, key=f"{k}_cust")
         else:
             customer_name = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
@@ -1971,7 +1995,8 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
                         "Expense_Status": expense_status(handler_local, taxi_station, pp_expense, taxi_expense),
                     })
                     audit("dispatch", f"{customer_name} | {cases} cases | by {dispatched_by}")
-                    flash_and_refresh(f"Dispatched by {dispatched_by}: {customer_name} | {cases} កេស")
+                    nj = "" if (fixed_customer is not None or customer_name in jset) else "  ⚠️ not in today's sale journal"
+                    flash_and_refresh(f"Dispatched by {dispatched_by}: {customer_name} | {cases} កេស{nj}")
                 except Exception as save_err:
                     bot_log("error", "Save dispatch", str(save_err), "-")
                     st.error(f"⚠️ Could not save: {save_err}")
@@ -1981,8 +2006,9 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
     k = form_key
     with st.form(form_key, clear_on_submit=True):
         if fixed_customer is None:
-            customer = st.selectbox("Customer Name / ID (Type to search):",
-                                    ["-- Select a Customer --"] + get_customer_list(), key=f"{k}_cust")
+            opts, lab, jset = customer_choices()
+            customer = st.selectbox(f"Customer Name / ID (Type to search) - 🧾 = has an order in today's sale journal ({len(jset)}):",
+                                    opts, format_func=lab, key=f"{k}_cust")
         else:
             customer = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
@@ -2014,7 +2040,8 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
                         "Status": pack_status,
                     })
                     audit("packing", f"{customer} | {cases_packed} cases | by {prepared_by}")
-                    flash_and_refresh(f"Packing logged: {customer} | {cases_packed} cases | {pack_status}")
+                    nj = "" if (fixed_customer is not None or customer in jset) else "  ⚠️ not in today's sale journal"
+                    flash_and_refresh(f"Packing logged: {customer} | {cases_packed} cases | {pack_status}{nj}")
                 except Exception as err:
                     bot_log("error", "Save packing", str(err), "-")
                     st.error(f"⚠️ Could not save: {err}")
