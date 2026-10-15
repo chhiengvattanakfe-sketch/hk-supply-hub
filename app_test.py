@@ -2881,6 +2881,34 @@ def _delivery_log():
         Waiting=("Expense_Status", lambda x: int((x == "Pending").sum()))).reset_index()
     show_df(per_staff)
 
+    # Pick a staff member to inspect the delivery tasks they completed today.
+    st.markdown("**🔎 Check completed delivery tasks by staff**")
+    recorded_staff = [str(x).strip() for x in df_today["Handled_By"].dropna().tolist()
+                      if str(x).strip() and str(x).strip() not in ("-", "nan", "None")]
+    staff_options = ["-- Select Staff --"] + sorted(set(OPS_STAFF).union(recorded_staff))
+    selected_staff = st.selectbox(
+        "Select staff name to see their completed tasks",
+        staff_options,
+        key="dispatch_completed_staff",
+    )
+    if selected_staff == "-- Select Staff --":
+        st.caption("Choose a staff member to see the customers and cases they dispatched today.")
+    else:
+        staff_tasks = df_today[df_today["Handled_By"].astype(str).str.strip() == selected_staff].copy()
+        if staff_tasks.empty:
+            st.info(f"No delivery tasks recorded for {selected_staff} today.")
+        else:
+            cases_done = int(pd.to_numeric(staff_tasks["Cases"], errors="coerce").fillna(0).sum())
+            expense_waiting = int((staff_tasks["Expense_Status"] == "Pending").sum())
+            k1, k2, k3 = st.columns(3)
+            kpi(k1, "Completed delivery slips", len(staff_tasks))
+            kpi(k2, "Cases dispatched", cases_done)
+            kpi(k3, "Expenses still pending", expense_waiting)
+            task_cols = [c for c in ["Time", "Customer", "Cases", "Note", "Local_Driver", "Taxi_Station",
+                                     "Phnom_Penh_Expense", "Taxi_Expense", "Expense_Status", "Verified_By"]
+                         if c in staff_tasks.columns]
+            show_df(staff_tasks[task_cols])
+
 
 def _dispatch_body():
     st.markdown("### 🚚 Delivery")
