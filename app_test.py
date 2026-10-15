@@ -2914,7 +2914,7 @@ def _join_unique(series, sep=", ", limit=3):
     return sep.join(vals)
 
 
-DASH_COLUMNS = ["🔥", "Customer", "In Master", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Prepared By",
+DASH_COLUMNS = ["🔥", "Customer", "In Master", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Packed Note", "Prepared By",
                 "Assigned To", "Sent Cases", "Left to send", "Sent Note", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Moved/Cancel Reason", "Note", "Time", "Source"]
 
 
@@ -2934,6 +2934,7 @@ def build_report(selected_date):
     # customers moved here from yesterday (they may not be in today's journal)
     holds = current_holds(selected_date)
     finals = current_final(selected_date)
+    finals_p = current_final(selected_date, "Packed")
     for cust, h in current_holds(selected_date - timedelta(days=1)).items():
         if h["action"] != "Tomorrow":
             continue
@@ -2969,10 +2970,12 @@ def build_report(selected_date):
     master_names = {norm_name(n) for n in snap["customers"]} if snap else set()
     ignore = {norm_name(n) for n in IGNORE_NEW}
     rows = []
-    for cust in set(scheduled) | set(pack_info) | set(sent_info) | set(finals):
+    for cust in set(scheduled) | set(pack_info) | set(sent_info) | set(finals) | set(finals_p):
         p, s, info = pack_info.get(cust), sent_info.get(cust), scheduled.get(cust)
         area, province, region, _how = resolve_location(cust, areas.get(norm_name(cust)), overrides.get(norm_name(cust)))
-        packed = p["cases"] if p else 0
+        finp = finals_p.get(cust)
+        sys_packed = p["cases"] if p else 0
+        packed = finp["cases"] if finp else sys_packed          # a hand-set FINAL packed number replaces the packing logs
         sys_sent = s["cases"] if s else 0
         fin = finals.get(cust)
         sent = fin["cases"] if fin else sys_sent               # a hand-set FINAL number replaces the sum of the delivery slips
@@ -2981,8 +2984,8 @@ def build_report(selected_date):
         target = packed if packed > 0 else (ordered or 0)
         if sent > 0 or (s and not fin):
             status = "🔵 Part sent" if (target > 0 and sent < target) else "✅ Sent"
-        elif p:
-            status = "🟠 Packing" if "In Progress" in p["status"] else "🟡 Ready for Delivery"
+        elif p or finp:
+            status = "🟠 Packing" if (p and not finp and "In Progress" in p["status"]) else "🟡 Ready for Delivery"
         else:
             status = "⏳ Pending"
         h = holds.get(cust)
@@ -2995,7 +2998,8 @@ def build_report(selected_date):
             "Area": AREA_LABEL[area], "Province": province,
             "Region": region, "Invoice": info["invoice"] if info else "-",
             "Status": status, "កេស": ordered,
-            "Packed Cases": packed, "Prepared By": p["by"] if p else "-", "Assigned To": assigned.get(cust, "-"),
+            "Packed Cases": packed, "Packed Note": (f"✏️ final packed {packed} (logs total {sys_packed}) by {finp['by']}: {finp['reason']}" if finp else ""),
+            "Prepared By": p["by"] if p else (finp["by"] if finp else "-"), "Assigned To": assigned.get(cust, "-"),
             "Sent Cases": sent, "Left to send": (max(target - sent, 0) if (s or fin) else 0),
             "Sent Note": (f"✏️ final {sent} (slips total {sys_sent}) by {fin['by']}: {fin['reason']}" if fin else ""), "Handled By": s["by"] if s else "-",
             "Verified By": s["verified"] if s else "-",
@@ -3084,14 +3088,15 @@ def render_cambodia_map(df, metric):
             st.bar_chart(dm.set_index("province")["value"])
 
 
-def current_final(day):
-    """{customer: {"cases","reason","by"}} - the FINAL number of កេស sent, set by hand (last FinalSent / FinalReset wins)."""
+def current_final(day, kind="Sent"):
+    """{customer: {"cases","reason","by"}} - the FINAL number of កេស sent (kind="Sent") or packed (kind="Packed"),
+    set by hand. The last Final<kind> / Final<kind>Reset of each customer wins."""
     df = rows_for_day(read_raw(HOLD_FILE, HOLD_COLS), day)
     out = {}
     for r in df.to_dict("records"):
-        if r["Action"] == "FinalSent":
+        if r["Action"] == f"Final{kind}":
             out[r["Customer"]] = {"cases": max(_int(r["Cases"]), 0), "reason": str(r["Reason"]), "by": str(r["By"])}
-        elif r["Action"] == "FinalReset":
+        elif r["Action"] == ("FinalReset" if kind == "Sent" else f"Final{kind}Reset"):
             out.pop(r["Customer"], None)
     return out
 
@@ -3152,7 +3157,7 @@ def card_html(r):
             f"<div class='hk-top'><span class='hk-name'>{'🔥 ' if r['🔥'] else ''}{_e(r['Customer'])}</span>"
             f"<span class='hk-badge' style='background:{bg};color:{fg}'>{_e(r['Status'])}</span></div>"
             f"<div class='hk-sub'>{_e(r['Area'])} · {_e(r['Province'])}{inv}{' · 🆕 NEW customer (not in master)' if r.get('In Master') == '🆕 NEW' else ''}</div>"
-            f"<div class='hk-nums'><span>កេស <b>{ordered}</b></span><span>📦 <b>{int(r['Packed Cases'])}</b>{prep}</span>"
+            f"<div class='hk-nums'><span>កេស <b>{ordered}</b></span><span>📦 <b>{int(r['Packed Cases'])}</b>{' ✏️' if r.get('Packed Note') else ''}{prep}</span>"
             f"<span>🚚 sent <b>{int(r['Sent Cases'])}</b>{' ✏️' if r.get('Sent Note') else ''}{(' · <b>' + str(int(r['Left to send'])) + ' left</b>') if r['Status'] == '🔵 Part sent' else ''}</span>{asg}</div>{note}{sent}</div>")
 
 
@@ -3395,10 +3400,11 @@ def _update_panel(selected, df_report, selected_date):
 
     st.markdown(f"#### 🚚 Final sent: **{sent_n} កេស**  ·  ordered {ordered_n if ordered_n is not None else '-'}  ·  "
                 f"packed {packed_n}  ·  left to send **{max(target_n - sent_n, 0)}**"
-                + (f"   \n✏️ {p_row['Sent Note']}" if p_row["Sent Note"] else ""))
+                + (f"   \n✏️ {p_row['Sent Note']}" if p_row["Sent Note"] else "")
+                + (f"   \n✏️ {p_row['Packed Note']}" if p_row["Packed Note"] else ""))
     t_pack, t_send, t_final, t_hold = st.tabs(["📦 Step 1: Packing (who prepared the buns)",
                                                "🚚 Step 2: Send (who delivered + verify កេស)",
-                                               "✏️ Edit final sent",
+                                               "✏️ Edit final packed / sent",
                                                "📅 Move to tomorrow / ❌ Cancel"])
     with t_pack:
         packing_form(f"dash_pack_{selected}_{pack_default}", fixed_customer=selected, default_cases=pack_default)
@@ -3504,7 +3510,42 @@ def _new_customers_panel(df_report, selected_date):
 
 
 def _final_panel(selected, p_row):
-    """Set the FINAL total of កេស sent for this customer today (fixes a wrong / double / missing slip)."""
+    """Set the FINAL កេស packed and the FINAL កេស sent for this customer today (fixes a wrong / double / missing entry)."""
+    st.markdown("##### 📦 Final packed")
+    st.caption("Packed less (or more) than ordered? Set the real number packed. The customer is then judged against what "
+               "was packed, so a short order is not shown as 'left to send'.")
+    packed_n = int(p_row["Packed Cases"])
+    pc1, pc2 = st.columns(2)
+    fp = pc1.number_input("Final កេស packed", min_value=0, max_value=MAX_CASES, step=1, value=packed_n, key=f"finp_n_{selected}_{packed_n}")
+    pwhy = pc2.selectbox("Reason", ["Not enough stock", "Packed less than the order", "Customer asked for less",
+                                    "Packing log was wrong", "Packed more", "Other"], key=f"finp_r_{selected}")
+    pnote = st.text_input("Extra note (optional)", max_chars=80, key=f"finp_t_{selected}")
+    pwho = st.selectbox("Who is editing?", ["-- Select Staff --"] + OPS_STAFF, key=f"finp_w_{selected}")
+    q1, q2 = st.columns(2)
+    if q1.button("💾 Save final packed", type="primary", key=f"finp_save_{selected}"):
+        if pwho.startswith("--"):
+            st.error("Choose your name first.")
+        else:
+            try:
+                append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalPacked", "Cases": int(fp),
+                                       "Reason": pwhy + (f" - {pnote.strip()}" if pnote.strip() else ""), "By": pwho})
+                audit("final_packed", f"{pwho}: {selected} -> {int(fp)} (was {packed_n})")
+                flash_and_refresh(f"{selected}: final packed = {int(fp)} កេស")
+            except (RuntimeError, ConflictError) as e:
+                st.error(f"❌ {e}")
+    if p_row["Packed Note"] and q2.button("↩ Back to the packing logs", key=f"finp_reset_{selected}"):
+        if pwho.startswith("--"):
+            st.error("Choose your name first.")
+        else:
+            try:
+                append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalPackedReset", "Cases": 0,
+                                       "Reason": "-", "By": pwho})
+                audit("final_packed_reset", f"{pwho}: {selected}")
+                flash_and_refresh(f"{selected}: back to the packing logs")
+            except (RuntimeError, ConflictError) as e:
+                st.error(f"❌ {e}")
+    st.markdown("---")
+    st.markdown("##### 🚚 Final sent")
     sent_n = int(p_row["Sent Cases"])
     st.caption("Use this when the total sent is wrong (a slip was entered twice, forgotten, or the customer got more / less). "
                "The number you save here becomes the final កេស sent for this customer today. The delivery slips stay as they are.")
