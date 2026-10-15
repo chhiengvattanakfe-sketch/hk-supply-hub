@@ -2868,7 +2868,7 @@ def _join_unique(series, sep=", ", limit=3):
 
 
 DASH_COLUMNS = ["🔥", "Customer", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Prepared By",
-                "Assigned To", "Sent Cases", "Handled By", "Verified By", "Driver/Station", "Journal Note", "Note", "Time", "Source"]
+                "Assigned To", "Sent Cases", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Note", "Time", "Source"]
 
 
 def build_report(selected_date):
@@ -2896,7 +2896,10 @@ def build_report(selected_date):
         last = g.iloc[-1]
         station = str(last["Taxi_Station"]).strip()
         driver = f"{last['Local_Driver']} ➡️ {station}" if station not in ("-", "") else str(last["Local_Driver"])
+        notes = [str(x).strip() for x in g["Note"] if str(x).strip() not in ("", "-")]
+        stations = [str(x).strip() for x in g["Taxi_Station"] if str(x).strip() not in ("", "-")]
         sent_info[cust] = {"cases": int(g["Cases"].sum()), "driver": driver, "note": str(last["Note"]),
+                           "station": " / ".join(dict.fromkeys(stations)), "taxi_no": " / ".join(dict.fromkeys(notes)),
                            "by": str(last["Handled_By"]), "verified": str(last["Verified_By"]), "time": last["Time"]}
 
     areas = areas_lookup(snap)
@@ -2925,7 +2928,10 @@ def build_report(selected_date):
             "Packed Cases": packed, "Prepared By": p["by"] if p else "-", "Assigned To": assigned.get(cust, "-"),
             "Sent Cases": sent, "Handled By": s["by"] if s else "-",
             "Verified By": s["verified"] if s else "-",
-            "Driver/Station": s["driver"] if s else "-", "Journal Note": remark,
+            "Driver/Station": s["driver"] if s else "-",
+            "Taxi Station": (s["station"] if s else "") if area == "Province" else "",
+            "Taxi No.": (s["taxi_no"] if s else "") if area == "Province" else "",
+            "Journal Note": remark,
             "Note": s["note"] if s else "-", "Time": s["time"] if s else "-",
             "Source": "Journal" if info else "⚠️ Not in journal",
         })
@@ -3007,7 +3013,7 @@ def render_cambodia_map(df, metric):
 STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Partial": ("#1565c0", "#ffffff"),
                 "🟡 Ready for Delivery": ("#f9a825", "#222222"), "🟠 Packing": ("#ef6c00", "#ffffff"),
                 "⏳ Pending": ("#757575", "#ffffff")}
-COMPACT_COLUMNS = ["🔥", "Customer", "Province", "Status", "កេស", "Packed Cases", "Assigned To", "Sent Cases", "Invoice"]
+COMPACT_COLUMNS = ["🔥", "Customer", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
 _REGION_ORDER = {r: i for i, r in enumerate(REGIONS)}
 
 
@@ -3039,6 +3045,8 @@ def card_html(r):
     if int(r["Sent Cases"]) > 0:
         sent = (f"<div class='hk-note'>🚚 {_e(r['Handled By'])} · {_e(r['Time'])} · {_e(r['Driver/Station'])}"
                 f" · ✅ {_e(r['Verified By'])}</div>")
+        if r.get("Taxi No.") not in ("", "-", None):
+            sent += f"<div class='hk-note'>🚕 Taxi no.: <b>{_e(r['Taxi No.'])}</b></div>"
     prep = f" · 👷 {_e(r['Prepared By'])}" if r["Prepared By"] not in ("-", "") else ""
     asg = f"<span>👤 {_e(r['Assigned To'])}</span>" if r.get("Assigned To") not in ("-", "", None) else ""
     return (f"<div class='hk-card' style='border-left:6px solid {bg}'>"
@@ -3105,6 +3113,10 @@ def _dashboard_body():
     counts = df_scope["Status"].value_counts()
     total, n_sent = len(df_scope), int(counts.get("✅ Sent", 0))
     st.markdown(kpi_strip(counts, total), unsafe_allow_html=True)
+    st_keys = [k for k in STATUS_RANK if int(counts.get(k, 0)) > 0]
+    pick_one = st.radio("👆 Click a status to see its customers in the table", ["All"] + st_keys, horizontal=True,
+                        key="dash_status_pick",
+                        format_func=lambda k: f"All ({total})" if k == "All" else f"{k.split(' ')[0]} {k.split(' ', 1)[1]} ({int(counts.get(k, 0))})")
     try:
         st.progress(n_sent / total, text=f"Delivered {n_sent} of {total} customers ({n_sent * 100 // total}%)")
     except TypeError:
@@ -3125,7 +3137,8 @@ def _dashboard_body():
 
     # ---- search + display style ----
     c1, c2, c3 = st.columns([3, 2, 2])
-    q = c1.text_input("🔎 Search customer or invoice", key="dash_q", max_chars=60)
+    q = c1.text_input("🔎 Search", key="dash_q", max_chars=60,
+                      placeholder="customer, invoice, province, taxi station, taxi no., staff... (several words = all must match)")
     display = c2.radio("Display", ["📱 Cards", "🖥️ Table"], horizontal=True, index=0 if mobile else 1, key="dash_display")
     with c3:
         st.write("")
@@ -3139,8 +3152,8 @@ def _dashboard_body():
         except Exception as e:
             st.warning(f"Could not build Excel report: {e}")
 
-    with st.expander("🎚️ Filters: status, region, province"):
-        pick_status = st.multiselect("Status filter", list(STATUS_RANK), key="dash_status", placeholder="All statuses")
+    with st.expander("🎚️ Filters: region, province"):
+        pick_status = [] if pick_one == "All" else [pick_one]
         pick_region = st.multiselect("Region filter", [r for r in REGIONS if r in set(df_scope["Region"])],
                                      key="dash_region", placeholder="All regions")
         pick_prov = st.multiselect("Province filter", sorted(set(df_scope["Province"])), key="dash_prov",
@@ -3152,10 +3165,13 @@ def _dashboard_body():
     if pick_prov:
         df_view = df_view[df_view["Province"].isin(pick_prov)]
     if q.strip():
-        qq = q.strip()
-        m = (df_view["Customer"].str.contains(qq, case=False, regex=False, na=False)
-             | df_view["Invoice"].str.contains(qq, case=False, regex=False, na=False))
+        hay = df_view[["Customer", "Invoice", "Province", "Region", "Taxi Station", "Taxi No.", "Handled By",
+                       "Prepared By", "Assigned To", "Driver/Station"]].astype(str).agg(" ".join, axis=1)
+        m = pd.Series(True, index=df_view.index)
+        for word in q.strip().split():
+            m &= hay.str.contains(word, case=False, regex=False, na=False)
         df_view = df_view[m]
+        st.caption(f"🔎 {len(df_view)} customer(s) found")
     if pick_status:
         df_view = df_view[df_view["Status"].isin(pick_status)]
     df_view = df_view.reset_index(drop=True)
@@ -3182,6 +3198,8 @@ def _dashboard_body():
             "Region": st.column_config.TextColumn("Region", width="medium"),
             "Invoice": st.column_config.TextColumn("Invoice", width="medium"),
             "Status": st.column_config.TextColumn("Status", width="medium"),
+            "Taxi Station": st.column_config.TextColumn("Taxi Station", width="medium"),
+            "Taxi No.": st.column_config.TextColumn("Taxi No. (phone/plate)", width="medium"),
         }
         cols = DASH_COLUMNS if all_cols else COMPACT_COLUMNS
         event = show_df(df_view[cols], height=430, key="dash_table", selectable=can_edit, column_config=cfg)
