@@ -127,7 +127,7 @@ FILES = {
     "holds": (HOLD_FILE, HOLD_COLS, HOLD_NUM_COLS, "Moved / cancelled CSV"),
 }
 
-STATUS_RANK = {"✅ Sent": 1, "🔵 Partial": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5,
+STATUS_RANK = {"✅ Sent": 1, "🔵 Part sent": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5,
                "📅 Moved to tomorrow": 6, "❌ Cancelled": 7}
 ROLE_LABEL = {"admin": "Admin", "staff": "Staff", "viewer": "Viewer (read-only)"}
 
@@ -1906,10 +1906,11 @@ def flash_and_refresh(msg):
 # FORMS
 # ==========================================
 BASE_VIA = "Grab/TukTuk"
+PICKUP_VIA = "Customer pick-up (មកយកខ្លួនឯង)"      # not our delivery: the customer collects the buns
 
 
 def via_options():
-    return [BASE_VIA] + LOCAL_DRIVERS
+    return [BASE_VIA] + LOCAL_DRIVERS + [PICKUP_VIA]
 
 
 def expense_status(via, station, pp, taxi):
@@ -1955,7 +1956,8 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
 
         st.markdown("---")
         st.markdown("#### Transportation Details")
-        local_driver = st.selectbox("Local Driver (Phnom Penh):", ["None (Grab/TukTuk)"] + LOCAL_DRIVERS, key=f"{k}_drv")
+        local_driver = st.selectbox("Local Driver (Phnom Penh) - choose Customer pick-up if the customer collects it themselves:",
+                                    ["None (Grab/TukTuk)"] + LOCAL_DRIVERS + [PICKUP_VIA], key=f"{k}_drv")
         taxi_station = st.text_input("Taxi Station Name (Leave blank if purely local Phnom Penh delivery):",
                                      max_chars=MAX_TEXT, key=f"{k}_taxi")
         delivery_note = st.text_input("📝 Note (Optional: Taxi phone number, plate, or instructions):",
@@ -2913,7 +2915,7 @@ def _join_unique(series, sep=", ", limit=3):
 
 
 DASH_COLUMNS = ["🔥", "Customer", "In Master", "Area", "Province", "Region", "Invoice", "Status", "កេស", "Packed Cases", "Prepared By",
-                "Assigned To", "Sent Cases", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Moved/Cancel Reason", "Note", "Time", "Source"]
+                "Assigned To", "Sent Cases", "Left to send", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Moved/Cancel Reason", "Note", "Time", "Source"]
 
 
 def build_report(selected_date):
@@ -2975,7 +2977,7 @@ def build_report(selected_date):
         remark = info["remark"] if info else "-"
         target = packed if packed > 0 else (ordered or 0)
         if s:
-            status = "🔵 Partial" if (target > 0 and sent < target) else "✅ Sent"
+            status = "🔵 Part sent" if (target > 0 and sent < target) else "✅ Sent"
         elif p:
             status = "🟠 Packing" if "In Progress" in p["status"] else "🟡 Ready for Delivery"
         else:
@@ -2991,7 +2993,7 @@ def build_report(selected_date):
             "Region": region, "Invoice": info["invoice"] if info else "-",
             "Status": status, "កេស": ordered,
             "Packed Cases": packed, "Prepared By": p["by"] if p else "-", "Assigned To": assigned.get(cust, "-"),
-            "Sent Cases": sent, "Handled By": s["by"] if s else "-",
+            "Sent Cases": sent, "Left to send": (max(target - sent, 0) if s else 0), "Handled By": s["by"] if s else "-",
             "Verified By": s["verified"] if s else "-",
             "Driver/Station": s["driver"] if s else "-",
             "Taxi Station": (s["station"] if s else "") if area == "Province" else "",
@@ -3019,7 +3021,7 @@ def summarize(df, by):
     g = df.groupby(by, sort=False)
     out = g.agg(Customers=("Customer", "count"),
                 Delivered=("Status", lambda x: int((x == "✅ Sent").sum())),
-                Partial=("Status", lambda x: int((x == "🔵 Partial").sum())),
+                Part_sent=("Status", lambda x: int((x == "🔵 Part sent").sum())),
                 Ordered=("កេស", lambda x: int(x.fillna(0).sum())),
                 Packed=("Packed Cases", "sum"), Sent=("Sent Cases", "sum")).reset_index()
     held = g["Status"].apply(lambda x: int(x.isin([ST_MOVED, ST_CANCEL]).sum())).values
@@ -3090,11 +3092,11 @@ def current_holds(day):
     return out
 
 
-STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Partial": ("#1565c0", "#ffffff"),
+STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Part sent": ("#1565c0", "#ffffff"),
                 "🟡 Ready for Delivery": ("#f9a825", "#222222"), "🟠 Packing": ("#ef6c00", "#ffffff"),
                 "⏳ Pending": ("#757575", "#ffffff"), "📅 Moved to tomorrow": ("#6a1b9a", "#ffffff"),
                 "❌ Cancelled": ("#b71c1c", "#ffffff")}
-COMPACT_COLUMNS = ["🔥", "Customer", "In Master", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
+COMPACT_COLUMNS = ["🔥", "Customer", "In Master", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Left to send", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
 _REGION_ORDER = {r: i for i, r in enumerate(REGIONS)}
 
 
@@ -3112,7 +3114,7 @@ def _e(x):
 
 def kpi_strip(counts, total):
     items = [("⏳ Pending", "⏳ Pending"), ("🟠 Packing", "🟠 Packing"), ("🟡 Ready", "🟡 Ready for Delivery"),
-             ("🔵 Partial", "🔵 Partial"), ("✅ Sent", "✅ Sent"), ("📅 Moved", ST_MOVED), ("❌ Cancelled", ST_CANCEL)]
+             ("🔵 Part sent", "🔵 Part sent"), ("✅ Sent", "✅ Sent"), ("📅 Moved", ST_MOVED), ("❌ Cancelled", ST_CANCEL)]
     pills = "".join(f"<span class='hk-pill'>{lab} <b>{int(counts.get(key, 0))}</b></span>" for lab, key in items)
     return f"<div class='hk-kpis'>{pills}<span class='hk-pill'>👥 Total <b>{total}</b></span></div>"
 
@@ -3135,7 +3137,7 @@ def card_html(r):
             f"<span class='hk-badge' style='background:{bg};color:{fg}'>{_e(r['Status'])}</span></div>"
             f"<div class='hk-sub'>{_e(r['Area'])} · {_e(r['Province'])}{inv}{' · 🆕 NEW customer (not in master)' if r.get('In Master') == '🆕 NEW' else ''}</div>"
             f"<div class='hk-nums'><span>កេស <b>{ordered}</b></span><span>📦 <b>{int(r['Packed Cases'])}</b>{prep}</span>"
-            f"<span>🚚 <b>{int(r['Sent Cases'])}</b></span>{asg}</div>{note}{sent}</div>")
+            f"<span>🚚 sent <b>{int(r['Sent Cases'])}</b>{(' · <b>' + str(int(r['Left to send'])) + ' left</b>') if r['Status'] == '🔵 Part sent' else ''}</span>{asg}</div>{note}{sent}</div>")
 
 
 def cards_html(df):
@@ -3217,6 +3219,16 @@ def _dashboard_body():
     total, n_sent = len(df_scope) - int(counts.get(ST_CANCEL, 0)), int(counts.get("✅ Sent", 0))
     total = max(total, 1)
     st.markdown(kpi_strip(counts, total), unsafe_allow_html=True)
+    with st.expander("ℹ️ What do the statuses mean?"):
+        st.markdown(
+            "- ⏳ **Pending** - ordered in the journal, nothing packed yet\n"
+            "- 🟠 **Packing** - being packed now\n"
+            "- 🟡 **Ready** - packed, waiting to be sent\n"
+            "- 🔵 **Part sent** - *some* of the កេស were sent but **not all yet** (the card shows how many are left). "
+            "Send the rest, or move the rest to tomorrow.\n"
+            "- ✅ **Sent** - everything was sent (or the customer picked it up)\n"
+            "- 📅 **Moved to tomorrow** / ❌ **Cancelled** - not delivered today\n\n"
+            "🏪 If the customer collects it themselves, choose **Customer pick-up** as the driver when you save the delivery.")
     st_keys = [k for k in STATUS_RANK if int(counts.get(k, 0)) > 0]
     pick_one = st.radio("👆 Click a status to see its customers in the table", ["All"] + st_keys, horizontal=True,
                         key="dash_status_pick",
@@ -3548,7 +3560,7 @@ def build_report_excel(df, day):
             r0 += len(t) + 3
         clean.to_excel(w, index=False, sheet_name="All customers")
         for stt, short in ((ST_MOVED, "Moved tomorrow"), (ST_CANCEL, "Cancelled"), ("⏳ Pending", "Pending"),
-                           ("🟡 Ready for Delivery", "Ready"), ("🔵 Partial", "Partial"), ("✅ Sent", "Sent")):
+                           ("🟡 Ready for Delivery", "Ready"), ("🔵 Part sent", "Part sent"), ("✅ Sent", "Sent")):
             part = clean[clean["Status"] == stt]
             if not part.empty:
                 part.to_excel(w, index=False, sheet_name=short)
