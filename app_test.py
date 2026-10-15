@@ -107,6 +107,11 @@ MAX_TEXT = 200
 
 LOCAL_DRIVERS = ["ងិន វុទ្ធា", "អួន តួ"]
 OPS_STAFF = ["ឆែម សំណុក", "សាយ ប៊ុនលី", "ប៉ៅ រីណា", "ពេជ រដ្ឋា", "រ៉ូ សុវណ្ណាឌែន", "ហេង រតនា", "កង សៀន", "ណាត ផានិត"]
+# Sales staff can verify case counts before an order is dispatched. They are not delivery handlers.
+SALES_STAFF = ["ចែម សារី", "ឃួន សុលីសា", "ថា សុខម៉េង", "ណាង សុបញ្ញា"]
+VERIFY_STAFF = OPS_STAFF + SALES_STAFF
+# Delivery drivers can also own, claim, send, and review their delivery tasks.
+DELIVERY_HANDLERS = OPS_STAFF + LOCAL_DRIVERS
 
 DISPATCH_COLS = ["Date", "Handled_By", "Customer", "Cases", "Local_Driver",
                  "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By", "Expense_Status"]
@@ -129,7 +134,7 @@ FILES = {
 
 STATUS_RANK = {"✅ Sent": 1, "🔵 Part sent": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5,
                "📅 Moved to tomorrow": 6, "❌ Cancelled": 7}
-ROLE_LABEL = {"admin": "Admin", "staff": "Staff", "viewer": "Viewer (read-only)"}
+ROLE_LABEL = {"admin": "Admin", "staff": "Staff", "sales": "Sales (dashboard/report)", "viewer": "Viewer (read-only)"}
 
 
 # ==========================================
@@ -498,7 +503,7 @@ DEFAULT_ADMIN_PW = "Hk-Admin-7Q4mW2"          # starter password: the app forces
 USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,30}$")
 COMMON_PW = {"password", "password1", "12345678", "123456789", "qwerty123", "admin123", "hk2026", "staff2026",
              "hk-admin-7q4mw2", "hk-staff-3rn8zp", "change-me-admin-9x", "11111111", "abcd1234"}
-ROLES = ["staff", "viewer", "admin"]
+ROLES = ["staff", "sales", "viewer", "admin"]
 
 
 def _hash_pw(password, salt=None, iters=PBKDF2_ITER):
@@ -1939,7 +1944,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
     k = form_key
     with st.form(form_key, clear_on_submit=True):
         st.markdown("#### Order Details")
-        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
+        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + DELIVERY_HANDLERS, key=f"{k}_by")
         if fixed_customer is None:
             opts, lab, jset = customer_choices()
             customer_name = st.selectbox(f"Customer Name / ID (Type to search) - 🧾 = has an order in today's sale journal ({len(jset)}):",
@@ -1952,9 +1957,9 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
                                 value=d_cases, key=f"{k}_cases_{d_cases}")
         if verify:
             verified_by = st.selectbox("✅ Cases verified by (confirms the កេស number is correct):",
-                                       ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_vby")
+                                       ["-- Select Staff --"] + VERIFY_STAFF, key=f"{k}_vby")
         else:
-            verified_by = st.selectbox("Cases verified by (optional):", ["-"] + OPS_STAFF, key=f"{k}_vby")
+            verified_by = st.selectbox("Cases verified by (optional):", ["-"] + VERIFY_STAFF, key=f"{k}_vby")
 
         st.markdown("---")
         st.markdown("#### Transportation Details")
@@ -2620,7 +2625,7 @@ def _send_tab(me, ctx):
         return
     c1, c2 = st.columns(2)
     default_via = c1.selectbox("Sent with (default)", via_options(), key="send_via")
-    verified_by = c2.selectbox("✅ Cases checked by", ["-- Select Staff --"] + OPS_STAFF, key="send_vby")
+    verified_by = c2.selectbox("✅ Cases checked by", ["-- Select Staff --"] + VERIFY_STAFF, key="send_vby")
     rows = []
     for r in recs:
         ordered = None if pd.isna(r["កេស"]) else int(r["កេស"])
@@ -2698,7 +2703,7 @@ def _expense_tab(me):
     scope = c1.radio("Show", ["Today", "Last 7 days", "All waiting"], horizontal=True, key="exp_scope")
     who = me
     if is_admin:
-        pick = c2.selectbox("Handler", ["(everyone)"] + OPS_STAFF, key="exp_who")
+        pick = c2.selectbox("Handler", ["(everyone)"] + DELIVERY_HANDLERS, key="exp_who")
         who = None if pick == "(everyone)" else pick
     elif me == "-- Select Staff --":
         st.info("Choose your name at the top first.")
@@ -2885,7 +2890,7 @@ def _delivery_log():
     st.markdown("**🔎 Check completed delivery tasks by staff**")
     recorded_staff = [str(x).strip() for x in df_today["Handled_By"].dropna().tolist()
                       if str(x).strip() and str(x).strip() not in ("-", "nan", "None")]
-    staff_options = ["-- Select Staff --"] + sorted(set(OPS_STAFF).union(recorded_staff))
+    staff_options = ["-- Select Staff --"] + sorted(set(DELIVERY_HANDLERS).union(recorded_staff))
     selected_staff = st.selectbox(
         "Select staff name to see their completed tasks",
         staff_options,
@@ -2912,7 +2917,8 @@ def _delivery_log():
 
 def _dispatch_body():
     st.markdown("### 🚚 Delivery")
-    me = st.selectbox("👷 I am (choose your name once)", ["-- Select Staff --"] + OPS_STAFF, key="me_staff")
+    me = st.selectbox("👷 I am (choose your name once — office staff or delivery driver)", ["-- Select Staff --"] + DELIVERY_HANDLERS, key="me_staff")
+    st.caption("Both delivery drivers can select their own names here, choose customers, mark deliveries as sent, and check any expenses under their names.")
     ctx = delivery_context()
     mine = [r for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
     n_wait = len(pending_expense_df(me, "All waiting")) if me != "-- Select Staff --" else 0
@@ -3004,9 +3010,12 @@ def build_report(selected_date):
         driver = f"{last['Local_Driver']} ➡️ {station}" if station not in ("-", "") else str(last["Local_Driver"])
         notes = [str(x).strip() for x in g["Note"] if str(x).strip() not in ("", "-")]
         stations = [str(x).strip() for x in g["Taxi_Station"] if str(x).strip() not in ("", "-")]
+        verifiers = [str(x).strip() for x in g["Verified_By"].tolist()
+                     if str(x).strip() not in ("", "-", "nan", "None")]
         sent_info[cust] = {"cases": int(g["Cases"].sum()), "driver": driver, "note": str(last["Note"]),
                            "station": " / ".join(dict.fromkeys(stations)), "taxi_no": " / ".join(dict.fromkeys(notes)),
-                           "by": str(last["Handled_By"]), "verified": str(last["Verified_By"]), "time": last["Time"]}
+                           "by": str(last["Handled_By"]), "verified": " / ".join(dict.fromkeys(verifiers)) or "-",
+                           "time": last["Time"]}
 
     areas = areas_lookup(snap)
     overrides = load_location_overrides()
@@ -3161,7 +3170,7 @@ STATUS_STYLE = {"✅ Sent": ("#2e7d32", "#ffffff"), "🔵 Part sent": ("#1565c0"
                 "🟡 Ready for Delivery": ("#f9a825", "#222222"), "🟠 Packing": ("#ef6c00", "#ffffff"),
                 "⏳ Pending": ("#757575", "#ffffff"), "📅 Moved to tomorrow": ("#6a1b9a", "#ffffff"),
                 "❌ Cancelled": ("#b71c1c", "#ffffff")}
-COMPACT_COLUMNS = ["🔥", "Customer", "In Master", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Left to send", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
+COMPACT_COLUMNS = ["🔥", "Customer", "In Master", "Province", "Status", "កេស", "Packed Cases", "Sent Cases", "Left to send", "Verified By", "Taxi Station", "Taxi No.", "Assigned To", "Invoice"]
 _REGION_ORDER = {r: i for i, r in enumerate(REGIONS)}
 
 
@@ -3332,21 +3341,27 @@ def _dashboard_body():
         except Exception as e:
             st.warning(f"Could not build Excel report: {e}")
 
-    with st.expander("🎚️ Filters: region, province"):
+    with st.expander("🎚️ Filters: region, province, verifier"):
         pick_status = [] if pick_one == "All" else [pick_one]
         pick_region = st.multiselect("Region filter", [r for r in REGIONS if r in set(df_scope["Region"])],
                                      key="dash_region", placeholder="All regions")
         pick_prov = st.multiselect("Province filter", sorted(set(df_scope["Province"])), key="dash_prov",
                                    placeholder="All provinces")
+        verifier_values = sorted({str(v).strip() for v in df_scope["Verified By"].dropna()
+                                  if str(v).strip() not in ("", "-", "nan", "None")})
+        verifier_filter = st.selectbox("Cases verified by", ["All verifiers"] + verifier_values,
+                                       key="dash_verified_filter")
 
     df_view = df_scope
     if pick_region:
         df_view = df_view[df_view["Region"].isin(pick_region)]
     if pick_prov:
         df_view = df_view[df_view["Province"].isin(pick_prov)]
+    if verifier_filter != "All verifiers":
+        df_view = df_view[df_view["Verified By"].astype(str).str.contains(verifier_filter, case=False, regex=False, na=False)]
     if q.strip():
         hay = df_view[["Customer", "Invoice", "Province", "Region", "Taxi Station", "Taxi No.", "Handled By",
-                       "Prepared By", "Assigned To", "Driver/Station"]].astype(str).agg(" ".join, axis=1)
+                       "Prepared By", "Assigned To", "Driver/Station", "Verified By", "Status"]].astype(str).agg(" ".join, axis=1)
         m = pd.Series(True, index=df_view.index)
         for word in q.strip().split():
             m &= hay.str.contains(word, case=False, regex=False, na=False)
@@ -3360,7 +3375,7 @@ def _dashboard_body():
         st.caption(f"ℹ️ No column '{JOURNAL_CASES_HEADER}' found in the journal, so ordered cases are empty. "
                    "Change JOURNAL_CASES_HEADER at the top of the file if your header is different.")
     # a different list (new filter / search / date) must not keep the row that was ticked in the old list
-    sig = (str(selected_date), view, pick_one, q.strip(), tuple(pick_region), tuple(pick_prov), display, len(df_view))
+    sig = (str(selected_date), view, pick_one, q.strip(), tuple(pick_region), tuple(pick_prov), verifier_filter, display, len(df_view))
     if st.session_state.get("dash_sig") != sig:
         st.session_state["dash_sig"] = sig
         st.session_state["clear_sel"] = True
@@ -3835,7 +3850,7 @@ def _users_panel():
     with st.expander("➕ Add a user"):
         with st.form("add_user_form", clear_on_submit=True):
             nu = st.text_input("Username (3-30 letters/numbers, for example: sokha)", max_chars=30)
-            nr = st.selectbox("Role", ROLES, help="staff = packing, delivery, dashboard | viewer = dashboard only | admin = everything")
+            nr = st.selectbox("Role", ROLES, help="staff = packing + delivery + dashboard | sales = dashboard/reports only; delivery staff record the chosen verifier | viewer = dashboard only | admin = everything")
             npw = st.text_input("Temporary password (leave empty to generate one)", max_chars=100)
             if st.form_submit_button("Create user", type="primary"):
                 uname = nu.strip().lower()
@@ -4037,7 +4052,7 @@ if ROLE in ("staff", "admin"):
                              else f"🤖 Bot: {_fixed} fixed, {_bad} need a look (see Bot tab)")
 st.caption(_chips)
 
-if ROLE == "viewer":
+if ROLE in ("viewer", "sales"):
     labels = ["📊 Live Dashboard (Sales)"]
 elif ROLE == "staff":
     labels = ["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)", "📊 3. Live Dashboard (Sales)"]
