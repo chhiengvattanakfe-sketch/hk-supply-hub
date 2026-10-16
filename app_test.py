@@ -1,7 +1,7 @@
 # ============================================================
 #  នំប៉ាវហុងកុង Supply Chain Hub  -  v3: fast, secure, self-healing
 #  Run: python -m streamlit run app_reviewed_custom_permissions.py
-#  Reviewed: deterministic dates, strict data checks, atomic saves, safer health bot.
+#  Reviewed: batched selections, independent drafts, strict data checks and atomic saves.
 # ============================================================
 """Delivery Operations — reviewed reliability update.
 
@@ -777,6 +777,9 @@ def _login_guard():
 
 
 def _clear_session():
+    st.session_state.pop("_table_drafts", None)
+    st.session_state.pop("_task_preferences", None)
+    st.session_state.pop("last_customer_upload_export", None)
     for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions"):
         st.session_state.pop(k, None)
 
@@ -2067,16 +2070,7 @@ def safe_render(fn, label):
     try:
         fn()
     except Exception as e:
-        # Step 1 - self-heal: stale widget state (a ticked row of an old list, a closed panel...) is the usual cause.
-        # Reset it and redraw once, silently. Max once per 20 s per person, so it can never loop.
-        flag0 = f"autoheal_{label}"
-        if time.time() - st.session_state.get(flag0, 0) > 20:
-            st.session_state[flag0] = time.time()
-            for k in list(st.session_state.keys()):
-                if str(k).startswith(("dash_table", "sel_cust", "clear_sel", "dash_sig", "pick_old", "card_limit")):
-                    st.session_state.pop(k, None)
-            bot_log("warn", label, f"{type(e).__name__}: {e}", "retrying screen once after clearing selection state")
-            st.rerun()
+        # Keep drafts and the current screen intact. Only the explicit Retry button reruns.
         bot_log("error", label, f"{type(e).__name__}: {e}", "diagnostics started")
         if current_role() == "admin":
             st.error(f"⚠️ Problem in {label}: {e}")
@@ -2624,52 +2618,113 @@ def _int(v, default=0):
         return default
 
 
-def bulk_editor(df, ctx, key, check_col="Save?", column_order=None):
-    """Editable preview + save button. Saves ALL chosen rows in one go."""
+def _draft_id(workflow, scope=""):
+    # User and day boundaries prevent yesterday's or another account's draft being submitted.
+    token = f"{current_user()}|{today_kh()}|{workflow}|{scope}"
+    return hashlib.sha256(token.encode()).hexdigest()[:20]
+
+
+def _draft_frame(workflow, candidate, scope=""):
+    identity = _draft_id(workflow, scope)
+    drafts = st.session_state.setdefault("_table_drafts", {})
+    if identity not in drafts:
+        drafts[identity] = {"frame": candidate.copy(deep=True), "generation": 0}
+    draft = drafts[identity]
+    return draft["frame"].copy(deep=True), f"draft_editor_{identity}_{draft['generation']}"
+
+
+def _reset_draft(workflow, scope=""):
+    identity = _draft_id(workflow, scope)
+    drafts = st.session_state.setdefault("_table_drafts", {})
+    old = drafts.get(identity, {})
+    drafts[identity] = {"frame": None, "generation": old.get("generation", 0) + 1}
+
+
+def _task_editor_frame(workflow, candidate, scope=""):
+    identity = _draft_id(workflow, scope)
+    draft = st.session_state.get("_table_drafts", {}).get(identity)
+    if draft is not None and draft.get("frame") is None:
+        draft["frame"] = candidate.copy(deep=True)
+    return _draft_frame(workflow, candidate, scope)
+
+
+def _form_preferences(workflow, scope=""):
+    return st.session_state.setdefault("_task_preferences", {}).setdefault(_draft_id(workflow, scope), {})
+
+
+def _has_editor_draft(workflow, scope=""):
+    draft = st.session_state.get("_table_drafts", {}).get(_draft_id(workflow, scope), {})
+    frame = draft.get("frame")
+    return frame is not None and not frame.empty
+
+
+def _reload_draft_button(workflow, scope=""):
+    if st.button("↻ Reload this list", key="reload_" + _draft_id(workflow, scope),
+                 help="Read the newest data and clear only this list's unsaved ticks and edits."):
+        _reset_draft(workflow, scope)
+
+
+def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
+    """Batch ticks, staff selection and cell edits; only Save sends them to the server."""
     if not has_permission("edit") or not has_permission("tasks"):
         st.warning("Editing packing tasks is disabled for your account.")
         return
-    if df.empty:
-        st.info("Nothing to show.")
+    workflow = "packing:" + key
+    _reload_draft_button(workflow, scope)
+    d, editor_key = _task_editor_frame(workflow, df, scope)
+    if d.empty:
+        st.info("No customers need packing in this list. Reload to check for new orders.")
         return
-    prepared_by = st.selectbox("👷 Prepared / packed by", ["-- Select Staff --"] + OPS_STAFF, key=f"{key}_by")
-    opts = sorted(set(ctx["today"]) | {c for c in df["Customer"] if c})
-    d = df.rename(columns={"Save?": check_col}) if check_col != "Save?" else df
-    sig = hashlib.md5("|".join(d["Customer"].astype(str) + d["Name in file"].astype(str)).encode("utf-8")).hexdigest()[:8]
-    edited = st.data_editor(
-        d, hide_index=True, height=min(480, 60 + 36 * len(d)), key=f"{key}_{sig}_{st.session_state.get('bulk_key', 0)}",
-        disabled=[c for c in d.columns if c not in (check_col, "Customer", "Status", "Cases")],
-        column_order=column_order,
-        column_config={
-            check_col: st.column_config.CheckboxColumn(check_col),
-            "Customer": st.column_config.SelectboxColumn("Customer", options=opts),
-            "Status": st.column_config.SelectboxColumn("Status", options=["Done", "Not yet", "Skip"]),
-            "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1)})
-    n_pick = int(edited[check_col].sum())
-    st.caption(f"{n_pick} row(s) ticked. 'Cases' = how many to record now. Review the remaining quantity before saving.")
-    if st.button(f"💾 Save {n_pick} packing record(s)", key=f"{key}_save", type="primary"):
-        if prepared_by == "-- Select Staff --":
-            st.error("❌ Please choose who prepared these orders.")
-            return
-        valid, recs, total = set(ctx["today"]) | set(ctx["master"]), [], 0
-        for r in edited.to_dict("records"):
-            cust, cases = str(r["Customer"] or "").strip(), _int(r["Cases"])
-            if not r[check_col] or r["Status"] == "Skip" or cust not in valid or cases <= 0 or cases > MAX_CASES:
-                continue
-            recs.append({"Date": now_str(), "Prepared_By": prepared_by, "Customer": cust, "Cases_Packed": cases,
-                         "Status": "Completed (រួចរាល់)" if r["Status"] == "Done" else "In Progress (កំពុងធ្វើ)"})
-            total += cases
-        if not recs:
-            st.warning("Nothing to save: tick at least one row that has a customer and cases above 0.")
-            return
-        try:
-            append_rows(PACKING_FILE, recs)
-            audit("packing_bulk", f"{len(recs)} customers, {total} cases, by {prepared_by}")
-            st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
-            flash_and_refresh(f"Saved {len(recs)} packing records ({total} cases)")
-        except (RuntimeError, ConflictError, PermissionError) as err:
-            bot_log("error", "Save packing (bulk)", str(err), "-")
-            st.error(f"⚠️ Could not save: {err}")
+    if check_col != "Save?":
+        d = d.rename(columns={"Save?": check_col})
+    opts = sorted(set(ctx["today"]) | {c for c in d["Customer"] if c})
+    st.caption("Tick several customers and edit their cases, then save once. Ticks and typing stay on this screen until you save.")
+    preferences = _form_preferences("packing_staff")
+    linked = preferences.get("prepared_by") or staff_name_for_user()
+    staff_options = ["-- Select Staff --"] + OPS_STAFF
+    with st.form("batch_" + editor_key, clear_on_submit=False):
+        prepared_by = st.selectbox("👷 Prepared / packed by", staff_options,
+            index=staff_options.index(linked) if linked in staff_options else 0, key=f"{key}_by")
+        include_all = st.checkbox("Include every customer shown when saving", key=editor_key + "_all",
+            help="Applies to the whole list below when you press Save. Otherwise, tick individual rows.")
+        editable = (check_col, "Cases") if key == "tick" else (check_col, "Customer", "Status", "Cases")
+        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+            disabled=[c for c in d.columns if c not in editable], column_order=column_order,
+            column_config={check_col: st.column_config.CheckboxColumn(check_col),
+                "Customer": st.column_config.SelectboxColumn("Customer", options=opts),
+                "Status": st.column_config.SelectboxColumn("Status", options=["Done", "Not yet", "Skip"]),
+                "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1)})
+        submitted = st.form_submit_button("💾 Save selected packing records", type="primary")
+    if not submitted:
+        return
+    if prepared_by == "-- Select Staff --":
+        st.error("Please choose who prepared these orders. Your ticks and case edits are kept.")
+        return
+    preferences["prepared_by"] = prepared_by
+    valid, recs, total, changed = set(ctx["today"]) | set(ctx["master"]), [], 0, []
+    for r in edited.to_dict("records"):
+        cust, cases = str(r["Customer"] or "").strip(), _int(r["Cases"])
+        if not (include_all or r[check_col]) or r["Status"] == "Skip" or cust not in valid or cases <= 0 or cases > MAX_CASES:
+            continue
+        if _int(ctx["packed"].get(cust, 0)) != _int(r.get("Already packed", 0)):
+            changed.append(cust)
+        recs.append({"Date": now_str(), "Prepared_By": prepared_by, "Customer": cust, "Cases_Packed": cases,
+                     "Status": "Completed (រួចរាល់)" if r["Status"] == "Done" else "In Progress (កំពុងធ្វើ)"})
+        total += cases
+    if changed:
+        st.error("Packing totals changed for: " + ", ".join(changed[:5]) + ". Reload this list before saving; your current selections are still here.")
+        return
+    if not recs:
+        st.warning("Tick at least one customer with cases above 0, or choose Include every customer shown.")
+        return
+    try:
+        append_rows(PACKING_FILE, recs)
+        audit("packing_bulk", f"{len(recs)} customers, {total} cases, by {prepared_by}")
+        _reset_draft(workflow, scope)
+        flash_and_refresh(f"Saved {len(recs)} packing records ({total} cases)")
+    except (RuntimeError, ConflictError, PermissionError) as err:
+        bot_log("error", "Save packing (bulk)", str(err), "-")
+        st.error(f"Could not save: {err}. Your ticks and edits are kept.")
 
 
 def checklist_xlsx(ctx):
@@ -2710,13 +2765,13 @@ def _ticklist_tab():
         return
     st.caption("Tick the customers whose buns are packed, check the cases, choose who packed them, and save. "
                "Fastest way on a phone.")
-    show_all = st.checkbox("Also show customers that are already packed or sent", key="tick_all")
+    with st.form("packing_list_options"):
+        show_all = st.checkbox("Also show customers that are already packed or sent", key="tick_all")
+        if st.form_submit_button("Apply list options"):
+            _reset_draft("packing:tick")
     d = df[df["Source"] == "Journal"].copy()
     if not show_all:
         d = d[d["Status"].isin(["⏳ Pending", "🟠 Packing"])]
-    if d.empty:
-        st.success("Everything in today's journal is already packed. 🎉")
-        return
     d["_a"] = d["Area"].map(AREA_RANK)
     d["_g"] = d["Region"].map(_REGION_ORDER).fillna(99)
     d = d.sort_values(["_a", "_g", "Province", "Customer"])
@@ -2741,8 +2796,7 @@ def _upload_tab():
         st.download_button("📥 Download today's checklist (Excel with a Done / Not yet drop-down)", data=data,
                            file_name=f"Packing_checklist_{today_kh()}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    bk = st.session_state.get("bulk_key", 0)
-    up = st.file_uploader("Excel (.xlsx) or CSV file", type=["xlsx", "xlsm", "csv", "txt"], key=f"bulk_up_{bk}")
+    up = st.file_uploader("Excel (.xlsx) or CSV file", type=["xlsx", "xlsm", "csv", "txt"], key="bulk_upload_file")
     if not up:
         return
     try:
@@ -2784,7 +2838,7 @@ def _upload_tab():
     n_bad = int((df["Customer"] == "").sum())
     st.info(f"📄 {len(df)} lines: ✅ {n_done} done, ⏳ {n_not} not yet, ❌ {n_bad} names not found. "
             f"Rows with a green match are ticked for you; check the others.")
-    bulk_editor(df, ctx, key="upl", check_col="Save?")
+    bulk_editor(df, ctx, key="upl", check_col="Save?", scope=hashlib.sha256(up.getvalue() + str((sheet, name_col, status_col, cases_col, blank_means, mark_progress)).encode()).hexdigest())
 
 
 def _packing_body():
@@ -2854,34 +2908,36 @@ def _claim_tab(me, ctx):
     st.caption("Choose the customers **you** will deliver today, before you start. Other staff will see they are taken. "
                "You can release a customer again if you cannot go.")
     recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND]
-    f1, f2 = st.columns(2)
-    area = f1.radio("Show", ["All", AREA_LABEL[PP], AREA_LABEL["Province"]], horizontal=True, key="claim_area")
-    q = f2.text_input("🔎 Search customer", key="claim_q", max_chars=60)
+    with st.form("claim_filters"):
+        f1, f2 = st.columns(2)
+        area = f1.radio("Show", ["All", AREA_LABEL[PP], AREA_LABEL["Province"]], horizontal=True, key="claim_area")
+        q = f2.text_input("🔎 Search customer", key="claim_q", max_chars=60)
+        if st.form_submit_button("Apply customer filter"):
+            _reset_draft("claim", me)
     if area != "All":
         recs = [r for r in recs if r["Area"] == area]
     if q.strip():
         recs = [r for r in recs if q.strip().lower() in r["Customer"].lower()]
-    if not recs:
+    if not recs and not _has_editor_draft("claim", me):
         st.info("No customers to choose right now.")
     else:
         assigned = ctx["assigned"]
         rows = [{"Take ✅": False, "Customer": r["Customer"], "Province": r["Province"], "Status": r["Status"],
                  "Packed": int(r["Packed Cases"]), "Ordered": None if pd.isna(r["កេស"]) else int(r["កេស"]),
                  "Taken by": assigned.get(r["Customer"], "-")} for r in recs]
-        d = pd.DataFrame(rows)
-        select_all = st.checkbox("☑️ Select all visible customers", key=f"claim_select_all_{st.session_state.get('bulk_key', 0)}")
-        if select_all:
-            d["Take ✅"] = True
-        sig = hashlib.md5("|".join(d["Customer"] + d["Taken by"]).encode("utf-8")).hexdigest()[:8]
-        edited = st.data_editor(d, hide_index=True, height=min(460, 60 + 36 * len(d)),
-                                key=f"claim_ed_{sig}_{st.session_state.get('bulk_key', 0)}_{int(select_all)}",
-                                disabled=[c for c in d.columns if c != "Take ✅"],
-                                column_config={"Take ✅": st.column_config.CheckboxColumn("Take ✅")})
-        n = int(edited["Take ✅"].sum())
-        if st.button(f"✅ I will deliver these {n} customer(s)", key="claim_save", type="primary"):
+        _reload_draft_button("claim", me)
+        d, editor_key = _task_editor_frame("claim", pd.DataFrame(rows), me)
+        st.caption("Choose all the customers you need, then save once. Ticks do not refresh the page.")
+        with st.form("batch_" + editor_key, clear_on_submit=False):
+            select_all = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
+            edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+                disabled=[c for c in d.columns if c != "Take ✅"],
+                column_config={"Take ✅": st.column_config.CheckboxColumn("Take ✅")})
+            submitted = st.form_submit_button("✅ Save selected delivery customers", type="primary")
+        if submitted:
             new, blocked = [], []
             for r in edited.to_dict("records"):
-                if not r["Take ✅"]:
+                if not (select_all or r["Take ✅"]):
                     continue
                 owner = assigned.get(r["Customer"])
                 if owner == me:
@@ -2899,7 +2955,7 @@ def _claim_tab(me, ctx):
                 try:
                     append_rows(ASSIGN_FILE, new)
                     audit("assign", f"{me}: {len(new)} customers")
-                    st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
+                    _reset_draft("claim", me)
                     flash_and_refresh(f"{me} will deliver {len(new)} customers")
                 except (RuntimeError, ConflictError, PermissionError) as err:
                     st.error(f"⚠️ Could not save: {err}")
@@ -2907,8 +2963,10 @@ def _claim_tab(me, ctx):
     mine = [r["Customer"] for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
     pool = mine if current_role() != "admin" else [c for c in ctx["assigned"] if c in {r["Customer"] for r in ctx["recs"]}]
     with st.expander(f"↩️ Release customers ({len(mine)} are mine)"):
-        rel = st.multiselect("Customers I will NOT deliver after all", pool, key="claim_release")
-        if st.button("↩️ Release selected", key="claim_release_btn") and rel:
+        with st.form("release_customers", clear_on_submit=False):
+            rel = st.multiselect("Customers I will NOT deliver after all", pool, key="claim_release")
+            release = st.form_submit_button("↩️ Release selected")
+        if release and rel:
             try:
                 append_rows(ASSIGN_FILE, [{"Date": now_str(), "Handler": me, "Customer": c, "Action": "Release"} for c in rel])
                 audit("assign_release", f"{me}: {len(rel)} customers")
@@ -2922,53 +2980,72 @@ def _send_tab(me, ctx):
         st.warning("Editing delivery tasks is disabled for your account.")
         return
     st.caption("Tick the customers whose buns you have **sent**. Choose **My own delivery** when you deliver it yourself; no transport expense is required unless a taxi station is also recorded. Expenses can be filled later in step 3.")
-    include_free = st.checkbox("Also show customers nobody has taken yet", key="send_free")
+    with st.form("send_list_options"):
+        include_free = st.checkbox("Also show customers nobody has taken yet", key="send_free")
+        search_send = st.text_input("🔎 Find customer to send", key="send_customer_search", max_chars=60)
+        if st.form_submit_button("Apply delivery filter"):
+            _reset_draft("send", me)
     assigned = ctx["assigned"]
     recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND
             and (assigned.get(r["Customer"]) == me or (include_free and r["Customer"] not in assigned))]
-    search_send = st.text_input("🔎 Find customer to send", key="send_customer_search", max_chars=60)
     if search_send.strip():
         q_send = search_send.strip().casefold()
         recs = [r for r in recs if q_send in str(r["Customer"]).casefold()
                 or q_send in str(r.get("Province", "")).casefold()]
-    if not recs:
+    if not recs and not _has_editor_draft("send", me):
         st.info("You have no customers to send. Choose your customers in step 1 first.")
         return
-    c1, c2 = st.columns(2)
-    default_via = c1.selectbox("Sent with (default)", via_options(), key="send_via")
-    verified_by = c2.selectbox("✅ Cases checked by", ["-- Select Staff --"] + VERIFY_STAFF, key="send_vby")
     rows = []
     for r in recs:
         ordered = None if pd.isna(r["កេស"]) else int(r["កេស"])
         packed, sent = int(r["Packed Cases"]), int(r["Sent Cases"])
         left = (packed - sent) if packed > sent else ((ordered - sent) if (ordered and ordered > sent) else 1)
-        rows.append({"Sent ✅": False, "Customer": r["Customer"], "Cases": int(left), "Via": default_via, "Taxi station": "",
-                     "Note": "", "Status": r["Status"], "Province": r["Province"]})
-    d = pd.DataFrame(rows)
-    select_all_send = st.checkbox("☑️ Select all visible customers to mark as sent", key=f"send_select_all_{st.session_state.get('bulk_key', 0)}")
-    if select_all_send:
-        d["Sent ✅"] = True
-    sig = hashlib.md5(("|".join(d["Customer"]) + default_via).encode("utf-8")).hexdigest()[:8]
-    edited = st.data_editor(
-        d, hide_index=True, height=min(480, 60 + 36 * len(d)),
-        key=f"send_ed_{sig}_{st.session_state.get('bulk_key', 0)}_{int(select_all_send)}",
-        column_order=["Sent ✅", "Customer", "Cases", "Via", "Taxi station", "Note", "Status"],
-        disabled=["Customer", "Status", "Province"],
-        column_config={"Sent ✅": st.column_config.CheckboxColumn("Sent ✅"),
-                       "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1),
-                       "Via": st.column_config.SelectboxColumn("Via", options=via_options()),
-                       "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT, help="Only for provincial taxi / bus"),
-                       "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT)})
-    n = int(edited["Sent ✅"].sum())
-    st.caption("Cases are filled in from what is packed. Change them if you sent a different number.")
-    if st.button(f"🚚 Save {n} delivery(ies) as sent", key="send_save", type="primary"):
+        rows.append({"Sent ✅": False, "Customer": r["Customer"], "Cases": int(left), "Via": "Use default", "Taxi station": "",
+                     "Note": "", "Status": r["Status"], "Province": r["Province"],
+                     "Saved sent cases": sent, "Saved packed cases": packed, "Saved order cases": ordered if ordered is not None else -1})
+    _reload_draft_button("send", me)
+    d, editor_key = _task_editor_frame("send", pd.DataFrame(rows), me)
+    st.caption("Tick several deliveries, edit cases and notes, then save once.")
+    preferences = _form_preferences("send_defaults", me)
+    via_values = via_options()
+    verifier_values = ["-- Select Staff --"] + VERIFY_STAFF
+    with st.form("batch_" + editor_key, clear_on_submit=False):
+        c1, c2 = st.columns(2)
+        default_via = c1.selectbox("Sent with (default)", via_values,
+            index=via_values.index(preferences.get("via")) if preferences.get("via") in via_values else 0, key="send_via")
+        verified_by = c2.selectbox("✅ Cases checked by", verifier_values,
+            index=verifier_values.index(preferences.get("verifier")) if preferences.get("verifier") in verifier_values else 0, key="send_vby")
+        select_all_send = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
+        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+            column_order=["Sent ✅", "Customer", "Cases", "Via", "Taxi station", "Note", "Status"],
+            disabled=["Customer", "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
+            column_config={"Sent ✅": st.column_config.CheckboxColumn("Sent ✅"),
+                "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1),
+                "Via": st.column_config.SelectboxColumn("Via", options=["Use default"] + via_options()),
+                "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
+                "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT)})
+        submitted = st.form_submit_button("🚚 Save selected deliveries", type="primary")
+    if submitted:
         if verified_by == "-- Select Staff --":
             st.error("❌ Please choose who checked the number of cases.")
+            return
+        preferences.update({"via": default_via, "verifier": verified_by})
+        selected_rows = [r for r in edited.to_dict("records") if select_all_send or r["Sent ✅"]]
+        fresh = {r["Customer"]: r for r in ctx["recs"]}
+        blocked = [r["Customer"] for r in selected_rows if r["Customer"] not in fresh
+                   or fresh[r["Customer"]]["Status"] in NOT_TO_SEND
+                   or _int(fresh[r["Customer"]]["Sent Cases"]) != _int(r["Saved sent cases"])
+                   or _int(fresh[r["Customer"]]["Packed Cases"]) != _int(r["Saved packed cases"])
+                   or _int(fresh[r["Customer"]]["កេស"], -1) != _int(r["Saved order cases"], -1)
+                   or (assigned.get(r["Customer"]) not in (None, me) and current_role() != "admin")]
+        if blocked:
+            st.error("These deliveries changed while you were selecting: " + ", ".join(blocked[:5]) + ". Reload this list before saving.")
             return
         out, take, total = [], [], 0
         for r in edited.to_dict("records"):
             cust, cases, via = r["Customer"], _int(r["Cases"]), r["Via"]
-            if not r["Sent ✅"] or cases <= 0 or cases > MAX_CASES or via not in via_options():
+            via = default_via if via == "Use default" else via
+            if not (select_all_send or r["Sent ✅"]) or cases <= 0 or cases > MAX_CASES or via not in via_options():
                 continue
             station = safe_text(r["Taxi station"] or "")
             out.append({"Date": now_str(), "Handled_By": me, "Customer": cust, "Cases": cases, "Local_Driver": via,
@@ -2992,7 +3069,7 @@ def _send_tab(me, ctx):
                     st.session_state["assignment_warning"] = "Deliveries were saved. Assignment updates failed; ask Admin to review. Do not resend these deliveries."
             waiting = sum(1 for o in out if o["Expense_Status"] == "Pending")
             audit("dispatch_bulk", f"{len(out)} customers, {total} cases, by {me}")
-            st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
+            _reset_draft("send", me)
             flash_and_refresh(f"Saved {len(out)} deliveries ({total} cases). {waiting} need expenses - fill them in step 3")
         except (RuntimeError, ConflictError, PermissionError) as err:
             bot_log("error", "Save dispatch (bulk)", str(err), "-")
@@ -3018,17 +3095,20 @@ def _expense_tab(me):
         return
     is_admin = current_role() == "admin"
     st.caption("Fill in expenses for deliveries you already sent. Self-delivered orders need no transport expense unless a taxi station is recorded. Tick **Done** for each row you finish, then save.")
-    c1, c2 = st.columns(2)
-    scope = c1.radio("Show", ["Today", "Last 7 days", "All waiting"], horizontal=True, key="exp_scope")
-    who = me
-    if is_admin:
-        pick = c2.selectbox("Handler", ["(everyone)"] + DELIVERY_HANDLERS, key="exp_who")
-        who = None if pick == "(everyone)" else pick
-    elif me == "-- Select Staff --":
+    with st.form("expense_filters"):
+        c1, c2 = st.columns(2)
+        scope = c1.radio("Show", ["Today", "Last 7 days", "All waiting"], horizontal=True, key="exp_scope")
+        who = me
+        if is_admin:
+            pick = c2.selectbox("Handler", ["(everyone)"] + DELIVERY_HANDLERS, key="exp_who")
+            who = None if pick == "(everyone)" else pick
+        if st.form_submit_button("Apply expense filter"):
+            _reset_draft("expenses", str((who, scope)))
+    if not is_admin and me == "-- Select Staff --":
         st.info("Choose your name at the top first.")
         return
     df = pending_expense_df(who, scope)
-    if df.empty:
+    if df.empty and not _has_editor_draft("expenses", str((who, scope))):
         st.success("Nothing is waiting for expenses. 🎉")
         return
     st.info(f"⏳ {len(df)} deliveries are waiting for expenses.")
@@ -3036,18 +3116,19 @@ def _expense_tab(me):
              "Taxi station": "" if r["Taxi_Station"] in ("-", "") else r["Taxi_Station"],
              "Phnom Penh ៛": int(r["Phnom_Penh_Expense"]), "Taxi ៛": int(r["Taxi_Expense"]),
              "By": r["Handled_By"], "Date": r["Date"]} for r in df.to_dict("records")]
-    d = pd.DataFrame(rows)
+    draft_scope = str((who, scope))
+    _reload_draft_button("expenses", draft_scope)
+    d, editor_key = _task_editor_frame("expenses", pd.DataFrame(rows), draft_scope)
     order = ["Done ✅", "Customer", "When", "Via", "Taxi station", "Phnom Penh ៛", "Taxi ៛"] + (["By"] if who is None else [])
-    sig = hashlib.md5("|".join(d["Date"] + d["Customer"]).encode("utf-8")).hexdigest()[:8]
-    edited = st.data_editor(
-        d, hide_index=True, height=min(480, 60 + 36 * len(d)), key=f"exp_ed_{sig}_{st.session_state.get('bulk_key', 0)}",
-        column_order=order, disabled=["Customer", "When", "Via", "By", "Date"],
-        column_config={"Done ✅": st.column_config.CheckboxColumn("Done ✅"),
-                       "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
-                       "Phnom Penh ៛": st.column_config.NumberColumn("Phnom Penh ៛", min_value=0, max_value=MAX_RIEL, step=500),
-                       "Taxi ៛": st.column_config.NumberColumn("Taxi ៛", min_value=0, max_value=MAX_RIEL, step=500)})
-    n = int(edited["Done ✅"].sum())
-    if st.button(f"💾 Save expenses for {n} delivery(ies)", key="exp_save", type="primary"):
+    with st.form("batch_" + editor_key, clear_on_submit=False):
+        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+            column_order=order, disabled=["Customer", "When", "Via", "By", "Date"],
+            column_config={"Done ✅": st.column_config.CheckboxColumn("Done ✅"),
+                "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
+                "Phnom Penh ៛": st.column_config.NumberColumn("Phnom Penh ៛", min_value=0, max_value=MAX_RIEL, step=500),
+                "Taxi ៛": st.column_config.NumberColumn("Taxi ៛", min_value=0, max_value=MAX_RIEL, step=500)})
+        submitted = st.form_submit_button("💾 Save selected expenses", type="primary")
+    if submitted:
         updates, problems, total = {}, [], 0
         for r in edited.to_dict("records"):
             if not r["Done ✅"]:
@@ -3069,7 +3150,7 @@ def _expense_tab(me):
 
         def _apply(frame):
             for (dt, cust, by), (station, pp, tx) in updates.items():
-                m = (frame["Date"].astype(str) == dt) & (frame["Customer"] == cust) & (frame["Handled_By"] == by)
+                m = (frame["Date"].astype(str) == dt) & (frame["Customer"] == cust) & (frame["Handled_By"] == by) & (frame["Expense_Status"] == "Pending")
                 if not m.any():
                     raise ValueError(f"The delivery of {cust} was changed by someone else. Reload and try again.")
                 i = frame.index[m][0]
@@ -3081,7 +3162,7 @@ def _expense_tab(me):
         try:
             modify_csv(DATA_FILE, DISPATCH_COLS, _apply)
             audit("expenses_filled", f"{len(updates)} deliveries, {total} riel, by {me}")
-            st.session_state["bulk_key"] = st.session_state.get("bulk_key", 0) + 1
+            _reset_draft("expenses", draft_scope)
             flash_and_refresh(f"Saved expenses for {len(updates)} deliveries (៛{total:,})")
         except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
             st.error(f"❌ {err}")
@@ -3966,21 +4047,32 @@ def _new_customers_panel(df_report, selected_date):
             sim = difflib.get_close_matches(n, master_list, n=1, cutoff=0.85)
             rows.append({"Add": not sim, "Customer name": n, "Type": TYPE_GENERAL, "Phone (optional)": "",
                          "⚠️ Looks like (already in master?)": sim[0] if sim else ""})
-        edited = st.data_editor(
-            pd.DataFrame(rows), hide_index=True, height=min(80 + 36 * len(rows), 420), key=f"new_cust_{len(rows)}_{whole}",
-            disabled=["Customer name", "⚠️ Looks like (already in master?)"],
-            column_config={"Type": st.column_config.SelectboxColumn("Type", options=[TYPE_GENERAL, TYPE_DEALER], required=True),
-                           "Add": st.column_config.CheckboxColumn("Add", help="Untick if it is only a spelling mistake")})
-        st.caption("⚠️ If a name 'looks like' one already in the master, it is probably a spelling mistake in the journal - "
-                   "fix the journal name instead of adding a duplicate (those rows start unticked).")
-        start = st.number_input("Next customer number (C-xxxxx) in your accounting system", min_value=1, max_value=999999,
-                                value=1315, step=1, key="new_cust_start")
+        with st.form("new_customer_export_form", clear_on_submit=False):
+            edited = st.data_editor(
+                pd.DataFrame(rows), hide_index=True, height=min(80 + 36 * len(rows), 420), key=f"new_cust_{len(rows)}_{whole}",
+                disabled=["Customer name", "⚠️ Looks like (already in master?)"],
+                column_config={"Type": st.column_config.SelectboxColumn("Type", options=[TYPE_GENERAL, TYPE_DEALER], required=True),
+                               "Add": st.column_config.CheckboxColumn("Add", help="Untick if it is only a spelling mistake")})
+            st.caption("⚠️ If a name 'looks like' one already in the master, it is probably a spelling mistake in the journal - "
+                       "fix the journal name instead of adding a duplicate (those rows start unticked).")
+            start = st.number_input("Next customer number (C-xxxxx) in your accounting system", min_value=1, max_value=999999,
+                                    value=1315, step=1, key="new_cust_start")
+            build_export = st.form_submit_button("Build customer upload file")
+        if not build_export:
+            saved_export = st.session_state.get("last_customer_upload_export")
+            if saved_export:
+                st.caption("Last built upload file: " + saved_export["built"])
+                st.download_button("Download last built customer upload file", data=saved_export["data"],
+                    file_name=saved_export["name"], mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            return
         pick = edited[edited["Add"]]
         if pick.empty:
             st.info("Tick at least one customer to make the upload file.")
         else:
             data = build_master_upload([(r["Customer name"], r["Type"], r["Phone (optional)"]) for _, r in pick.iterrows()],
                                        int(start))
+            st.session_state["last_customer_upload_export"] = {"data": data, "built": now_str(),
+                "name": f"New_Customers_{selected_date}.xlsx"}
             st.download_button(f"📥 Download upload file for master data ({len(pick)} customers)", data=data,
                                file_name=f"New_Customers_{selected_date}.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="new_cust_dl")
@@ -3992,69 +4084,71 @@ def _final_panel(selected, p_row):
     st.caption("Packed less (or more) than ordered? Set the real number packed. The customer is then judged against what "
                "was packed, so a short order is not shown as 'left to send'.")
     packed_n = int(p_row["Packed Cases"])
-    pc1, pc2 = st.columns(2)
-    fp = pc1.number_input("Final កេស packed", min_value=0, max_value=MAX_CASES, step=1, value=packed_n, key=f"finp_n_{selected}_{packed_n}")
-    pwhy = pc2.selectbox("Reason", ["Not enough stock", "Packed less than the order", "Customer asked for less",
-                                    "Packing log was wrong", "Packed more", "Other"], key=f"finp_r_{selected}")
-    pnote = st.text_input("Extra note (optional)", max_chars=80, key=f"finp_t_{selected}")
-    pwho = st.selectbox("Who is editing?", ["-- Select Staff --"] + OPS_STAFF, key=f"finp_w_{selected}")
-    q1, q2 = st.columns(2)
-    if q1.button("💾 Save final packed", type="primary", key=f"finp_save_{selected}"):
-        if pwho.startswith("--"):
-            st.error("Choose your name first.")
-        else:
-            try:
-                append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalPacked", "Cases": int(fp),
-                                       "Reason": pwhy + (f" - {pnote.strip()}" if pnote.strip() else ""), "By": pwho})
-                audit("final_packed", f"{pwho}: {selected} -> {int(fp)} (was {packed_n})")
-                flash_and_refresh(f"{selected}: final packed = {int(fp)} កេស")
-            except (RuntimeError, ConflictError) as e:
-                st.error(f"❌ {e}")
-    if p_row["Packed Note"] and q2.button("↩ Back to the packing logs", key=f"finp_reset_{selected}"):
-        if pwho.startswith("--"):
-            st.error("Choose your name first.")
-        else:
-            try:
-                append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalPackedReset", "Cases": 0,
-                                       "Reason": "-", "By": pwho})
-                audit("final_packed_reset", f"{pwho}: {selected}")
-                flash_and_refresh(f"{selected}: back to the packing logs")
-            except (RuntimeError, ConflictError) as e:
-                st.error(f"❌ {e}")
+    with st.form(f"final_packed_{selected}", clear_on_submit=False):
+        pc1, pc2 = st.columns(2)
+        fp = pc1.number_input("Final កេស packed", min_value=0, max_value=MAX_CASES, step=1, value=packed_n, key=f"finp_n_{selected}_{packed_n}")
+        pwhy = pc2.selectbox("Reason", ["Not enough stock", "Packed less than the order", "Customer asked for less",
+                                        "Packing log was wrong", "Packed more", "Other"], key=f"finp_r_{selected}")
+        pnote = st.text_input("Extra note (optional)", max_chars=80, key=f"finp_t_{selected}")
+        pwho = st.selectbox("Who is editing?", ["-- Select Staff --"] + OPS_STAFF, key=f"finp_w_{selected}")
+        q1, q2 = st.columns(2)
+        if q1.form_submit_button("💾 Save final packed", type="primary"):
+            if pwho.startswith("--"):
+                st.error("Choose your name first.")
+            else:
+                try:
+                    append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalPacked", "Cases": int(fp),
+                                           "Reason": pwhy + (f" - {pnote.strip()}" if pnote.strip() else ""), "By": pwho})
+                    audit("final_packed", f"{pwho}: {selected} -> {int(fp)} (was {packed_n})")
+                    flash_and_refresh(f"{selected}: final packed = {int(fp)} កេស")
+                except (RuntimeError, ConflictError) as e:
+                    st.error(f"❌ {e}")
+        if p_row["Packed Note"] and q2.form_submit_button("↩ Back to the packing logs"):
+            if pwho.startswith("--"):
+                st.error("Choose your name first.")
+            else:
+                try:
+                    append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalPackedReset", "Cases": 0,
+                                           "Reason": "-", "By": pwho})
+                    audit("final_packed_reset", f"{pwho}: {selected}")
+                    flash_and_refresh(f"{selected}: back to the packing logs")
+                except (RuntimeError, ConflictError) as e:
+                    st.error(f"❌ {e}")
     st.markdown("---")
     st.markdown("##### 🚚 Final sent")
     sent_n = int(p_row["Sent Cases"])
     st.caption("Use this when the total sent is wrong (a slip was entered twice, forgotten, or the customer got more / less). "
                "The number you save here becomes the final កេស sent for this customer today. The delivery slips stay as they are.")
-    c1, c2 = st.columns(2)
-    final = c1.number_input("Final កេស sent", min_value=0, max_value=MAX_CASES, step=1, value=sent_n, key=f"fin_n_{selected}_{sent_n}")
-    why = c2.selectbox("Reason", ["Counted again at the truck", "Slip entered twice", "A slip was missing",
-                                  "Customer returned some", "Extra items added", "Other"], key=f"fin_r_{selected}")
-    note = st.text_input("Extra note (optional)", max_chars=80, key=f"fin_t_{selected}")
-    who = st.selectbox("Who is editing?", ["-- Select Staff --"] + OPS_STAFF, key=f"fin_w_{selected}")
-    b1, b2 = st.columns(2)
-    if b1.button("💾 Save final sent", type="primary", key=f"fin_save_{selected}"):
-        if who.startswith("--"):
-            st.error("Choose your name first.")
-        else:
-            try:
-                append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalSent", "Cases": int(final),
-                                       "Reason": why + (f" - {note.strip()}" if note.strip() else ""), "By": who})
-                audit("final_sent", f"{who}: {selected} -> {int(final)} (was {sent_n})")
-                flash_and_refresh(f"{selected}: final sent = {int(final)} កេស")
-            except (RuntimeError, ConflictError) as e:
-                st.error(f"❌ {e}")
-    if p_row["Sent Note"] and b2.button("↩ Back to the total of the slips", key=f"fin_reset_{selected}"):
-        if who.startswith("--"):
-            st.error("Choose your name first.")
-        else:
-            try:
-                append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalReset", "Cases": 0,
-                                       "Reason": "-", "By": who})
-                audit("final_reset", f"{who}: {selected}")
-                flash_and_refresh(f"{selected}: back to the slips total")
-            except (RuntimeError, ConflictError) as e:
-                st.error(f"❌ {e}")
+    with st.form(f"final_sent_{selected}", clear_on_submit=False):
+        c1, c2 = st.columns(2)
+        final = c1.number_input("Final កេស sent", min_value=0, max_value=MAX_CASES, step=1, value=sent_n, key=f"fin_n_{selected}_{sent_n}")
+        why = c2.selectbox("Reason", ["Counted again at the truck", "Slip entered twice", "A slip was missing",
+                                      "Customer returned some", "Extra items added", "Other"], key=f"fin_r_{selected}")
+        note = st.text_input("Extra note (optional)", max_chars=80, key=f"fin_t_{selected}")
+        who = st.selectbox("Who is editing?", ["-- Select Staff --"] + OPS_STAFF, key=f"fin_w_{selected}")
+        b1, b2 = st.columns(2)
+        if b1.form_submit_button("💾 Save final sent", type="primary"):
+            if who.startswith("--"):
+                st.error("Choose your name first.")
+            else:
+                try:
+                    append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalSent", "Cases": int(final),
+                                           "Reason": why + (f" - {note.strip()}" if note.strip() else ""), "By": who})
+                    audit("final_sent", f"{who}: {selected} -> {int(final)} (was {sent_n})")
+                    flash_and_refresh(f"{selected}: final sent = {int(final)} កេស")
+                except (RuntimeError, ConflictError) as e:
+                    st.error(f"❌ {e}")
+        if p_row["Sent Note"] and b2.form_submit_button("↩ Back to the total of the slips"):
+            if who.startswith("--"):
+                st.error("Choose your name first.")
+            else:
+                try:
+                    append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "FinalReset", "Cases": 0,
+                                           "Reason": "-", "By": who})
+                    audit("final_reset", f"{who}: {selected}")
+                    flash_and_refresh(f"{selected}: back to the slips total")
+                except (RuntimeError, ConflictError) as e:
+                    st.error(f"❌ {e}")
 
 
 def _hold_panel(selected, p_row, left):
@@ -4062,19 +4156,20 @@ def _hold_panel(selected, p_row, left):
     status = p_row["Status"]
     if status in (ST_MOVED, ST_CANCEL):
         st.warning(f"This customer is now **{status}** - {p_row['Moved/Cancel Reason'] or 'no reason written'}")
-        c1, c2 = st.columns(2)
-        who = c1.selectbox("Who is doing this?", ["-- Select Staff --"] + OPS_STAFF, key=f"hold_who_{selected}")
-        if c2.button("↩ Put back as normal (today)", key=f"hold_back_{selected}"):
-            if who.startswith("--"):
-                st.error("Choose your name first.")
-            else:
-                try:
-                    append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "Restore", "Cases": 0,
-                                           "Reason": "-", "By": who})
-                    audit("hold_restore", f"{who}: {selected}")
-                    flash_and_refresh(f"{selected} is back on today's list")
-                except (RuntimeError, ConflictError) as e:
-                    st.error(f"❌ {e}")
+        with st.form(f"restore_customer_{selected}", clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            who = c1.selectbox("Who is doing this?", ["-- Select Staff --"] + OPS_STAFF, key=f"hold_who_{selected}")
+            if c2.form_submit_button("↩ Put back as normal (today)"):
+                if who.startswith("--"):
+                    st.error("Choose your name first.")
+                else:
+                    try:
+                        append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": "Restore", "Cases": 0,
+                                               "Reason": "-", "By": who})
+                        audit("hold_restore", f"{who}: {selected}")
+                        flash_and_refresh(f"{selected} is back on today's list")
+                    except (RuntimeError, ConflictError) as e:
+                        st.error(f"❌ {e}")
         return
     if status == "✅ Sent":
         st.success("This customer is already fully sent - nothing to move or cancel.")
@@ -4082,30 +4177,31 @@ def _hold_panel(selected, p_row, left):
     st.caption("📅 **Tomorrow**: the customer leaves today's to-send lists and appears automatically on tomorrow's board "
                "with the remaining កេស.  ❌ **Cancel**: the order is closed and not counted as waiting.  "
                "Everything stays in the report with your reason, so you can see it later.")
-    action = st.radio("What do you want to do?", ["📅 Move to tomorrow", "❌ Cancel the order"], horizontal=True,
-                      key=f"hold_act_{selected}")
-    c1, c2 = st.columns(2)
-    reason = c1.selectbox("Reason", ["Customer asked to wait", "Not enough stock", "Cannot reach customer",
-                                     "Transport problem", "Customer cancelled", "Other"], key=f"hold_reason_{selected}")
-    extra = c2.text_input("Extra note (optional)", max_chars=80, key=f"hold_note_{selected}")
-    cases = st.number_input("កេស to carry to tomorrow", min_value=0, max_value=MAX_CASES, step=1,
-                            value=max(int(left), 0), key=f"hold_cases_{selected}") if action.startswith("📅") else 0
-    who = st.selectbox("Who is doing this?", ["-- Select Staff --"] + OPS_STAFF, key=f"hold_who2_{selected}")
-    if st.button("💾 Save", type="primary", key=f"hold_save_{selected}"):
-        if who.startswith("--"):
-            st.error("Choose your name first.")
-            return
-        act = "Tomorrow" if action.startswith("📅") else "Cancel"
-        why = reason + (f" - {extra.strip()}" if extra.strip() else "")
-        try:
-            append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": act, "Cases": int(cases),
-                                   "Reason": why, "By": who})
-            audit("hold_" + act.lower(), f"{who}: {selected} ({why})")
-            st.session_state.pop("sel_cust", None)
-            st.session_state["clear_sel"] = True
-            flash_and_refresh(f"{selected}: {'moved to tomorrow' if act == 'Tomorrow' else 'cancelled'}")
-        except (RuntimeError, ConflictError) as e:
-            st.error(f"❌ {e}")
+    with st.form(f"hold_customer_{selected}", clear_on_submit=False):
+        action = st.radio("What do you want to do?", ["📅 Move to tomorrow", "❌ Cancel the order"], horizontal=True,
+                          key=f"hold_act_{selected}")
+        c1, c2 = st.columns(2)
+        reason = c1.selectbox("Reason", ["Customer asked to wait", "Not enough stock", "Cannot reach customer",
+                                         "Transport problem", "Customer cancelled", "Other"], key=f"hold_reason_{selected}")
+        extra = c2.text_input("Extra note (optional)", max_chars=80, key=f"hold_note_{selected}")
+        cases = st.number_input("កេស to carry to tomorrow (ignored when cancelling)", min_value=0, max_value=MAX_CASES, step=1,
+                                value=max(int(left), 0), key=f"hold_cases_{selected}")
+        who = st.selectbox("Who is doing this?", ["-- Select Staff --"] + OPS_STAFF, key=f"hold_who2_{selected}")
+        if st.form_submit_button("💾 Save move / cancellation", type="primary"):
+            if who.startswith("--"):
+                st.error("Choose your name first.")
+                return
+            act = "Tomorrow" if action.startswith("📅") else "Cancel"
+            why = reason + (f" - {extra.strip()}" if extra.strip() else "")
+            try:
+                append_row(HOLD_FILE, {"Date": now_str(), "Customer": selected, "Action": act, "Cases": int(cases) if act == "Tomorrow" else 0,
+                                       "Reason": why, "By": who})
+                audit("hold_" + act.lower(), f"{who}: {selected} ({why})")
+                st.session_state.pop("sel_cust", None)
+                st.session_state["clear_sel"] = True
+                flash_and_refresh(f"{selected}: {'moved to tomorrow' if act == 'Tomorrow' else 'cancelled'}")
+            except (RuntimeError, ConflictError) as e:
+                st.error(f"❌ {e}")
 
 
 def build_report_excel(df, day):
@@ -4206,8 +4302,12 @@ def _locations_panel():
                f"{int(unknown.sum())} still need a province - pick it below and save, the app remembers it.")
     if not snap.get("area_col_found"):
         st.warning("No Province / Phnom Penh column was found in the Master List, so the places come from the customer names only.")
-    mode = st.radio("Show", ["Only unknown", "Guessed from a town name (please check)", "Set by admin", "All"],
-                    horizontal=True, key="loc_show")
+    with st.form("province_filters"):
+        mode = st.radio("Show", ["Only unknown", "Guessed from a town name (please check)", "Set by admin", "All"],
+                        horizontal=True, key="loc_show")
+        q = st.text_input("🔎 Search customer", key="loc_q", max_chars=60)
+        if st.form_submit_button("Apply location filter"):
+            _reset_draft("admin_locations")
     if mode == "Only unknown":
         sub = df[unknown]
     elif mode.startswith("Guessed"):
@@ -4216,18 +4316,21 @@ def _locations_panel():
         sub = df[df["How we know"] == "set by admin"]
     else:
         sub = df
-    q = st.text_input("🔎 Search customer", key="loc_q", max_chars=60)
     if q.strip():
         sub = sub[sub["Customer"].str.contains(q.strip(), case=False, regex=False, na=False)]
     sub = sub.head(300).copy()
     sub["Set province"] = ""
     choices = [""] + sorted(PROVINCES) + ["↩ remove my setting"]
-    edited = st.data_editor(
-        sub, hide_index=True, height=360, key="loc_editor",
-        disabled=["Customer", "Area", "Province", "Region", "How we know"],
-        column_config={"Set province": st.column_config.SelectboxColumn(
-            "Set province", options=choices, help="Choose the province of this customer, then press Save.")})
-    if st.button("💾 Save locations", key="loc_save", type="primary"):
+    _reload_draft_button("admin_locations")
+    sub, editor_key = _task_editor_frame("admin_locations", sub)
+    with st.form("batch_" + editor_key, clear_on_submit=False):
+        edited = st.data_editor(
+            sub, hide_index=True, height=360, key=editor_key,
+            disabled=["Customer", "Area", "Province", "Region", "How we know"],
+            column_config={"Set province": st.column_config.SelectboxColumn(
+                "Set province", options=choices, help="Choose the province of this customer, then press Save.")})
+        submitted = st.form_submit_button("💾 Save locations", type="primary")
+    if submitted:
         picked = {r["Customer"]: r["Set province"] for _, r in edited.iterrows() if r["Set province"]}
         if not picked:
             st.info("Nothing selected. Choose a province in the 'Set province' column first.")
@@ -4241,6 +4344,7 @@ def _locations_panel():
                 return cur
             try:
                 modify_locations(_apply)
+                _reset_draft("admin_locations")
                 audit("locations_set", f"{len(picked)} customers")
                 flash_and_refresh(f"Saved {len(picked)} customer locations")
             except (RuntimeError, ConflictError) as err2:
@@ -4548,11 +4652,13 @@ def _bot_body():
     if suggestions:
         st.markdown("**Names that look like typos (the bot suggests the Master List name):**")
         show_df(pd.DataFrame(suggestions, columns=["File", "Name in file", "Suggested name"]))
-        selected_fixes = st.data_editor(
-            pd.DataFrame([{"Apply?": False, "File": key, "Name in file": bad, "Suggested name": good}
-                          for key, bad, good in suggestions]), hide_index=True,
-            disabled=["File", "Name in file", "Suggested name"], key="name_fix_review")
-        if st.button("Apply selected name corrections", key="bot_apply"):
+        with st.form("review_name_corrections", clear_on_submit=False):
+            selected_fixes = st.data_editor(
+                pd.DataFrame([{"Apply?": False, "File": key, "Name in file": bad, "Suggested name": good}
+                              for key, bad, good in suggestions]), hide_index=True,
+                disabled=["File", "Name in file", "Suggested name"], key="name_fix_review")
+            apply_names = st.form_submit_button("Apply selected name corrections")
+        if apply_names:
             chosen = [(r["File"], r["Name in file"], r["Suggested name"])
                       for r in selected_fixes.to_dict("records") if r["Apply?"]]
             if not chosen:
@@ -5502,14 +5608,17 @@ def _map_admin_panel(registry, locations):
                     st.error(f"Could not save this location: {e}")
     with st.expander("Match a delivery customer to a saved location"):
         st.caption("Use this for different spellings or repeated names. This match does not rename customers or change order quantities.")
-        snap, _, _, _ = current_snapshot()
-        system_names = sorted(set(snap["customers"]) | set(snap["journal"]["Customer"])) if snap else []
-        if system_names:
-            system_customer = st.selectbox("Customer in your delivery system", system_names, key="map_bind_customer")
-        else:
-            system_customer = st.text_input("Exact customer name in your delivery system", key="map_bind_customer_text")
-        target = st.selectbox("Correct saved location", all_ids, format_func=labels.get, key="map_bind_location")
-        if st.button("Save customer match", key="map_bind_save"):
+        with st.form("customer_map_binding", clear_on_submit=False):
+            snap, _, _, _ = current_snapshot()
+            system_names = sorted(set(snap["customers"]) | set(snap["journal"]["Customer"])) if snap else []
+            if system_names:
+                system_customer = st.selectbox("Customer in your delivery system", system_names, key="map_bind_customer")
+            else:
+                system_customer = st.text_input("Exact customer name in your delivery system", key="map_bind_customer_text")
+            target = st.selectbox("Correct saved location", all_ids, format_func=labels.get, key="map_bind_location")
+            save_binding = st.form_submit_button("Save customer match")
+            remove_binding = st.form_submit_button("Remove this saved match")
+        if save_binding:
             if system_customer.strip():
                 try:
                     modify_map_registry(lambda overlay: overlay["bindings"].update({norm_name(system_customer): target}))
@@ -5520,7 +5629,7 @@ def _map_admin_panel(registry, locations):
         current_binding = registry["bindings"].get(norm_name(system_customer))
         if current_binding:
             st.caption("Current location: " + labels.get(current_binding, current_binding))
-            if st.button("Remove this saved match", key="map_bind_remove"):
+            if remove_binding:
                 try:
                     modify_map_registry(lambda overlay: overlay["bindings"].pop(norm_name(system_customer), None))
                     flash_and_refresh("Customer map match removed")
@@ -5576,10 +5685,12 @@ def _customer_map_body():
              int((locations["Map status"] == "Needs link expansion").sum()),
              int((~locations["Map status"].isin(["Ready pin", "Needs link expansion"])).sum()))):
         col.metric(title, value)
-    search = st.text_input("Search customer, province or location ID", key="customer_map_search", max_chars=MAX_TEXT)
-    statuses = ["All"] + sorted(locations["Map status"].unique())
-    status = st.selectbox("Location status", statuses, key="customer_map_filter")
-    scope = st.radio("Map selection", ["All imported locations", "Today's delivery customers"], horizontal=True, key="customer_map_scope")
+    with st.form("customer_map_filters"):
+        search = st.text_input("Search customer, province or location ID", key="customer_map_search", max_chars=MAX_TEXT)
+        statuses = ["All"] + sorted(locations["Map status"].unique())
+        status = st.selectbox("Location status", statuses, key="customer_map_filter")
+        scope = st.radio("Map selection", ["All imported locations", "Today's delivery customers"], horizontal=True, key="customer_map_scope")
+        st.form_submit_button("Apply map filters")
     view = locations
     if scope == "Today's delivery customers":
         report, _, error = build_report(today_kh())
