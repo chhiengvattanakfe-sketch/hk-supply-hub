@@ -3170,13 +3170,17 @@ def _expense_tab(me):
 
 # ---- Journal fill sheet: expenses/driver in the same order as the Sale Journal ----
 DRIVER_CODE = {"ងិន វុទ្ធា": "VUTHEA", "អួន តួ": "TOU"}      # name in this app -> code typed in journal column អ្នកដឹក
-JF_COLS = ["Date", "Customer", "Invoice", "អ្នកដឹក", "សេវាដឹក (ចំណាយ)", "សេវាតាក់ស៊ី (ចំណាយ)", "Taxi station", "Note"]
+JF_COLS = ["Date", "Customer", "Invoice", "ចំនួនកេស", "កេស (journal)", "អ្នកដឹក", "សេវាដឹក (ចំណាយ)",
+           "សេវាតាក់ស៊ី (ចំណាយ)", "Taxi station", "Note"]
 
 
 def build_journal_fill(d_from, d_to):
-    """(fill_df, unmatched_df) for deliveries between two dates.
+    """(fill_df, unmatched_df, error) for deliveries between two dates.
     One row per journal invoice, in journal order. A customer's expenses for one day go on its FIRST invoice
-    of that day (0 on the others) so nothing is counted twice - the same way the journal is filled by hand."""
+    of that day (0 on the others) so nothing is counted twice - the same way the journal is filled by hand.
+    ចំនួនកេស = cases SENT (from the Delivery tab). When a customer has several invoices that day, the cases sent are
+    shared over the invoices by the journal's កេស, so the column adds up to exactly what was sent.
+    កេស (journal) = the cases written in the journal for that invoice (to compare)."""
     snap, _, _, err = current_snapshot()
     if not snap:
         return None, None, err or "Journal not found"
@@ -3196,32 +3200,95 @@ def build_journal_fill(d_from, d_to):
         notes = [str(x).strip() for x in g["Note"] if str(x).strip() not in ("", "-")]
         agg[(day, cust)] = {"drv": drv[-1] if drv else "", "pp": int(g["Phnom_Penh_Expense"].sum()),
                             "taxi": int(g["Taxi_Expense"].sum()), "station": " / ".join(dict.fromkeys(st_)),
-                            "note": " / ".join(dict.fromkeys(notes))}
+                            "note": " / ".join(dict.fromkeys(notes)), "cases": int(g["Cases"].sum())}
     jr = snap["journal"]
     jr = jr[(jr["Date"] >= d_from) & (jr["Date"] <= d_to)]
+    # cases sent for each journal row: the customer's sent cases shared over its invoices of that day
+    members = {}
+    for idx, r in jr.iterrows():
+        members.setdefault((r["Date"], r["Customer"]), []).append(idx)
+    sent_cases = {}
+    for key, idxs in members.items():
+        a = agg.get(key)
+        if a is None:
+            continue
+        w = [max(float(jr.at[i, "Cases"]), 0) if pd.notna(jr.at[i, "Cases"]) else 0 for i in idxs]
+        if sum(w) == 0:
+            w = [1] * len(idxs)
+        parts = [int(a["cases"] * x / sum(w)) for x in w]
+        parts[0] += a["cases"] - sum(parts)
+        sent_cases.update(zip(idxs, parts))
     rows, used = [], set()
-    for _, r in jr.iterrows():
+    for idx, r in jr.iterrows():
         key = (r["Date"], r["Customer"])
         a = agg.get(key)
         first = a is not None and key not in used
         if a is not None:
             used.add(key)
         rows.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": r["Invoice"],
+                     "ចំនួនកេស": sent_cases.get(idx),
+                     "កេស (journal)": (int(r["Cases"]) if pd.notna(r["Cases"]) else None),
                      "អ្នកដឹក": a["drv"] if a else "",
                      "សេវាដឹក (ចំណាយ)": (a["pp"] if first else (0 if a else None)),
                      "សេវាតាក់ស៊ី (ចំណាយ)": (a["taxi"] if first else (0 if a and a["taxi"] else None)),
                      "Taxi station": a["station"] if first else "", "Note": a["note"] if first else ""})
     fill = pd.DataFrame(rows, columns=JF_COLS)
-    miss = [{"Date": k[0], "Customer": k[1], "អ្នកដឹក": v["drv"], "សេវាដឹក (ចំណាយ)": v["pp"],
-             "សេវាតាក់ស៊ី (ចំណាយ)": v["taxi"], "Taxi station": v["station"], "Note": v["note"]}
+    for c in ("ចំនួនកេស", "កេស (journal)"):
+        fill[c] = pd.array(fill[c].tolist(), dtype="Int64")
+    miss = [{"Date": k[0], "Customer": k[1], "ចំនួនកេស": v["cases"], "អ្នកដឹក": v["drv"],
+             "សេវាដឹក (ចំណាយ)": v["pp"], "សេវាតាក់ស៊ី (ចំណាយ)": v["taxi"], "Taxi station": v["station"], "Note": v["note"]}
             for k, v in agg.items() if k not in used]
     return fill, pd.DataFrame(miss), None
+
+
+DRIVER_TOTAL_COLS = ["អ្នកដឹក", "Name", "Deliveries", "Customers", "ចំនួនកេស", "កេស via taxi",
+                     "សេវាដឹក ៛", "សេវាតាក់ស៊ី ៛"]
+
+
+def build_driver_totals(d_from, d_to):
+    """(by_driver, by_day): how many កេស each driver sent between two dates.
+    Uses ALL saved deliveries in those dates (also the ones whose customer is not found in the journal).
+    Own drivers show their journal code (VUTHEA / TOU); Grab/TukTuk is its own line."""
+    disp = read_raw(DATA_FILE, DISPATCH_COLS)
+    if disp.empty or "_dt" not in disp.columns:
+        return None, None
+    day = disp["_dt"].dt.normalize()
+    disp = disp[(day >= pd.Timestamp(d_from)) & (day <= pd.Timestamp(d_to))].copy()
+    if disp.empty:
+        return None, None
+    disp["_day"] = disp["_dt"].dt.date
+    names = {code: name for name, code in DRIVER_CODE.items()}
+
+    def who(v):
+        v = str(v).strip()
+        return DRIVER_CODE.get(v) or (v if v not in ("", "-") else "(not set)")
+    disp["_who"] = disp["Local_Driver"].map(who)
+    disp["_k"] = disp["_day"].astype(str) + "|" + disp["Customer"].astype(str).map(lambda x: re.sub(r"\s+", " ", x).strip())
+    by_taxi = disp["Taxi_Station"].astype(str).str.strip().map(lambda x: x not in ("", "-"))
+    disp["_taxi_cases"] = disp["Cases"].where(by_taxi, 0)
+    g = disp.groupby("_who", sort=False).agg(
+        Deliveries=("Customer", "count"), Customers=("_k", "nunique"), cases=("Cases", "sum"),
+        taxi_cases=("_taxi_cases", "sum"), pp=("Phnom_Penh_Expense", "sum"), tx=("Taxi_Expense", "sum")).reset_index()
+    g = g.sort_values("cases", ascending=False)
+    out = pd.DataFrame({"អ្នកដឹក": g["_who"], "Name": g["_who"].map(lambda x: names.get(x, "")),
+                        "Deliveries": g["Deliveries"], "Customers": g["Customers"], "ចំនួនកេស": g["cases"],
+                        "កេស via taxi": g["taxi_cases"], "សេវាដឹក ៛": g["pp"], "សេវាតាក់ស៊ី ៛": g["tx"]})
+    total = {"អ្នកដឹក": "TOTAL", "Name": "", "Deliveries": int(out["Deliveries"].sum()),
+             "Customers": int(disp["_k"].nunique()), "ចំនួនកេស": int(out["ចំនួនកេស"].sum()),
+             "កេស via taxi": int(out["កេស via taxi"].sum()), "សេវាដឹក ៛": int(out["សេវាដឹក ៛"].sum()),
+             "សេវាតាក់ស៊ី ៛": int(out["សេវាតាក់ស៊ី ៛"].sum())}
+    out = pd.concat([out, pd.DataFrame([total])], ignore_index=True)[DRIVER_TOTAL_COLS]
+    piv = disp.pivot_table(index="_day", columns="_who", values="Cases", aggfunc="sum", fill_value=0).astype(int)
+    piv["TOTAL"] = piv.sum(axis=1)
+    piv = piv.reset_index().rename(columns={"_day": "Date"})
+    return out, piv
 
 
 def _journal_fill_panel():
     with st.expander("📋 Journal fill sheet - driver & expenses for the Sale Journal"):
         st.caption("Gives អ្នកដឹក, សេវាដឹក (ចំណាយ) and សេវាតាក់ស៊ី (ចំណាយ) in the same order as your journal, "
-                   "matched by date + customer. Copy the 3 columns into the journal (or look them up by Invoice).")
+                   "matched by date + customer. ចំនួនកេស shows the cases sent. Copy the 3 columns into the journal "
+                   "(or look them up by Invoice).")
         c1, c2 = st.columns(2)
         d_from = c1.date_input("From", value=today_kh().replace(day=1), key="jf_from")
         d_to = c2.date_input("To", value=today_kh(), key="jf_to")
@@ -3230,21 +3297,38 @@ def _journal_fill_panel():
             if err:
                 st.warning(err)
                 return
-            st.session_state["jf_result"] = (fill, miss)
-        res = st.session_state.get("jf_result")
+            drv, drv_day = build_driver_totals(d_from, d_to)
+            st.session_state["jf_result2"] = (fill, miss, drv, drv_day, d_from, d_to)
+        res = st.session_state.get("jf_result2")
         if not res:
             return
-        fill, miss = res
-        has = fill[(fill["អ្នកដឹក"] != "") | fill["សេវាដឹក (ចំណាយ)"].notna() | fill["សេវាតាក់ស៊ី (ចំណាយ)"].notna()]
+        fill, miss, drv, drv_day, r_from, r_to = res
+        has = fill[(fill["អ្នកដឹក"] != "") | fill["ចំនួនកេស"].notna() | fill["សេវាដឹក (ចំណាយ)"].notna()
+                   | fill["សេវាតាក់ស៊ី (ចំណាយ)"].notna()]
+        sent_total = int(drv.iloc[-1]["ចំនួនកេស"]) if drv is not None and not drv.empty else 0
+        in_table = int(fill["ចំនួនកេស"].fillna(0).sum())
         st.success(f"{len(has)} journal rows have delivery data (of {len(fill)} rows in range). "
                    f"Pending expenses are 0 until you fill them in the Delivery tab.")
+        st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📦 កេស sent <b>{sent_total}</b></span>"
+                    f"<span class='hk-pill'>🧾 In the table below <b>{in_table}</b></span>"
+                    f"<span class='hk-pill'>❓ Not found in journal <b>{sent_total - in_table}</b></span></div>",
+                    unsafe_allow_html=True)
+        if drv is not None:
+            st.markdown("**👷 Total by driver - how many កេស each one sent**")
+            show_df(drv)
+            if drv_day is not None and len(drv_day) > 1:
+                with st.expander("📅 By driver and by day"):
+                    show_df(drv_day)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
             fill.to_excel(w, index=False, sheet_name="Journal_Fill")
+            if drv is not None:
+                drv.to_excel(w, index=False, sheet_name="By_driver")
+                drv_day.to_excel(w, index=False, sheet_name="By_driver_by_day")
             if not miss.empty:
                 miss.to_excel(w, index=False, sheet_name="Not_in_journal")
         st.download_button("📥 Download journal fill sheet (Excel)", data=buf.getvalue(),
-                           file_name=f"Journal_Fill_{d_from}_{d_to}.xlsx",
+                           file_name=f"Journal_Fill_{r_from}_{r_to}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         show_df(has)
         if not miss.empty:
