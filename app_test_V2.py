@@ -6624,7 +6624,7 @@ def _si_no_order(daily, names, areas, month_start, month_end, today, avgs=None):
     return out.reset_index(drop=True)
 
 
-def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=None):
+def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=None, measure="Pcs"):
     """Rule-based customer-care list: who to contact, why, and what to say / offer."""
     t = pd.Timestamp(today)
     if daily.empty:
@@ -6632,8 +6632,10 @@ def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=No
     d90 = daily[daily["D"] > t - pd.Timedelta(days=90)]
     d30 = daily[daily["D"] > t - pd.Timedelta(days=30)]
     p30 = daily[(daily["D"] > t - pd.Timedelta(days=60)) & (daily["D"] <= t - pd.Timedelta(days=30))]
-    s90, s30, sp30 = (x.groupby("Key")["Sales"].sum() for x in (d90, d30, p30))
-    pcs90 = d90.groupby("Key")["Pcs"].sum()
+    mcol = "Pcs" if measure == "Pcs" else "Sales"                       # measure customers by bun pieces or by riel
+    unit = "pcs" if measure == "Pcs" else "៛"
+    s90, s30, sp30 = (x.groupby("Key")[mcol].sum() for x in (d90, d30, p30))
+    c_last, c_prev, c_avg = f"Last 30d {unit}", f"Prev 30d {unit}", f"Avg {unit}/month"
     first, last = daily.groupby("Key")["D"].min(), daily.groupby("Key")["D"].max()
     total_days = daily.groupby("Key")["D"].nunique()
     this_month = set(daily.loc[daily["D"] >= pd.Timestamp(month_start), "Key"])
@@ -6656,8 +6658,11 @@ def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=No
         h = hab.loc[key] if (not hab.empty and key in hab.index) else None
         status = h["Status"] if h is not None else ""
         a30, b30 = float(s30.get(key, 0)), float(sp30.get(key, 0))
-        avg_p, avg_m, basis = _si_avg_get(avgs, key)
-        avg_txt = (f"≈{avg_m:,.0f} ៛ / " if pd.notna(avg_m) else "≈") + (f"{avg_p:,.0f} pcs" if pd.notna(avg_p) else "- pcs") + f" per month, based on {basis}"
+        _ap, _as, basis = _si_avg_get(avgs, key)
+        avg_p = _ap if measure == "Pcs" else _as
+        if measure == "Pcs":
+            basis = str(basis).split(" · ")[0]
+        avg_txt = (f"≈{avg_p:,.0f} {unit}" if pd.notna(avg_p) else f"≈- {unit}") + f" per month, based on {basis}"
         chg = (a30 - b30) / b30 * 100 if b30 > 0 else None
         is_vip = key in vips
         no_order_month = key not in this_month
@@ -6674,7 +6679,7 @@ def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=No
             act = "Message or call: remind them and offer their usual order for the next delivery day."
         elif chg is not None and chg <= -40 and a30 >= 0:
             seg, pr = "🟠 Ordering less", 2
-            why = f"Last 30 days {a30:,.0f} ៛ vs {b30:,.0f} ៛ the 30 days before ({chg:.0f}%)"
+            why = f"Last 30 days {a30:,.0f} {unit} vs {b30:,.0f} {unit} the 30 days before ({chg:.0f}%)"
             act = "Ask for feedback: stock, price, quality or delivery problem? Check if another supplier is taking part of the order."
         elif status == "Dormant" or (45 <= since <= 180 and total_days[key] >= 2 and status != "On track"):
             seg, pr = "🟡 Win-back", 3
@@ -6686,7 +6691,7 @@ def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=No
             act = "Call after the first delivery: is the quality OK? Confirm their usual order day and save their phone and map location."
         elif chg is not None and chg >= 40 and b30 > 0:
             seg, pr = "🟢 Growing", 4
-            why = f"Last 30 days {a30:,.0f} ៛ vs {b30:,.0f} ៛ before (+{chg:.0f}%)"
+            why = f"Last 30 days {a30:,.0f} {unit} vs {b30:,.0f} {unit} before (+{chg:.0f}%)"
             act = "Thank them, check stock is ready for the higher volume, and suggest extra bun types."
         elif is_vip:
             seg, pr = "⭐ VIP – keep happy", 5
@@ -6700,14 +6705,17 @@ def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=No
             tip = ("Try offering: " + ", ".join(miss)) if miss else ""
         rows.append({"Priority": pr, "Segment": seg, "Customer": names.get(key, key), "Area": areas.get(key, AREA_LABEL["Unknown"]),
                      "Why": why, "Suggested action": act, "Cross-sell idea": tip, "Last order": f"{last[key]:%Y-%m-%d}",
-                     "Avg pcs/month": avg_p, "Avg ៛/month": avg_m, "Avg based on": basis})
+                     c_last: int(round(a30)), c_prev: int(round(b30)),
+                     "Change %": round(chg) if chg is not None else None,
+                     c_avg: avg_p, "Avg based on": basis})
     out = pd.DataFrame(rows, columns=["Priority", "Segment", "Customer", "Area", "Why", "Suggested action",
-                                      "Cross-sell idea", "Last order", "Avg pcs/month", "Avg ៛/month", "Avg based on"])
+                                      "Cross-sell idea", "Last order", c_last, c_prev, "Change %",
+                                      c_avg, "Avg based on"])
     if out.empty:
         return out
-    out = out.sort_values(["Priority", "Avg pcs/month"], ascending=[True, False], na_position="last").reset_index(drop=True)
-    for c in ("Avg pcs/month", "Avg ៛/month"):
-        out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
+    out = out.sort_values(["Priority", c_avg], ascending=[True, False], na_position="last").reset_index(drop=True)
+    out[c_avg] = pd.to_numeric(out[c_avg], errors="coerce").round(0).astype("Int64")
+    out["Change %"] = pd.to_numeric(out["Change %"], errors="coerce").round(0).astype("Int64")
     return out
 
 
@@ -6937,7 +6945,9 @@ def _sales_insights_body():
     kpi(k5, "Lost sales risk ៛ (est.)", f"{int(missing['Lost sales ៛ (est.)'].sum()) if len(missing) else 0:,}")
     st.caption("Sales % compares with the same days of last month.")
 
-    care = _si_care(daily, df, codes, habits, names, areas, today, this_start, avgs)
+    care_measure = "Sales" if str(st.session_state.get("si_care_measure", "")).startswith("💵") else "Pcs"
+    care = _si_care(daily, df, codes, habits, names, areas, today, this_start, avgs, care_measure)
+    care_unit = "pcs" if care_measure == "Pcs" else "៛"
     top = pd.DataFrame()
     t_top, t_miss, t_none, t_care, t_hist, t_det = st.tabs(["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
                                                            "💝 Customer care", "📆 Monthly history", "🔎 Customer detail"])
@@ -7020,6 +7030,7 @@ def _sales_insights_body():
             sel = st.session_state.get("si_seg_sel")
             if sel not in segs:
                 sel = None
+            st.radio("Measure customers by", ["🥟 Bun pcs", "💵 Sales ៛"], horizontal=True, key="si_care_measure")
             st.caption("👆 Click a card to filter the lists below. Click it again (or 📋 All) to clear.")
             cards = [(None, f"📋 All · {len(care)}")] + [(sg, f"{sg} · {cnt[sg]}") for sg in segs]
             for i in range(0, len(cards), 4):
@@ -7046,14 +7057,15 @@ def _sales_insights_body():
                                 f"{r['Why']}  \n👉 {r['Suggested action']}"
                                 + (f"  \n💡 {r['Cross-sell idea']}" if r["Cross-sell idea"] else ""))
             st.markdown(f"#### Customer-care suggestions ({len(view)} of {len(care)})")
-            _si_show(view.drop(columns="Priority"), money=("Avg pcs/month", "Avg ៛/month"), height=520)
+            _si_show(view.drop(columns="Priority"), money=(f"Avg {care_unit}/month", f"Last 30d {care_unit}", f"Prev 30d {care_unit}"), height=520)
             with st.expander("How these suggestions are made"):
                 st.markdown(
-                    "- 🔴 **VIP at risk**: top 20% by 90-day sales and late / silent.\n"
+                    "- 🔴 **VIP at risk**: top 20% (by the measure you picked, bun pieces or riel) over the last 90 days and late / silent.\n"
                     "- 🟠 **Missed usual order**: later than their own usual gap. 🟠 **Ordering less**: last 30 days at least 40% below the 30 days before.\n"
                     "- 🟡 **Win-back**: dormant, or silent 45–180 days.\n"
                     "- 🟢 **New customer**: first order in the last 30 days. 🟢 **Growing**: last 30 days at least 40% above the 30 days before.\n"
                     "- ⭐ **VIP – keep happy**: top 20% and ordering normally.\n"
+                    "- 🥟 / 💵 **Measure**: choose bun pieces (default) or riel above the cards. Riel only exists for months with daily data (September onward).\n"
                     "- 📊 **Averages** are per month the customer actually bought (finished months only; months without a purchase are not counted). "
                     "The 'Avg based on' column says how many months. A customer with no finished month yet shows this month so far, based on order days.\n"
                     "- 💡 **Cross-sell**: top-3 best-selling bun types of the last 90 days that this customer did not buy.")
