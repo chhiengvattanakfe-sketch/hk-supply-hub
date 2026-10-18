@@ -6356,6 +6356,9 @@ def tab_customer_map():
 # Uses only data the app already has: journal + orders typed on the site (journal_plus_orders).
 # FOC (free) rows are ignored: a free gift is not an order. STAFF / GENERAL are ignored.
 # ==========================================
+SI_HIST_DAILY_FILE = os.path.join(DATA_DIR, "sales_history_daily.csv")      # older months, one row per invoice line
+SI_HIST_MONTHLY_FILE = os.path.join(DATA_DIR, "sales_history_monthly.csv")  # older months, bun pieces per customer per month
+SI_IGNORE_NAMES = {x.upper() for x in IGNORE_NEW} | {"STAF"}          # staff / general sales are not customers
 SI_PERIODS = ["This month", "Last month", "Last 30 days", "Last 90 days", "All time"]
 SI_METRICS = {"Sales ៛": "Sales", "Bun pcs": "Pcs", "Cases": "Cases", "Orders (days)": "Orders"}
 
@@ -6374,15 +6377,69 @@ def _si_period(choice, today):
     return date(2000, 1, 1), today
 
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def _si_hist_cached(path, mtime_ns, size):
+    return pd.read_csv(path, encoding="utf-8-sig")
+
+
+def _si_read_hist(path):
+    """History CSV (empty DataFrame if the file is not there). In Dropbox mode it is pulled from the data folder."""
+    if USE_DROPBOX:
+        try:
+            pull(path)
+        except Exception as e:
+            bot_log("warn", "Sales history", f"Could not refresh {os.path.basename(path)}: {str(e)[:100]}", "using the saved copy")
+    if not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        stt = os.stat(path)
+        return _si_hist_cached(path, stt.st_mtime_ns, stt.st_size).copy()
+    except Exception as e:
+        bot_log("warn", "Sales history", f"{os.path.basename(path)} could not be read: {str(e)[:120]}", "ignored")
+        return pd.DataFrame()
+
+
+def _si_add_history(j, codes, hist_daily, hist_monthly):
+    """Older daily rows are added to the journal rows. A day that is already in the journal is never added twice."""
+    if hist_daily is None or hist_daily.empty or not {"Date", "Customer"} <= set(hist_daily.columns):
+        return j, codes, 0
+    h = hist_daily.copy()
+    h["Date"] = pd.to_datetime(h["Date"], errors="coerce").dt.normalize()
+    h = h.dropna(subset=["Date"])
+    if j is not None and not j.empty:
+        have = set(pd.to_datetime(j["Date"], errors="coerce").dt.normalize().dropna())
+        h = h[~h["Date"].isin(have)]
+    if h.empty:
+        return j, codes, 0
+    if hist_monthly is not None and not hist_monthly.empty and "Code" in h.columns and "Code" in hist_monthly.columns:
+        code_name = dict(zip(hist_monthly["Code"], hist_monthly["Customer"]))      # same customer, same spelling as the master list
+        h["Customer"] = h["Code"].map(code_name).fillna(h["Customer"])
+    extra = [c for c in h.columns if re.match(r"^N\d+$", str(c)) and c not in codes]
+    all_codes = list(codes) + extra
+    out = pd.DataFrame({"Date": h["Date"].dt.date, "Customer": h["Customer"].astype(str),
+                        "Cases": pd.to_numeric(h["Cases_est"] if "Cases_est" in h.columns else 0, errors="coerce"),
+                        "Invoice": h["Invoice"] if "Invoice" in h.columns else "-",
+                        "Remark": h["Remark"] if "Remark" in h.columns else "-", "FOC": False, "_site": False})
+    for c in all_codes:
+        out[c] = pd.to_numeric(h[c], errors="coerce").fillna(0.0) if c in h.columns else 0.0
+    base = j if (j is not None and not j.empty) else out.iloc[0:0]
+    for c in all_codes:
+        if c not in base.columns:
+            base = base.assign(**{c: 0.0})
+    merged = pd.concat([base, out[[c for c in base.columns if c in out.columns]]], ignore_index=True)
+    return merged, all_codes, len(out)
+
+
 def _si_prepare(snap):
     """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows."""
     j = journal_plus_orders(snap)
     codes = bun_codes(snap)
+    j, codes, _n_hist = _si_add_history(j, codes, _si_read_hist(SI_HIST_DAILY_FILE), _si_read_hist(SI_HIST_MONTHLY_FILE))
     if j is None or j.empty:
         return pd.DataFrame(), pd.DataFrame(), codes
     df = j.copy()
     df["Customer"] = df["Customer"].astype(str).str.strip()
-    df = df[df["Customer"].ne("") & ~df["Customer"].str.upper().isin([x.upper() for x in IGNORE_NEW])]
+    df = df[df["Customer"].ne("") & ~df["Customer"].str.upper().isin(SI_IGNORE_NAMES)]
     df = df[~df["FOC"].fillna(False).astype(bool)]                       # free buns are not orders
     df["D"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
     df = df.dropna(subset=["D"]).copy()
@@ -6613,6 +6670,63 @@ def _si_care(daily, df, codes, habits, names, areas, today, month_start):
     return out.sort_values(["Priority", "Avg ៛/month (90d)"], ascending=[True, False]).reset_index(drop=True)
 
 
+def _si_monthly_table(hist_monthly, daily):
+    """Bun pieces per customer per month: the monthly file for older months + the daily data for every month it covers."""
+    d = daily.copy()
+    d["Month"] = d["D"].dt.strftime("%Y-%m")
+    dm = d.groupby(["Month", "Key"], as_index=False).agg(Customer=("Customer", "first"), Pcs=("Pcs", "sum"))
+    parts = [dm]
+    if hist_monthly is not None and not hist_monthly.empty and {"Month", "Customer", "Pcs"} <= set(hist_monthly.columns):
+        m = hist_monthly.copy()
+        m["Key"] = m["Customer"].map(norm_name)
+        m["Pcs"] = pd.to_numeric(m["Pcs"], errors="coerce").fillna(0)
+        m = m[~m["Month"].isin(set(dm["Month"])) & ~m["Customer"].astype(str).str.strip().str.upper().isin(SI_IGNORE_NAMES)]
+        parts.append(m[["Month", "Key", "Customer", "Pcs"]])
+    allm = pd.concat(parts, ignore_index=True)
+    return allm.groupby(["Month", "Key"], as_index=False).agg(Customer=("Customer", "first"), Pcs=("Pcs", "sum"))
+
+
+def _si_month_summary(mon):
+    rows, prev = [], set()
+    for m in sorted(mon["Month"].unique()):
+        cur = mon[(mon["Month"] == m) & (mon["Pcs"] > 0)]
+        act = set(cur["Key"])
+        rows.append({"Month": m, "Bun pcs": int(cur["Pcs"].sum()), "Active customers": len(act),
+                     "New / resumed": len(act - prev) if prev else 0, "Dropped (ordered last month, not now)": len(prev - act) if prev else 0})
+        prev = act
+    return pd.DataFrame(rows)
+
+
+def _si_month_detail(mon, month, names, areas, top_n=20):
+    months = sorted(mon["Month"].unique())
+    i = months.index(month)
+    prev_m = months[i - 1] if i > 0 else None
+    cur = mon[mon["Month"] == month].set_index("Key")["Pcs"]
+    prev = mon[mon["Month"] == prev_m].set_index("Key")["Pcs"] if prev_m else pd.Series(dtype=float)
+
+    def _frame(series, with_prev=True):
+        out = pd.DataFrame({"Customer": [names.get(k, k) for k in series.index],
+                            "Area": [areas.get(k, AREA_LABEL["Unknown"]) for k in series.index],
+                            "Bun pcs": series.round(0).astype("int64").values})
+        if with_prev:
+            pv = prev.reindex(series.index).fillna(0)
+            out["Previous month pcs"] = pv.round(0).astype("int64").values
+            out["Change %"] = ((series.values - pv.values) / pv.where(pv > 0).values * 100).round(0)
+        return out
+    top = _frame(cur[cur > 0].sort_values(ascending=False).head(top_n))
+    top.insert(0, "Rank", range(1, len(top) + 1))
+    top["Share %"] = (top["Bun pcs"] / max(float(cur.sum()), 1) * 100).round(1)
+    dropped_s = prev[(prev > 0) & (cur.reindex(prev.index).fillna(0) <= 0)].sort_values(ascending=False)
+    dropped = pd.DataFrame({"Customer": [names.get(k, k) for k in dropped_s.index],
+                            "Area": [areas.get(k, AREA_LABEL["Unknown"]) for k in dropped_s.index],
+                            f"Pcs in {prev_m}": dropped_s.round(0).astype("int64").values})
+    new_s = cur[(cur > 0) & (prev.reindex(cur.index).fillna(0) <= 0)].sort_values(ascending=False)
+    new = pd.DataFrame({"Customer": [names.get(k, k) for k in new_s.index],
+                        "Area": [areas.get(k, AREA_LABEL["Unknown"]) for k in new_s.index],
+                        "Bun pcs": new_s.round(0).astype("int64").values})
+    return top, dropped, new, prev_m
+
+
 # ---------- UI helpers ----------
 def _si_show(df, money=(), pct=(), height=None):
     """Table with thousands separators where the Streamlit version supports it."""
@@ -6670,6 +6784,13 @@ def _sales_insights_body():
         st.info("No paid orders found in the journal yet.")
         return
     names, areas = _si_names_areas(snap, daily)
+    hist_monthly = _si_read_hist(SI_HIST_MONTHLY_FILE)
+    mon = _si_monthly_table(hist_monthly, daily)
+    if not hist_monthly.empty and "Zone" in hist_monthly.columns:
+        for k, c, z in zip(hist_monthly["Customer"].map(norm_name), hist_monthly["Customer"], hist_monthly["Zone"]):
+            names.setdefault(k, c)
+            if areas.get(k, AREA_LABEL["Unknown"]) == AREA_LABEL["Unknown"]:
+                areas[k] = AREA_LABEL[PP] if str(z).strip() == "ភ្នំពេញ" else AREA_LABEL["Province"]
     span = (daily["D"].max() - daily["D"].min()).days + 1
     st.caption(f"Data: {daily['D'].min():%Y-%m-%d} → {daily['D'].max():%Y-%m-%d} ({span} days, "
                f"{daily['Key'].nunique()} customers with orders). Free (FOC) rows are not counted as orders.")
@@ -6707,7 +6828,8 @@ def _sales_insights_body():
 
     care = _si_care(daily, df, codes, habits, names, areas, today, this_start)
     top = pd.DataFrame()
-    t_top, t_miss, t_none, t_care = st.tabs(["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month", "💝 Customer care"])
+    t_top, t_miss, t_none, t_care, t_hist = st.tabs(["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
+                                                    "💝 Customer care", "📆 Monthly history"])
 
     with t_top:
         c1, c2 = st.columns([2, 2])
@@ -6806,7 +6928,30 @@ def _sales_insights_body():
                     "- 🟢 **New customer**: first order in the last 30 days. 🟢 **Growing**: last 30 days at least 40% above the 30 days before.\n"
                     "- ⭐ **VIP – keep happy**: top 20% and ordering normally.\n"
                     "- 💡 **Cross-sell**: top-3 best-selling bun types of the last 90 days that this customer did not buy.")
-    _si_download({"Top 20": top, "Missing from habit": missing,
+    with t_hist:
+        summ = _si_month_summary(mon)
+        if summ.empty:
+            st.info("No monthly data yet.")
+        else:
+            st.caption("Bun pieces per month. Older months come from sales_history_monthly.csv; months with daily data use the daily rows. "
+                       f"The newest month ({summ['Month'].iloc[-1]}) may still be running." +
+                       ("" if not hist_monthly.empty else "  ⚠️ sales_history_monthly.csv was not found in the data folder."))
+            st.bar_chart(summ.set_index("Month")["Bun pcs"])
+            _si_show(summ, money=("Bun pcs",))
+            month = st.selectbox("Month detail", list(summ["Month"])[::-1], key="si_hist_month")
+            h_top, h_drop, h_new, prev_m = _si_month_detail(mon, month, names, areas)
+            st.markdown(f"**🏆 Top 20 in {month}** (bun pcs)" + (f" — compared with {prev_m}" if prev_m else ""))
+            _si_show(h_top, money=("Bun pcs", "Previous month pcs"), pct=("Share %",), height=760)
+            if prev_m:
+                with st.expander(f"📉 Ordered in {prev_m} but not in {month} ({len(h_drop)})"):
+                    _si_show(h_drop, money=(f"Pcs in {prev_m}",), height=420)
+                with st.expander(f"🆕 New or resumed in {month} ({len(h_new)})"):
+                    _si_show(h_new, money=("Bun pcs",), height=420)
+            tot = mon.groupby("Key")["Pcs"].sum().sort_values(ascending=False)
+            pick = st.selectbox("Customer trend", list(tot.index), format_func=lambda k: names.get(k, k), key="si_hist_cust")
+            series = mon[mon["Key"] == pick].set_index("Month")["Pcs"].reindex(summ["Month"]).fillna(0)
+            st.line_chart(series.rename("Bun pcs"))
+    _si_download({"Monthly history": _si_month_summary(mon), "Top 20": top, "Missing from habit": missing,
                   "No order this month": no_month, "Customer care": care}, f"Sales_Insights_{today}.xlsx")
 
 
