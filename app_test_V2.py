@@ -6352,6 +6352,444 @@ def tab_customer_map():
 
 
 # ==========================================
+# TAB: SALES INSIGHTS  (top customers, missed orders, no order this month, customer care)
+# Uses only data the app already has: journal + orders typed on the site (journal_plus_orders).
+# FOC (free) rows are ignored: a free gift is not an order. STAFF / GENERAL are ignored.
+# ==========================================
+SI_PERIODS = ["This month", "Last month", "Last 30 days", "Last 90 days", "All time"]
+SI_METRICS = {"Sales ៛": "Sales", "Cases": "Cases", "Orders (days)": "Orders"}
+
+
+def _si_period(choice, today):
+    first_this = today.replace(day=1)
+    last_prev = first_this - timedelta(days=1)
+    if choice == "This month":
+        return first_this, today
+    if choice == "Last month":
+        return last_prev.replace(day=1), last_prev
+    if choice == "Last 30 days":
+        return today - timedelta(days=29), today
+    if choice == "Last 90 days":
+        return today - timedelta(days=89), today
+    return date(2000, 1, 1), today
+
+
+def _si_prepare(snap):
+    """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows."""
+    j = journal_plus_orders(snap)
+    codes = bun_codes(snap)
+    if j is None or j.empty:
+        return pd.DataFrame(), pd.DataFrame(), codes
+    df = j.copy()
+    df["Customer"] = df["Customer"].astype(str).str.strip()
+    df = df[df["Customer"].ne("") & ~df["Customer"].str.upper().isin([x.upper() for x in IGNORE_NEW])]
+    df = df[~df["FOC"].fillna(False).astype(bool)]                       # free buns are not orders
+    df["D"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
+    df = df.dropna(subset=["D"]).copy()
+    df["Key"] = df["Customer"].map(norm_name)
+    for c in codes:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    sell = (snap.get("buns", {}) or {}).get("sell", {}) or {}
+    if codes:
+        price = pd.Series({c: float(sell.get(c) or 0) for c in codes})
+        df["Sales"] = (df[codes] * price).sum(axis=1)
+        df["Pcs"] = df[codes].sum(axis=1)
+    else:
+        df["Sales"], df["Pcs"] = 0.0, 0.0
+    df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
+    daily = df.groupby(["Key", "D"], as_index=False).agg(
+        Customer=("Customer", "first"), Cases=("Cases", "sum"), Sales=("Sales", "sum"), Pcs=("Pcs", "sum"))
+    return daily, df, codes
+
+
+def _si_names_areas(snap, daily):
+    names = {norm_name(n): n for n in snap.get("customers", [])}
+    for k, n in zip(daily["Key"], daily["Customer"]):
+        names.setdefault(k, n)
+    amap = areas_lookup(snap)
+    areas = {k: AREA_LABEL.get(amap.get(k, "Unknown"), AREA_LABEL["Unknown"]) for k in names}
+    return names, areas
+
+
+def _si_top(daily, start, end, metric, names, areas, top_n=20):
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+
+    def _agg(a, b):
+        part = daily[(daily["D"] >= a) & (daily["D"] <= b)]
+        return part.groupby("Key").agg(Orders=("D", "nunique"), Cases=("Cases", "sum"),
+                                       Sales=("Sales", "sum"), Last=("D", "max"))
+    cur = _agg(s, e)
+    if cur.empty:
+        return pd.DataFrame(), 0
+    total = float(cur[metric].sum())
+    if start.year > 2001:                                                 # not "All time" -> compare with the period before
+        length = (e - s).days + 1
+        prev = _agg(s - pd.Timedelta(days=length), s - pd.Timedelta(days=1))[metric]
+        cur["Prev"] = prev.reindex(cur.index)
+    else:
+        cur["Prev"] = float("nan")
+    cur = cur.sort_values([metric, "Sales"], ascending=False).head(top_n).reset_index()
+    out = pd.DataFrame({
+        "Rank": range(1, len(cur) + 1),
+        "Customer": cur["Key"].map(lambda k: names.get(k, k)),
+        "Area": cur["Key"].map(lambda k: areas.get(k, AREA_LABEL["Unknown"])),
+        "Orders (days)": cur["Orders"].astype(int),
+        "Cases": cur["Cases"].round(1),
+        "Sales ៛": cur["Sales"].round(0).astype("int64"),
+        "Avg order ៛": (cur["Sales"] / cur["Orders"].clip(lower=1)).round(0).astype("int64"),
+        "Share %": (cur[metric] / total * 100).round(1) if total else 0.0,
+        "Last order": cur["Last"].dt.strftime("%Y-%m-%d"),
+        "vs previous %": ((cur[metric] - cur["Prev"]) / cur["Prev"] * 100).where(cur["Prev"] > 0).round(0),
+    })
+    return out, total
+
+
+def _si_habits(daily, today, min_orders=4, lookback=180, factor=1.5, dormant_factor=4.0, names=None, areas=None):
+    """Usual ordering rhythm of each customer and whether they are late. Status: On track | Missing | Dormant."""
+    names, areas = names or {}, areas or {}
+    t = pd.Timestamp(today)
+    d = daily[daily["D"] >= t - pd.Timedelta(days=lookback)]
+    rows = []
+    for key, g in d.groupby("Key"):
+        dates = g["D"].sort_values().reset_index(drop=True)
+        if len(dates) < min_orders:
+            continue
+        gaps = dates.diff().dt.days.dropna()
+        gap = max(1.0, float(gaps.median()))
+        cv = float(gaps.std() / gaps.mean()) if len(gaps) > 1 and gaps.mean() > 0 else 0.0
+        last = dates.iloc[-1]
+        since = int((t - last).days)
+        late_at = max(gap * factor, gap + 1)
+        dormant_at = max(min(gap * dormant_factor, 90), late_at + 1)
+        status = "Dormant" if since > dormant_at else ("Missing" if since >= late_at else "On track")
+        wd = dates.dt.dayofweek.value_counts()
+        wd_name = ("Mon Tue Wed Thu Fri Sat Sun".split()[int(wd.index[0])]) if wd.iloc[0] / len(dates) >= 0.5 else "-"
+        avg_order = float(g["Sales"].mean())
+        cycles = max(1, int(since // gap)) if status != "On track" else 0
+        rows.append({
+            "Key": key, "Customer": names.get(key, g["Customer"].iloc[0]), "Area": areas.get(key, AREA_LABEL["Unknown"]),
+            "Orders in period": len(dates), "Usual gap (days)": round(gap, 1), "Usual day": wd_name,
+            "Pattern": "🟢 Regular" if cv <= 0.6 else "🟡 Irregular",
+            "Last order": last.strftime("%Y-%m-%d"), "Days since": since,
+            "Expected by": (last + pd.Timedelta(days=gap)).strftime("%Y-%m-%d"),
+            "Days late": max(0, int(round(since - gap))), "Usual cases": round(float(g["Cases"].median()), 1),
+            "Avg order ៛": int(round(avg_order)), "Missed orders (est.)": cycles,
+            "Lost sales ៛ (est.)": int(round(cycles * avg_order)), "Status": status})
+    cols = ["Key", "Customer", "Area", "Orders in period", "Usual gap (days)", "Usual day", "Pattern", "Last order",
+            "Days since", "Expected by", "Days late", "Usual cases", "Avg order ៛", "Missed orders (est.)",
+            "Lost sales ៛ (est.)", "Status"]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _si_no_order(daily, names, areas, month_start, month_end, today):
+    """Customers (master list + journal) with no order in the chosen month."""
+    s, e = pd.Timestamp(month_start), pd.Timestamp(month_end)
+    ref = min(pd.Timestamp(today), e)
+    ordered = set(daily.loc[(daily["D"] >= s) & (daily["D"] <= e), "Key"])
+    prev_end = s - pd.Timedelta(days=1)
+    prev_start = prev_end.replace(day=1)
+    in_prev = set(daily.loc[(daily["D"] >= prev_start) & (daily["D"] <= prev_end), "Key"])
+    before = daily[daily["D"] < s]
+    last = before.groupby("Key")["D"].max()
+    cnt = before.groupby("Key")["D"].nunique()
+    win = before[before["D"] >= s - pd.Timedelta(days=90)]
+    monthly = (win.groupby("Key")["Sales"].sum() / 3.0)
+    rows = []
+    for key, name in names.items():
+        if key in ordered:
+            continue
+        if key in last.index:
+            group = "Ordered last month" if key in in_prev else "Ordered earlier"
+            rows.append({"Group": group, "Customer": name, "Area": areas.get(key, AREA_LABEL["Unknown"]),
+                         "Last order": last[key].strftime("%Y-%m-%d"), "Days since": int((ref - last[key]).days),
+                         "Total order days": int(cnt[key]), "Avg ៛/month (90d)": int(round(monthly.get(key, 0.0)))})
+        else:
+            rows.append({"Group": "Never ordered", "Customer": name, "Area": areas.get(key, AREA_LABEL["Unknown"]),
+                         "Last order": "-", "Days since": None, "Total order days": 0, "Avg ៛/month (90d)": 0})
+    cols = ["Group", "Customer", "Area", "Last order", "Days since", "Total order days", "Avg ៛/month (90d)"]
+    out = pd.DataFrame(rows, columns=cols)
+    rank = {"Ordered last month": 0, "Ordered earlier": 1, "Never ordered": 2}
+    if out.empty:
+        return out
+    out["Days since"] = out["Days since"].astype("Int64")
+    out["_r"] = out["Group"].map(rank)
+    out = out.sort_values(["_r", "Avg ៛/month (90d)", "Customer"], ascending=[True, False, True]).drop(columns="_r")
+    return out.reset_index(drop=True)
+
+
+def _si_care(daily, df, codes, habits, names, areas, today, month_start):
+    """Rule-based customer-care list: who to contact, why, and what to say / offer."""
+    t = pd.Timestamp(today)
+    if daily.empty:
+        return pd.DataFrame()
+    d90 = daily[daily["D"] > t - pd.Timedelta(days=90)]
+    d30 = daily[daily["D"] > t - pd.Timedelta(days=30)]
+    p30 = daily[(daily["D"] > t - pd.Timedelta(days=60)) & (daily["D"] <= t - pd.Timedelta(days=30))]
+    s90, s30, sp30 = (x.groupby("Key")["Sales"].sum() for x in (d90, d30, p30))
+    first, last = daily.groupby("Key")["D"].min(), daily.groupby("Key")["D"].max()
+    total_days = daily.groupby("Key")["D"].nunique()
+    this_month = set(daily.loc[daily["D"] >= pd.Timestamp(month_start), "Key"])
+    active = s90[s90 > 0]
+    vip_cut = active.quantile(0.8) if len(active) >= 5 else (active.max() if len(active) else 0)
+    vips = set(active[active >= vip_cut].index) if len(active) else set()
+    hab = habits.set_index("Key") if not habits.empty else pd.DataFrame()
+    best = []
+    if codes and not df.empty:
+        recent = df[df["D"] > t - pd.Timedelta(days=90)]
+        best = list(recent[codes].sum().sort_values(ascending=False).head(3).index)
+        mine = recent.groupby("Key")[codes].sum()
+    else:
+        mine = pd.DataFrame()
+    rows = []
+    for key in last.index:
+        since = int((t - last[key]).days)
+        if since > 180:
+            continue                                                       # lost long ago: not a care case
+        h = hab.loc[key] if (not hab.empty and key in hab.index) else None
+        status = h["Status"] if h is not None else ""
+        a30, b30 = float(s30.get(key, 0)), float(sp30.get(key, 0))
+        avg_m = int(round(float(s90.get(key, 0)) / 3.0))
+        chg = (a30 - b30) / b30 * 100 if b30 > 0 else None
+        is_vip = key in vips
+        no_order_month = key not in this_month
+        gap = float(h["Usual gap (days)"]) if h is not None else None
+        usual_cases = h["Usual cases"] if h is not None else None
+        seg = pr = why = act = None
+        if is_vip and (status in ("Missing", "Dormant") or (no_order_month and since >= 14)):
+            seg, pr = "🔴 VIP at risk", 1
+            why = f"Top customer (≈{avg_m:,} ៛/month) but no order for {since} days" + (f"; usually every {gap:g} days" if gap else "")
+            act = "Call the owner personally today. Ask if anything went wrong (quality, price, late delivery) and offer to take the usual order now."
+        elif status == "Missing":
+            seg, pr = "🟠 Missed usual order", 2
+            why = f"Usually orders every ~{gap:g} days (≈{usual_cases:g} cases), now {since} days without an order"
+            act = "Message or call: remind them and offer their usual order for the next delivery day."
+        elif chg is not None and chg <= -40 and a30 >= 0:
+            seg, pr = "🟠 Ordering less", 2
+            why = f"Last 30 days {a30:,.0f} ៛ vs {b30:,.0f} ៛ the 30 days before ({chg:.0f}%)"
+            act = "Ask for feedback: stock, price, quality or delivery problem? Check if another supplier is taking part of the order."
+        elif status == "Dormant" or (45 <= since <= 180 and total_days[key] >= 2 and status != "On track"):
+            seg, pr = "🟡 Win-back", 3
+            why = f"No order for {since} days (last: {last[key]:%Y-%m-%d})"
+            act = "Visit or call to win them back. Consider a free sample (FOC) of a best seller with the next order."
+        elif (t - first[key]).days <= 30:
+            seg, pr = "🟢 New customer", 4
+            why = f"First order {first[key]:%Y-%m-%d}; {int(total_days[key])} order day(s) so far"
+            act = "Call after the first delivery: is the quality OK? Confirm their usual order day and save their phone and map location."
+        elif chg is not None and chg >= 40 and b30 > 0:
+            seg, pr = "🟢 Growing", 4
+            why = f"Last 30 days {a30:,.0f} ៛ vs {b30:,.0f} ៛ before (+{chg:.0f}%)"
+            act = "Thank them, check stock is ready for the higher volume, and suggest extra bun types."
+        elif is_vip:
+            seg, pr = "⭐ VIP – keep happy", 5
+            why = f"Top 20% customer (≈{avg_m:,} ៛/month), ordering normally"
+            act = "Give stock priority, send a thank-you at month end and ask for feedback or a referral."
+        if seg is None:
+            continue
+        tip = ""
+        if len(mine) and key in mine.index and best:
+            miss = [c for c in best if mine.loc[key, c] <= 0]
+            tip = ("Try offering: " + ", ".join(miss)) if miss else ""
+        rows.append({"Priority": pr, "Segment": seg, "Customer": names.get(key, key), "Area": areas.get(key, AREA_LABEL["Unknown"]),
+                     "Why": why, "Suggested action": act, "Cross-sell idea": tip, "Last order": f"{last[key]:%Y-%m-%d}",
+                     "Avg ៛/month (90d)": avg_m})
+    out = pd.DataFrame(rows, columns=["Priority", "Segment", "Customer", "Area", "Why", "Suggested action",
+                                      "Cross-sell idea", "Last order", "Avg ៛/month (90d)"])
+    if out.empty:
+        return out
+    return out.sort_values(["Priority", "Avg ៛/month (90d)"], ascending=[True, False]).reset_index(drop=True)
+
+
+# ---------- UI helpers ----------
+def _si_show(df, money=(), pct=(), height=None):
+    """Table with thousands separators where the Streamlit version supports it."""
+    cfg = {}
+    try:
+        for c in money:
+            if c in df.columns:
+                cfg[c] = st.column_config.NumberColumn(c, format="localized")
+        for c in pct:
+            if c in df.columns:
+                cfg[c] = st.column_config.NumberColumn(c, format="%.1f")
+    except Exception:
+        cfg = {}
+    try:
+        show_df(df, height=height, column_config=cfg or None)
+    except Exception:
+        show_df(df, height=height)
+
+
+def _si_download(frames, filename):
+    if not has_permission("reports"):
+        return
+    try:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+            for name, frame in frames.items():
+                f = frame.drop(columns=[c for c in ("Key",) if c in frame.columns])
+                f.to_excel(xw, sheet_name=name[:31], index=False)
+        st.download_button("📥 Download all lists (Excel)", data=buf.getvalue(), file_name=filename,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="si_dl")
+    except Exception as e:
+        st.warning(f"Could not build Excel file: {e}")
+
+
+def _si_bar(frame, label_col, value_col):
+    data = frame[[label_col, value_col]].copy()
+    for kw in ({"x": label_col, "y": value_col, "sort": f"-{value_col}", "horizontal": True},
+               {"x": label_col, "y": value_col}):
+        try:
+            st.bar_chart(data, **kw)
+            return
+        except Exception:
+            continue
+    st.bar_chart(data.set_index(label_col))
+
+
+def _sales_insights_body():
+    snap, _src, _path, err = current_snapshot()
+    if not snap:
+        st.warning(f"Excel problem: {err}")
+        return
+    today = today_kh()
+    daily, df, codes = _si_prepare(snap)
+    if daily.empty:
+        st.info("No paid orders found in the journal yet.")
+        return
+    names, areas = _si_names_areas(snap, daily)
+    span = (daily["D"].max() - daily["D"].min()).days + 1
+    st.caption(f"Data: {daily['D'].min():%Y-%m-%d} → {daily['D'].max():%Y-%m-%d} ({span} days, "
+               f"{daily['Key'].nunique()} customers with orders). Free (FOC) rows are not counted as orders.")
+
+    with st.expander("⚙️ Settings for 'missing from habit'"):
+        c1, c2, c3, c4 = st.columns(4)
+        lookback = c1.slider("Look back (days)", 30, 365, min(180, max(30, span)), 15, key="si_lookback")
+        min_orders = c2.slider("Min. order days to learn a habit", 2, 10, 4 if span >= 60 else 3, key="si_minord")
+        factor = c3.slider("Late when silent × usual gap", 1.2, 3.0, 1.5, 0.1, key="si_factor")
+        dormant_factor = c4.slider("Dormant after × usual gap", 2.0, 8.0, 4.0, 0.5, key="si_dormant")
+        if span < 60:
+            st.info("The journal covers less than 60 days, so habits are still rough. They get better as more days are added.")
+
+    habits = _si_habits(daily, today, min_orders, lookback, factor, dormant_factor, names, areas)
+    this_start = today.replace(day=1)
+    d_mtd = daily[(daily["D"] >= pd.Timestamp(this_start)) & (daily["D"] <= pd.Timestamp(today))]
+    last_end = this_start - timedelta(days=1)
+    last_start = last_end.replace(day=1)
+    same_end = min(last_start + timedelta(days=today.day - 1), last_end)
+    d_prev = daily[(daily["D"] >= pd.Timestamp(last_start)) & (daily["D"] <= pd.Timestamp(same_end))]
+    no_month = _si_no_order(daily, names, areas, this_start, today, today)
+    lost_month = no_month[no_month["Group"] == "Ordered last month"] if not no_month.empty else no_month
+    missing = habits[habits["Status"] == "Missing"] if not habits.empty else habits
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    kpi(k1, "Customers ordered this month", f"{d_mtd['Key'].nunique():,}")
+    s_now, s_prev = d_mtd["Sales"].sum(), d_prev["Sales"].sum()
+    kpi(k2, "Sales this month ៛", f"{s_now:,.0f}" + (f"  ({(s_now - s_prev) / s_prev * 100:+.0f}%)" if s_prev > 0 else ""))
+    kpi(k3, "Missing from habit", f"{len(missing):,}")
+    kpi(k4, "Ordered last month, not yet this month", f"{len(lost_month):,}")
+    kpi(k5, "Lost sales risk ៛ (est.)", f"{int(missing['Lost sales ៛ (est.)'].sum()) if len(missing) else 0:,}")
+    st.caption("Sales % compares with the same days of last month.")
+
+    care = _si_care(daily, df, codes, habits, names, areas, today, this_start)
+    top = pd.DataFrame()
+    t_top, t_miss, t_none, t_care = st.tabs(["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month", "💝 Customer care"])
+
+    with t_top:
+        c1, c2 = st.columns([2, 2])
+        period = c1.selectbox("Period", SI_PERIODS, key="si_period")
+        metric_label = c2.radio("Rank by", list(SI_METRICS), horizontal=True, key="si_metric")
+        metric = SI_METRICS[metric_label]
+        if metric == "Sales" and not daily["Sales"].sum():
+            st.info("No sell prices found in the journal header; ranking by Cases instead.")
+            metric, metric_label = "Cases", "Cases"
+        start, end = _si_period(period, today)
+        top, total = _si_top(daily, start, end, metric, names, areas, 20)
+        if top.empty:
+            st.info(f"No orders in this period ({start} → {end}).")
+        else:
+            st.caption(f"{start} → {end} · Top 20 hold {top['Share %'].sum():.0f}% of all {metric_label} in this period.")
+            _si_bar(top, "Customer", metric_label if metric_label in top.columns else "Sales ៛")
+            _si_show(top, money=("Sales ៛", "Avg order ៛"), pct=("Share %",), height=760)
+
+    with t_miss:
+        st.markdown("Customers who normally order every X days but are **later than usual**. "
+                    "Call the 🟢 Regular ones first — their habit is the most reliable.")
+        only_regular = st.checkbox("Only regular buyers 🟢", value=False, key="si_regular")
+        view = missing if not only_regular else missing[missing["Pattern"].str.contains("Regular")]
+        if view.empty:
+            st.success("Nobody is late compared with their usual habit. 🎉")
+        else:
+            view = view.sort_values(["Lost sales ៛ (est.)", "Days late"], ascending=False)
+            _si_show(view.drop(columns=["Key", "Status"]), money=("Avg order ៛", "Lost sales ៛ (est.)"))
+        dorm = habits[habits["Status"] == "Dormant"] if not habits.empty else habits
+        if len(dorm):
+            with st.expander(f"💤 Dormant ({len(dorm)}): silent far longer than their habit"):
+                _si_show(dorm.sort_values("Avg order ៛", ascending=False).drop(columns=["Key", "Status"]),
+                         money=("Avg order ៛", "Lost sales ៛ (est.)"))
+
+    with t_none:
+        mode = st.radio("Month", ["This month", "Last month"], horizontal=True, key="si_month")
+        if mode == "This month":
+            m_start, m_end = this_start, today
+        else:
+            m_start, m_end = last_start, last_end
+        table = _si_no_order(daily, names, areas, m_start, m_end, today)
+        if table.empty:
+            st.success("Every customer ordered in this month. 🎉")
+        else:
+            counts = table["Group"].value_counts()
+            st.caption(f"{m_start} → {m_end} · {len(table)} customers without an order "
+                       f"({counts.get('Ordered last month', 0)} ordered the month before, "
+                       f"{counts.get('Ordered earlier', 0)} earlier, {counts.get('Never ordered', 0)} never).")
+            if mode == "This month" and today.day <= 5:
+                st.info("It is the start of the month, so many customers have not ordered yet. Check 'Missing from habit' for who is really late.")
+            g1 = table[table["Group"] == "Ordered last month"]
+            g2 = table[table["Group"] == "Ordered earlier"]
+            g3 = table[table["Group"] == "Never ordered"]
+            st.markdown(f"**📞 Ordered the month before but not this month ({len(g1)})**")
+            _si_show(g1.drop(columns="Group"), money=("Avg ៛/month (90d)",), height=420)
+            with st.expander(f"Ordered earlier, silent for more than a month ({len(g2)})"):
+                _si_show(g2.drop(columns="Group"), money=("Avg ៛/month (90d)",), height=420)
+            with st.expander(f"In the Master List but never ordered in the journal ({len(g3)})"):
+                _si_show(g3[["Customer", "Area"]], height=420)
+
+    with t_care:
+        if care.empty:
+            st.info("No customer-care actions found right now.")
+        else:
+            counts = care["Segment"].value_counts()
+            cols = st.columns(min(7, len(counts)))
+            for col, (seg, n) in zip(cols, counts.items()):
+                kpi(col, seg, f"{n}")
+            st.markdown("#### 📞 Call list for today (top 10 urgent)")
+            urgent = care[care["Priority"] <= 2].head(10)
+            if urgent.empty:
+                st.success("Nobody urgent today.")
+            else:
+                for r in urgent.to_dict("records"):
+                    st.markdown(f"**{r['Segment']} — {r['Customer']}** ({r['Area']})  \n"
+                                f"{r['Why']}  \n👉 {r['Suggested action']}"
+                                + (f"  \n💡 {r['Cross-sell idea']}" if r["Cross-sell idea"] else ""))
+            st.markdown("#### All customer-care suggestions")
+            pick = st.multiselect("Show segments", list(counts.index), default=list(counts.index), key="si_seg")
+            _si_show(care[care["Segment"].isin(pick)].drop(columns="Priority"), money=("Avg ៛/month (90d)",), height=520)
+            with st.expander("How these suggestions are made"):
+                st.markdown(
+                    "- 🔴 **VIP at risk**: top 20% by 90-day sales and late / silent.\n"
+                    "- 🟠 **Missed usual order**: later than their own usual gap. 🟠 **Ordering less**: last 30 days at least 40% below the 30 days before.\n"
+                    "- 🟡 **Win-back**: dormant, or silent 45–180 days.\n"
+                    "- 🟢 **New customer**: first order in the last 30 days. 🟢 **Growing**: last 30 days at least 40% above the 30 days before.\n"
+                    "- ⭐ **VIP – keep happy**: top 20% and ordering normally.\n"
+                    "- 💡 **Cross-sell**: top-3 best-selling bun types of the last 90 days that this customer did not buy.")
+    _si_download({"Top 20": top, "Missing from habit": missing,
+                  "No order this month": no_month, "Customer care": care}, f"Sales_Insights_{today}.xlsx")
+
+
+@st.fragment
+def tab_sales_insights():
+    safe_render(_sales_insights_body, "Sales insights")
+
+
+# ==========================================
 # APP LAYOUT
 # ==========================================
 @st.fragment(run_every=60)
@@ -6445,6 +6883,7 @@ if ROLE in ("admin", "staff", "sales"):
 if _perms.get("view"):
     labels.append("📊 Live Dashboard (Sales)")
     labels.append("📍 Customer Map")
+    labels.append("🎯 Sales Insights")
 elif _perms.get("reports"):
     labels.append("📑 Reports")
 if ROLE == "admin":
@@ -6469,5 +6908,7 @@ for _label, _tab in _tabs.items():
             tab_dashboard(False)
         elif _label.startswith("📍"):
             tab_customer_map()
+        elif _label.startswith("🎯"):
+            tab_sales_insights()
         else:
             tab_bot()
