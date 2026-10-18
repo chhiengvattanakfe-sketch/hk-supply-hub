@@ -89,6 +89,7 @@ AUDIT_FILE = os.path.join(DATA_DIR, "audit_log.csv")
 REMEMBER_FILE = os.path.join(DATA_DIR, "remember_tokens.json")     # "keep me logged in" tokens (only a hash is stored)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")          # accounts (passwords are stored hashed, never as text)
 ASSIGN_FILE = os.path.join(DATA_DIR, "delivery_assignments.csv")   # who will deliver which customer today
+ORDERS_FILE = os.path.join(DATA_DIR, "sale_orders.csv")              # orders typed on the site (synced to Dropbox)
 HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers moved to tomorrow / cancelled
 MAP_REGISTRY_FILE = os.path.join(DATA_DIR, "customer_map_registry.json")
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
@@ -149,12 +150,16 @@ ST_MOVED, ST_CANCEL = "📅 Moved to tomorrow", "❌ Cancelled"
 IGNORE_NEW = ["STAFF", "GENERAL"]            # names that are not real customers: never reported as "new"
 NOT_TO_SEND = ("✅ Sent", ST_MOVED, ST_CANCEL)
 PACKING_NUM_COLS = ["Cases_Packed"]
-NUM_COLS_ALL = set(DISPATCH_NUM_COLS + PACKING_NUM_COLS + HOLD_NUM_COLS)
+ORDER_BUNS = ["N1", "N2", "N21", "N22", "N23", "N3", "N31", "N32", "N33", "N4", "N41", "N42", "N43"]
+ORDER_COLS = ["Date", "Customer", "OrderID", "Invoice", "Remark", "Payment", "Cases"] + ORDER_BUNS + ["Entered_By", "Entered_At", "Status"]
+ORDER_NUM_COLS = ["Cases"] + ORDER_BUNS             # Status: Active | Deleted | InJournal (already copied into the journal)
+NUM_COLS_ALL = set(DISPATCH_NUM_COLS + PACKING_NUM_COLS + HOLD_NUM_COLS + ORDER_NUM_COLS)
 FILES = {
     "dispatch": (DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, "Dispatch CSV"),
     "packing": (PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, "Packing CSV"),
     "assign": (ASSIGN_FILE, ASSIGN_COLS, [], "Assignments CSV"),
     "holds": (HOLD_FILE, HOLD_COLS, HOLD_NUM_COLS, "Moved / cancelled CSV"),
+    "orders": (ORDERS_FILE, ORDER_COLS, ORDER_NUM_COLS, "Sale orders CSV"),
 }
 
 STATUS_RANK = {"✅ Sent": 1, "🔵 Part sent": 2, "🟡 Ready for Delivery": 3, "🟠 Packing": 4, "⏳ Pending": 5,
@@ -1491,7 +1496,7 @@ def daily_backup_once(day_str):
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE)
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE)
         if USE_DROPBOX:
             try:
                 _dbx().files_create_folder_v2(_remote_backup_dir())
@@ -3666,13 +3671,13 @@ def build_report(selected_date):
     scheduled, cases_found = {}, False
     if snap:
         cases_found = snap["cases_col_found"]
-        j = snap["journal"]
-        sub = j[j["Date"] == selected_date]
+        sub = journal_plus_orders(snap, selected_date)
         _bc = bun_codes(snap)
         for name, g in sub.groupby("Customer", sort=False):
             tot = g["Cases"].sum(min_count=1)
             _bsum = g[_bc].sum() if _bc else None
             scheduled[name] = {"cases": int(tot) if pd.notna(tot) else None,
+                               "site_only": bool(g["_site"].all()),
                                "buns": bun_text(_bsum, _bc) if _bsum is not None else "",
                                "buns_total": int(_bsum.sum()) if _bsum is not None else 0,
                                "invoice": _join_unique(g["Invoice"]),
@@ -3767,7 +3772,7 @@ def build_report(selected_date):
             "Buns total": (info.get("buns_total", 0) if info else 0),
             "Moved/Cancel Reason": (f"{h['reason']} (by {h['by']})" if h else ""),
             "Note": s["note"] if s else "-", "Time": s["time"] if s else "-",
-            "Source": "Journal" if info else "⚠️ Not in journal",
+            "Source": ("📝 Site order" if info.get("site_only") else "Journal") if info else "⚠️ Not in journal",
         })
     if not rows:
         return pd.DataFrame(), cases_found, err
@@ -4262,9 +4267,7 @@ def new_customer_names(snap, day=None):
         return []
     master = {norm_name(n) for n in snap["customers"]}
     ignore = {norm_name(n) for n in IGNORE_NEW}
-    j = snap["journal"]
-    if day is not None:
-        j = j[j["Date"] == day]
+    j = journal_plus_orders(snap, day)
     out = {}
     for n in j["Customer"]:
         k = norm_name(n)
@@ -4291,6 +4294,41 @@ def build_master_upload(rows, start_no):
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         pd.DataFrame(recs, columns=IMPORT_HEADERS).to_excel(w, index=False, sheet_name="SHEET1")
     return buf.getvalue()
+
+
+def site_orders_df(day=None, status=("Active",)):
+    """Orders typed on the site, as a DataFrame (one day, or all days)."""
+    df = read_raw(ORDERS_FILE, ORDER_COLS)
+    if df.empty:
+        return df
+    df = df[df["Status"].isin(status)]
+    if day is not None:
+        df = rows_for_day(df, day)
+    return df
+
+
+def journal_plus_orders(snap, day=None):
+    """The journal rows (one day or all) + the active orders typed on the site, in the same shape.
+    A site order whose invoice number is already in the journal is not counted twice."""
+    j = snap["journal"]
+    codes = bun_codes(snap)
+    j = j if day is None else j[j["Date"] == day]
+    j = j.assign(_site=False)
+    try:
+        o = site_orders_df(day)
+    except Exception:
+        return j
+    if o.empty:
+        return j
+    in_journal = {str(x).strip().upper() for x in snap["journal"]["Invoice"] if str(x).strip() not in ("", "-")}
+    o = o[~o["Invoice"].astype(str).str.strip().str.upper().isin(in_journal)]
+    if o.empty:
+        return j
+    site = pd.DataFrame({"Date": o["_dt"].dt.date, "Customer": o["Customer"], "Cases": o["Cases"].astype(float),
+                         "Invoice": o["Invoice"], "Remark": o["Remark"], "FOC": o["Payment"].str.upper().eq("FOC"), "_site": True})
+    for c in codes:
+        site[c] = o[c].astype(float) if c in o.columns else 0.0
+    return pd.concat([j, site[[c for c in j.columns if c in site.columns]]], ignore_index=True).fillna({"FOC": False})
 
 
 def bun_codes(snap):
@@ -4326,8 +4364,7 @@ def _bun_panel(df_scope, selected_date, mobile=False):
         return
     with st.expander("🥐 Bun sales: number of buns N1-N43 (for review)", expanded=False):
         span = st.radio("Show", ["Selected day", "Whole month in the journal"], horizontal=True, key="bun_span")
-        j = snap["journal"]
-        j = j[j["Date"] == selected_date] if span == "Selected day" else j
+        j = journal_plus_orders(snap, selected_date if span == "Selected day" else None)
         if span == "Selected day":
             names_in_view = set(df_scope["Customer"])           # follows the Phnom Penh / Province choice above
             j = j[j["Customer"].isin(names_in_view)]
@@ -4624,6 +4661,228 @@ def build_report_excel(df, day):
         ws = w.book["Summary"]
         ws.column_dimensions["A"].width = 30
     return buf.getvalue()
+
+
+# ==========================================
+# TAB: SALE ORDER INPUT (sales types the order here; it is saved to Dropbox as sale_orders.csv)
+# ==========================================
+JOURNAL_EXPORT_HEADERS = (["កាលបរិច្ឆេទ", "ឈ្មោះអតិថិជន", "Column2", "NO", "ចំណាំ", "វិក្កយប័ត្រ"] + ORDER_BUNS +
+                          ["Column1", "កេស", "សេវាដឹក", "ថ្លៃដើម", "ថ្លៃលក់ជារៀល", "ថ្លៃលក់ជាដុល្លា", "ចំណេញដុល", "ការទូទាត់"])
+
+
+def build_orders_journal_export(df):
+    """Excel in the same column order as the DAILY SALE JOUNAL sheet (A..AA). Formula / price columns are left empty:
+    paste with 'Paste special > Skip blanks' so the journal's own formulas stay."""
+    rows = []
+    for r in df.sort_values(["_dt", "Customer"]).to_dict("records"):
+        rec = {h: None for h in JOURNAL_EXPORT_HEADERS}
+        rec.update({"កាលបរិច្ឆេទ": r["_dt"].date(), "ឈ្មោះអតិថិជន": r["Customer"],
+                    "ចំណាំ": None if r["Remark"] in ("-", "") else r["Remark"],
+                    "វិក្កយប័ត្រ": None if r["Invoice"] in ("-", "") else r["Invoice"],
+                    "កេស": int(r["Cases"]) or None, "ការទូទាត់": r["Payment"]})
+        for c in ORDER_BUNS:
+            rec[c] = int(r[c]) or None
+        rows.append(rec)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl", datetime_format="yyyy-mm-dd", date_format="yyyy-mm-dd") as w:
+        pd.DataFrame(rows, columns=JOURNAL_EXPORT_HEADERS).to_excel(w, index=False, sheet_name="Orders for journal")
+        ws = w.sheets["Orders for journal"]
+        ws.freeze_panes = "A2"
+        ws.column_dimensions["A"].width = 12
+        ws.column_dimensions["B"].width = 34
+    return buf.getvalue()
+
+
+def _order_prices(snap):
+    info = (snap or {}).get("buns", {})
+    return ({c: info.get("names", {}).get(c, "") for c in ORDER_BUNS}, {c: info.get("sell", {}).get(c) or 0 for c in ORDER_BUNS})
+
+
+def tab_sale_order():
+    if ROLE == "viewer":
+        st.info("Your account can only view. Ask Admin if you need to enter orders.")
+        return
+    snap, _, _, _ = current_snapshot()
+    names, sell = _order_prices(snap)
+    me = current_user() or "-"
+    gen = st.session_state.get("order_gen", 0)
+    k = lambda n: f"ord_{n}_{gen}"
+    st.markdown("### 📝 Sale order input")
+    st.caption("Type the order here. It is saved straight to Dropbox (`sale_orders.csv`), appears on the Live Dashboard at once, "
+               "and you can export it later in the journal's column layout.")
+    c1, c2 = st.columns([1, 2])
+    order_date = c1.date_input("Order date (delivery day)", value=today_kh(), key=k("date"))
+    master = get_customer_list()
+    choice = c2.selectbox("Customer (type to search)", ["-- Select a customer --", "➕ New customer (type the name below)"] + master, key=k("cust"))
+    new_name = ""
+    if choice.startswith("➕"):
+        new_name = st.text_input("New customer name (same spelling as on the invoice)", max_chars=MAX_TEXT, key=k("new"))
+    st.markdown("**Number of buns** (pieces)")
+    qty = {}
+    cols = st.columns(4)
+    for i, c in enumerate(ORDER_BUNS):
+        label = f"{c} {names.get(c, '')}" + (f" · ៛{int(sell[c]):,}" if sell.get(c) else "")
+        qty[c] = cols[i % 4].number_input(label, min_value=0, max_value=1_000_000, step=1, value=0, key=k("q_" + c))
+    pcs = sum(qty.values())
+    amount = sum(qty[c] * (sell.get(c) or 0) for c in ORDER_BUNS)
+    m1, m2 = st.columns(2)
+    kpi(m1, "Total buns (pcs)", f"{pcs:,}")
+    kpi(m2, "Amount (៛)", f"{int(amount):,}")
+    d1, d2, d3, d4 = st.columns(4)
+    cases = d1.number_input("កេស (cases)", min_value=0, max_value=MAX_CASES, step=1, value=0, key=k("cases"))
+    pay = d2.selectbox("Payment", ["AR", "FOC"], key=k("pay"), help="FOC = free of charge")
+    inv = d3.text_input("Invoice no. (optional)", max_chars=40, key=k("inv"), placeholder="NP312345")
+    remark = d4.text_input("Remark (optional)", max_chars=MAX_TEXT, key=k("rem"), placeholder="ប្រញាប់ / 5+1 ...")
+
+    customer = new_name.strip() if choice.startswith("➕") else ("" if choice.startswith("--") else choice)
+    customer = re.sub(r"\s+", " ", customer)
+    warn_dup = False
+    if customer:
+        canon = {norm_name(n): n for n in master}
+        if norm_name(customer) in canon:
+            customer = canon[norm_name(customer)]                 # same name as in the master: use the master spelling
+        elif choice.startswith("➕"):
+            near = difflib.get_close_matches(customer, master, n=3, cutoff=0.85)
+            if near:
+                st.warning("⚠️ Looks like an existing customer: " + " / ".join(near) + ". Choose it from the list if it is the same.")
+            else:
+                st.info("🆕 This customer is not in the Master List yet. The order is saved, and Sales will be asked to add it to the master data.")
+        try:
+            same = site_orders_df(order_date)
+            same = same[(same["Customer"] == customer) & (same[ORDER_BUNS].astype(int).apply(tuple, axis=1) == tuple(qty[c] for c in ORDER_BUNS))]
+            warn_dup = pcs > 0 and not same.empty
+        except Exception:
+            pass
+    allow_dup = True
+    if warn_dup:
+        st.warning("⚠️ The same order (same customer, day and quantities) was already entered. Tick the box to save it again.")
+        allow_dup = st.checkbox("Yes, save it again", key=k("dup"))
+    if st.button("💾 Save order", type="primary", key=k("save")):
+        if not customer:
+            st.error("❌ Choose a customer, or type the new customer name.")
+        elif pcs <= 0:
+            st.error("❌ Enter the number of buns for at least one type.")
+        elif not allow_dup:
+            st.error("❌ Tick 'Yes, save it again' or change the order.")
+        else:
+            try:
+                now = now_kh()
+                row = {"Date": f"{order_date} {now:%H:%M:%S}", "Customer": customer,
+                       "OrderID": f"SO-{now:%Y%m%d%H%M%S}-{pysecrets.token_hex(2)}", "Invoice": inv.strip() or "-",
+                       "Remark": remark.strip() or "-", "Payment": pay, "Cases": int(cases),
+                       "Entered_By": me, "Entered_At": now_str(), "Status": "Active"}
+                row.update({c: int(qty[c]) for c in ORDER_BUNS})
+                append_row(ORDERS_FILE, row)
+                audit("sale_order", f"{customer} | {order_date} | {pcs} pcs")
+                st.session_state["order_gen"] = gen + 1
+                st.session_state["flash"] = f"Order saved: {customer} | {pcs:,} pcs | ៛{int(amount):,} (synced to Dropbox)" if USE_DROPBOX else \
+                    f"Order saved: {customer} | {pcs:,} pcs | ៛{int(amount):,}"
+                st.rerun()
+            except (RuntimeError, ConflictError) as e:
+                st.error(f"❌ {e}")
+
+    # ---- the orders already entered ----
+    st.markdown("---")
+    st.markdown("#### 📋 Orders entered on the site")
+    f1, f2 = st.columns([1, 2])
+    view_day = f1.date_input("Show day", value=today_kh(), key="ord_view_day")
+    q = f2.text_input("🔎 Search customer / invoice", key="ord_q", max_chars=60)
+    try:
+        day_df = site_orders_df(view_day, status=("Active", "InJournal"))
+    except Exception as e:
+        st.error(f"❌ {e}")
+        return
+    if q.strip():
+        hay = (day_df["Customer"] + " " + day_df["Invoice"]).str.casefold()
+        for w in q.strip().casefold().split():
+            day_df = day_df[hay.reindex(day_df.index).str.contains(w, regex=False, na=False)]
+    if day_df.empty:
+        st.info("No orders entered on the site for this day.")
+    else:
+        pcs_day = int(day_df[ORDER_BUNS].astype(int).to_numpy().sum())
+        st.caption(f"{len(day_df)} order(s) · {pcs_day:,} pcs. You can fix the numbers in the table or tick Delete, then press Save changes.")
+        edit = day_df[["OrderID", "Customer", "Invoice", "Payment", "Cases"] + ORDER_BUNS + ["Remark", "Entered_By", "Status"]].copy()
+        edit.insert(0, "Delete", False)
+        cfg = {"Delete": st.column_config.CheckboxColumn("Delete"),
+               "Payment": st.column_config.SelectboxColumn("Payment", options=["AR", "FOC"])}
+        for c in ORDER_BUNS + ["Cases"]:
+            cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
+        edited = st.data_editor(edit, hide_index=True, height=min(90 + 36 * len(edit), 460), key=f"ord_edit_{view_day}_{len(edit)}",
+                                disabled=["OrderID", "Customer", "Entered_By", "Status"], column_config=cfg)
+        if st.button("💾 Save changes", key="ord_save_changes"):
+            changes = {}
+            for _, r in edited.iterrows():
+                changes[r["OrderID"]] = r
+            denied = []
+
+            def _apply(df):
+                for i, row in df.iterrows():
+                    r = changes.get(row["OrderID"])
+                    if r is None:
+                        continue
+                    if ROLE == "sales" and row["Entered_By"] != me:
+                        denied.append(row["Customer"])
+                        continue
+                    if bool(r["Delete"]):
+                        df.at[i, "Status"] = "Deleted"
+                        continue
+                    for c in ORDER_BUNS + ["Cases"]:
+                        df.at[i, c] = max(int(r[c]) if pd.notna(r[c]) else 0, 0)
+                    for c in ("Invoice", "Remark"):
+                        df.at[i, c] = (str(r[c]).strip() or "-")
+                    df.at[i, "Payment"] = r["Payment"]
+                return df
+            try:
+                modify_csv(ORDERS_FILE, ORDER_COLS, _apply)
+                audit("sale_order_edit", f"{view_day}: {len(changes)} rows checked by {me}")
+                if denied:
+                    st.warning("You can only change your own orders. Not changed: " + ", ".join(sorted(set(denied))))
+                st.session_state["flash"] = "Orders updated"
+                st.rerun()
+            except (RuntimeError, ConflictError) as e:
+                st.error(f"❌ {e}")
+
+    # ---- export to the journal ----
+    with st.expander("📤 Export orders to the Sale Journal (Excel, same column layout)"):
+        e1, e2 = st.columns(2)
+        d_from = e1.date_input("From", value=today_kh(), key="ord_ex_from")
+        d_to = e2.date_input("To", value=today_kh(), key="ord_ex_to")
+        try:
+            allo = site_orders_df(None)
+            allo = allo[(allo["_dt"].dt.date >= d_from) & (allo["_dt"].dt.date <= d_to)]
+        except Exception as e:
+            st.error(f"❌ {e}")
+            return
+        if allo.empty:
+            st.info("No active orders (not yet in the journal) in these dates.")
+        else:
+            st.caption(f"{len(allo)} order(s) not yet copied to the journal. Paste the file into the journal with "
+                       "**Paste special > Skip blanks** so the journal's formulas stay. Then press the green button.")
+            data = build_orders_journal_export(allo)
+            st.download_button("📥 Download orders for the journal", data=data, file_name=f"Orders_for_journal_{d_from}_{d_to}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="ord_dl")
+            if USE_DROPBOX and st.button("☁️ Also save this file in the Dropbox folder", key="ord_dbx"):
+                try:
+                    import dropbox
+                    _dbx().files_upload(data, _rpath(f"Orders_for_journal_{d_from}_{d_to}.xlsx"),
+                                        mode=dropbox.files.WriteMode.overwrite, mute=True)
+                    st.success("Saved in the Dropbox folder.")
+                except Exception as e:
+                    st.error(f"❌ Could not save to Dropbox: {str(e)[:150]}")
+            if ROLE in ("admin", "staff", "sales") and st.button("✅ I pasted them into the journal: mark as copied", key="ord_mark"):
+                ids = set(allo["OrderID"])
+
+                def _mark(df):
+                    df.loc[df["OrderID"].isin(ids) & (df["Status"] == "Active"), "Status"] = "InJournal"
+                    return df
+                try:
+                    modify_csv(ORDERS_FILE, ORDER_COLS, _mark)
+                    audit("sale_order_marked", f"{len(ids)} orders by {me}")
+                    st.session_state["flash"] = f"{len(ids)} order(s) marked as copied to the journal"
+                    st.rerun()
+                except (RuntimeError, ConflictError) as e:
+                    st.error(f"❌ {e}")
+
 
 
 def tab_dashboard(live):
@@ -6181,6 +6440,8 @@ _perms = effective_permissions(current_user())
 labels = []
 if _perms.get("tasks"):
     labels.extend(["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)"])
+if ROLE in ("admin", "staff", "sales"):
+    labels.append("📝 Sale Order")
 if _perms.get("view"):
     labels.append("📊 Live Dashboard (Sales)")
     labels.append("📍 Customer Map")
@@ -6199,6 +6460,8 @@ for _label, _tab in _tabs.items():
             tab_packing()
         elif _label.startswith("🚚"):
             tab_dispatch()
+        elif _label.startswith("📝"):
+            tab_sale_order()
         elif _label.startswith("📊"):
             _live = st.checkbox(f"🔄 Live mode (refresh every {LIVE_REFRESH_SECONDS}s)", value=False, key="live_mode")
             tab_dashboard(_live)
