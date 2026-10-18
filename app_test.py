@@ -86,6 +86,7 @@ PACKING_FILE = os.path.join(DATA_DIR, "daily_packing_progress.csv")
 BACKUP_DIR = os.path.join(CURRENT_DIR, "backups")                 # local mode only (Dropbox mode: <folder>/backups)
 BOT_LOG_FILE = os.path.join(DATA_DIR, "bot_log.csv")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit_log.csv")
+REMEMBER_FILE = os.path.join(DATA_DIR, "remember_tokens.json")     # "keep me logged in" tokens (only a hash is stored)
 USERS_FILE = os.path.join(DATA_DIR, "users.json")          # accounts (passwords are stored hashed, never as text)
 ASSIGN_FILE = os.path.join(DATA_DIR, "delivery_assignments.csv")   # who will deliver which customer today
 HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers moved to tomorrow / cancelled
@@ -118,6 +119,8 @@ BOT_INTERVAL_MIN = 30                  # the bot checks everything by itself eve
 LIVE_REFRESH_SECONDS = 20              # dashboard "Live" refresh
 
 # --- security ---
+REMEMBER_DAYS = 30                     # "Keep me logged in" lasts this long (renews every time the person comes back)
+COOKIE_TOKEN, COOKIE_USER = "hk_remember", "hk_user"
 LOGIN_TTL_HOURS = 12                   # automatic log-out after this many hours
 MAX_FAILS = 5                          # wrong codes before a temporary lock-out
 LOCKOUT_MIN = 5                        # lock-out length (minutes)
@@ -776,6 +779,122 @@ def _login_guard():
     return {"fails": {}, "locked": {}, "lock": threading.Lock()}
 
 
+# ---- "Keep me logged in": a random token in the phone's browser; the server keeps only its hash ----
+def _tok_hash(token):
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _read_tokens():
+    try:
+        with open(REMEMBER_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _modify_tokens(fn):
+    """Read-change-save of the token file (retries when Dropbox is busy). Never raises: remembering is a convenience."""
+    for attempt in range(4):
+        try:
+            with _sync_state()["lock"]:
+                if USE_DROPBOX:
+                    pull(REMEMBER_FILE, force=True)
+                data = _read_tokens()
+                data = fn(data) or data
+                tmp = REMEMBER_FILE + ".tmp"
+                with file_lock(REMEMBER_FILE):
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(data, f)
+                    os.replace(tmp, REMEMBER_FILE)
+                if USE_DROPBOX:
+                    push(REMEMBER_FILE)
+            return True
+        except ConflictError:
+            time.sleep(0.2 * (attempt + 1))
+        except Exception as e:
+            bot_log("warn", "Remember login", str(e)[:120], "skipped")
+            return False
+    return False
+
+
+def issue_remember_token(user, pw_stamp):
+    token = pysecrets.token_urlsafe(32)
+    now = time.time()
+
+    def _add(data):
+        for h in [h for h, r in data.items() if r.get("exp", 0) < now]:
+            data.pop(h, None)                                   # forget expired phones
+        mine = sorted([(r.get("created", 0), h) for h, r in data.items() if r.get("user") == user])
+        for _, h in mine[:-9]:
+            data.pop(h, None)                                   # at most 10 phones / browsers per person
+        data[_tok_hash(token)] = {"user": user, "created": now, "exp": now + REMEMBER_DAYS * 86400, "pw": pw_stamp}
+        return data
+    return token if _modify_tokens(_add) else None
+
+
+def _request_cookie(name):
+    try:
+        return st.context.cookies.get(name)
+    except Exception:
+        return None
+
+
+def restore_from_cookie():
+    """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, a new day...)."""
+    token = _request_cookie(COOKIE_TOKEN)
+    if not token:
+        return False
+    h, now = _tok_hash(token), time.time()
+    rec = _read_tokens().get(h)
+    try:
+        users = load_users()
+    except Exception:
+        return False
+    u = users.get(rec["user"]) if rec else None
+    if not rec or rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
+        if rec:
+            _modify_tokens(lambda d: (d.pop(h, None), d)[1])
+        st.session_state["cookie_cmd"] = ("clear",)
+        return False
+    st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
+                             "must_change": bool(u.get("must_change"))})
+    audit("login", f"{u['role']} (remembered)")
+    if rec.get("exp", 0) - now < (REMEMBER_DAYS - 1) * 86400:     # renew once a day
+        def _renew(d):
+            if h in d:
+                d[h]["exp"] = now + REMEMBER_DAYS * 86400
+            return d
+        _modify_tokens(_renew)
+    return True
+
+
+def forget_this_device():
+    token = _request_cookie(COOKIE_TOKEN)
+    if token:
+        _modify_tokens(lambda d: (d.pop(_tok_hash(token), None), d)[1])
+    st.session_state["cookie_cmd"] = ("clear",)
+
+
+def _emit_cookie_cmd():
+    """Writes / removes the cookies in the phone's browser (JavaScript, runs once)."""
+    cmd = st.session_state.pop("cookie_cmd", None)
+    if not cmd:
+        return
+    age = REMEMBER_DAYS * 86400
+    if cmd[0] == "set":
+        tok, user = json.dumps(cmd[1]), json.dumps(cmd[2])
+        js = (f"var s=(window.parent.location.protocol==='https:')?'; Secure':'';"
+              f"window.parent.document.cookie='{COOKIE_TOKEN}='+{tok}+'; max-age={age}; path=/; SameSite=Lax'+s;"
+              f"window.parent.document.cookie='{COOKIE_USER}='+encodeURIComponent({user})+'; max-age={age}; path=/; SameSite=Lax'+s;")
+    else:
+        js = (f"window.parent.document.cookie='{COOKIE_TOKEN}=; max-age=0; path=/';")
+    try:
+        st.components.v1.html(f"<script>try{{{js}}}catch(e){{}}</script>", height=0)
+    except Exception:
+        pass
+
+
 def _clear_session():
     st.session_state.pop("_table_drafts", None)
     st.session_state.pop("_task_preferences", None)
@@ -786,6 +905,8 @@ def _clear_session():
 
 def logout(reason="manual"):
     audit("logout", reason)
+    if reason == "manual":
+        forget_this_device()                               # a manual log-out also forgets this phone
     _clear_session()
 
 
@@ -810,7 +931,7 @@ def session_ok():
     return True
 
 
-def _try_login(username, password):
+def _try_login(username, password, remember=False):
     guard, cid, now = _login_guard(), client_id(), time.time()
     uname = re.sub(r"\s+", "", username or "").lower()[:40]
     keys = [cid, "u:" + uname]
@@ -834,6 +955,10 @@ def _try_login(username, password):
         st.session_state.update({"user": uname, "role": rec["role"], "login_time": time.time(),
                                  "must_change": bool(rec.get("must_change"))})
         audit("login", rec["role"])
+        if remember and not rec.get("must_change"):      # starter password: remember only after they choose their own
+            tok = issue_remember_token(uname, rec.get("pw_changed", ""))
+            if tok:
+                st.session_state["cookie_cmd"] = ("set", tok, uname)
 
         def _stamp(u):
             if uname in u:
@@ -890,12 +1015,19 @@ def render_login():
     with mid:
         st.markdown("## 🔐 នំប៉ាវហុងកុង Hub")
         st.caption("Enter your username and password to continue.")
+        last_user = urllib.parse.unquote(_request_cookie(COOKIE_USER) or "")[:40]
         with st.form("login_form"):
-            u = st.text_input("Username", max_chars=40)
-            p = st.text_input("Password", type="password", max_chars=100)
+            try:
+                u = st.text_input("Username", value=last_user, max_chars=40, autocomplete="username")
+                p = st.text_input("Password", type="password", max_chars=100, autocomplete="current-password")
+            except TypeError:                              # older Streamlit without autocomplete
+                u = st.text_input("Username", value=last_user, max_chars=40)
+                p = st.text_input("Password", type="password", max_chars=100)
+            keep = st.checkbox(f"Keep me logged in on this phone / computer ({REMEMBER_DAYS} days)", value=True)
             go = st.form_submit_button("Log in", type="primary")
+        st.caption("Tip: do not tick this on a shared computer. Log out removes it.")
         if go:
-            _try_login(u, p)
+            _try_login(u, p, keep)
 
 
 def render_force_change():
@@ -917,6 +1049,13 @@ def render_force_change():
                 st.error(f"❌ {err}")
             else:
                 st.session_state["must_change"] = False
+                try:
+                    _rec = load_users().get(user, {})
+                    _tok = issue_remember_token(user, _rec.get("pw_changed", ""))
+                    if _tok:
+                        st.session_state["cookie_cmd"] = ("set", _tok, user)
+                except Exception:
+                    pass
                 st.session_state["flash"] = "Password changed. Welcome!"
                 st.rerun()
         if st.button("🚪 Log out", key="force_logout"):
@@ -926,6 +1065,9 @@ def render_force_change():
 
 def require_login():
     """Shows the login page (and stops the app) until the person is logged in. Returns the role."""
+    if not session_ok():
+        restore_from_cookie()                              # phone was locked / tab closed: use the saved token
+    _emit_cookie_cmd()
     if session_ok():
         if st.session_state.get("must_change"):
             render_force_change()
@@ -4660,6 +4802,7 @@ def _users_panel():
                     pw = tpw.strip() or "12345"
                     u[who].update(_hash_pw(pw))
                     u[who]["must_change"] = True
+                    u[who]["pw_changed"] = now_str()          # signs this person out of every saved phone
                     st.session_state["show_pw"] = (who, pw)
                 elif act == "toggle":
                     u[who]["active"] = not u[who].get("active", True)
@@ -5869,6 +6012,12 @@ with st.sidebar:
                 if _err:
                     st.error(f"❌ {_err}")
                 else:
+                    try:                                          # this phone stays logged in after the change
+                        _t = issue_remember_token(USER, load_users().get(USER, {}).get("pw_changed", ""))
+                        if _t:
+                            st.session_state["cookie_cmd"] = ("set", _t, USER)
+                    except Exception:
+                        pass
                     st.session_state["flash"] = "Password changed"
                     st.rerun()
         st.caption("At least 8 characters, letters and numbers.")
