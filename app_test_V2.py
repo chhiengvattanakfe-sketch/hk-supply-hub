@@ -6768,7 +6768,76 @@ def _si_month_detail(mon, month, names, areas, top_n=20):
     return top, dropped, new, prev_m
 
 
+def _si_customer_detail(key, daily, df, codes, mon, today, snap, factor=1.5, dormant_factor=4.0):
+    """Everything about ONE customer: bun types (N1..N43), sum, averages, monthly table, habit, recent orders."""
+    cur_m = pd.Timestamp(today).strftime("%Y-%m")
+    info = snap.get("buns", {}) or {}
+    sell, bnames = info.get("sell", {}) or {}, info.get("names", {}) or {}
+    d = daily[daily["Key"] == key]
+    rows = df[df["Key"] == key].copy()
+    out = {"daily": d, "buns": pd.DataFrame(), "orders": pd.DataFrame(), "habit": None}
+    pm = pd.DataFrame()
+    if len(rows):
+        rows["Month"] = rows["D"].dt.strftime("%Y-%m")
+        pm = rows.groupby("Month")[list(codes)].sum()
+        fin = pm[pm.index < cur_m]
+        recs = []
+        total_all = float(rows[list(codes)].sum().sum())
+        last30 = rows[rows["D"] > pd.Timestamp(today) - pd.Timedelta(days=30)]
+        for c in codes:
+            tot = float(rows[c].sum())
+            bought = rows[rows[c] > 0]
+            fc = fin[c][fin[c] > 0]
+            if len(fc):
+                avg_m, n_m = float(fc.mean()), len(fc)
+            elif pm[c].get(cur_m, 0) > 0:
+                avg_m, n_m = float(pm[c][cur_m]), 0
+            else:
+                avg_m, n_m = 0.0, 0
+            price = float(sell.get(c) or 0)
+            recs.append({"Code": c, "Bun": bnames.get(c, ""), "Price ៛": int(price), "Total pcs": int(tot),
+                         "Share %": round(tot / total_all * 100, 1) if total_all else 0.0,
+                         "Order days": int(bought["D"].nunique()),
+                         "Avg per order": int(round(tot / bought["D"].nunique())) if len(bought) else 0,
+                         "Avg per month": int(round(avg_m)), "Months (finished)": n_m,
+                         "Last 30 days pcs": int(last30[c].sum()),
+                         "Last bought": bought["D"].max().strftime("%Y-%m-%d") if len(bought) else "-",
+                         "Sales ៛": int(tot * price)})
+        out["buns"] = pd.DataFrame(recs)
+        show = [c for c in codes if rows[c].sum() > 0]
+        o = rows.sort_values("D", ascending=False).head(60)
+        keep = ["D", "Invoice", "Remark", "Cases", "Pcs", "Sales"] + show
+        o = o[[c for c in keep if c in o.columns]].copy()
+        o["D"] = o["D"].dt.strftime("%Y-%m-%d")
+        out["orders"] = o.rename(columns={"D": "Date", "Pcs": "Bun pcs", "Sales": "Sales ៛"})
+    m = mon[mon["Key"] == key][["Month", "Pcs"]].rename(columns={"Pcs": "Bun pcs"})
+    if len(d):
+        dm = d.assign(Month=d["D"].dt.strftime("%Y-%m")).groupby("Month").agg(
+            **{"Order days": ("D", "nunique"), "Sales ៛": ("Sales", "sum")}).reset_index()
+        m = m.merge(dm, on="Month", how="left")
+    else:
+        m["Order days"], m["Sales ៛"] = pd.NA, pd.NA
+    if len(pm):
+        pmx = pm.loc[:, (pm.sum() > 0)].reset_index()
+        m = m.merge(pmx, on="Month", how="left")
+    m["Bun pcs"] = m["Bun pcs"].round(0).astype("int64")
+    out["monthly"] = m.sort_values("Month").reset_index(drop=True)
+    hb = _si_habits(d, today, 2, 3650, factor, dormant_factor) if len(d) else pd.DataFrame()
+    out["habit"] = hb.iloc[0] if len(hb) else None
+    out["orders_n"] = int(d["D"].nunique())
+    out["first"] = d["D"].min() if len(d) else None
+    out["last"] = d["D"].max() if len(d) else None
+    out["sum_pcs"] = int(mon.loc[mon["Key"] == key, "Pcs"].sum())
+    out["sum_sales"] = float(d["Sales"].sum()) if len(d) else 0.0
+    out["pcs_per_order"] = float(d["Pcs"].mean()) if len(d) else float("nan")
+    return out
+
+
 # ---------- UI helpers ----------
+def _si_set_seg(seg):
+    st.session_state["si_seg_sel"] = seg
+
+
 def _si_show(df, money=(), pct=(), height=None):
     """Table with thousands separators where the Streamlit version supports it."""
     cfg = {}
@@ -6870,8 +6939,8 @@ def _sales_insights_body():
 
     care = _si_care(daily, df, codes, habits, names, areas, today, this_start, avgs)
     top = pd.DataFrame()
-    t_top, t_miss, t_none, t_care, t_hist = st.tabs(["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
-                                                    "💝 Customer care", "📆 Monthly history"])
+    t_top, t_miss, t_none, t_care, t_hist, t_det = st.tabs(["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
+                                                           "💝 Customer care", "📆 Monthly history", "🔎 Customer detail"])
 
     with t_top:
         c1, c2 = st.columns([2, 2])
@@ -6946,22 +7015,38 @@ def _sales_insights_body():
         if care.empty:
             st.info("No customer-care actions found right now.")
         else:
-            counts = care["Segment"].value_counts()
-            cols = st.columns(min(7, len(counts)))
-            for col, (seg, n) in zip(cols, counts.items()):
-                kpi(col, seg, f"{n}")
-            st.markdown("#### 📞 Call list for today (top 10 urgent)")
-            urgent = care[care["Priority"] <= 2].head(10)
+            segs = list(care.drop_duplicates("Segment").sort_values("Priority")["Segment"])
+            cnt = care["Segment"].value_counts()
+            sel = st.session_state.get("si_seg_sel")
+            if sel not in segs:
+                sel = None
+            st.caption("👆 Click a card to filter the lists below. Click it again (or 📋 All) to clear.")
+            cards = [(None, f"📋 All · {len(care)}")] + [(sg, f"{sg} · {cnt[sg]}") for sg in segs]
+            for i in range(0, len(cards), 4):
+                for col, (sg, lab) in zip(st.columns(4), cards[i:i + 4]):
+                    col.button(lab, key=f"si_segbtn_{sg or 'all'}", type="primary" if sel == sg else "secondary",
+                               use_container_width=True, on_click=_si_set_seg, args=(None if sel == sg else sg,))
+            f1, f2 = st.columns([2, 3])
+            area_pick = f1.multiselect("Area", sorted(care["Area"].unique()), key="si_care_area")
+            q = f2.text_input("Search customer name", key="si_care_q")
+            view = care.copy()
+            if sel:
+                view = view[view["Segment"] == sel]
+            if area_pick:
+                view = view[view["Area"].isin(area_pick)]
+            if q.strip():
+                view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
+            st.markdown("#### 📞 Call list (urgent first)")
+            urgent = view[view["Priority"] <= 2].head(10)
             if urgent.empty:
-                st.success("Nobody urgent today.")
+                st.success("Nobody urgent in this selection.")
             else:
                 for r in urgent.to_dict("records"):
                     st.markdown(f"**{r['Segment']} — {r['Customer']}** ({r['Area']})  \n"
                                 f"{r['Why']}  \n👉 {r['Suggested action']}"
                                 + (f"  \n💡 {r['Cross-sell idea']}" if r["Cross-sell idea"] else ""))
-            st.markdown("#### All customer-care suggestions")
-            pick = st.multiselect("Show segments", list(counts.index), default=list(counts.index), key="si_seg")
-            _si_show(care[care["Segment"].isin(pick)].drop(columns="Priority"), money=("Avg pcs/month", "Avg ៛/month"), height=520)
+            st.markdown(f"#### Customer-care suggestions ({len(view)} of {len(care)})")
+            _si_show(view.drop(columns="Priority"), money=("Avg pcs/month", "Avg ៛/month"), height=520)
             with st.expander("How these suggestions are made"):
                 st.markdown(
                     "- 🔴 **VIP at risk**: top 20% by 90-day sales and late / silent.\n"
@@ -6995,6 +7080,62 @@ def _sales_insights_body():
             pick = st.selectbox("Customer trend", list(tot.index), format_func=lambda k: names.get(k, k), key="si_hist_cust")
             series = mon[mon["Key"] == pick].set_index("Month")["Pcs"].reindex(summ["Month"]).fillna(0)
             st.line_chart(series.rename("Bun pcs"))
+    with t_det:
+        q = st.text_input("🔎 Search customer name (any part, Khmer or English)", key="si_det_q")
+        order_keys = list(mon.groupby("Key")["Pcs"].sum().sort_values(ascending=False).index)
+        keys = order_keys + [k for k in names if k not in set(order_keys)]
+        if q.strip():
+            ql = q.strip().casefold()
+            keys = [k for k in keys if ql in names.get(k, k).casefold()]
+        if not keys:
+            st.info("No customer matches this search.")
+        else:
+            pick = st.selectbox(f"Customer ({len(keys)} found, biggest first)", keys, format_func=lambda k: names.get(k, k), key="si_det_pick")
+            det = _si_customer_detail(pick, daily, df, codes, mon, today, snap, factor, dormant_factor)
+            a_p, a_s, a_b = _si_avg_get(avgs, pick)
+            st.markdown(f"### {names.get(pick, pick)}  \n{areas.get(pick, AREA_LABEL['Unknown'])}")
+            c1, c2, c3, c4 = st.columns(4)
+            kpi(c1, "Sum bun pcs (all months)", f"{det['sum_pcs']:,}")
+            kpi(c2, "Avg pcs / month", f"{a_p:,.0f}" if pd.notna(a_p) else "-")
+            kpi(c3, "Avg ៛ / month", f"{a_s:,.0f}" if pd.notna(a_s) else "-")
+            kpi(c4, "Avg based on", a_b)
+            c5, c6, c7, c8 = st.columns(4)
+            kpi(c5, "Order days (daily data)", f"{det['orders_n']:,}")
+            kpi(c6, "Avg pcs / order", f"{det['pcs_per_order']:,.0f}" if pd.notna(det["pcs_per_order"]) else "-")
+            kpi(c7, "Sum ៛ (months with ៛)", f"{det['sum_sales']:,.0f}")
+            kpi(c8, "Last order", f"{det['last']:%Y-%m-%d} ({(pd.Timestamp(today) - det['last']).days} d ago)" if det["last"] is not None else "-")
+
+            st.markdown("#### ⏰ Habit")
+            hb = det["habit"]
+            if hb is None:
+                st.info("Not enough orders yet to see a habit (needs at least 2 order days).")
+            else:
+                icon = {"On track": "✅ On track", "Missing": "⏰ Late — missing usual order", "Dormant": "💤 Dormant"}[hb["Status"]]
+                st.markdown(f"**{icon}** · {hb['Pattern']} · orders every ~{hb['Usual gap (days)']:g} days"
+                            + (f", usually on **{hb['Usual day']}**" if hb["Usual day"] != "-" else "")
+                            + f" · usual order ≈ {hb['Usual cases']:g} cases / {hb['Usual pcs']:,} pcs · last order {hb['Last order']} ({hb['Days since']} days ago)"
+                            + f" · next expected by {hb['Expected by']}"
+                            + (f" · **{hb['Days late']} days late**" if hb["Status"] != "On track" else ""))
+            mine = care[care["Customer"] == names.get(pick, pick)] if not care.empty else care
+            if len(mine):
+                r = mine.iloc[0]
+                st.markdown(f"**💝 {r['Segment']}** — {r['Why']}  \n👉 {r['Suggested action']}"
+                            + (f"  \n💡 {r['Cross-sell idea']}" if r["Cross-sell idea"] else ""))
+
+            st.markdown("#### 🥟 Buns by type (N1–N43)")
+            if det["buns"].empty:
+                st.info("No bun-type detail for this customer yet: older months only have the monthly total. "
+                        "Bun types are available from the daily data (September onward and the live journal).")
+            else:
+                st.caption("Total, share and averages come from the daily data. 'Avg per month' = months the customer bought that bun (finished months).")
+                _si_show(det["buns"], money=("Price ៛", "Total pcs", "Sales ៛", "Avg per order", "Avg per month", "Last 30 days pcs"), pct=("Share %",), height=520)
+            st.markdown("#### 📆 Month by month")
+            if len(det["monthly"]):
+                st.bar_chart(det["monthly"].set_index("Month")["Bun pcs"])
+                _si_show(det["monthly"], money=("Bun pcs", "Sales ៛"))
+            if len(det["orders"]):
+                with st.expander(f"🧾 Recent orders ({len(det['orders'])})"):
+                    _si_show(det["orders"], money=("Sales ៛",), height=420)
     _si_download({"Monthly history": _si_month_summary(mon), "Top 20": top, "Missing from habit": missing,
                   "No order this month": no_month, "Customer care": care}, f"Sales_Insights_{today}.xlsx")
 
