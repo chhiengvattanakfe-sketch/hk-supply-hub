@@ -3218,12 +3218,13 @@ def _send_tab(me, ctx):
             st.error(f"⚠️ Could not save: {err}")
 
 
-def pending_expense_df(who, scope):
+def pending_expense_df(who, scope, include_done=False):
     """Deliveries still waiting for expenses. who = staff name or None (everyone); scope = Today | Last 7 days | All waiting."""
     df = read_raw(DATA_FILE, DISPATCH_COLS)
-    df = df[df["Expense_Status"] == "Pending"]
+    if not include_done:
+        df = df[df["Expense_Status"] == "Pending"]
     if who:
-        df = df[df["Handled_By"] == who]
+        df = df[(df["Handled_By"] == who) | (df["Local_Driver"] == who)]
     if scope == "Today":
         df = df[df["_dt"].dt.normalize() == pd.Timestamp(today_kh())]
     elif scope == "Last 7 days":
@@ -3240,25 +3241,26 @@ def _expense_tab(me):
     with st.form("expense_filters"):
         c1, c2 = st.columns(2)
         scope = c1.radio("Show", ["Today", "Last 7 days", "All waiting"], horizontal=True, key="exp_scope")
+        show_done = st.checkbox("Also show deliveries with no expense required / already done", key="exp_done")
         who = me
         if is_admin:
             pick = c2.selectbox("Handler", ["(everyone)"] + DELIVERY_HANDLERS, key="exp_who")
             who = None if pick == "(everyone)" else pick
         if st.form_submit_button("Apply expense filter"):
-            _reset_draft("expenses", str((who, scope)))
+            _reset_draft("expenses", str((who, scope, show_done)))
     if not is_admin and me == "-- Select Staff --":
         st.info("Choose your name at the top first.")
         return
-    df = pending_expense_df(who, scope)
-    if df.empty and not _has_editor_draft("expenses", str((who, scope))):
+    df = pending_expense_df(who, scope, show_done)
+    draft_scope = str((who, scope, show_done))
+    if df.empty and not _has_editor_draft("expenses", draft_scope):
         st.success("Nothing is waiting for expenses. 🎉")
         return
-    st.info(f"⏳ {len(df)} deliveries are waiting for expenses.")
+    st.info(f"⏳ {len(df)} deliveries to review for expenses.")
     rows = [{"Done ✅": False, "Customer": r["Customer"], "When": str(r["Date"])[5:16], "Via": r["Local_Driver"],
              "Taxi station": "" if r["Taxi_Station"] in ("-", "") else r["Taxi_Station"],
              "Phnom Penh ៛": int(r["Phnom_Penh_Expense"]), "Taxi ៛": int(r["Taxi_Expense"]),
              "By": r["Handled_By"], "Date": r["Date"]} for r in df.to_dict("records")]
-    draft_scope = str((who, scope))
     _reload_draft_button("expenses", draft_scope)
     d, editor_key = _task_editor_frame("expenses", pd.DataFrame(rows), draft_scope)
     order = ["Done ✅", "Customer", "When", "Via", "Taxi station", "Phnom Penh ៛", "Taxi ៛"] + (["By"] if who is None else [])
@@ -3292,7 +3294,7 @@ def _expense_tab(me):
 
         def _apply(frame):
             for (dt, cust, by), (station, pp, tx) in updates.items():
-                m = (frame["Date"].astype(str) == dt) & (frame["Customer"] == cust) & (frame["Handled_By"] == by) & (frame["Expense_Status"] == "Pending")
+                m = (frame["Date"].astype(str) == dt) & (frame["Customer"] == cust) & (frame["Handled_By"] == by)
                 if not m.any():
                     raise ValueError(f"The delivery of {cust} was changed by someone else. Reload and try again.")
                 i = frame.index[m][0]
