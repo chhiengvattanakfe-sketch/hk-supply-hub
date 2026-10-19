@@ -92,6 +92,7 @@ ASSIGN_FILE = os.path.join(DATA_DIR, "delivery_assignments.csv")   # who will de
 ORDERS_FILE = os.path.join(DATA_DIR, "sale_orders.csv")              # orders typed on the site (synced to Dropbox)
 HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers moved to tomorrow / cancelled
 MAP_REGISTRY_FILE = os.path.join(DATA_DIR, "customer_map_registry.json")
+CALLS_FILE = os.path.join(DATA_DIR, "customer_call_history.csv")
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache_" + _APP_SCOPE)       # outside Dropbox = faster
@@ -1496,7 +1497,7 @@ def daily_backup_once(day_str):
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE)
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE)
         if USE_DROPBOX:
             try:
                 _dbx().files_create_folder_v2(_remote_backup_dir())
@@ -6864,6 +6865,137 @@ def _si_show(df, money=(), pct=(), height=None):
         show_df(df, height=height)
 
 
+# Each call is an immutable customer snapshot; the newest call supplies current details.
+CALL_COLS = ["Date", "Customer", "CallID", "Outcome", "Notes", "Customer status",
+             "Contact person", "Phone", "Next action", "Follow-up date", "Assigned to", "Recorded by"]
+CALL_OUTCOMES = ["Reached customer", "No answer", "Busy / call back", "Wrong number",
+                 "Order requested", "Complaint / problem", "Not interested", "Customer update only"]
+CALL_STATUSES = ["Active", "Follow-up needed", "Temporarily closed", "Stopped buying", "Do not contact"]
+
+
+def _si_call_latest(history):
+    if history.empty:
+        return history.copy()
+    latest = history.copy()
+    latest["_key"] = latest["Customer"].map(norm_name)
+    # File order is commit order, including multiple calls in the same second.
+    return latest.drop_duplicates("_key", keep="last")
+
+
+def _si_save_call(row):
+    if not has_permission("edit"):
+        raise PermissionError("Your account needs Create, edit, and submit changes permission.")
+    if not str(row.get("Customer", "")).strip() or not str(row.get("Notes", "")).strip():
+        raise ValueError("Choose a customer and enter a call note.")
+    if row.get("Outcome") not in CALL_OUTCOMES or row.get("Customer status") not in CALL_STATUSES:
+        raise ValueError("Choose a valid outcome and customer status.")
+    follow = row.get("Follow-up date", "")
+    if follow:
+        date.fromisoformat(follow)
+        if row["Customer status"] == "Do not contact":
+            raise ValueError("Remove the follow-up date for a Do not contact customer.")
+        if not str(row.get("Next action", "")).strip():
+            raise ValueError("Enter the next action for this follow-up.")
+    clean = {c: safe_text(row.get(c, ""), maxlen=4000 if c == "Notes" else MAX_TEXT) for c in CALL_COLS}
+    # Same form token can be retried after a network error without a duplicate call.
+    def add(frame):
+        if clean["CallID"] in set(frame["CallID"]):
+            return frame
+        return pd.concat([frame, pd.DataFrame([clean])], ignore_index=True)
+    modify_csv(CALLS_FILE, CALL_COLS, add)
+
+
+def _si_choose_call(customer):
+    st.session_state["si_call_customer"] = customer
+
+
+@st.fragment
+def _si_call_panel(names):
+    st.markdown("#### 📝 Call notes & customer updates")
+    st.caption("Select a customer, record what happened, and save once. Previous calls stay in the history. "
+               "Contact details here are customer-care details; requested orders must be entered in Sales Orders.")
+    try:
+        history = read_raw(CALLS_FILE, CALL_COLS)
+    except Exception as e:
+        st.error(f"Call history could not be opened: {e}")
+        return
+    latest = _si_call_latest(history)
+    if not latest.empty:
+        due_dates = pd.to_datetime(latest["Follow-up date"], errors="coerce")
+        due = latest[due_dates.notna() & (due_dates <= pd.Timestamp(today_kh())) & latest["Customer status"].ne("Do not contact")]
+        with st.expander(f"📅 Follow-ups due today or overdue ({len(due)})", expanded=not due.empty):
+            if due.empty:
+                st.caption("No follow-ups due.")
+            else:
+                st.dataframe(due[["Customer", "Phone", "Follow-up date", "Next action", "Assigned to"]]
+                             .sort_values("Follow-up date"), hide_index=True, use_container_width=True)
+    options = sorted(set(names.values()) | set(history["Customer"]), key=str.casefold)
+    if not options:
+        st.info("No customers available.")
+        return
+    if st.session_state.get("si_call_customer") not in options:
+        st.session_state["si_call_customer"] = options[0]
+    customer = st.selectbox("Customer to call / update", options, key="si_call_customer")
+    mine = history[history["Customer"].map(norm_name).eq(norm_name(customer))]
+    prev = mine.iloc[-1].to_dict() if not mine.empty else {}
+    def value(col, default=""):
+        result = prev.get(col, default)
+        return default if result in ("-", "", None) else str(result)
+    token_key = "si_call_token_" + hashlib.sha256(norm_name(customer).encode()).hexdigest()[:20]
+    if token_key not in st.session_state:
+        st.session_state[token_key] = pysecrets.token_hex(16)
+    token = st.session_state[token_key]
+    if value("Customer status") == "Do not contact":
+        st.warning("This customer is marked Do not contact. Record an internal update if needed.")
+    if has_permission("edit"):
+        with st.form("call_form_" + token, clear_on_submit=False):
+            a, b = st.columns(2)
+            outcome = a.selectbox("Call outcome", CALL_OUTCOMES)
+            status = b.selectbox("Customer status", CALL_STATUSES,
+                                 index=CALL_STATUSES.index(value("Customer status", "Active"))
+                                 if value("Customer status", "Active") in CALL_STATUSES else 0)
+            a, b = st.columns(2)
+            contact = a.text_input("Contact person", value("Contact person"), max_chars=MAX_TEXT)
+            phone = b.text_input("Phone / Telegram", value("Phone"), max_chars=MAX_TEXT)
+            notes = st.text_area("Call notes (required)", max_chars=4000,
+                                 placeholder="What did the customer say? Quality, price, delivery, requested products, or agreed actions…")
+            action = st.text_input("Next action", value("Next action"), max_chars=MAX_TEXT)
+            a, b = st.columns(2)
+            old_due = pd.to_datetime(value("Follow-up date"), errors="coerce")
+            follow = a.date_input("Next follow-up date (clear to close follow-up)",
+                                 value=None if pd.isna(old_due) else old_due.date(), format="YYYY-MM-DD")
+            owner = b.text_input("Assigned to", value("Assigned to", current_user() or ""), max_chars=MAX_TEXT)
+            saved = st.form_submit_button("💾 Save call & customer update", type="primary")
+        if saved:
+            row = {"Date": now_str(), "Customer": customer, "CallID": token, "Outcome": outcome,
+                   "Notes": notes, "Customer status": status, "Contact person": contact, "Phone": phone,
+                   "Next action": action, "Follow-up date": follow.isoformat() if follow else "",
+                   "Assigned to": owner, "Recorded by": current_user() or "-"}
+            try:
+                _si_save_call(row)
+            except Exception as e:
+                st.error(f"Could not save call: {e}")
+            else:
+                st.session_state.pop(token_key, None)
+                st.session_state["si_call_saved"] = customer
+                st.rerun()
+    else:
+        st.info("Read-only access. An admin can enable Create, edit, and submit changes for your account.")
+    if st.session_state.pop("si_call_saved", None) == customer:
+        st.success("Call saved. Customer details and follow-up updated.")
+    if not mine.empty:
+        st.markdown("**Latest customer details**")
+        st.write(f"Status: {value('Customer status')} · Contact: {value('Contact person', '—')} · Phone: {value('Phone', '—')}")
+        st.markdown(f"**Call history ({len(mine)}) — newest first**")
+        display = mine[CALL_COLS].drop(columns=["CallID", "Customer"]).iloc[::-1]
+        st.dataframe(display, hide_index=True, use_container_width=True)
+        if has_permission("reports"):
+            st.download_button("Download this customer's call history", display.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="customer_call_history.csv", mime="text/csv", key="si_call_export")
+    else:
+        st.caption("No calls recorded for this customer yet.")
+
+
 def _si_download(frames, filename):
     if not has_permission("reports"):
         return
@@ -7056,6 +7188,8 @@ def _sales_insights_body():
                     st.markdown(f"**{r['Segment']} — {r['Customer']}** ({r['Area']})  \n"
                                 f"{r['Why']}  \n👉 {r['Suggested action']}"
                                 + (f"  \n💡 {r['Cross-sell idea']}" if r["Cross-sell idea"] else ""))
+                    st.button("📝 Record call / update customer", key="si_open_call_" + hashlib.sha256(r["Customer"].encode()).hexdigest()[:20],
+                              on_click=_si_choose_call, args=(r["Customer"],))
             st.markdown(f"#### Customer-care suggestions ({len(view)} of {len(care)})")
             _si_show(view.drop(columns="Priority"), money=(f"Avg {care_unit}/month", f"Last 30d {care_unit}", f"Prev 30d {care_unit}"), height=520)
             with st.expander("How these suggestions are made"):
@@ -7069,6 +7203,7 @@ def _sales_insights_body():
                     "- 📊 **Averages** are per month the customer actually bought (finished months only; months without a purchase are not counted). "
                     "The 'Avg based on' column says how many months. A customer with no finished month yet shows this month so far, based on order days.\n"
                     "- 💡 **Cross-sell**: top-3 best-selling bun types of the last 90 days that this customer did not buy.")
+        _si_call_panel(names)
     with t_hist:
         summ = _si_month_summary(mon)
         if summ.empty:
