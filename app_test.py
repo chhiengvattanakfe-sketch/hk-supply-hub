@@ -2293,6 +2293,11 @@ footer {visibility: hidden;}
 .hk-group {font-weight: 700; margin: 16px 0 4px; padding-bottom: 3px; border-bottom: 2px solid rgba(128,128,128,.3);}
 @media (max-width: 640px) {
   .block-container {padding-left: .7rem; padding-right: .7rem;}
+  input, textarea, [data-baseweb="select"] {font-size: 16px !important;}
+  .stButton > button, div[data-testid="stFormSubmitButton"] > button {min-height: 48px; width: 100%;}
+  .hk-top {flex-wrap: wrap;}
+  [data-testid="stHorizontalBlock"] {flex-wrap: wrap;}
+  [data-testid="stColumn"] {min-width: min(100%, 280px);}
   h1 {font-size: 1.45rem !important;}
   h3 {font-size: 1.15rem !important;}
   .hk-pill {font-size: .85rem; padding: 3px 9px;}
@@ -2857,7 +2862,7 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
         include_all = st.checkbox("Include every customer shown when saving", key=editor_key + "_all",
             help="Applies to the whole list below when you press Save. Otherwise, tick individual rows.")
         editable = (check_col, "Cases", "Invoice") if key == "tick" else (check_col, "Customer", "Status", "Cases", "Invoice")
-        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+        edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
             disabled=[c for c in d.columns if c not in editable], column_order=column_order,
             column_config={check_col: st.column_config.CheckboxColumn(check_col),
                 "Customer": st.column_config.SelectboxColumn("Customer", options=opts),
@@ -3099,7 +3104,7 @@ def _claim_tab(me, ctx):
         st.caption("Choose all the customers you need, then save once. Ticks do not refresh the page.")
         with st.form("batch_" + editor_key, clear_on_submit=False):
             select_all = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
-            edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+            edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
                 disabled=[c for c in d.columns if c != "Take ✅"],
                 column_config={"Take ✅": st.column_config.CheckboxColumn("Take ✅")})
             submitted = st.form_submit_button("✅ Save selected delivery customers", type="primary")
@@ -3180,7 +3185,7 @@ def _send_tab(me, ctx):
     with st.form("batch_" + editor_key, clear_on_submit=False):
         default_via = PENDING_VIA
         select_all_send = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
-        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+        edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
             column_order=["Sent ✅", "Customer", "Cases", "Invoice", "Note", "Status"],
             disabled=["Customer", "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
             column_config={"Sent ✅": st.column_config.CheckboxColumn("Sent ✅"),
@@ -3250,95 +3255,137 @@ def pending_expense_df(who, scope, include_done=False):
     return df.reset_index(drop=True)
 
 
+
+def phone_task_editor(frame, **kwargs):
+    """Native vertical inputs inside the caller's form: no rerun while typing."""
+    key = kwargs["key"]
+    disabled = set(kwargs.get("disabled", []))
+    columns = kwargs.get("column_order") or list(frame.columns)
+    out = []
+    for pos, original in enumerate(frame.to_dict("records")):
+        row = dict(original)
+        with st.container(border=True):
+            st.write("**" + str(row.get("Customer", "Customer")) + "**")
+            details = [str(row.get(c, "")) for c in ("Province", "Status", "Taken by") if c in row]
+            if details:
+                st.caption(" · ".join(details))
+            for col in columns:
+                if col in disabled or col not in row:
+                    continue
+                widget_key = f"{key}_card_{pos}_{col}"
+                if col in ("Take ✅", "Sent ✅", "Save?", "Done ✅"):
+                    row[col] = st.checkbox(col, value=bool(row[col]), key=widget_key)
+                elif col == "Cases":
+                    row[col] = st.number_input("Cases / ចំនួនកេស", min_value=0, max_value=MAX_CASES,
+                        value=max(0, min(MAX_CASES, _int(row[col]))), step=1, key=widget_key)
+                elif col == "Status":
+                    options = ["Done", "Not yet", "Skip"]
+                    row[col] = st.selectbox(col, options, index=options.index(row[col]) if row[col] in options else 0, key=widget_key)
+                elif col == "Customer":
+                    opts, _, _ = customer_choices()
+                    choices = list(dict.fromkeys([str(row[col])] + list(opts)))
+                    row[col] = st.selectbox("Customer", choices, key=widget_key)
+                else:
+                    row[col] = st.text_input(col, value=str(row[col] or ""), key=widget_key)
+        out.append(row)
+    return pd.DataFrame(out, columns=frame.columns)
+
+
+def _save_expense_card(original, via, station, pp, taxi, note):
+    """Update exactly one delivery; reject edits made since this card was loaded."""
+    station = safe_text(station or "").strip()
+    station = "" if station == "-" else station
+    if via not in via_options():
+        raise ValueError("Choose who delivered first.")
+    pp, taxi = driver_pp_expense(via, pp), _int(taxi)
+    if not (0 <= pp <= MAX_RIEL and 0 <= taxi <= MAX_RIEL):
+        raise ValueError("Expense amount is outside the allowed range.")
+    if expense_status(via, station, pp, taxi) != "Done":
+        raise ValueError("Enter the paid transport expense. If no taxi was used, leave taxi station blank and taxi expense 0.")
+    def apply(frame):
+        mask = pd.Series(True, index=frame.index)
+        for field in ("Date", "Customer", "Handled_By", "Invoice"):
+            mask &= frame[field].fillna("").astype(str).eq(str(original.get(field, "") or ""))
+        if int(mask.sum()) != 1:
+            raise ValueError("This delivery changed or is ambiguous. Refresh the list.")
+        idx = frame.index[mask][0]
+        for field in ("Local_Driver", "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Expense_Status"):
+            if str(frame.at[idx, field]) != str(original.get(field, "")):
+                raise ValueError("Another staff member updated this delivery. Refresh before saving.")
+        for field, value in {"Local_Driver": via, "Taxi_Station": station or "-",
+                             "Phnom_Penh_Expense": pp, "Taxi_Expense": taxi,
+                             "Note": safe_text(note or "") or "-", "Expense_Status": "Done"}.items():
+            frame.loc[idx, field] = value
+        return frame
+    modify_csv(DATA_FILE, DISPATCH_COLS, apply)
+
+
+@st.fragment
+def _expense_phone_card(record, me):
+    token = _draft_id("expense_card", "|".join(str(record.get(c, "")) for c in ("Date", "Customer", "Handled_By", "Invoice")))
+    if st.session_state.get(token + "_saved"):
+        st.success(str(record["Customer"]) + " — saved ✅")
+        return
+    with st.container(border=True):
+        st.write("**" + str(record["Customer"]) + "**")
+        st.caption(f'{record["Date"]} · {record.get("Cases", 0)} cases · Invoice {record.get("Invoice", "")}')
+        choices = [PENDING_VIA] + via_options()
+        previous = str(record.get("Local_Driver", ""))
+        default = previous if previous in choices else PENDING_VIA
+        if default == PENDING_VIA and me in LOCAL_DRIVERS:
+            default = me
+        via = st.selectbox("🚚 Sent with / អ្នកដឹក", choices, index=choices.index(default), key=token + "_via")
+        with st.form(token + "_form"):
+            if via in LOCAL_DRIVERS:
+                pp = 0
+                st.caption("Phnom Penh expense: 0៛ automatically")
+            else:
+                pp = st.number_input("Phnom Penh expense ៛", min_value=0, max_value=MAX_RIEL,
+                                     value=_int(record.get("Phnom_Penh_Expense")), step=500, key=token + "_pp")
+            station = st.text_input("Taxi station — blank if no taxi", value="" if record.get("Taxi_Station") in ("", "-") else str(record.get("Taxi_Station", "")), max_chars=MAX_TEXT, key=token + "_station")
+            taxi = st.number_input("Taxi expense ៛ — 0 if no taxi", min_value=0, max_value=MAX_RIEL,
+                                   value=_int(record.get("Taxi_Expense")), step=500, key=token + "_taxi")
+            st.caption("Phnom Penh / តាខ្មៅ / direct delivery: no taxi needed? Leave station blank and taxi 0.")
+            note = st.text_input("Note / កំណត់ចំណាំ", value="" if record.get("Note") == "-" else str(record.get("Note", "")), max_chars=MAX_TEXT, key=token + "_note")
+            save = st.form_submit_button("💾 Save this customer", type="primary", use_container_width=True)
+        if save:
+            try:
+                _save_expense_card(record, via, station, pp, taxi, note)
+                audit("expenses_filled", f'Card: {record["Customer"]}, by {me}')
+                st.session_state[token + "_saved"] = True
+                st.rerun(scope="fragment")
+            except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
+                st.error(str(err))
+
+
 def _expense_tab(me):
     if not has_permission("edit") or not has_permission("tasks"):
-        st.warning("Editing delivery expenses is disabled for your account.")
+        st.warning("Editing delivery details is disabled for your account.")
         return
-    is_admin = current_role() == "admin"
-    st.caption("តួ and វុទ្ធា: Phnom Penh expense is automatically 0. Leave taxi station blank and taxi expense at 0 when no paid taxi is used, including Ta Khmau. Complete driver, taxi and expenses for deliveries already sent. Cases checked by is optional. Self-delivered orders need no transport expense unless a taxi station is recorded. Tick **Done** for each row you finish, then save.")
-    with st.form("expense_filters"):
-        c1, c2 = st.columns(2)
-        scope = c1.radio("Show", ["All waiting", "Today", "Last 7 days"], horizontal=True, key="exp_scope")
-        show_done = st.checkbox("Also show deliveries with no expense required / already done", key="exp_done")
-        who = me
-        if is_admin:
-            pick = c2.selectbox("Handler", ["(everyone)"] + DELIVERY_HANDLERS, key="exp_who")
-            who = None if pick == "(everyone)" else pick
-        if st.form_submit_button("Apply expense filter"):
-            _reset_draft("expenses", str((who, scope, show_done)))
-    if not is_admin and me == "-- Select Staff --":
-        st.info("Choose your name at the top first.")
+    if me == "-- Select Staff --":
+        st.info("Choose your name first.")
         return
-    df = pending_expense_df(who, scope, show_done)
-    draft_scope = str((who, scope, show_done))
-    if df.empty and not _has_editor_draft("expenses", draft_scope):
-        st.success("No delivery details or expenses are waiting. 🎉")
+    st.caption("Complete one customer card and Save. Choose the driver before entering expenses. Other cards stay open.")
+    who = me
+    if current_role() == "admin":
+        pick = st.selectbox("Staff", ["My deliveries", "Everyone"] + DELIVERY_HANDLERS, key="phone_exp_staff")
+        who = None if pick == "Everyone" else me if pick == "My deliveries" else pick
+    query = st.text_input("🔎 Find customer or invoice", key="phone_exp_search").strip().casefold()
+    df = pending_expense_df(who, "All waiting")
+    if query and not df.empty:
+        df = df[df["Customer"].astype(str).str.casefold().str.contains(query, regex=False) |
+                df["Invoice"].astype(str).str.casefold().str.contains(query, regex=False)]
+    st.caption(f"{len(df)} deliveries waiting")
+    if st.button("↻ Refresh completed list", key="phone_exp_refresh", use_container_width=True):
+        st.rerun()
+    if df.empty:
+        st.success("All delivery details completed ✅")
         return
-    st.info(f"⏳ {len(df)} deliveries to complete.")
-    rows = [{"Done ✅": False, "Customer": r["Customer"], "When": str(r["Date"])[5:16], "Via": r["Local_Driver"],
-             "Taxi station": "" if r["Taxi_Station"] in ("-", "") else r["Taxi_Station"],
-             "Phnom Penh ៛": driver_pp_expense(r["Local_Driver"], r["Phnom_Penh_Expense"]), "Taxi ៛": int(r["Taxi_Expense"]),
-             "Cases checked by": str(r.get("Verified_By", "-")), "Note": str(r.get("Note", "-")), "Invoice": str(r.get("Invoice", "")), "By": r["Handled_By"], "Date": r["Date"]} for r in df.to_dict("records")]
-    _reload_draft_button("expenses", draft_scope)
-    d, editor_key = _task_editor_frame("expenses", pd.DataFrame(rows), draft_scope)
-    order = ["Done ✅", "Customer", "When", "Via", "Taxi station", "Phnom Penh ៛", "Taxi ៛", "Cases checked by", "Note", "Invoice"] + (["By"] if who is None else [])
-    with st.form("batch_" + editor_key, clear_on_submit=False):
-        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
-            column_order=order, disabled=["Customer", "When", "By", "Date", "Invoice"],
-            column_config={"Via": st.column_config.SelectboxColumn("Sent with", options=[PENDING_VIA] + via_options()),
-                "Cases checked by": st.column_config.SelectboxColumn("Cases checked by (optional)", options=list(dict.fromkeys(["-"] + VERIFY_STAFF + d["Cases checked by"].astype(str).tolist()))),
-                "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT),
-                "Done ✅": st.column_config.CheckboxColumn("Done ✅"),
-                "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
-                "Phnom Penh ៛": st.column_config.NumberColumn("Phnom Penh ៛", min_value=0, max_value=MAX_RIEL, step=500, help="Automatically saved as 0 for តួ and វុទ្ធា; only enter a fee for paid transport."),
-                "Taxi ៛": st.column_config.NumberColumn("Taxi ៛", min_value=0, max_value=MAX_RIEL, step=500)})
-        submitted = st.form_submit_button("💾 Save completed delivery details", type="primary")
-    if submitted:
-        updates, problems, total = {}, [], 0
-        for r in edited.to_dict("records"):
-            if not r["Done ✅"]:
-                continue
-            station, pp, tx = safe_text(r["Taxi station"] or ""), _int(r["Phnom Penh ៛"]), _int(r["Taxi ៛"])
-            pp = driver_pp_expense(r["Via"], pp)
-            station = "" if station == "-" else station
-            if r["Via"] not in via_options():
-                problems.append(f"{r['Customer']}: choose who delivered")
-            elif r["Via"] == BASE_VIA and pp <= 0:
-                problems.append(f"{r['Customer']}: enter the Phnom Penh ៛ (Grab/TukTuk)")
-            elif station and tx <= 0:
-                problems.append(f"{r['Customer']}: enter the Taxi ៛ for {station}")
-            else:
-                updates[(str(r["Date"]), r["Customer"], r["By"], str(r.get("Invoice", "")))] = (station or "-", pp, tx, r["Via"], safe_text(r.get("Cases checked by", "-") or "-"), safe_text(r.get("Note", "-") or "-"))
-                total += pp + tx
-        if problems:
-            st.error("❌ Not saved yet:\n\n" + "\n".join(f"- {p}" for p in problems[:8]))
-            return
-        if not updates:
-            st.warning("Tick **Done** on the rows you have finished first.")
-            return
-
-        def _apply(frame):
-            for (dt, cust, by, invoice), (station, pp, tx, via, checker, note) in updates.items():
-                m = (frame["Date"].astype(str) == dt) & (frame["Customer"] == cust) & (frame["Handled_By"] == by)
-                m = m & (frame["Invoice"].fillna("").astype(str) == invoice)
-                if int(m.sum()) != 1:
-                    raise ValueError(f"The delivery of {cust} was changed by someone else. Reload and try again.")
-                i = frame.index[m][0]
-                frame.loc[i, "Local_Driver"] = via
-                frame.loc[i, "Verified_By"] = checker
-                frame.loc[i, "Note"] = note
-                frame.loc[i, "Taxi_Station"] = station
-                frame.loc[i, "Phnom_Penh_Expense"] = pp
-                frame.loc[i, "Taxi_Expense"] = tx
-                frame.loc[i, "Expense_Status"] = "Done"
-            return frame
-        try:
-            modify_csv(DATA_FILE, DISPATCH_COLS, _apply)
-            audit("expenses_filled", f"{len(updates)} deliveries, {total} riel, by {me}")
-            _reset_draft("expenses", draft_scope)
-            flash_and_refresh(f"Completed delivery details for {len(updates)} deliveries (៛{total:,})")
-        except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
-            st.error(f"❌ {err}")
+    records = df.to_dict("records")
+    pages = (len(records) + 7) // 8
+    page = st.selectbox("Page (8 customers each)", list(range(1, pages + 1)), key="phone_exp_page")
+    for record in records[(page - 1) * 8:page * 8]:
+        _expense_phone_card(record, me)
 
 
 # ---- Journal fill sheet: expenses/driver in the same order as the Sale Journal ----
@@ -3599,25 +3646,19 @@ def _dispatch_body():
     if me != "-- Select Staff --":
         st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📌 To send <b>{len(mine)}</b></span>"
                     f"<span class='hk-pill'>⏳ Details to complete <b>{n_wait}</b></span></div>", unsafe_allow_html=True)
-    t1, t2, t3, t4, t5 = st.tabs(["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Complete delivery details",
-                                  "✍️ One customer", "📊 Today's log"])
-    need_name = me == "-- Select Staff --"
-    with t1:
-        if need_name:
-            st.info("Choose your name at the top first.")
-        else:
-            _claim_tab(me, ctx)
-    with t2:
-        if need_name:
-            st.info("Choose your name at the top first.")
-        else:
-            _send_tab(me, ctx)
-    with t3:
+    step = st.selectbox("Delivery step", ["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Complete delivery details", "✍️ One customer", "📊 Today's log"], key="phone_delivery_step")
+    if me == "-- Select Staff --" and not step.startswith("📊"):
+        st.info("Choose your name at the top first.")
+        return
+    if step.startswith("1"):
+        _claim_tab(me, ctx)
+    elif step.startswith("2"):
+        _send_tab(me, ctx)
+    elif step.startswith("3"):
         _expense_tab(me)
-    with t4:
-        st.caption("The full form for a single customer. Expenses are optional - leave them empty to fill them later.")
+    elif step.startswith("✍"):
         dispatch_form("expense_form")
-    with t5:
+    else:
         _delivery_log()
 
 
