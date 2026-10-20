@@ -95,9 +95,10 @@ LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces 
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache_" + _APP_SCOPE)       # outside Dropbox = faster
 
-# Excel journal. The bot tries EXCEL_PATTERN first; if nothing matches it switches to
+# Excel journal. Normal journals are preferred; conflicted copies require EXCEL_OVERRIDE.
+# The bot tries EXCEL_PATTERN first; if nothing matches it switches to
 # EXCEL_FALLBACK_PATTERN by itself. To force one exact file: EXCEL_OVERRIDE = "name.xlsx"
-EXCEL_PATTERN = "*conflicted copy*.xlsx"
+EXCEL_PATTERN = "*Sale*Jou*.xlsx"
 EXCEL_FALLBACK_PATTERN = "*Sale_Journal*.xlsx"
 EXCEL_OVERRIDE = ""
 
@@ -137,9 +138,9 @@ VERIFY_STAFF = OPS_STAFF + SALES_STAFF
 DELIVERY_HANDLERS = OPS_STAFF + LOCAL_DRIVERS
 
 DISPATCH_COLS = ["Date", "Handled_By", "Customer", "Cases", "Local_Driver",
-                 "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By", "Expense_Status"]
+                 "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By", "Expense_Status", "Invoice"]
 DISPATCH_NUM_COLS = ["Cases", "Phnom_Penh_Expense", "Taxi_Expense"]
-PACKING_COLS = ["Date", "Prepared_By", "Customer", "Cases_Packed", "Status"]
+PACKING_COLS = ["Date", "Prepared_By", "Customer", "Cases_Packed", "Status", "Invoice"]
 ASSIGN_COLS = ["Date", "Handler", "Customer", "Action"]
 HOLD_COLS = ["Date", "Customer", "Action", "Cases", "Reason", "By"]   # Action: Tomorrow | Cancel | Restore
 HOLD_NUM_COLS = ["Cases"]
@@ -1349,7 +1350,9 @@ def _list_remote_folder(_token=0):
 def _remote_excel_names():
     try:
         return [x for x in _list_remote_folder()
-                if x["name"].lower().endswith(".xlsx") and not x["name"].startswith("~$")]
+                if x["name"].lower().endswith(".xlsx") and not x["name"].startswith("~$")
+                and ("conflicted copy" not in x["name"].lower() or x["name"].lower() == EXCEL_OVERRIDE.lower())
+                and not x["name"].lower().endswith("__status.xlsx")]
     except Exception:
         return []
 
@@ -1371,7 +1374,9 @@ def _dropbox_excel():
     S = _sync_state()
     try:
         names = [x for x in _list_remote_folder()
-                 if x["name"].lower().endswith(".xlsx") and not x["name"].startswith("~$")]
+                 if x["name"].lower().endswith(".xlsx") and not x["name"].startswith("~$")
+                and ("conflicted copy" not in x["name"].lower() or x["name"].lower() == EXCEL_OVERRIDE.lower())
+                and not x["name"].lower().endswith("__status.xlsx")]
         chosen = None
         if EXCEL_OVERRIDE:
             chosen = next((x for x in names if x["name"].lower() == EXCEL_OVERRIDE.lower()), None)
@@ -1647,6 +1652,9 @@ def append_rows(path, rows):
     rows = [{k: (v if k == "Date" or not isinstance(v, str) else safe_text(v)) for k, v in r.items()} for r in rows]
     if not rows:
         return
+    if path in (PACKING_FILE, DATA_FILE):
+        for row in rows:
+            row["Invoice"] = _resolve_record_invoice(row)
     spec = next((spec for spec in FILES.values() if spec[0] == path), None)
     if spec:
         raw = pd.DataFrame(rows)
@@ -1716,7 +1724,9 @@ def find_excel_file():
 
     def _files(pattern):
         fs = glob.glob(os.path.join(CURRENT_DIR, pattern))
-        return [f for f in fs if not os.path.basename(f).startswith("~$")]
+        return [f for f in fs if not os.path.basename(f).startswith("~$")
+                and "conflicted copy" not in os.path.basename(f).lower()
+                and not os.path.basename(f).lower().endswith("__status.xlsx")]
 
     if EXCEL_OVERRIDE:
         p = os.path.join(CURRENT_DIR, EXCEL_OVERRIDE)
@@ -2371,6 +2381,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
         else:
             customer_name = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
+        invoice_number = st.text_input("Invoice number (blank only when this customer has one invoice today)", key=f"{k}_invoice", max_chars=80)
         d_cases = max(0, min(int(default_cases), MAX_CASES))
         cases = st.number_input("ចំនួនកេស (Number of Cases):", min_value=0, max_value=MAX_CASES, step=1,
                                 value=d_cases, key=f"{k}_cases_{d_cases}")
@@ -2415,6 +2426,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
                         "Date": now_str(),
                         "Handled_By": dispatched_by,
                         "Customer": customer_name.strip(),
+                        "Invoice": invoice_number.strip(),
                         "Cases": cases,
                         "Local_Driver": handler_local,
                         "Taxi_Station": taxi_station.strip() or "-",
@@ -2445,6 +2457,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
         else:
             customer = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
+        invoice_number = st.text_input("Invoice number (blank only when this customer has one invoice today)", key=f"{k}_invoice", max_chars=80)
         prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
 
         col1, col2 = st.columns(2)
@@ -2469,6 +2482,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
                         "Date": now_str(),
                         "Prepared_By": prepared_by,
                         "Customer": customer.strip(),
+                        "Invoice": invoice_number.strip(),
                         "Cases_Packed": cases_packed,
                         "Status": pack_status,
                     })
@@ -2819,6 +2833,10 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
         return
     if check_col != "Save?":
         d = d.rename(columns={"Save?": check_col})
+    if "Invoice" not in d.columns:
+        d["Invoice"] = ""
+    if column_order is not None and "Invoice" not in column_order:
+        column_order = list(column_order) + ["Invoice"]
     opts = sorted(set(ctx["today"]) | {c for c in d["Customer"] if c})
     st.caption("Tick several customers and edit their cases, then save once. Ticks and typing stay on this screen until you save.")
     preferences = _form_preferences("packing_staff")
@@ -2829,7 +2847,7 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
             index=staff_options.index(linked) if linked in staff_options else 0, key=f"{key}_by")
         include_all = st.checkbox("Include every customer shown when saving", key=editor_key + "_all",
             help="Applies to the whole list below when you press Save. Otherwise, tick individual rows.")
-        editable = (check_col, "Cases") if key == "tick" else (check_col, "Customer", "Status", "Cases")
+        editable = (check_col, "Cases", "Invoice") if key == "tick" else (check_col, "Customer", "Status", "Cases", "Invoice")
         edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
             disabled=[c for c in d.columns if c not in editable], column_order=column_order,
             column_config={check_col: st.column_config.CheckboxColumn(check_col),
@@ -2850,7 +2868,7 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
             continue
         if _int(ctx["packed"].get(cust, 0)) != _int(r.get("Already packed", 0)):
             changed.append(cust)
-        recs.append({"Date": now_str(), "Prepared_By": prepared_by, "Customer": cust, "Cases_Packed": cases,
+        recs.append({"Date": now_str(), "Prepared_By": prepared_by, "Customer": cust, "Invoice": str(r.get("Invoice", "")), "Cases_Packed": cases,
                      "Status": "Completed (រួចរាល់)" if r["Status"] == "Done" else "In Progress (កំពុងធ្វើ)"})
         total += cases
     if changed:
@@ -3142,12 +3160,14 @@ def _send_tab(me, ctx):
         ordered = None if pd.isna(r["កេស"]) else int(r["កេស"])
         packed, sent = int(r["Packed Cases"]), int(r["Sent Cases"])
         left = (packed - sent) if packed > sent else ((ordered - sent) if (ordered and ordered > sent) else 1)
-        rows.append({"Sent ✅": False, "Customer": r["Customer"], "Cases": int(left), "Via": "Use default", "Taxi station": "",
+        rows.append({"Sent ✅": False, "Customer": r["Customer"], "Invoice": "", "Cases": int(left), "Via": "Use default", "Taxi station": "",
                      "Note": "", "Status": r["Status"], "Province": r["Province"],
                      "Saved sent cases": sent, "Saved packed cases": packed, "Saved order cases": ordered if ordered is not None else -1})
     _reload_draft_button("send", me)
     d, editor_key = _task_editor_frame("send", pd.DataFrame(rows), me)
-    st.caption("Tick several deliveries, edit cases and notes, then save once.")
+    if "Invoice" not in d.columns:
+        d["Invoice"] = ""
+    st.caption("Enter an invoice for customers with multiple invoices. Cases must belong to that invoice. Save other invoices separately.")
     preferences = _form_preferences("send_defaults", me)
     via_values = via_options()
     verifier_values = ["-- Select Staff --"] + VERIFY_STAFF
@@ -3159,7 +3179,7 @@ def _send_tab(me, ctx):
             index=verifier_values.index(preferences.get("verifier")) if preferences.get("verifier") in verifier_values else 0, key="send_vby")
         select_all_send = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
         edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
-            column_order=["Sent ✅", "Customer", "Cases", "Via", "Taxi station", "Note", "Status"],
+            column_order=["Sent ✅", "Customer", "Invoice", "Cases", "Via", "Taxi station", "Note", "Status"],
             disabled=["Customer", "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
             column_config={"Sent ✅": st.column_config.CheckboxColumn("Sent ✅"),
                 "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1),
@@ -3190,7 +3210,7 @@ def _send_tab(me, ctx):
             if not (select_all_send or r["Sent ✅"]) or cases <= 0 or cases > MAX_CASES or via not in via_options():
                 continue
             station = safe_text(r["Taxi station"] or "")
-            out.append({"Date": now_str(), "Handled_By": me, "Customer": cust, "Cases": cases, "Local_Driver": via,
+            out.append({"Date": now_str(), "Handled_By": me, "Customer": cust, "Invoice": str(r.get("Invoice", "")), "Cases": cases, "Local_Driver": via,
                         "Taxi_Station": station or "-", "Phnom_Penh_Expense": 0, "Taxi_Expense": 0,
                         "Note": safe_text(r["Note"] or "") or "-", "Verified_By": verified_by,
                         "Expense_Status": expense_status(via, station, 0, 0)})
@@ -5969,6 +5989,362 @@ def tab_customer_map():
 
 
 # ==========================================
+# AUTOMATIC INVOICE STATUS EXPORT (source workbook is NEVER written)
+# ==========================================
+def _invoice_choices(customer, day=None):
+    snap, src, _, error = current_snapshot()
+    if error or not snap or src == "stale":
+        raise RuntimeError("Journal unavailable; retry before saving invoice-linked records")
+    sub = snap["journal"]
+    sub = sub[(sub["Date"] == (day or today_kh())) & (sub["Customer"].map(norm_name) == norm_name(customer))]
+    return sorted({str(v).strip() for v in sub["Invoice"] if str(v).strip() not in ("", "-", "nan")})
+
+
+def _resolve_record_invoice(row):
+    day = parse_dt(row["Date"])
+    choices = _invoice_choices(row["Customer"], day.date())
+    supplied = str(row.get("Invoice", "")).strip()
+    if supplied in ("", "-", "nan"):
+        if len(choices) == 1:
+            return choices[0]
+        if len(choices) > 1:
+            raise RuntimeError(f"{row['Customer']}: enter one invoice number for these cases ({', '.join(choices)}). Save different invoices separately.")
+        return "-"  # Non-journal tasks are allowed, but never colored.
+    matches = [v for v in choices if v.casefold() == supplied.casefold()]
+    if len(matches) != 1:
+        raise RuntimeError(f"{row['Customer']}: invoice {supplied} does not match this customer and date in the journal")
+    return matches[0]
+
+
+def _make_invoice_status_csv(source, packing, deliveries, holds):
+    """Export exact invoice status, conservatively skipping ambiguous legacy rows."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(source), read_only=True, data_only=True)
+    try:
+        ws = wb[JOURNAL_SHEET]; ws.reset_dimensions()
+        raw = list(ws.iter_rows(values_only=True))
+    finally:
+        wb.close()
+    ci = next((i for row in raw[:15] for i,v in enumerate(row) if v is not None and JOURNAL_CASES_HEADER in str(v)), None)
+    ii = next((i for row in raw[:15] for i,v in enumerate(row) if v is not None and JOURNAL_INVOICE_HEADER in str(v)), None)
+    if ci is None or ii is None:
+        raise RuntimeError("Journal invoice/cases column missing")
+    months = Counter((r[0].year,r[0].month) for r in raw if r and isinstance(r[0],datetime))
+    dominant = months.most_common(1)[0][0] if months else None
+    groups, by_day = {}, {}
+    for r in raw:
+        if len(r) <= max(ci,ii) or not r[1]:continue
+        day = cell_to_date(r[0], dominant)
+        inv, cust = _cell_text(r[ii]), _cell_text(r[1])
+        if not day or inv in ("", "-"):continue
+        key = (norm_name(cust), inv.casefold())
+        g = groups.setdefault(key, dict(Customer=cust,Invoice=inv,ordered=0.,days=set(),ids=set(),packed=0.,sent=0.,completed=False))
+        qty = pd.to_numeric(r[ci],errors="coerce")
+        if pd.notna(qty):g['ordered'] += max(float(qty),0)
+        g['days'].add(day)
+        if len(r)>2 and _cell_text(r[2]):g['ids'].add(_cell_text(r[2]))
+        by_day.setdefault((day,norm_name(cust)),set()).add(key)
+    skipped=0
+    for frame,kind,field in ((packing,'packed','Cases_Packed'),(deliveries,'sent','Cases')):
+        for r in frame.to_dict('records'):
+            dt=r.get('_dt',parse_dt(r.get('Date')))
+            if pd.isna(dt): skipped+=1;continue
+            possibilities=by_day.get((dt.date(),norm_name(r['Customer'])),set())
+            inv=_cell_text(r.get('Invoice'))
+            if inv not in ('','-','nan'):
+                possibilities={k for k in possibilities if k[1]==inv.casefold()}
+            if len(possibilities)!=1:skipped+=1;continue
+            key=next(iter(possibilities));g=groups[key]
+            g[kind]+=max(float(r[field]),0)
+            if kind=='packed':g['completed']=str(r.get('Status','')).startswith('Completed')
+    # Customer-level corrections cannot be divided across several invoices.
+    correction={}
+    for r in holds.to_dict('records'):
+        dt=r.get('_dt',parse_dt(r.get('Date')))
+        if pd.isna(dt):continue
+        k=(dt.date(),norm_name(r['Customer']));a=correction.setdefault(k,{})
+        action=r['Action']
+        if action in ('FinalSent','FinalPacked'):a[action]=max(float(r['Cases']),0)
+        elif action in ('FinalReset','FinalPackedReset'):a.pop('FinalSent' if action=='FinalReset' else 'FinalPacked',None)
+        elif action in ('Tomorrow','Cancel'):a['hold']=True
+        elif action=='Restore':a.pop('hold',None)
+    out=[]
+    for key,g in groups.items():
+        status='Pending'
+        if len(g['days'])!=1 or len(g['ids'])>1:status='Review'
+        else:
+            day=next(iter(g['days']));ck=(day,key[0]);o=correction.get(ck,{})
+            if o.get('hold'):status='Hold'
+            elif o and len(by_day[ck])>1:status='Review'
+            else:
+                g['packed']=o.get('FinalPacked',g['packed']);g['sent']=o.get('FinalSent',g['sent'])
+                target=max(g['ordered'],g['packed'])
+                if g['sent']>0:status='Sent' if target>0 and g['sent']>=target else 'Part sent'
+                elif g['packed']>0 and (g['completed'] or 'FinalPacked' in o) and g['packed']>=g['ordered']:status='Packed'
+        out.append(dict(Customer=g['Customer'],Invoice=g['Invoice'],Status=status,Packed_Cases=g['packed'],Sent_Cases=g['sent'],Ordered_Cases=g['ordered']))
+    result=pd.DataFrame(out,columns=['Customer','Invoice','Status','Packed_Cases','Sent_Cases','Ordered_Cases'])
+    return result.to_csv(index=False).encode('utf-8-sig'), {'highlighted':int(result.Status.isin(['Sent','Packed','Part sent']).sum()),'ambiguous':int((result.Status=='Review').sum()),'unmatched':skipped}
+
+
+STATUS_COPY_FOLDER = "Auto_Status"
+STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V2:"
+
+
+def _journal_status_rows(journal_rows, packing, deliveries, holds):
+    """Exact date/name matching; a repeated name with different IDs is ambiguous.
+    All invoices for a customer/day share one aggregate status, not an invoice status.
+    """
+    groups = {}
+    for row_no, day, name, customer_id, cases in journal_rows:
+        key = (day, norm_name(name))
+        g = groups.setdefault(key, {"rows": [], "ids": set(), "ordered": 0.0})
+        g["rows"].append(row_no)
+        if customer_id:
+            g["ids"].add(customer_id)
+        if cases is not None and not pd.isna(cases):
+            g["ordered"] += max(float(cases), 0)
+    activity = {}
+    for frame, kind, field in ((packing, "packed", "Cases_Packed"), (deliveries, "sent", "Cases")):
+        for r in frame.to_dict("records"):
+            dt = r.get("_dt", parse_dt(r.get("Date")))
+            if pd.isna(dt):
+                continue
+            key = (dt.date(), norm_name(r["Customer"]))
+            a = activity.setdefault(key, {})
+            a[kind] = a.get(kind, 0) + max(float(r[field]), 0)
+            if kind == "packed":
+                a["completed"] = str(r.get("Status", "")).startswith("Completed")
+    overrides = {}
+    for r in holds.to_dict("records"):
+        dt = r.get("_dt", parse_dt(r.get("Date")))
+        if pd.isna(dt):
+            continue
+        a = overrides.setdefault((dt.date(), norm_name(r["Customer"])), {})
+        action = r["Action"]
+        if action in ("FinalSent", "FinalPacked"):
+            a[action] = max(float(r["Cases"]), 0)
+        elif action in ("FinalReset", "FinalPackedReset"):
+            a.pop("FinalSent" if action == "FinalReset" else "FinalPacked", None)
+        elif action in ("Tomorrow", "Cancel"):
+            a["hold"] = action
+        elif action == "Restore":
+            a.pop("hold", None)
+    marked, ambiguous = {}, 0
+    for key, g in groups.items():
+        if len(g["ids"]) > 1:
+            ambiguous += 1
+            continue
+        a, o = activity.get(key, {}), overrides.get(key, {})
+        if o.get("hold"):
+            continue
+        packed = o.get("FinalPacked", a.get("packed", 0))
+        sent = o.get("FinalSent", a.get("sent", 0))
+        target = max(g["ordered"], packed)
+        status = None
+        if sent > 0:
+            # Without any known target, sending cannot prove full completion.
+            status = "sent" if target > 0 and sent >= target else "part"
+        elif packed > 0 and ("FinalPacked" in o or a.get("completed")):
+            if g["ordered"] <= 0 or packed >= g["ordered"]:
+                status = "packed"
+        if status:
+            marked.update({n: status for n in g["rows"]})
+    unmatched = sum(1 for k in activity if k not in groups)
+    return marked, {"highlighted": len(marked), "ambiguous": ambiguous, "unmatched": unmatched}
+
+
+def _make_status_workbook(source, packing, deliveries, holds):
+    """Patch B-cell fills in the XLSX ZIP; preserve formulas, cached values and all other parts."""
+    import zipfile
+    import posixpath
+    import xml.etree.ElementTree as ET
+    from openpyxl import load_workbook
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    wb = load_workbook(io.BytesIO(source), read_only=True, data_only=True)
+    try:
+        ws = wb[JOURNAL_SHEET]
+        ws.reset_dimensions()
+        raw = list(ws.iter_rows(values_only=True))
+        cases_col = next((i for row in raw[:15] for i, v in enumerate(row)
+                          if v is not None and JOURNAL_CASES_HEADER in str(v)), None)
+        if cases_col is None:
+            raise ValueError("Journal cases column was not found; status copy postponed.")
+        months = Counter((r[0].year, r[0].month) for r in raw if r and isinstance(r[0], datetime))
+        dominant = months.most_common(1)[0][0] if months else None
+        rows = []
+        for n, r in enumerate(raw, 1):
+            if len(r) < 2 or not r[1] or str(r[1]).strip() == JOURNAL_HEADER_TEXT:
+                continue
+            day = cell_to_date(r[0], dominant)
+            if day:
+                qty = pd.to_numeric(r[cases_col] if cases_col < len(r) else None, errors="coerce")
+                rows.append((n, day, str(r[1]), _cell_text(r[2]) if len(r) > 2 else "", qty))
+    finally:
+        wb.close()
+    marks, stats = _journal_status_rows(rows, packing, deliveries, holds)
+    with zipfile.ZipFile(io.BytesIO(source)) as zin:
+        book = ET.fromstring(zin.read("xl/workbook.xml"))
+        sheet = next(s for s in book.find(ns + "sheets") if s.get("name") == JOURNAL_SHEET)
+        rid = sheet.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        rels = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
+        target = next(r.get("Target") for r in rels if r.get("Id") == rid)
+        part = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
+        styles = zin.read("xl/styles.xml").decode("utf-8")
+        root = ET.fromstring(styles)
+        fills, xfs = root.find(ns + "fills"), root.find(ns + "cellXfs")
+        if fills is None or xfs is None:
+            raise ValueError("Unsupported Excel style table")
+        colors = {"packed": "FFFFE699", "sent": "FFC6EFCE", "part": "FFBDD7EE"}
+        extra_fills = "".join('<fill><patternFill patternType="solid"><fgColor rgb="%s"/><bgColor indexed="64"/></patternFill></fill>' % c for c in colors.values())
+        fill_ids = {k: len(fills) + i for i, k in enumerate(colors)}
+        # Copy raw style XML so unsupported style extensions remain intact.
+        block = re.search(r'<cellXfs\b[^>]*>(.*?)</cellXfs>', styles, re.S)
+        if not block:
+            raise ValueError("Unsupported prefixed Excel styles")
+        originals = re.findall(r'<xf\b[^>]*?/>|<xf\b[^>]*>.*?</xf>', block.group(1), re.S)
+        if len(originals) != len(xfs):
+            raise ValueError("Cannot safely preserve Excel styles")
+        added, style_ids = [], {}
+        sheet_xml = zin.read(part).decode("utf-8")
+        def patch_cell(match):
+            tag = match.group(0)
+            ref = re.search(r'\br="B(\d+)"', tag)
+            status = marks.get(int(ref.group(1))) if ref else None
+            if not status:
+                return tag
+            existing = re.search(r'\bs="(\d+)"', tag)
+            old = int(existing.group(1)) if existing else 0
+            key = (old, status)
+            if key not in style_ids:
+                xf = originals[old]
+                end = xf.index(">")
+                head, tail = xf[:end], xf[end:]
+                for attr, value in (("fillId", fill_ids[status]), ("applyFill", 1)):
+                    head = re.sub(r'\s' + attr + r'="[^"]*"', '', head)
+                    where = len(head) - 1 if head.endswith("/") else len(head)
+                    head = head[:where] + f' {attr}="{value}"' + head[where:]
+                style_ids[key] = len(xfs) + len(added)
+                added.append(head + tail)
+            tag = re.sub(r'\ss="[^"]*"', '', tag)
+            return tag[:-1] + f' s="{style_ids[key]}">' if not tag.endswith('/>') else tag[:-2] + f' s="{style_ids[key]}"/>'
+        sheet_xml = re.sub(r'<c\b[^>]*>', patch_cell, sheet_xml)
+        for name, count, extra in (("fills", len(fills) + 3, extra_fills), ("cellXfs", len(xfs) + len(added), "".join(added))):
+            styles = re.sub(r'<' + name + r'\b[^>]*>', f'<{name} count="{count}">', styles, count=1)
+            styles = styles.replace('</' + name + '>', extra + '</' + name + '>', 1)
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for entry in zin.infolist():
+                data = sheet_xml.encode("utf-8") if entry.filename == part else styles.encode("utf-8") if entry.filename == "xl/styles.xml" else zin.read(entry.filename)
+                zout.writestr(entry, data)
+        return out.getvalue(), stats
+
+
+@st.cache_resource(show_spinner=False)
+def _status_copy_state():
+    return {"lock": threading.Lock(), "last_check": 0, "fingerprint": None,
+            "message": "Waiting for first automatic update", "path": None, "error": False}
+
+
+def sync_journal_status_copy(force=False):
+    """Rebuild only on changed input. Fail closed on stale reads; never upload to source path."""
+    import zipfile
+    state = _status_copy_state()
+    if not state["lock"].acquire(blocking=False):
+        return
+    try:
+        if not force and time.time() - state["last_check"] < 55:
+            return
+        state["last_check"] = time.time()
+        # Capture destination revision BEFORE reading inputs, so competing app writers cannot win stale.
+        if USE_DROPBOX:
+            names = _remote_excel_names()
+            chosen = next((x for x in names if x["name"].lower() == EXCEL_OVERRIDE.lower()), None) if EXCEL_OVERRIDE else None
+            chosen = chosen or _pick_remote(names, EXCEL_PATTERN) or _pick_remote(names, EXCEL_FALLBACK_PATTERN)
+            if not chosen:
+                raise ValueError("No source journal found; check the journal filename settings")
+            base = os.path.splitext(chosen["name"])[0] + "__INVOICE_STATUS.csv"
+            remote_out = _rpath(STATUS_COPY_FOLDER + "/" + base)
+            try:
+                output_md = _dbx().files_get_metadata(remote_out)
+            except Exception as e:
+                if not _is_not_found(e):
+                    raise
+                output_md = None
+            source_md, response = _dbx().files_download(_rpath(chosen["name"]))
+            source = response.content
+            source_name = chosen["name"]
+        else:
+            source_path = find_excel_file()
+            if not source_path:
+                raise ValueError("No source journal found")
+            source_name = os.path.basename(source_path)
+            with open(source_path, "rb") as f:
+                source = f.read()
+            base = os.path.splitext(source_name)[0] + "__INVOICE_STATUS.csv"
+        # Strict reads: no cached/offline fallback is allowed for publishing highlights.
+        frames, signatures = [], []
+        with _sync_state()["lock"]:
+            for path, cols in ((PACKING_FILE, PACKING_COLS), (DATA_FILE, DISPATCH_COLS), (HOLD_FILE, HOLD_COLS)):
+                pull(path, force=True)
+                if path in (PACKING_FILE, DATA_FILE) and not os.path.exists(path):
+                    raise ValueError(os.path.basename(path) + " is missing; status copy postponed")
+                frame = _csv_read(path, cols)
+                if frame["_dt"].isna().any():
+                    raise ValueError(os.path.basename(path) + " has invalid dates; correct them before highlighting")
+                frames.append(frame)
+                signatures.append(frame.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8"))
+            versions = {p: _sync_state()["rev"].get(p) for p in (PACKING_FILE, DATA_FILE, HOLD_FILE)}
+        fingerprint = hashlib.sha256(STATUS_COPY_VERSION.encode() + source + b"\0".join(signatures)).hexdigest()
+        local_out = os.path.join(DATA_DIR, STATUS_COPY_FOLDER, base)
+        if state["fingerprint"] == (source_name, fingerprint) and os.path.exists(local_out):
+            return
+        data, stats = _make_invoice_status_csv(source, *frames)
+        if USE_DROPBOX:
+            import dropbox
+            if remote_meta(source_name).rev != source_md.rev:
+                raise ConflictError("Sales journal changed during update; retrying next minute")
+            for path, rev in versions.items():
+                md = remote_meta(os.path.basename(path))
+                if (md.rev if md else None) != rev:
+                    raise ConflictError("Packing/delivery data changed; retrying next minute")
+            try:
+                _dbx().files_create_folder_v2(_rpath(STATUS_COPY_FOLDER))
+            except Exception as e:
+                if not _is_conflict(e):
+                    raise
+            mode = dropbox.files.WriteMode.update(output_md.rev) if output_md else dropbox.files.WriteMode.add
+            _dbx().files_upload(data, remote_out, mode=mode, autorename=False, mute=True, strict_conflict=True)
+        else:
+            if os.path.exists(os.path.join(os.path.dirname(local_out), "~$" + base)):
+                raise RuntimeError("Close the status copy in Excel to let it refresh")
+        _write_atomic(local_out, data)
+        state.update(fingerprint=(source_name, fingerprint), path=local_out, error=False,
+                     message=f"Updated {now_kh():%d %b %H:%M} — {stats['highlighted']} invoice statuses ready for Excel. "
+                             f"{stats['ambiguous']} ambiguous customer/day matches skipped; {stats['unmatched']} log customer/day matches absent from this journal.")
+    except Exception as e:
+        state.update(error=True, message="Invoice status update pending: " + str(e)[:220])
+    finally:
+        state["lock"].release()
+
+
+@st.fragment(run_every=60)
+def journal_status_copy_panel():
+    sync_journal_status_copy()
+    state = _status_copy_state()
+    with st.expander("🟨🟩 Original journal: invoice conditional formatting"):
+        st.caption("The app publishes Auto_Status / <journal>__INVOICE_STATUS.csv. Connect this CSV once to the original journal’s App_Status sheet. Excel conditional formatting colors customer names using customer + invoice; the app never saves the sales workbook.")
+        st.caption("Yellow = fully packed · Green = fully sent · Blue = partly sent. Status is matched by customer + invoice. Old records without invoices are used only when there is exactly one matching invoice that day. Existing product and remark colors stay intact.")
+        st.caption("Updates within about 60 seconds while an authorized app session is open. In Excel, refresh the App_Status query (or enable refresh every minute). No update runs when the app is asleep or closed.")
+        if st.button("Refresh invoice status CSV now", key="journal_highlight_refresh"):
+            sync_journal_status_copy(force=True)
+        (st.warning if state["error"] else st.caption)(state["message"])
+        if state.get("path") and os.path.exists(state["path"]):
+            with open(state["path"], "rb") as f:
+                st.download_button("Download invoice status CSV", f.read(), file_name=os.path.basename(state["path"]),
+                                   mime="text/csv", key="journal_highlight_download")
+
+
+# ==========================================
 # APP LAYOUT
 # ==========================================
 @st.fragment(run_every=60)
@@ -6052,6 +6428,9 @@ if ROLE in ("staff", "admin"):
 st.caption(_chips)
 if ROLE in ("staff", "admin"):
     health_status()
+
+if has_permission("view") or has_permission("reports") or ROLE == "admin":
+    journal_status_copy_panel()
 
 _perms = effective_permissions(current_user())
 labels = []
