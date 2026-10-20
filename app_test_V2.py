@@ -114,7 +114,7 @@ INVOICE_PREFIX = "NP"                  # if the invoice column is empty, the fir
 URGENT_WORDS = ["ប្រញាប់", "URGENT"]    # a remark containing one of these gets a 🔥
 JOURNAL_PAY_HEADER = "ការទូទាត់"        # journal column: payment (AR / FOC ...). FOC rows = free buns
 BUN_CODE_RE = re.compile(r"^N\d+$")  # journal columns N1, N2, N21 ... N43
-SNAPSHOT_VERSION = 5                   # change this number to force the journal to be re-read
+SNAPSHOT_VERSION = 6                   # change this number to force the journal to be re-read
 
 TZ = ZoneInfo("Asia/Phnom_Penh")
 DAYFIRST = True                        # only used for ambiguous TEXT dates with no other hint
@@ -1821,7 +1821,7 @@ def _read_excel_snapshot(path):
         except Exception:
             pass
         raw_rows = []
-        cases_col = inv_col = rem_col = pay_col = None
+        cases_col = inv_col = rem_col = pay_col = sales_col = None
         bun_cols, top_rows, hdr_i = {}, [], None            # bun_cols = {"N1": column index, ...}
         for r_i, row in enumerate(ws.iter_rows(values_only=True)):
             if r_i < 8:
@@ -1830,6 +1830,12 @@ def _read_excel_snapshot(path):
                 found = {str(v).strip(): c_i for c_i, v in enumerate(row) if v is not None and BUN_CODE_RE.match(str(v).strip())}
                 if len(found) >= 3:
                     bun_cols, hdr_i = found, r_i
+            if r_i < 15 and sales_col is None:
+                for c_i, v in enumerate(row):
+                    text = str(v or '').replace('\n', '').replace(' ', '')
+                    if 'ថ្លៃលក់' in text and 'រៀល' in text:
+                        sales_col = c_i
+                        break
             if r_i < 15 and pay_col is None:
                 for c_i, v in enumerate(row):
                     if v is not None and JOURNAL_PAY_HEADER in str(v):
@@ -1856,7 +1862,8 @@ def _read_excel_snapshot(path):
             rem = _cell_text(row[rem_col]) if (rem_col is not None and rem_col < len(row)) else ""
             buns = [row[ci] if ci < len(row) else None for ci in bun_cols.values()]
             pay = str(row[pay_col]).strip().upper() if (pay_col is not None and pay_col < len(row) and row[pay_col] is not None) else ""
-            raw_rows.append((row[0], name, qty, inv, rem or "-", buns, pay == "FOC"))
+            actual_sales = row[sales_col] if sales_col is not None and sales_col < len(row) else None
+            raw_rows.append((row[0], name, qty, inv, rem or "-", buns, pay == "FOC" or rem.strip().upper() == "FOC", actual_sales))
     finally:
         wb.close()
     # bun names (row above the header), sell price and cost per piece (rows labelled SELL/PCS and NET/PCS)
@@ -1881,7 +1888,7 @@ def _read_excel_snapshot(path):
     months = Counter((r[0].year, r[0].month) for r in raw_rows if isinstance(r[0], datetime))
     dominant = months.most_common(1)[0][0] if months else None
     out = []
-    for v, name, qty, inv, rem, buns, foc in raw_rows:
+    for v, name, qty, inv, rem, buns, foc, actual_sales in raw_rows:
         d = cell_to_date(v, dominant)
         if d is None:
             continue
@@ -1890,8 +1897,8 @@ def _read_excel_snapshot(path):
             q = None if pd.isna(q) else float(q)
         except Exception:
             q = None
-        out.append((d, name, q, inv, rem, foc, *buns))
-    journal = pd.DataFrame(out, columns=["Date", "Customer", "Cases", "Invoice", "Remark", "FOC"] + list(bun_cols))
+        out.append((d, name, q, inv, rem, foc, pd.to_numeric(actual_sales, errors="coerce"), *buns))
+    journal = pd.DataFrame(out, columns=["Date", "Customer", "Cases", "Invoice", "Remark", "FOC", "SalesActual"] + list(bun_cols))
     for _c in bun_cols:
         journal[_c] = pd.to_numeric(journal[_c], errors="coerce").fillna(0)
     journal["Cases"] = pd.to_numeric(journal["Cases"], errors="coerce")
@@ -6430,7 +6437,11 @@ def _si_add_history(j, codes, hist_daily, hist_monthly):
                         "Remark": h["Remark"] if "Remark" in h.columns else "-", "FOC": False, "_site": False})
     for c in all_codes:
         out[c] = pd.to_numeric(h[c], errors="coerce").fillna(0.0) if c in h.columns else 0.0
+    if "SalesActual" in h:
+        out["SalesActual"] = pd.to_numeric(h["SalesActual"], errors="coerce")
     base = j if (j is not None and not j.empty) else out.iloc[0:0]
+    if "SalesActual" in base and "SalesActual" not in out:
+        out["SalesActual"] = float("nan")
     for c in all_codes:
         if c not in base.columns:
             base = base.assign(**{c: 0.0})
@@ -6438,18 +6449,114 @@ def _si_add_history(j, codes, hist_daily, hist_monthly):
     return merged, all_codes, len(out)
 
 
+SI_JOURNAL_HISTORY_FILE = os.path.join(DATA_DIR, 'sales_journal_history.csv')
+
+
+def _si_is_journal_name(name):
+    cleaned = re.sub(r'[\s\u200b_\-.]+', '', name).lower()
+    return (name.lower().endswith('.xlsx') and 'sale' in cleaned and 'jou' in cleaned
+            and not name.startswith('~$') and 'conflictedcopy' not in cleaned
+            and '__status' not in name.lower())
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _si_archive_snapshot(path, mtime_ns, size):
+    return _read_excel_snapshot(path)
+
+
+def _si_merge_month_sources(sources, live, today):
+    """Replace whole monthly snapshots, not individual rows, so deleted invoices stay deleted.
+    Sources are ordered old -> new. Live journal wins for the months it contains.
+    """
+    months={};codes=[]
+    for label,frame in sources+[('Live journal',live)]:
+        if frame is None or frame.empty:continue
+        data=frame.copy()
+        data['Date']=pd.to_datetime(data['Date'],errors='coerce').dt.date
+        data=data[data['Date'].notna()]
+        # September onward is authoritative journal detail. Older history stays in its own files.
+        data=data[data['Date']>=date(2026,9,1)]
+        for c in data:
+            if re.fullmatch(r'N\d+',str(c)) and c not in codes:codes.append(c)
+        data['_month']=data['Date'].map(lambda d:d.strftime('%Y-%m'))
+        primary = data['_month'].value_counts().index[0] if not data.empty else None
+        for month,g in data.groupby('_month',sort=False):
+            # September workbooks may contain a few October rows. They must not replace October's journal.
+            owns_month = month == primary
+            if month not in months or owns_month or not months[month][2]:
+                months[month]=(label,g.drop(columns='_month').copy(),owns_month)
+    coverage=[]
+    for month in sorted(set(months)|{'2026-09','2026-10','2026-11','2026-12'}):
+        if month in months:
+            label,g,_=months[month]
+            dated=g[g['Date']<=today]
+            coverage.append({'Month':month,'Data status':'Available through '+str(dated['Date'].max()) if not dated.empty else 'Future-dated records only',
+                             'Source':label,'Journal rows':len(g),'Last recorded date':str(g['Date'].max())})
+        else:coverage.append({'Month':month,'Data status':'Not loaded — not zero sales','Source':'','Journal rows':0,'Last recorded date':''})
+    parts=[g for _,g,_ in months.values()]
+    combined=pd.concat(parts,ignore_index=True,sort=False) if parts else live.iloc[0:0].copy()
+    for c in codes:combined[c]=pd.to_numeric(combined[c],errors='coerce').fillna(0)
+    if 'FOC' in combined:combined['FOC']=combined['FOC'].map(lambda v: str(v).strip().lower() in ('true','1','yes'))
+    return combined,codes,pd.DataFrame(coverage)
+
+
+def _si_collect_journals(snap):
+    sources=[];warnings_out=[]
+    seed=_si_read_hist(SI_JOURNAL_HISTORY_FILE)
+    if not seed.empty and {'Date','Customer','Cases','Invoice'} <= set(seed):
+        if 'Source_File' in seed:
+            for label,frame in seed.groupby('Source_File',sort=False):
+                sources.append(('Saved history: '+str(label),frame))
+        else:
+            for month,frame in seed.groupby(pd.to_datetime(seed['Date'],errors='coerce').dt.strftime('%Y-%m')):
+                sources.append(('Saved history: '+str(month),frame))
+    try:
+        if USE_DROPBOX:
+            candidates=[r for r in _list_remote_folder() if _si_is_journal_name(r['name'])]
+        else:
+            candidates=[{'name':os.path.basename(p),'mtime':os.path.getmtime(p),'path':p} for p in glob.glob(os.path.join(CURRENT_DIR,'*.xlsx')) if _si_is_journal_name(os.path.basename(p))]
+        current=find_excel_file()
+        current_name=os.path.basename(current) if current else ''
+        for item in sorted(candidates,key=lambda r:(r['mtime'],r['name'])):
+            if item['name']==current_name:continue
+            try:
+                if USE_DROPBOX:
+                    local=os.path.join(CACHE_DIR,'analysis_journals',item['name'])
+                    state=_sync_state()
+                    with state['lock']:
+                        revs=state.setdefault('analysis_revs',{})
+                        if not os.path.exists(local) or revs.get(item['name'])!=item['rev']:
+                            md,response=_dbx().files_download(_rpath(item['name']))
+                            _write_atomic(local,response.content)
+                            revs[item['name']]=md.rev
+                else:local=item['path']
+                info=os.stat(local)
+                archive=_si_archive_snapshot(local,info.st_mtime_ns,info.st_size)
+                sources.append((item['name'],archive['journal']))
+            except Exception as error:
+                warnings_out.append(item['name']+': '+str(error)[:100])
+    except Exception as error:
+        warnings_out.append('Journal folder could not be checked: '+str(error)[:100])
+    merged,codes,coverage=_si_merge_month_sources(sources,snap['journal'],today_kh())
+    # Add unposted site orders only after merging every month's invoices.
+    combined_snap=dict(snap,journal=merged,buns=dict(snap.get('buns',{}),codes=codes))
+    combined=journal_plus_orders(combined_snap)
+    st.session_state['si_journal_coverage']=coverage
+    st.session_state['si_journal_warnings']=warnings_out
+    return combined,codes
+
+
 def _si_prepare(snap):
     """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows."""
-    j = journal_plus_orders(snap)
-    codes = bun_codes(snap)
+    j, codes = _si_collect_journals(snap)
     history_daily = _si_read_hist(SI_HIST_DAILY_FILE)
     history_monthly = _si_read_hist(SI_HIST_MONTHLY_FILE)
     sell = (snap.get("buns", {}) or {}).get("sell", {}) or {}
-    return _si_prepare_cached(j, codes, history_daily, history_monthly, sell)
+    return _si_prepare_cached(j, codes, history_daily, history_monthly, sell, today_kh())
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
-def _si_prepare_cached(j, codes, history_daily, history_monthly, sell):
+def _si_prepare_cached(j, codes, history_daily, history_monthly, sell, as_of):
     """Inputs include current orders, both history sources, product codes and prices."""
     j, codes, _n_hist = _si_add_history(j, codes, history_daily, history_monthly)
     if j is None or j.empty:
@@ -6469,6 +6576,14 @@ def _si_prepare_cached(j, codes, history_daily, history_monthly, sell):
         df["Pcs"] = df[codes].sum(axis=1)
     else:
         df["Sales"], df["Pcs"] = 0.0, 0.0
+    if "SalesActual" in df:
+        actual = pd.to_numeric(df["SalesActual"], errors="coerce")
+        df["Sales basis"] = actual.notna().map({True: "Journal amount", False: "Estimated from product prices"})
+        df["Sales"] = actual.fillna(df["Sales"])
+    else:
+        df["Sales basis"] = "Estimated from product prices"
+    # Future orders are not treated as actual historical sales.
+    df = df[df["D"] <= pd.Timestamp(as_of)].copy()
     df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
     daily = df.groupby(["Key", "D"], as_index=False).agg(
         Customer=("Customer", "first"), Cases=("Cases", "sum"), Sales=("Sales", "sum"), Pcs=("Pcs", "sum"))
@@ -6882,10 +6997,158 @@ def _si_show(df, money=(), pct=(), height=None):
 
 # Each call is an immutable customer snapshot; the newest call supplies current details.
 CALL_COLS = ["Date", "Customer", "CallID", "Outcome", "Notes", "Customer status",
-             "Contact person", "Phone", "Next action", "Follow-up date", "Assigned to", "Recorded by"]
+             "Contact person", "Phone", "Next action", "Follow-up date", "Assigned to", "Recorded by", "Reason", "Follow-up state", "Priority", "Result"]
 CALL_OUTCOMES = ["Reached customer", "No answer", "Busy / call back", "Wrong number",
                  "Order requested", "Complaint / problem", "Not interested", "Customer update only"]
 CALL_STATUSES = ["Active", "Follow-up needed", "Temporarily closed", "Stopped buying", "Do not contact"]
+
+
+FOLLOWUP_REASONS = ['Not specified', 'Price', 'Product quality', 'Delivery problem', 'Still has stock',
+                    'Low demand', 'Shop closed', 'Competitor', 'No answer', 'Wrong contact', 'Other']
+FOLLOWUP_STATES = ['Open', 'Awaiting order', 'Resolved', 'No follow-up']
+FOLLOWUP_PRIORITIES = ['Normal', 'High', 'Urgent']
+
+
+def _followup_review_data(history, orders, today, names=None, sales_available=True):
+    """Read-only report. Dates without time cannot prove a same-day order followed a call."""
+    latest = _si_call_latest(history)
+    last_orders = {}
+    if orders is not None and not orders.empty and {'Date', 'Customer'} <= set(orders.columns):
+        for r in orders.to_dict('records'):
+            if r.get('FOC') is True:
+                continue
+            dt = parse_dt(r['Date'])
+            if pd.notna(dt) and dt.date() <= today:
+                key = norm_name(r['Customer'])
+                last_orders[key] = max(last_orders.get(key, date.min), dt.date())
+    def clean(v, default=''):
+        return default if v is None or str(v).strip() in ('', '-', 'nan', 'None', 'NaT') else str(v).strip()
+    rows=[]
+    for r in latest.to_dict('records'):
+        customer=clean(r.get('Customer'));key=norm_name(customer)
+        due=parse_dt(r.get('Follow-up date'));called=parse_dt(r.get('Date'))
+        due_day=due.date() if pd.notna(due) else None
+        state=clean(r.get('Follow-up state'), 'Open' if due_day or r.get('Customer status')=='Follow-up needed' else 'No follow-up')
+        status=clean(r.get('Customer status'));last=last_orders.get(key)
+        next_action=clean(r.get('Next action'));owner=clean(r.get('Assigned to'))
+        evidence='Sales data unavailable' if not sales_available else 'No later order found in available data'
+        recovered=bool(sales_available and last and pd.notna(called) and last>called.date())
+        if recovered:evidence='Order recorded on '+str(last)
+        elif sales_available and last and pd.notna(called) and last==called.date():evidence='Same-day order: sequence needs review'
+        if status=='Do not contact':alert='Do not contact'
+        elif state=='Resolved':alert='Resolved'
+        elif state=='No follow-up':alert='No follow-up'
+        elif state=='Awaiting order' and recovered:alert='Order received'
+        elif not due_day or not owner or not next_action:alert='Needs setup'
+        elif due_day<today:alert='Overdue'
+        elif due_day==today:alert='Due today'
+        else:alert='Scheduled'
+        rows.append({'Customer':customer,'Alert':alert,'Priority':clean(r.get('Priority'),'Normal'),
+                     'Reason':clean(r.get('Reason'),'Not specified'),'Customer status':status,
+                     'Last call':clean(r.get('Date')),'Last order':str(last) if last else '',
+                     'Outcome':clean(r.get('Outcome')),'Notes':clean(r.get('Notes')),
+                     'Next action':next_action,'Assigned to':owner,'Follow-up date':str(due_day) if due_day else '',
+                     'Overdue days':max(0,(today-due_day).days) if due_day and alert=='Overdue' else 0,
+                     'Follow-up state':state,'Result':clean(r.get('Result')),'Order evidence':evidence,
+                     'Phone':clean(r.get('Phone')),'Recorded by':clean(r.get('Recorded by'))})
+    columns=['Customer','Alert','Priority','Reason','Customer status','Last call','Last order','Outcome','Notes',
+             'Next action','Assigned to','Follow-up date','Overdue days','Follow-up state','Result','Order evidence','Phone','Recorded by']
+    report=pd.DataFrame(rows,columns=columns)
+    if not report.empty:
+        rank={'Overdue':0,'Due today':1,'Needs setup':2,'Scheduled':3,'Order received':4,'Resolved':5,'No follow-up':6,'Do not contact':7}
+        report=report.assign(_rank=report['Alert'].map(rank),_priority=report['Priority'].map({'Urgent':0,'High':1,'Normal':2}).fillna(2))
+        report=report.sort_values(['_rank','_priority','Follow-up date','Customer']).drop(columns=['_rank','_priority']).reset_index(drop=True)
+    return report
+
+
+def _followup_sales_context():
+    """Use the existing journal cache; keep call management usable during a sales outage."""
+    try:
+        snap,source,journal_path,error=current_snapshot()
+        names={norm_name(n):n for n in (snap or {}).get('customers',[])}
+        if error or not snap or source=='stale':
+            return names,pd.DataFrame(),False
+        # Confirm order storage is readable rather than silently assuming it is empty.
+        if USE_DROPBOX:
+            metadata = remote_meta(os.path.basename(journal_path))
+            if metadata is None:
+                return names,pd.DataFrame(),False
+            expected_hash = getattr(metadata, 'content_hash', None) or metadata.rev
+            if _sync_state()["xl_hash"].get(os.path.basename(journal_path)) != expected_hash:
+                return names,pd.DataFrame(),False
+            pull(ORDERS_FILE, force=True)
+        read_raw(ORDERS_FILE, ORDER_COLS)
+        orders=journal_plus_orders(snap)
+        if 'FOC' in orders:orders=orders[~orders['FOC'].fillna(False).astype(bool)]
+        return names,orders,True
+    except Exception:
+        return {},pd.DataFrame(),False
+
+
+def _followup_review_panel(history):
+    names,orders,available=_followup_sales_context()
+    report=_followup_review_data(history,orders,today_kh(),names,available)
+    st.markdown('#### Follow-up review & results')
+    st.caption('Alerts are in this app; no email, Telegram or phone notifications are sent. Record reasons and actions below. Sales-based suggestions do not replace staff follow-up decisions.')
+    if not available:st.warning('Sales data is unavailable. Call reports and due alerts still work; order recovery cannot be confirmed.')
+    if report.empty:
+        st.info('No call updates recorded yet. Choose a customer below to start.')
+        return report
+    counts=report['Alert'].value_counts()
+    for col,label in zip(st.columns(5),['Overdue','Due today','Needs setup','Scheduled','Order received']):
+        col.metric(label,int(counts.get(label,0)))
+    with st.form('followup_review_filters'):
+        a,b,c=st.columns(3)
+        status=a.multiselect('Alert status',list(dict.fromkeys(report['Alert'])),key='fu_filter_status')
+        owner=b.multiselect('Assigned staff',sorted(set(report['Assigned to'])- {''}),key='fu_filter_owner')
+        reason=c.multiselect('Reason',sorted(set(report['Reason'])),key='fu_filter_reason')
+        search=st.text_input('Find customer',key='fu_filter_search')
+        st.form_submit_button('Apply review filters')
+    view=report
+    if status:view=view[view['Alert'].isin(status)]
+    if owner:view=view[view['Assigned to'].isin(owner)]
+    if reason:view=view[view['Reason'].isin(reason)]
+    if search.strip():view=view[view['Customer'].str.contains(search.strip(),case=False,regex=False)]
+    st.dataframe(view,hide_index=True,use_container_width=True)
+    if view.empty:st.info('No follow-ups match these filters. Clear the filters to see all records.')
+    st.caption('Order received is detected only from an order dated after the latest call. A same-day order needs manual confirmation. Receipt of an order does not prove a complaint was resolved. Save Resolved with a result after checking.')
+    if has_permission('reports'):
+        by_reason=report.groupby(['Reason','Alert'],dropna=False).size().reset_index(name='Customers')
+        by_owner=report.assign(**{'Assigned to':report['Assigned to'].replace('','Unassigned')}).groupby(['Assigned to','Alert']).size().reset_index(name='Customers')
+        buf=io.BytesIO()
+        with pd.ExcelWriter(buf,engine='xlsxwriter',engine_kwargs={'options':{'strings_to_formulas':False,'strings_to_urls':False}}) as writer:
+            for title,frame in [('Current follow-ups',report),('Filtered review',view),('Reasons',by_reason),('Staff results',by_owner),('Call history',history[[c for c in CALL_COLS if c in history]])]:
+                frame.to_excel(writer,sheet_name=title,index=False)
+                writer.sheets[title].freeze_panes(1,0)
+                writer.sheets[title].autofilter(0,0,len(frame),max(len(frame.columns)-1,0))
+                writer.sheets[title].set_column(0,max(len(frame.columns)-1,0),22)
+        st.download_button('Download follow-up review report',buf.getvalue(),file_name=f'Followup_Review_{today_kh()}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',key='fu_review_download')
+    return report
+
+
+@st.fragment(run_every=60)
+def followup_alert_banner():
+    if not (has_permission('view') or has_permission('reports')):return
+    try:
+        history=read_raw(CALLS_FILE,CALL_COLS)
+        if history.empty:return
+        _,orders,available=_followup_sales_context()
+        report=_followup_review_data(history,orders,today_kh(),sales_available=available)
+        due=int(report['Alert'].isin(['Overdue','Due today']).sum())
+        setup=int(report['Alert'].eq('Needs setup').sum())
+        if due or setup:
+            st.warning(f'Customer follow-ups: {due} due/overdue · {setup} need a date, owner or next action. Open Customer Follow-ups to review.')
+        if not available:st.caption('Follow-up alerts: order confirmation is unavailable until sales data is accessible.')
+    except Exception as e:
+        st.warning('Follow-up alerts could not refresh: '+str(e)[:150])
+
+
+@st.fragment
+def tab_followups():
+    if not (has_permission('view') or has_permission('reports')):
+        st.error('You do not have permission to view follow-ups.');return
+    names,_,_=_followup_sales_context()
+    _si_call_panel(names)
 
 
 def _si_call_latest(history):
@@ -6907,11 +7170,22 @@ def _si_save_call(row):
     follow = row.get("Follow-up date", "")
     if follow:
         date.fromisoformat(follow)
-        if row["Customer status"] == "Do not contact":
-            raise ValueError("Remove the follow-up date for a Do not contact customer.")
-        if not str(row.get("Next action", "")).strip():
-            raise ValueError("Enter the next action for this follow-up.")
-    clean = {c: safe_text(row.get(c, ""), maxlen=4000 if c == "Notes" else MAX_TEXT) for c in CALL_COLS}
+    state = row.get("Follow-up state", "Open" if follow else "No follow-up")
+    if state not in FOLLOWUP_STATES or row.get("Reason", "Not specified") not in FOLLOWUP_REASONS or row.get("Priority", "Normal") not in FOLLOWUP_PRIORITIES:
+        raise ValueError("Choose a valid reason, priority and follow-up state.")
+    if row["Customer status"] == "Do not contact" and state not in ("Resolved", "No follow-up"):
+        raise ValueError("Do not contact customers must have Resolved or No follow-up selected.")
+    if state in ("Open", "Awaiting order"):
+        if not follow or not str(row.get("Assigned to", "")).strip() or not str(row.get("Next action", "")).strip():
+            raise ValueError("An open follow-up requires a date, assigned person and next action.")
+        if row.get("Reason", "Not specified") == "Not specified":
+            raise ValueError("Choose a reason for this follow-up.")
+    if state == "Resolved" and not str(row.get("Result", "")).strip():
+        raise ValueError("Enter the result before closing this follow-up.")
+    row = dict(row, **{"Follow-up state": state})
+    if state in ("Resolved", "No follow-up"):
+        row["Follow-up date"] = ""
+    clean = {c: safe_text(row.get(c, ""), maxlen=4000 if c in ("Notes", "Result") else MAX_TEXT) for c in CALL_COLS}
     # Same form token can be retried after a network error without a duplicate call.
     def add(frame):
         if clean["CallID"] in set(frame["CallID"]):
@@ -6930,24 +7204,21 @@ def _si_call_panel(names):
     st.caption("Select a customer, record what happened, and save once. Previous calls stay in the history. "
                "Contact details here are customer-care details; requested orders must be entered in Sales Orders.")
     try:
+        if st.button("Refresh follow-up report", key="fu_refresh_now"):
+            pull(CALLS_FILE, force=True)
         history = read_raw(CALLS_FILE, CALL_COLS)
     except Exception as e:
         st.error(f"Call history could not be opened: {e}")
         return
     latest = _si_call_latest(history)
-    if not latest.empty:
-        due_dates = pd.to_datetime(latest["Follow-up date"], errors="coerce")
-        due = latest[due_dates.notna() & (due_dates <= pd.Timestamp(today_kh())) & latest["Customer status"].ne("Do not contact")]
-        with st.expander(f"📅 Follow-ups due today or overdue ({len(due)})", expanded=not due.empty):
-            if due.empty:
-                st.caption("No follow-ups due.")
-            else:
-                st.dataframe(due[["Customer", "Phone", "Follow-up date", "Next action", "Assigned to"]]
-                             .sort_values("Follow-up date"), hide_index=True, use_container_width=True)
+    _followup_review_panel(history)
     options = sorted(set(names.values()) | set(history["Customer"]), key=str.casefold)
     if not options:
-        st.info("No customers available.")
-        return
+        manual = st.text_input("Customer name (sales list unavailable)", key="fu_manual_customer", max_chars=MAX_TEXT).strip()
+        if not manual:
+            st.info("Enter the customer name to record a follow-up without sales data.")
+            return
+        options = [manual]
     if st.session_state.get("si_call_customer") not in options:
         st.session_state["si_call_customer"] = options[0]
     customer = st.selectbox("Customer to call / update", options, key="si_call_customer")
@@ -6974,10 +7245,17 @@ def _si_call_panel(names):
             phone = b.text_input("Phone / Telegram", value("Phone"), max_chars=MAX_TEXT)
             notes = st.text_area("Call notes (required)", max_chars=4000,
                                  placeholder="What did the customer say? Quality, price, delivery, requested products, or agreed actions…")
+            a, b, c = st.columns(3)
+            reason = a.selectbox("Reason", FOLLOWUP_REASONS, index=FOLLOWUP_REASONS.index(value("Reason", "Not specified")) if value("Reason", "Not specified") in FOLLOWUP_REASONS else 0)
+            default_state = value("Follow-up state", "Open" if value("Follow-up date") else "No follow-up")
+            follow_state = b.selectbox("Follow-up state", FOLLOWUP_STATES, index=FOLLOWUP_STATES.index(default_state) if default_state in FOLLOWUP_STATES else 0)
+            priority = c.selectbox("Priority", FOLLOWUP_PRIORITIES, index=FOLLOWUP_PRIORITIES.index(value("Priority", "Normal")) if value("Priority", "Normal") in FOLLOWUP_PRIORITIES else 0)
+            result = st.text_area("Result / resolution (required when Resolved)", max_chars=4000)
+            st.caption("Open: action still needed. Awaiting order: watch for a later order. Resolved: close with a result. No follow-up: keep the note without reminders.")
             action = st.text_input("Next action", value("Next action"), max_chars=MAX_TEXT)
             a, b = st.columns(2)
             old_due = pd.to_datetime(value("Follow-up date"), errors="coerce")
-            follow = a.date_input("Next follow-up date (clear to close follow-up)",
+            follow = a.date_input("Next follow-up date (required for Open / Awaiting order)",
                                  value=None if pd.isna(old_due) else old_due.date(), format="YYYY-MM-DD")
             owner = b.text_input("Assigned to", value("Assigned to", current_user() or ""), max_chars=MAX_TEXT)
             saved = st.form_submit_button("💾 Save call & customer update", type="primary")
@@ -6985,7 +7263,8 @@ def _si_call_panel(names):
             row = {"Date": now_str(), "Customer": customer, "CallID": token, "Outcome": outcome,
                    "Notes": notes, "Customer status": status, "Contact person": contact, "Phone": phone,
                    "Next action": action, "Follow-up date": follow.isoformat() if follow else "",
-                   "Assigned to": owner, "Recorded by": current_user() or "-"}
+                   "Assigned to": owner, "Recorded by": current_user() or "-",
+                   "Reason": reason, "Follow-up state": follow_state, "Priority": priority, "Result": result}
             try:
                 _si_save_call(row)
             except Exception as e:
@@ -7011,12 +7290,21 @@ def _si_call_panel(names):
         st.caption("No calls recorded for this customer yet.")
 
 
+def _followup_export_frame():
+    try:
+        history = read_raw(CALLS_FILE, CALL_COLS)
+        names, orders, available = _followup_sales_context()
+        return _followup_review_data(history, orders, today_kh(), names, available)
+    except Exception as error:
+        return pd.DataFrame([{"Report unavailable": str(error)[:200]}])
+
+
 def _si_download(frames, filename):
     if not has_permission("reports"):
         return
     try:
         buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+        with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_formulas": False, "strings_to_urls": False}}) as xw:
             for name, frame in frames.items():
                 f = frame.drop(columns=[c for c in ("Key",) if c in frame.columns])
                 f.to_excel(xw, sheet_name=name[:31], index=False)
@@ -7042,11 +7330,21 @@ def _sales_insights_body():
     snap, _src, _path, err = current_snapshot()
     if not snap:
         st.warning(f"Excel problem: {err}")
+        _si_call_panel({})
         return
     today = today_kh()
     daily, df, codes = _si_prepare(snap)
+    with st.expander("Journal sources: September → December and onward", expanded=True):
+        coverage = st.session_state.get("si_journal_coverage", pd.DataFrame())
+        if not coverage.empty: st.dataframe(coverage, hide_index=True, use_container_width=True)
+        st.caption("September and October use journal records. November/December appear when their journals are added to the same data folder. Missing months are not zero sales. Current-month figures are month-to-date, not a forecast.")
+        for message in st.session_state.get("si_journal_warnings", []): st.warning(message)
+        if not df.empty and "Sales basis" in df:
+            estimated = int(df["Sales basis"].eq("Estimated from product prices").sum())
+            st.caption(f"Revenue uses each journal's recorded riel amount; {estimated} rows use estimated product prices because recorded amounts are unavailable. Free (FOC) rows are excluded from paid-sales insights.")
     if daily.empty:
-        st.info("No paid orders found in the journal yet.")
+        st.info("No paid orders found in the journal yet. Customer follow-ups remain available below.")
+        _si_call_panel({norm_name(n): n for n in snap.get("customers", [])})
         return
     names, areas = _si_names_areas(snap, daily)
     hist_monthly = _si_read_hist(SI_HIST_MONTHLY_FILE)
@@ -7096,6 +7394,16 @@ def _sales_insights_body():
     care = _si_care(daily, df, codes, habits, names, areas, today, this_start, avgs, care_measure)
     care_unit = "pcs" if care_measure == "Pcs" else "៛"
     top = pd.DataFrame()
+    # A sales risk can still appear in analytical reports, but not as a call recommendation.
+    try:
+        call_latest = _si_call_latest(read_raw(CALLS_FILE, CALL_COLS))
+        excluded = set(call_latest.loc[call_latest["Customer status"].eq("Do not contact"), "Customer"].map(norm_name)) if not call_latest.empty else set()
+        if not care.empty:
+            care = care[~care["Customer"].map(norm_name).isin(excluded)]
+    except Exception as call_error:
+        st.warning("Call recommendations hidden because contact preferences could not be checked: " + str(call_error)[:120])
+        care = care.iloc[0:0]
+
     t_top, t_miss, t_none, t_care, t_hist, t_det = st.tabs(["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
                                                            "💝 Customer care", "📆 Monthly history", "🔎 Customer detail"])
 
@@ -7299,7 +7607,7 @@ def _sales_insights_body():
                 with st.expander(f"🧾 Recent orders ({len(det['orders'])})"):
                     _si_show(det["orders"], money=("Sales ៛",), height=420)
     _si_download({"Monthly history": _si_month_summary(mon), "Top 20": top, "Missing from habit": missing,
-                  "No order this month": no_month, "Customer care": care}, f"Sales_Insights_{today}.xlsx")
+                  "No order this month": no_month, "Customer care": care, "Follow-ups": _followup_export_frame(), "Journal sources": st.session_state.get("si_journal_coverage", pd.DataFrame())}, f"Sales_Insights_{today}.xlsx")
 
 
 @st.fragment
@@ -7404,11 +7712,15 @@ if _perms.get("view"):
     labels.append("🎯 Sales Insights")
 elif _perms.get("reports"):
     labels.append("📑 Reports")
+if _perms.get("view") or _perms.get("reports"):
+    labels.append("📞 Customer Follow-ups")
 if ROLE == "admin":
     labels.append("🤖 4. Admin: Bot, Users & Security")
 if not labels:
     st.warning("No app sections are enabled for your account. Ask Admin to turn on Tasks, View, or Reports.")
     st.stop()
+followup_alert_banner()
+
 # Render only the selected section. Ordinary tabs execute every section on each rerun.
 if st.session_state.get("main_section") not in labels:
     st.session_state["main_section"] = labels[0]
@@ -7429,5 +7741,7 @@ elif _label.startswith("📍"):
     tab_customer_map()
 elif _label.startswith("🎯"):
     tab_sales_insights()
+elif _label.startswith("📞"):
+    tab_followups()
 else:
     tab_bot()
