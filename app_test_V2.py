@@ -279,7 +279,10 @@ def parse_dt(v):
 
 def parse_dates(series):
     """Use one stable parser for mixed timestamps, including timezone offsets."""
-    return pd.to_datetime(series.map(parse_dt), errors="coerce")
+    # CSV timestamps repeat in bulk saves; parse each distinct value only once.
+    unique = series.drop_duplicates()
+    parsed = {value: parse_dt(value) for value in unique}
+    return pd.to_datetime(series.map(parsed), errors="coerce")
 
 
 def cell_to_date(v, dominant=None):
@@ -1605,7 +1608,7 @@ def _csv_read(path, cols):
     return df.reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_data(show_spinner=False, max_entries=32)
 def _csv_cached(path, mtime_ns, size, cols):
     return _csv_read(path, list(cols))
 
@@ -2976,11 +2979,12 @@ def _upload_tab():
     ctx = packing_context()
     st.caption("Upload an Excel (.xlsx) or CSV list of customers with **done / not yet**. The app finds the columns, "
                "matches the names, and shows you everything before saving.")
-    data = checklist_xlsx(ctx)
-    if data:
-        st.download_button("📥 Download today's checklist (Excel with a Done / Not yet drop-down)", data=data,
-                           file_name=f"Packing_checklist_{today_kh()}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    if st.checkbox("Prepare today's downloadable checklist", key="prepare_packing_checklist"):
+        data = checklist_xlsx(ctx)
+        if data:
+            st.download_button("📥 Download today's checklist (Excel with a Done / Not yet drop-down)", data=data,
+                               file_name=f"Packing_checklist_{today_kh()}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     up = st.file_uploader("Excel (.xlsx) or CSV file", type=["xlsx", "xlsm", "csv", "txt"], key="bulk_upload_file")
     if not up:
         return
@@ -3041,12 +3045,13 @@ def _packing_body():
         st.markdown("**👷 Cases packed per staff (today)**")
         show_df(df_today.groupby("Prepared_By")["Cases_Packed"].sum().reset_index())
         return
-    t_tick, t_up, t_one = st.tabs(["📋 Quick tick list", "📤 Upload a file", "✍️ One customer"])
-    with t_tick:
+    packing_mode = st.radio("Packing method", ["📋 Quick tick list", "📤 Upload a file", "✍️ One customer"],
+                            horizontal=True, key="packing_method")
+    if packing_mode.startswith("📋"):
         _ticklist_tab()
-    with t_up:
+    elif packing_mode.startswith("📤"):
         _upload_tab()
-    with t_one:
+    else:
         packing_form("packing_form")
 
     with st.expander("🛠️ Admin: Fix or Edit Today's Packing"):
@@ -3611,26 +3616,23 @@ def _dispatch_body():
     if me != "-- Select Staff --":
         st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📌 To send <b>{len(mine)}</b></span>"
                     f"<span class='hk-pill'>⏳ Expenses to fill <b>{n_wait}</b></span></div>", unsafe_allow_html=True)
-    t1, t2, t3, t4, t5 = st.tabs(["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Fill my expenses",
-                                  "✍️ One customer", "📊 Today's log"])
+    step = st.radio("Delivery step", ["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Fill my expenses",
+                                    "✍️ One customer", "📊 Today's log"], horizontal=True, key="delivery_step")
     need_name = me == "-- Select Staff --"
-    with t1:
-        if need_name:
-            st.info("Choose your name at the top first.")
-        else:
-            _claim_tab(me, ctx)
-    with t2:
-        if need_name:
-            st.info("Choose your name at the top first.")
-        else:
-            _send_tab(me, ctx)
-    with t3:
+    if step.startswith(("1️⃣", "2️⃣")) and need_name:
+        st.info("Choose your name at the top first.")
+    elif step.startswith("1️⃣"):
+        _claim_tab(me, ctx)
+    elif step.startswith("2️⃣"):
+        _send_tab(me, ctx)
+    elif step.startswith("3️⃣"):
         _expense_tab(me)
-    with t4:
-        st.caption("The full form for a single customer. Expenses are optional - leave them empty to fill them later.")
+    elif step.startswith("✍️"):
+        st.caption("Expenses are optional now. Save this form before changing steps.")
         dispatch_form("expense_form")
-    with t5:
+    else:
         _delivery_log()
+
 
 
 @st.fragment
@@ -6003,12 +6005,17 @@ def _read_map_overlay():
         raise RuntimeError("Customer map registry cannot be read safely. Original records were preserved; restore a verified backup.") from e
 
 
+@st.cache_data(show_spinner=False, max_entries=1)
+def _map_seed_records():
+    return {r["id"]: dict(r) for r in json.loads(_MAP_SEED_JSON)}
+
+
 def load_map_registry(force=False):
     with _sync_state()["lock"]:
         if USE_DROPBOX:
             pull(MAP_REGISTRY_FILE, force=force)
         overlay = _read_map_overlay()
-        records = {r["id"]: dict(r) for r in json.loads(_MAP_SEED_JSON)}
+        records = _map_seed_records()
         records.update({key: dict(rec) for key, rec in overlay["records"].items()})
         return {"records": records, "bindings": dict(overlay["bindings"])}
 
@@ -6435,7 +6442,16 @@ def _si_prepare(snap):
     """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows."""
     j = journal_plus_orders(snap)
     codes = bun_codes(snap)
-    j, codes, _n_hist = _si_add_history(j, codes, _si_read_hist(SI_HIST_DAILY_FILE), _si_read_hist(SI_HIST_MONTHLY_FILE))
+    history_daily = _si_read_hist(SI_HIST_DAILY_FILE)
+    history_monthly = _si_read_hist(SI_HIST_MONTHLY_FILE)
+    sell = (snap.get("buns", {}) or {}).get("sell", {}) or {}
+    return _si_prepare_cached(j, codes, history_daily, history_monthly, sell)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _si_prepare_cached(j, codes, history_daily, history_monthly, sell):
+    """Inputs include current orders, both history sources, product codes and prices."""
+    j, codes, _n_hist = _si_add_history(j, codes, history_daily, history_monthly)
     if j is None or j.empty:
         return pd.DataFrame(), pd.DataFrame(), codes
     df = j.copy()
@@ -6447,7 +6463,6 @@ def _si_prepare(snap):
     df["Key"] = df["Customer"].map(norm_name)
     for c in codes:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    sell = (snap.get("buns", {}) or {}).get("sell", {}) or {}
     if codes:
         price = pd.Series({c: float(sell.get(c) or 0) for c in codes})
         df["Sales"] = (df[codes] * price).sum(axis=1)
@@ -7394,24 +7409,25 @@ if ROLE == "admin":
 if not labels:
     st.warning("No app sections are enabled for your account. Ask Admin to turn on Tasks, View, or Reports.")
     st.stop()
-_tabs = dict(zip(labels, st.tabs(labels)))
-
-for _label, _tab in _tabs.items():
-    with _tab:
-        if _label.startswith("📦"):
-            tab_packing()
-        elif _label.startswith("🚚"):
-            tab_dispatch()
-        elif _label.startswith("📝"):
-            tab_sale_order()
-        elif _label.startswith("📊"):
-            _live = st.checkbox(f"🔄 Live mode (refresh every {LIVE_REFRESH_SECONDS}s)", value=False, key="live_mode")
-            tab_dashboard(_live)
-        elif _label.startswith("📑"):
-            tab_dashboard(False)
-        elif _label.startswith("📍"):
-            tab_customer_map()
-        elif _label.startswith("🎯"):
-            tab_sales_insights()
-        else:
-            tab_bot()
+# Render only the selected section. Ordinary tabs execute every section on each rerun.
+if st.session_state.get("main_section") not in labels:
+    st.session_state["main_section"] = labels[0]
+_label = st.radio("Open section", labels, key="main_section", horizontal=True)
+st.caption("Save your form before changing sections. Only the selected section loads.")
+if _label.startswith("📦"):
+    tab_packing()
+elif _label.startswith("🚚"):
+    tab_dispatch()
+elif _label.startswith("📝"):
+    tab_sale_order()
+elif _label.startswith("📊"):
+    _live = st.checkbox(f"🔄 Live mode (refresh every {LIVE_REFRESH_SECONDS}s)", value=False, key="live_mode")
+    tab_dashboard(_live)
+elif _label.startswith("📑"):
+    tab_dashboard(False)
+elif _label.startswith("📍"):
+    tab_customer_map()
+elif _label.startswith("🎯"):
+    tab_sales_insights()
+else:
+    tab_bot()
