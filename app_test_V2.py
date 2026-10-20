@@ -6,7 +6,7 @@
 """Delivery Operations — reviewed reliability update.
 
 Run: python -m streamlit run app_reviewed_custom_permissions.py
-Dependencies: streamlit>=1.37, pandas, openpyxl, xlsxwriter; dropbox for online mode.
+Dependencies: streamlit>=1.37, pandas, openpyxl; dropbox for online mode.
 Existing users.json accounts remain valid. For a NEW installation, configure a
 unique INITIAL_ADMIN_PASSWORD in Streamlit secrets or the server environment,
 then sign in as admin and change it. There is no shared starter password.
@@ -2197,7 +2197,7 @@ def run_health_check(auto_fix=True):
 
     try:
         import importlib.util
-        for package in ("openpyxl", "xlsxwriter") + (("dropbox",) if USE_DROPBOX else ()):
+        for package in ("openpyxl",) + (("dropbox",) if USE_DROPBOX else ()):
             if importlib.util.find_spec(package) is None:
                 add("warn", "Dependencies", f"Missing package: {package}", f"install with python -m pip install {package}")
         for directory in {DATA_DIR, CACHE_DIR}:
@@ -7115,14 +7115,8 @@ def _followup_review_panel(history):
     if has_permission('reports'):
         by_reason=report.groupby(['Reason','Alert'],dropna=False).size().reset_index(name='Customers')
         by_owner=report.assign(**{'Assigned to':report['Assigned to'].replace('','Unassigned')}).groupby(['Assigned to','Alert']).size().reset_index(name='Customers')
-        buf=io.BytesIO()
-        with pd.ExcelWriter(buf,engine='xlsxwriter',engine_kwargs={'options':{'strings_to_formulas':False,'strings_to_urls':False}}) as writer:
-            for title,frame in [('Current follow-ups',report),('Filtered review',view),('Reasons',by_reason),('Staff results',by_owner),('Call history',history[[c for c in CALL_COLS if c in history]])]:
-                frame.to_excel(writer,sheet_name=title,index=False)
-                writer.sheets[title].freeze_panes(1,0)
-                writer.sheets[title].autofilter(0,0,len(frame),max(len(frame.columns)-1,0))
-                writer.sheets[title].set_column(0,max(len(frame.columns)-1,0),22)
-        st.download_button('Download follow-up review report',buf.getvalue(),file_name=f'Followup_Review_{today_kh()}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',key='fu_review_download')
+        buf=_report_excel_bytes(dict([('Current follow-ups',report),('Filtered review',view),('Reasons',by_reason),('Staff results',by_owner),('Call history',history[[c for c in CALL_COLS if c in history]])]))
+        st.download_button('Download follow-up review report',buf,file_name=f'Followup_Review_{today_kh()}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',key='fu_review_download')
     return report
 
 
@@ -7299,16 +7293,33 @@ def _followup_export_frame():
         return pd.DataFrame([{"Report unavailable": str(error)[:200]}])
 
 
+def _report_excel_bytes(frames):
+    """Export reports with the same Excel dependency used to read journals."""
+    from openpyxl.utils import get_column_letter
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, frame in frames.items():
+            title = name[:31]
+            frame.to_excel(writer, sheet_name=title, index=False)
+            sheet = writer.sheets[title]
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for column in range(1, sheet.max_column + 1):
+                sheet.column_dimensions[get_column_letter(column)].width = 22
+            # Reports contain data, never executable spreadsheet formulas.
+            for row in sheet.iter_rows():
+                for cell in row:
+                    if cell.data_type == "f":
+                        cell.data_type = "s"
+    return buf.getvalue()
+
+
 def _si_download(frames, filename):
     if not has_permission("reports"):
         return
     try:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_formulas": False, "strings_to_urls": False}}) as xw:
-            for name, frame in frames.items():
-                f = frame.drop(columns=[c for c in ("Key",) if c in frame.columns])
-                f.to_excel(xw, sheet_name=name[:31], index=False)
-        st.download_button("📥 Download all lists (Excel)", data=buf.getvalue(), file_name=filename,
+        buf = _report_excel_bytes({name: frame.drop(columns=[c for c in ("Key",) if c in frame.columns]) for name, frame in frames.items()})
+        st.download_button("📥 Download all lists (Excel)", data=buf, file_name=filename,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="si_dl")
     except Exception as e:
         st.warning(f"Could not build Excel file: {e}")
