@@ -4319,7 +4319,7 @@ def site_orders_df(day=None, status=("Active",)):
 
 def journal_plus_orders(snap, day=None):
     """The journal rows (one day or all) + the active orders typed on the site, in the same shape.
-    A site order whose invoice number is already in the journal is not counted twice."""
+    A site order matching customer, invoice and date in the journal is not counted twice."""
     j = snap["journal"]
     codes = bun_codes(snap)
     j = j if day is None else j[j["Date"] == day]
@@ -4330,8 +4330,12 @@ def journal_plus_orders(snap, day=None):
         return j
     if o.empty:
         return j
-    in_journal = {str(x).strip().upper() for x in snap["journal"]["Invoice"] if str(x).strip() not in ("", "-")}
-    o = o[~o["Invoice"].astype(str).str.strip().str.upper().isin(in_journal)]
+    def order_keys(frame, dates):
+        return list(zip(frame["Customer"].map(norm_name),
+                        frame["Invoice"].fillna("").astype(str).str.strip().str.upper(),
+                        pd.to_datetime(dates, errors="coerce").dt.strftime("%Y-%m-%d")))
+    in_journal = {key for key in order_keys(snap["journal"], snap["journal"]["Date"]) if key[1] not in ("", "-")}
+    o = o.loc[[key not in in_journal for key in order_keys(o, o["_dt"])]]
     if o.empty:
         return j
     site = pd.DataFrame({"Date": o["_dt"].dt.date, "Customer": o["Customer"], "Cases": o["Cases"].astype(float),
@@ -7145,6 +7149,38 @@ def tab_followups():
     _si_call_panel(names)
 
 
+def _si_contact_context(frame, history, daily, today):
+    """Join saved contact history and latest paid orders onto customer lists."""
+    result = frame.copy()
+    latest = _si_call_latest(history)
+    contacts = latest.set_index("_key").to_dict("index") if not latest.empty else {}
+    last_orders = daily.groupby("Key")["D"].max().to_dict() if not daily.empty else {}
+    def clean(value):
+        return "" if pd.isna(value) else str(value).strip()
+    rows = []
+    for customer in result.get("Customer", pd.Series(dtype=str)):
+        key = norm_name(customer)
+        call = contacts.get(key, {})
+        called = pd.to_datetime(call.get("Date", ""), errors="coerce")
+        order = pd.to_datetime(last_orders.get(key), errors="coerce")
+        called_today = pd.notna(called) and called.date() == today
+        ordered_today = pd.notna(order) and order.date() == today
+        due = pd.to_datetime(call.get("Follow-up date", ""), errors="coerce")
+        scheduled = pd.notna(due) and due.date() > today and call.get("Follow-up state") in ("Open", "Awaiting order")
+        state = "Ordered today" if ordered_today else ("Call recorded today" if called_today else ("Follow-up scheduled" if scheduled else ("Previously contacted" if call else "Not contacted")))
+        rows.append({"Contact status": state, "Last call": clean(call.get("Date", "")),
+                     "Call outcome": clean(call.get("Outcome", "")), "Last call note": clean(call.get("Notes", "")),
+                     "Next action": clean(call.get("Next action", "")), "Follow-up date": clean(call.get("Follow-up date", "")),
+                     "Last order": order.strftime("%Y-%m-%d") if pd.notna(order) else "",
+                     "Call now": not (ordered_today or called_today or scheduled or call.get("Customer status") == "Do not contact")})
+    if rows:
+        for column in rows[0]: result[column] = [r[column] for r in rows]
+    else:
+        for column in ("Contact status", "Last call", "Call outcome", "Last call note", "Next action", "Follow-up date", "Call now"):
+            result[column] = pd.Series(index=result.index, dtype=bool if column == "Call now" else str)
+    return result
+
+
 def _si_call_latest(history):
     if history.empty:
         return history.copy()
@@ -7338,13 +7374,25 @@ def _si_bar(frame, label_col, value_col):
 
 
 def _sales_insights_body():
+    if st.button("🔄 Refresh latest data", key="si_refresh_latest"):
+        try:
+            if USE_DROPBOX:
+                _list_remote_folder.clear()
+                pull(ORDERS_FILE, force=True)
+                pull(CALLS_FILE, force=True)
+            get_snapshot.clear()
+        except Exception as error:
+            st.warning("Latest data could not be refreshed: " + str(error)[:160])
     snap, _src, _path, err = current_snapshot()
     if not snap:
         st.warning(f"Excel problem: {err}")
         _si_call_panel({})
         return
     today = today_kh()
+    if _src == "stale":
+        st.warning("The journal could not be read. These figures use the last readable copy; today's orders may be missing.")
     daily, df, codes = _si_prepare(snap)
+    st.caption(f"Data checked: {now_str()} · Journal: {os.path.basename(_path or '')}. Save Excel and wait for Dropbox to finish syncing before refreshing.")
     with st.expander("Journal sources: September → December and onward", expanded=True):
         coverage = st.session_state.get("si_journal_coverage", pd.DataFrame())
         if not coverage.empty: st.dataframe(coverage, hide_index=True, use_container_width=True)
@@ -7407,10 +7455,13 @@ def _sales_insights_body():
     top = pd.DataFrame()
     # A sales risk can still appear in analytical reports, but not as a call recommendation.
     try:
-        call_latest = _si_call_latest(read_raw(CALLS_FILE, CALL_COLS))
+        call_history = read_raw(CALLS_FILE, CALL_COLS)
+        call_latest = _si_call_latest(call_history)
         excluded = set(call_latest.loc[call_latest["Customer status"].eq("Do not contact"), "Customer"].map(norm_name)) if not call_latest.empty else set()
         if not care.empty:
             care = care[~care["Customer"].map(norm_name).isin(excluded)]
+        care = _si_contact_context(care, call_history, daily, today)
+        missing = _si_contact_context(missing, call_history, daily, today)
     except Exception as call_error:
         st.warning("Call recommendations hidden because contact preferences could not be checked: " + str(call_error)[:120])
         care = care.iloc[0:0]
@@ -7514,7 +7565,8 @@ def _sales_insights_body():
             if q.strip():
                 view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
             st.markdown("#### 📞 Call list (urgent first)")
-            urgent = view[view["Priority"] <= 2].head(10)
+            urgent = view[(view["Priority"] <= 2) & view["Call now"].eq(True)].head(10)
+            st.caption("Calls recorded today, customers who ordered today, and future scheduled follow-ups stay in the table below but are excluded from this urgent sales-call queue. Due follow-ups remain in the follow-up review.")
             if urgent.empty:
                 st.success("Nobody urgent in this selection.")
             else:
@@ -7522,10 +7574,15 @@ def _sales_insights_body():
                     st.markdown(f"**{r['Segment']} — {r['Customer']}** ({r['Area']})  \n"
                                 f"{r['Why']}  \n👉 {r['Suggested action']}"
                                 + (f"  \n💡 {r['Cross-sell idea']}" if r["Cross-sell idea"] else ""))
+                    st.caption(f"{r['Contact status']} · Last order: {r['Last order']}")
+                    if r['Last call']:
+                        st.write(f"Last call: {r['Last call']} · {r['Call outcome']}")
+                        st.write("Note: " + r['Last call note'])
+                        st.write("Next action: " + (r['Next action'] or 'None recorded') + " · Follow-up: " + (r['Follow-up date'] or 'None'))
                     st.button("📝 Record call / update customer", key="si_open_call_" + hashlib.sha256(r["Customer"].encode()).hexdigest()[:20],
                               on_click=_si_choose_call, args=(r["Customer"],))
             st.markdown(f"#### Customer-care suggestions ({len(view)} of {len(care)})")
-            _si_show(view.drop(columns="Priority"), money=(f"Avg {care_unit}/month", f"Last 30d {care_unit}", f"Prev 30d {care_unit}"), height=520)
+            _si_show(view.drop(columns=["Priority", "Call now"], errors="ignore"), money=(f"Avg {care_unit}/month", f"Last 30d {care_unit}", f"Prev 30d {care_unit}"), height=520)
             with st.expander("How these suggestions are made"):
                 st.markdown(
                     "- 🔴 **VIP at risk**: top 20% (by the measure you picked, bun pieces or riel) over the last 90 days and late / silent.\n"
