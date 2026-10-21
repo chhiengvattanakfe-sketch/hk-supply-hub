@@ -6,7 +6,7 @@
 """Delivery Operations — reviewed reliability update.
 
 Run: python -m streamlit run app_reviewed_custom_permissions.py
-Dependencies: streamlit>=1.37, pandas, openpyxl, xlsxwriter; dropbox for online mode.
+Dependencies: streamlit>=1.37, pandas, openpyxl, xlsxwriter, extra-streamlit-components; dropbox for online mode.
 Existing users.json accounts remain valid. For a NEW installation, configure a
 unique INITIAL_ADMIN_PASSWORD in Streamlit secrets or the server environment,
 then sign in as admin and change it. There is no shared starter password.
@@ -17,6 +17,10 @@ Customer Map includes the supplied NPHK leads as separate location records.
 Map corrections are stored in customer_map_registry.json, including Dropbox mode.
 """
 import streamlit as st
+try:
+    import extra_streamlit_components as stx
+except ImportError:
+    stx = None
 import pandas as pd
 import os
 import io
@@ -836,6 +840,9 @@ def issue_remember_token(user, pw_stamp):
 
 def _request_cookie(name):
     try:
+        browser = st.session_state.get("_browser_cookies", {})
+        if name in browser:
+            return browser[name]
         return st.context.cookies.get(name)
     except Exception:
         return None
@@ -846,8 +853,20 @@ def restore_from_cookie():
     token = _request_cookie(COOKIE_TOKEN)
     if not token:
         return False
+    # A browser refresh/server restart must validate against durable storage.
+    try:
+        if USE_DROPBOX:
+            pull(REMEMBER_FILE, force=True)
+        with open(REMEMBER_FILE, "r", encoding="utf-8") as handle:
+            records = json.load(handle)
+        if not isinstance(records, dict):
+            raise ValueError("Invalid remembered-device storage")
+    except Exception:
+        st.session_state["_remember_retry"] = True
+        return False  # Storage failure is not evidence of an invalid token.
+    st.session_state.pop("_remember_retry", None)
     h, now = _tok_hash(token), time.time()
-    rec = _read_tokens().get(h)
+    rec = records.get(h)
     try:
         users = load_users()
     except Exception:
@@ -866,7 +885,8 @@ def restore_from_cookie():
             if h in d:
                 d[h]["exp"] = now + REMEMBER_DAYS * 86400
             return d
-        _modify_tokens(_renew)
+        if _modify_tokens(_renew):
+            st.session_state["cookie_cmd"] = ("set", token, rec["user"])
     return True
 
 
@@ -883,6 +903,20 @@ def _emit_cookie_cmd():
     if not cmd:
         return
     age = REMEMBER_DAYS * 86400
+    manager = st.session_state.get("_cookie_manager")
+    if manager is not None:
+        if cmd[0] == "set":
+            for name, value in ((COOKIE_TOKEN, cmd[1]), (COOKIE_USER, cmd[2])):
+                manager.set(name, value, key="remember_set_" + name, max_age=age,
+                            expires_at=datetime.now(timezone.utc) + timedelta(days=REMEMBER_DAYS),
+                            secure=True, same_site="lax", path="/")
+                st.session_state.setdefault("_browser_cookies", {})[name] = value
+        else:
+            manager.set(COOKIE_TOKEN, "", key="remember_clear", max_age=0,
+                        expires_at=datetime(1970, 1, 1, tzinfo=timezone.utc),
+                        secure=True, same_site="lax", path="/")
+            st.session_state.setdefault("_browser_cookies", {})[COOKIE_TOKEN] = ""
+        return
     if cmd[0] == "set":
         tok, user = json.dumps(cmd[1]), json.dumps(cmd[2])
         js = (f"var s=(window.parent.location.protocol==='https:')?'; Secure':'';"
@@ -956,6 +990,7 @@ def _try_login(username, password, remember=False):
         st.session_state.update({"user": uname, "role": rec["role"], "login_time": time.time(),
                                  "must_change": bool(rec.get("must_change"))})
         audit("login", rec["role"])
+        st.session_state["_remember_requested"] = bool(remember)
         if remember and not rec.get("must_change"):      # starter password: remember only after they choose their own
             tok = issue_remember_token(uname, rec.get("pw_changed", ""))
             if tok:
@@ -1026,7 +1061,9 @@ def render_login():
                 p = st.text_input("Password", type="password", max_chars=100)
             keep = st.checkbox(f"Keep me logged in on this phone / computer ({REMEMBER_DAYS} days)", value=True)
             go = st.form_submit_button("Log in", type="primary")
-        st.caption("Tip: do not tick this on a shared computer. Log out removes it.")
+        st.caption("Use your normal browser and keep this option checked on your own device. Log out forgets this device.")
+        if stx is None:
+            st.info("For reliable saved login, the app owner needs to add extra-streamlit-components to requirements.txt and restart the app.")
         if go:
             _try_login(u, p, keep)
 
@@ -1052,7 +1089,7 @@ def render_force_change():
                 st.session_state["must_change"] = False
                 try:
                     _rec = load_users().get(user, {})
-                    _tok = issue_remember_token(user, _rec.get("pw_changed", ""))
+                    _tok = issue_remember_token(user, _rec.get("pw_changed", "")) if st.session_state.get("_remember_requested", False) else None
                     if _tok:
                         st.session_state["cookie_cmd"] = ("set", _tok, user)
                 except Exception:
@@ -1066,6 +1103,11 @@ def render_force_change():
 
 def require_login():
     """Shows the login page (and stops the app) until the person is logged in. Returns the role."""
+    if stx is not None:
+        # Render each run so its browser response can restore a new session.
+        manager = stx.CookieManager(key="remember_cookie_reader")
+        st.session_state["_cookie_manager"] = manager
+        st.session_state["_browser_cookies"] = dict(manager.cookies or {})
     if not session_ok():
         restore_from_cookie()                              # phone was locked / tab closed: use the saved token
     _emit_cookie_cmd()
@@ -1074,6 +1116,10 @@ def require_login():
             render_force_change()
             st.stop()
         return st.session_state["role"]
+    if st.session_state.get("_remember_retry"):
+        st.warning("Your saved login could not be checked because account storage is temporarily unavailable. Try again; you do not need to reset your password.")
+        if st.button("Retry saved login", key="retry_saved_login"):
+            st.rerun()
     render_login()
     st.stop()
 
