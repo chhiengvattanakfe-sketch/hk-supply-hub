@@ -3278,6 +3278,25 @@ def phone_task_editor(frame, **kwargs):
                 elif col == "Cases":
                     row[col] = st.number_input("Cases / ចំនួនកេស", min_value=0, max_value=MAX_CASES,
                         value=max(0, min(MAX_CASES, _int(row[col]))), step=1, key=widget_key)
+                elif col == "Invoice":
+                    try:
+                        invoices = _invoice_choices(str(row.get("Customer", "")))
+                    except RuntimeError:
+                        invoices = []
+                        st.caption("Journal unavailable. Invoice will be checked again when saving.")
+                    if len(invoices) == 1:
+                        row[col] = invoices[0]
+                        st.caption("Invoice: " + invoices[0] + " (automatic)")
+                    elif len(invoices) > 1:
+                        options = [""] + invoices
+                        previous = str(row.get(col, "") or "").strip()
+                        row[col] = st.selectbox("Invoice — choose for these cases",
+                            options, index=options.index(previous) if previous in options else 0,
+                            format_func=lambda value: value or "Select invoice…",
+                            key=widget_key + "_pick")
+                        st.caption("Multiple invoices: enter cases for the selected invoice only. Save other invoices separately.")
+                    else:
+                        row[col] = st.text_input("Invoice (if known)", value=str(row[col] or ""), key=widget_key)
                 elif col == "Status":
                     options = ["Done", "Not yet", "Skip"]
                     row[col] = st.selectbox(col, options, index=options.index(row[col]) if row[col] in options else 0, key=widget_key)
