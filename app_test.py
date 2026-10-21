@@ -2394,7 +2394,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
         else:
             customer_name = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
-        invoice_number = st.text_input("Invoice number (blank only when this customer has one invoice today)", key=f"{k}_invoice", max_chars=80)
+        invoice_number = ""  # Invoice linking is automatic; staff save by customer.
         d_cases = max(0, min(int(default_cases), MAX_CASES))
         cases = st.number_input("ចំនួនកេស (Number of Cases):", min_value=0, max_value=MAX_CASES, step=1,
                                 value=d_cases, key=f"{k}_cases_{d_cases}")
@@ -2471,7 +2471,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
         else:
             customer = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
-        invoice_number = st.text_input("Invoice number (blank only when this customer has one invoice today)", key=f"{k}_invoice", max_chars=80)
+        invoice_number = ""  # Invoice linking is automatic; staff save by customer.
         prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
 
         col1, col2 = st.columns(2)
@@ -3017,6 +3017,7 @@ def _upload_tab():
 
 def _packing_body():
     st.markdown("### 📦 Bun Preparation & Packing")
+    task_view_selector("packing")
     if not has_permission("edit"):
         if not has_permission("view"):
             st.warning("View is turned off. Enable View to allow read-only access to the packing log, or enable Editing to work on tasks.")
@@ -3181,7 +3182,7 @@ def _send_tab(me, ctx):
     d, editor_key = _task_editor_frame("send", pd.DataFrame(rows), me)
     if "Invoice" not in d.columns:
         d["Invoice"] = ""
-    st.caption("Enter an invoice for customers with multiple invoices. Cases must belong to that invoice. Save other invoices separately.")
+    st.caption("Save the total cases for this customer. No invoice entry is needed.")
     with st.form("batch_" + editor_key, clear_on_submit=False):
         default_via = PENDING_VIA
         select_all_send = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
@@ -3256,14 +3257,40 @@ def pending_expense_df(who, scope, include_done=False):
 
 
 
+
+def task_view_selector(section):
+    options = ["Cards", "Table"]
+    preference = st.session_state.get("_task_view_preference", "Cards")
+    selected = st.radio("View", options, index=options.index(preference),
+                        horizontal=True, key="task_view_" + section)
+    st.session_state["_task_view_preference"] = selected
+    st.caption("Cards: easy on phones. Table: compact for tablets and computers. Save your edits before switching views.")
+    return selected
+
+
 def phone_task_editor(frame, **kwargs):
     """Native vertical inputs inside the caller's form: no rerun while typing."""
     key = kwargs["key"]
     disabled = set(kwargs.get("disabled", []))
-    columns = kwargs.get("column_order") or list(frame.columns)
+    columns = [c for c in (kwargs.get("column_order") or list(frame.columns)) if c != "Invoice"]
+    if st.session_state.get("_task_view_preference", "Cards") == "Table":
+        table = frame.copy(deep=True)
+        if "Invoice" in table:
+            table["Invoice"] = ""
+        options = dict(kwargs)
+        options["key"] = key + "_table"
+        options["column_order"] = columns
+        config = dict(options.get("column_config", {}))
+        for hidden in set(table.columns) - set(columns):
+            config[hidden] = None
+        options["column_config"] = config
+        options["use_container_width"] = True
+        return st.data_editor(table, **options)
     out = []
     for pos, original in enumerate(frame.to_dict("records")):
         row = dict(original)
+        if "Invoice" in row:
+            row["Invoice"] = ""
         with st.container(border=True):
             st.write("**" + str(row.get("Customer", "Customer")) + "**")
             details = [str(row.get(c, "")) for c in ("Province", "Status", "Taken by") if c in row]
@@ -3278,25 +3305,6 @@ def phone_task_editor(frame, **kwargs):
                 elif col == "Cases":
                     row[col] = st.number_input("Cases / ចំនួនកេស", min_value=0, max_value=MAX_CASES,
                         value=max(0, min(MAX_CASES, _int(row[col]))), step=1, key=widget_key)
-                elif col == "Invoice":
-                    try:
-                        invoices = _invoice_choices(str(row.get("Customer", "")))
-                    except RuntimeError:
-                        invoices = []
-                        st.caption("Journal unavailable. Invoice will be checked again when saving.")
-                    if len(invoices) == 1:
-                        row[col] = invoices[0]
-                        st.caption("Invoice: " + invoices[0] + " (automatic)")
-                    elif len(invoices) > 1:
-                        options = [""] + invoices
-                        previous = str(row.get(col, "") or "").strip()
-                        row[col] = st.selectbox("Invoice — choose for these cases",
-                            options, index=options.index(previous) if previous in options else 0,
-                            format_func=lambda value: value or "Select invoice…",
-                            key=widget_key + "_pick")
-                        st.caption("Multiple invoices: enter cases for the selected invoice only. Save other invoices separately.")
-                    else:
-                        row[col] = st.text_input("Invoice (if known)", value=str(row[col] or ""), key=widget_key)
                 elif col == "Status":
                     options = ["Done", "Not yet", "Skip"]
                     row[col] = st.selectbox(col, options, index=options.index(row[col]) if row[col] in options else 0, key=widget_key)
@@ -3310,7 +3318,7 @@ def phone_task_editor(frame, **kwargs):
     return pd.DataFrame(out, columns=frame.columns)
 
 
-def _save_expense_card(original, via, station, pp, taxi, note):
+def _save_expense_card(original, via, station, pp, taxi, note, _frame=None):
     """Update exactly one delivery; reject edits made since this card was loaded."""
     station = safe_text(station or "").strip()
     station = "" if station == "-" else station
@@ -3336,6 +3344,8 @@ def _save_expense_card(original, via, station, pp, taxi, note):
                              "Note": safe_text(note or "") or "-", "Expense_Status": "Done"}.items():
             frame.loc[idx, field] = value
         return frame
+    if _frame is not None:
+        return apply(_frame)
     modify_csv(DATA_FILE, DISPATCH_COLS, apply)
 
 
@@ -3377,6 +3387,58 @@ def _expense_phone_card(record, me):
                 st.error(str(err))
 
 
+
+def _expense_table(df, me, scope):
+    st.caption("Edit several rows, tick Save, then save once. Phnom Penh expense is automatically 0 for តួ and វុទ្ធា.")
+    rows = []
+    for original in df.to_dict("records"):
+        row = {c: original.get(c, "") for c in DISPATCH_COLS}
+        via = row["Local_Driver"]
+        if via == PENDING_VIA and me in LOCAL_DRIVERS:
+            via = me
+        row.update({"Save": False, "Sent with": via,
+                    "Taxi station": "" if row["Taxi_Station"] == "-" else row["Taxi_Station"],
+                    "Phnom Penh ៛": driver_pp_expense(via, row["Phnom_Penh_Expense"]),
+                    "Taxi ៛": _int(row["Taxi_Expense"]),
+                    "Delivery note": "" if row["Note"] == "-" else row["Note"]})
+        rows.append(row)
+    _reload_draft_button("expense_table", scope)
+    frame, key = _task_editor_frame("expense_table", pd.DataFrame(rows), scope)
+    visible = ["Save", "Customer", "Date", "Cases", "Sent with", "Taxi station", "Phnom Penh ៛", "Taxi ៛", "Delivery note"]
+    config = {c: None for c in frame.columns if c not in visible}
+    config.update({
+        "Save": st.column_config.CheckboxColumn("Save"),
+        "Sent with": st.column_config.SelectboxColumn("Sent with", options=[PENDING_VIA] + via_options()),
+        "Phnom Penh ៛": st.column_config.NumberColumn("Phnom Penh ៛", min_value=0, max_value=MAX_RIEL, step=500),
+        "Taxi ៛": st.column_config.NumberColumn("Taxi ៛", min_value=0, max_value=MAX_RIEL, step=500),
+        "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
+        "Delivery note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT)})
+    with st.form("form_" + key):
+        edited = st.data_editor(frame, key=key, hide_index=True, use_container_width=True,
+            column_order=visible, column_config=config, disabled=DISPATCH_COLS,
+            height=min(600, 70 + 36 * len(frame)))
+        save = st.form_submit_button("💾 Save selected expenses", type="primary", use_container_width=True)
+    if save:
+        selected = [r for r in edited.to_dict("records") if r["Save"]]
+        if not selected:
+            st.warning("Tick Save for the rows you finished.")
+            return
+        def apply(latest):
+            result = latest.copy(deep=True)
+            for row in selected:
+                original = {c: row[c] for c in DISPATCH_COLS}
+                result = _save_expense_card(original, row["Sent with"], row["Taxi station"],
+                    row["Phnom Penh ៛"], row["Taxi ៛"], row["Delivery note"], _frame=result)
+            return result
+        try:
+            modify_csv(DATA_FILE, DISPATCH_COLS, apply)
+            audit("expenses_filled", f"Table: {len(selected)} deliveries, by {me}")
+            _reset_draft("expense_table", scope)
+            flash_and_refresh(f"Saved expenses for {len(selected)} deliveries")
+        except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
+            st.error(f"Not saved: {err}. Your edits are kept.")
+
+
 def _expense_tab(me):
     if not has_permission("edit") or not has_permission("tasks"):
         st.warning("Editing delivery details is disabled for your account.")
@@ -3384,7 +3446,8 @@ def _expense_tab(me):
     if me == "-- Select Staff --":
         st.info("Choose your name first.")
         return
-    st.caption("Complete one customer card and Save. Choose the driver before entering expenses. Other cards stay open.")
+    if st.session_state.get("_task_view_preference", "Cards") == "Cards":
+        st.caption("Complete one customer card and Save. Choose the driver before entering expenses. Other cards stay open.")
     who = me
     if current_role() == "admin":
         pick = st.selectbox("Staff", ["My deliveries", "Everyone"] + DELIVERY_HANDLERS, key="phone_exp_staff")
@@ -3399,6 +3462,9 @@ def _expense_tab(me):
         st.rerun()
     if df.empty:
         st.success("All delivery details completed ✅")
+        return
+    if st.session_state.get("_task_view_preference", "Cards") == "Table":
+        _expense_table(df, me, str((who, query)))
         return
     records = df.to_dict("records")
     pages = (len(records) + 7) // 8
@@ -3654,6 +3720,7 @@ def _dispatch_body():
         st.warning("Delivery task editing is disabled for your account.")
         return
     st.markdown("### 🚚 Delivery")
+    task_view_selector("delivery")
     linked_staff = staff_name_for_user()
     default_staff_index = DELIVERY_HANDLERS.index(linked_staff) + 1 if linked_staff in DELIVERY_HANDLERS else 0
     me = st.selectbox("👷 I am (choose your name once — office staff or delivery driver)",
@@ -6070,15 +6137,17 @@ def _invoice_choices(customer, day=None):
 
 
 def _resolve_record_invoice(row):
-    day = parse_dt(row["Date"])
-    choices = _invoice_choices(row["Customer"], day.date())
+    # Staff save customer totals. Link only an unambiguous invoice.
     supplied = str(row.get("Invoice", "")).strip()
+    day = parse_dt(row["Date"])
+    try:
+        choices = _invoice_choices(row["Customer"], day.date())
+    except RuntimeError:
+        if supplied in ("", "-", "nan"):
+            return "-"
+        raise
     if supplied in ("", "-", "nan"):
-        if len(choices) == 1:
-            return choices[0]
-        if len(choices) > 1:
-            raise RuntimeError(f"{row['Customer']}: enter one invoice number for these cases ({', '.join(choices)}). Save different invoices separately.")
-        return "-"  # Non-journal tasks are allowed, but never colored.
+        return choices[0] if len(choices) == 1 else "-"
     matches = [v for v in choices if v.casefold() == supplied.casefold()]
     if len(matches) != 1:
         raise RuntimeError(f"{row['Customer']}: invoice {supplied} does not match this customer and date in the journal")
@@ -6122,7 +6191,11 @@ def _make_invoice_status_csv(source, packing, deliveries, holds):
             inv=_cell_text(r.get('Invoice'))
             if inv not in ('','-','nan'):
                 possibilities={k for k in possibilities if k[1]==inv.casefold()}
-            if len(possibilities)!=1:skipped+=1;continue
+            if len(possibilities)!=1:
+                for candidate in possibilities:
+                    groups[candidate]['customer_total_only'] = True
+                skipped+=1
+                continue
             key=next(iter(possibilities));g=groups[key]
             g[kind]+=max(float(r[field]),0)
             if kind=='packed':g['completed']=str(r.get('Status','')).startswith('Completed')
@@ -6140,7 +6213,7 @@ def _make_invoice_status_csv(source, packing, deliveries, holds):
     out=[]
     for key,g in groups.items():
         status='Pending'
-        if len(g['days'])!=1 or len(g['ids'])>1:status='Review'
+        if len(g['days'])!=1 or len(g['ids'])>1 or g.get('customer_total_only'):status='Review'
         else:
             day=next(iter(g['days']));ck=(day,key[0]);o=correction.get(ck,{})
             if o.get('hold'):status='Hold'
