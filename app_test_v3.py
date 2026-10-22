@@ -1023,91 +1023,46 @@ def change_password(user, current, new, new2):
 # ===== LANDING PAGE (paste ABOVE def render_login) =====
 import streamlit.components.v1 as components
 
-LANDING_HEIGHT = 900          # iframe height in px; the page scrolls inside it if taller
+LANDING_HEIGHT = 600          # one-screen poster cover; raise it if the cover is cut off
 
 LANDING_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@500;700&family=Noto+Sans+Khmer:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&family=Noto+Sans+Khmer:wght@400;700&display=swap">
 <style>
 *{box-sizing:border-box}
-body{margin:0;background:#0B1411;color:#E8F1ED;font-family:'Space Grotesk','Noto Sans Khmer',system-ui,sans-serif;line-height:1.5}
-.wrap{max-width:1200px;margin:0 auto;padding:0 24px}
-.mono{font-family:'JetBrains Mono',monospace}
-.mint{color:#6BE7B8}
-.muted{color:#A9BDB4}
-header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:14px;padding:24px 0}
-.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px}
-.dot{width:12px;height:12px;border-radius:50%;background:#6BE7B8}
-.hint{min-height:44px;padding:0 20px;border-radius:10px;border:1px solid #6BE7B8;color:#6BE7B8;font-weight:700;display:inline-flex;align-items:center}
-.hero{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:48px;align-items:center;padding:40px 0 72px}
-.eyebrow{font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:700;letter-spacing:.08em;color:#6BE7B8}
-h1{margin:16px 0 20px;font-size:clamp(36px,5.6vw,68px);line-height:1.03;letter-spacing:-.03em;font-weight:700}
-.lead{margin:0;font-size:19px;color:#A9BDB4;max-width:500px}
-.card{background:#12201B;border:1px solid #27403A;border-radius:18px;padding:26px;display:flex;flex-direction:column;gap:12px}
-.card h3{margin:0;font-size:21px;font-weight:700}
-.card p{margin:0;font-size:16px;line-height:1.5;color:#A9BDB4}
-.card small{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;letter-spacing:.06em;color:#6BE7B8}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;padding-bottom:72px}
-.step{display:flex;gap:16px}
-.rail{display:flex;flex-direction:column;align-items:center}
-.pt{width:14px;height:14px;border-radius:50%}
-.ln{width:2px;flex:1;min-height:40px;background:#27403A}
-.step b{font-size:18px}
-.step div.sub{font-family:'JetBrains Mono',monospace;font-size:13px;color:#A9BDB4}
-.stats{border-top:1px solid #27403A;border-bottom:1px solid #27403A}
-.stats .wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:28px;padding:56px 24px}
-.big{font-family:'JetBrains Mono',monospace;font-size:48px;font-weight:700;color:#6BE7B8;line-height:1}
-.stats p{margin:8px 0 0;color:#A9BDB4}
-.end{text-align:center;padding:72px 0 48px}
-.end h2{margin:0 auto 14px;font-size:clamp(30px,4.4vw,52px);line-height:1.06;letter-spacing:-.02em;max-width:760px}
+body{margin:0;background:transparent;color:#1B1B1B;font-family:'Bricolage Grotesque','Noto Sans Khmer',system-ui,sans-serif;line-height:1.35}
+.wrap{max-width:1240px;margin:0 auto;padding:6px 8px 18px}
+header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:10px 0 18px}
+.brand{padding:9px 18px;border:3px solid #1B1B1B;border-radius:999px;background:#fff;font-weight:800;font-size:16px}
+.hint{min-height:44px;padding:0 22px;border-radius:999px;background:#1B1B1B;color:#fff;font-weight:800;display:inline-flex;align-items:center;white-space:nowrap}
+.sticker{display:inline-block;transform:rotate(-3deg);padding:8px 16px;border:3px solid #1B1B1B;border-radius:999px;background:#fff;font-weight:700;font-size:17px;margin-bottom:18px}
+h1{margin:0 0 16px;font-size:clamp(40px,8.4vw,104px);line-height:.96;letter-spacing:-.04em;font-weight:800}
+h1 span{display:inline-block;background:#fff;border:3px solid #1B1B1B;border-radius:18px;padding:0 16px}
+.lead{margin:0 0 22px;font-size:clamp(17px,1.9vw,22px);font-weight:600;max-width:620px}
+.chips{display:flex;flex-wrap:wrap;gap:12px}
+.chip{border:3px solid #1B1B1B;border-radius:999px;padding:8px 18px;font-weight:800;font-size:15px;box-shadow:4px 4px 0 #1B1B1B}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <div class="brand"><span class="dot"></span>Supply Chain Hub</div>
+    <div class="brand">Supply Chain Hub</div>
     <span class="hint">Log in below &darr;</span>
   </header>
-
-  <section class="hero">
-    <div>
-      <div class="eyebrow">នំប៉ាវហុងកុង &middot; OPERATIONS</div>
-      <h1>The whole delivery day, on one screen.</h1>
-      <p class="lead">Packing, delivery, orders and follow-ups, live for the whole team.</p>
-    </div>
-    <div class="card" style="gap:0;padding:28px">
-      <div class="step"><div class="rail"><span class="pt" style="background:#6BE7B8"></span><span class="ln"></span></div><div style="padding-bottom:18px"><b>Packed</b><div class="sub">Customer &middot; cases</div></div></div>
-      <div class="step"><div class="rail"><span class="pt" style="background:#7FB6FF"></span><span class="ln"></span></div><div style="padding-bottom:18px"><b>Sent</b><div class="sub">Driver &middot; expenses</div></div></div>
-      <div class="step"><div class="rail"><span class="pt" style="background:#FFC857"></span><span class="ln"></span></div><div style="padding-bottom:18px"><b>Pending</b><div class="sub">Customer &middot; handler</div></div></div>
-      <div class="step"><div class="rail"><span class="pt" style="background:#C9B6FF"></span></div><div><b>Moved to tomorrow</b><div class="sub">Customer &middot; reason</div></div></div>
-    </div>
-  </section>
-
-  <section class="grid">
-    <article class="card"><small>01 &middot; PREP</small><h3>Packing progress</h3><p>Log cases packed per customer as the day goes on.</p></article>
-    <article class="card"><small>02 &middot; OPS</small><h3>Delivery log</h3><p>Claim customers, mark cases sent, record driver and taxi expenses.</p></article>
-    <article class="card"><small>03 &middot; SALES</small><h3>Sale orders</h3><p>Orders by bun code with remarks, payment and urgent flags.</p></article>
-    <article class="card"><small>LIVE &middot; 20S</small><h3>Live dashboard</h3><p>See what is packed, sent or pending for any customer.</p></article>
-    <article class="card"><small>MAP</small><h3>Customer map</h3><p>Search locations and open directions instantly.</p></article>
-    <article class="card"><small>INSIGHTS</small><h3>Follow-ups</h3><p>Top customers, missing habits and who has not ordered this month.</p></article>
-  </section>
-</div>
-
-<section class="stats">
-  <div class="wrap">
-    <div><div class="big">30 min</div><p>Health Bot checks the data</p></div>
-    <div><div class="big">20 sec</div><p>Live dashboard refresh</p></div>
-    <div><div class="big">12 hrs</div><p>Automatic log-out</p></div>
-    <div><div class="big">Daily</div><p>Backups, synced to Dropbox</p></div>
+  <div class="sticker">នំប៉ាវហុងកុង team only</div>
+  <h1>Pack it. Send it. <span>Track it.</span></h1>
+  <p class="lead">One hub for packing, delivery, orders and customer follow-ups. Everyone sees the same day.</p>
+  <div class="chips">
+    <span class="chip" style="background:#fff">Packing progress</span>
+    <span class="chip" style="background:#9ED0FF">Delivery log</span>
+    <span class="chip" style="background:#FFB3D1">Sale orders</span>
+    <span class="chip" style="background:#A8EBBB">Live dashboard</span>
+    <span class="chip" style="background:#D3C4FF">Customer map</span>
+    <span class="chip" style="background:#fff">Follow-ups</span>
   </div>
-</section>
-
-<div class="wrap end">
-  <h2>Ready for a smoother delivery day?</h2>
-  <p class="muted" style="font-size:18px;margin:0">Log in below with the account your Admin gave you.</p>
 </div>
 </body>
 </html>"""
@@ -2439,6 +2394,94 @@ footer {visibility: hidden;}
   h1 {font-size: 1.45rem !important;}
   h3 {font-size: 1.15rem !important;}
   .hk-pill {font-size: .85rem; padding: 3px 9px;}
+}
+</style>
+"""
+
+
+POSTER_CSS = r"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&family=Noto+Sans+Khmer:wght@400;700&display=swap');
+:root {--ink:#1B1B1B; --sun:#FFD23F; --paper:#FFFFFF;}
+.stApp {background: var(--sun); color: var(--ink); color-scheme: light;
+    font-family: 'Bricolage Grotesque','Noto Sans Khmer',system-ui,sans-serif;}
+.stApp button, .stApp input, .stApp textarea {font-family: inherit;}
+header[data-testid="stHeader"] {background: transparent;}
+::selection {background: var(--ink); color: var(--sun);}
+
+/* text */
+.stApp p, .stApp label, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+[data-testid="stCaptionContainer"], [data-testid="stWidgetLabel"] p, [data-testid="stMetricLabel"] p,
+[data-testid="stMetricValue"] {color: var(--ink) !important;}
+.stApp h1, .stApp h2, .stApp h3 {font-weight: 800; letter-spacing: -0.02em;}
+.stApp a {color: var(--ink); text-decoration: underline; text-decoration-thickness: 2px;}
+
+/* buttons */
+.stButton > button, .stDownloadButton > button, div[data-testid="stFormSubmitButton"] > button {
+    background: var(--paper); color: var(--ink); border: 3px solid var(--ink); border-radius: 999px;
+    box-shadow: 4px 4px 0 var(--ink); font-weight: 800; transition: transform .08s, box-shadow .08s;}
+.stButton > button:hover, .stDownloadButton > button:hover, div[data-testid="stFormSubmitButton"] > button:hover {
+    transform: translate(-1px,-1px); box-shadow: 6px 6px 0 var(--ink); border-color: var(--ink); color: var(--ink);}
+.stButton > button:active, .stDownloadButton > button:active, div[data-testid="stFormSubmitButton"] > button:active {
+    transform: translate(3px,3px); box-shadow: 1px 1px 0 var(--ink);}
+.stApp button[kind="primary"], .stApp button[data-testid="stBaseButton-primary"],
+.stApp button[data-testid="stBaseButton-primaryFormSubmit"] {background: var(--ink); color: #FFFFFF;}
+.stApp button[kind="primary"] p, .stApp button[data-testid="stBaseButton-primary"] p,
+.stApp button[data-testid="stBaseButton-primaryFormSubmit"] p {color: #FFFFFF !important;}
+
+/* inputs */
+[data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div {
+    background: var(--paper) !important; border: 3px solid var(--ink) !important; border-radius: 14px !important;}
+[data-baseweb="input"] > div, [data-baseweb="base-input"] {background: transparent !important; border: 0 !important;}
+.stApp input, .stApp textarea {color: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important;}
+[data-baseweb="select"] div, [data-baseweb="select"] span {color: var(--ink);}
+[data-baseweb="tag"] {background: var(--ink) !important; border-radius: 999px !important;}
+[data-baseweb="tag"] span, [data-baseweb="tag"] svg {color: #FFFFFF !important; fill: #FFFFFF !important;}
+[data-baseweb="popover"] > div {background: var(--paper) !important; border: 3px solid var(--ink); border-radius: 14px;}
+[data-baseweb="popover"] li, [data-baseweb="popover"] li * {color: var(--ink) !important; background: transparent;}
+[data-baseweb="popover"] li:hover {background: var(--sun) !important;}
+
+/* section chips: radio groups (the main navigation) */
+div[role="radiogroup"] {gap: 4px 0;}
+label[data-baseweb="radio"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 999px;
+    padding: 5px 16px; margin: 4px 8px 4px 0; box-shadow: 3px 3px 0 var(--ink); cursor: pointer;}
+label[data-baseweb="radio"] > div:first-child {display: none;}
+label[data-baseweb="radio"] p {font-weight: 700;}
+label[data-baseweb="radio"]:has(input:checked) {background: var(--ink);}
+label[data-baseweb="radio"]:has(input:checked) *, label[data-baseweb="radio"]:has(input:checked) p {color: #FFFFFF !important;}
+
+/* tabs */
+button[data-baseweb="tab"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 999px;
+    margin-right: 8px; padding: 6px 16px; height: auto;}
+button[data-baseweb="tab"] p {font-weight: 800;}
+button[data-baseweb="tab"][aria-selected="true"] {background: var(--ink);}
+button[data-baseweb="tab"][aria-selected="true"] p {color: #FFFFFF !important;}
+[data-baseweb="tab-highlight"], [data-baseweb="tab-border"] {display: none;}
+div[data-baseweb="tab-list"] {gap: 4px; padding-bottom: 8px;}
+
+/* cards: forms, expanders, metrics, alerts, tables, sidebar */
+[data-testid="stForm"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 22px;
+    box-shadow: 6px 6px 0 var(--ink); padding: 20px;}
+[data-testid="stExpander"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--ink); overflow: hidden;}
+[data-testid="stExpander"] details, [data-testid="stExpander"] summary {background: transparent; border: 0;}
+[data-testid="stExpander"] summary p {font-weight: 800;}
+div[data-testid="stMetric"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 16px;
+    box-shadow: 4px 4px 0 var(--ink); padding: 10px 16px;}
+[data-testid="stAlert"] {border: 3px solid var(--ink); border-radius: 16px;}
+[data-testid="stDataFrame"] {border: 3px solid var(--ink); border-radius: 14px; overflow: hidden; background: var(--paper);}
+section[data-testid="stSidebar"] {background: var(--paper); border-right: 3px solid var(--ink);}
+
+/* the app's own cards and pills */
+.hk-card {background: var(--paper); border: 3px solid var(--ink); border-radius: 16px; box-shadow: 4px 4px 0 var(--ink);}
+.hk-pill {background: var(--paper); border: 2px solid var(--ink); font-weight: 700;}
+.hk-badge {border: 2px solid var(--ink); font-weight: 700;}
+.hk-group {border-bottom: 3px solid var(--ink);}
+.hk-sub {opacity: .85;}
+
+@media (max-width: 640px) {
+  label[data-baseweb="radio"] {padding: 4px 12px; margin-right: 6px;}
+  [data-testid="stForm"] {box-shadow: 4px 4px 0 var(--ink); padding: 14px;}
 }
 </style>
 """
@@ -7800,6 +7843,7 @@ def health_status():
 st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="wide",
                    initial_sidebar_state="collapsed")
 st.markdown(CSS, unsafe_allow_html=True)
+st.markdown(POSTER_CSS, unsafe_allow_html=True)
 _reset_prefix = st.session_state.pop("reset_form_prefix", None)
 if _reset_prefix:
     for _key in list(st.session_state):
