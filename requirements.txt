@@ -3,3 +3,10 @@ pandas
 openpyxl
 dropbox
 extra-streamlit-components
+[theme]
+base = "light"
+primaryColor = "#1B1B1B"
+backgroundColor = "#FFD23F"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1B1B1B"
+font = "sans serif"
