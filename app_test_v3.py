@@ -3093,6 +3093,56 @@ def _upload_tab():
     bulk_editor(df, ctx, key="upl", check_col="Save?", scope=hashlib.sha256(up.getvalue() + str((sheet, name_col, status_col, cases_col, blank_means, mark_progress)).encode()).hexdigest())
 
 
+def _quick_pack():
+    """Phone-first packing: progress, To pack / Packed pills, one card per customer with a big stepper + one Save."""
+    if not has_permission("edit"):
+        return
+    ctx = packing_context()
+    cust = [c for c in ctx["today"] if (ctx["ordered"].get(c) or 0) > 0]
+    if not cust:
+        st.info("No customers with cases in today's journal yet.")
+        return
+    done = [c for c in cust if ctx["packed"].get(c, 0) >= ctx["ordered"][c]]
+    todo = [c for c in cust if c not in done]
+    pct = int(100 * len(done) / len(cust))
+    st.markdown(f"<div class='hk-card'><div class='hk-top'><b>Packing today</b><span>{len(done)} / {len(cust)} done</span></div>"
+                f"<div style='height:8px;border-radius:999px;background:rgba(128,128,128,.25);margin-top:8px;overflow:hidden'>"
+                f"<div style='width:{pct}%;height:100%;background:#E3B400'></div></div></div>", unsafe_allow_html=True)
+    linked = staff_name_for_user()
+    names = ["-- Select Staff --"] + OPS_STAFF
+    who = st.selectbox("Packed by", names, index=names.index(linked) if linked in names else 0, key="qp_by")
+    view = st.radio("Show", [f"To pack · {len(todo)}", f"Packed · {len(done)}"], horizontal=True,
+                    key="qp_view", label_visibility="collapsed")
+    show = todo if view.startswith("To pack") else done
+    q = st.text_input("Search customer", key="qp_q", max_chars=60, placeholder="Search customer")
+    if q.strip():
+        show = [c for c in show if q.strip().lower() in c.lower()]
+    if not show:
+        st.caption("Nothing here.")
+    for i, c in enumerate(show[:8]):
+        ordered, packed = ctx["ordered"][c], ctx["packed"].get(c, 0)
+        with st.container(border=True):
+            st.markdown(f"**{c}**  \nOrdered {ordered} · packed {packed}")
+            n = st.number_input("Cases packed now", min_value=0, max_value=MAX_CASES, step=1,
+                                value=max(0, min(ordered - packed, MAX_CASES)), key=f"qp_n_{i}_{c}")
+            if st.button("Save and next", key=f"qp_s_{i}_{c}", type="primary", use_container_width=True):
+                if who == "-- Select Staff --":
+                    st.error("Choose who packed this first.")
+                elif n == 0:
+                    st.error("Cases must be at least 1.")
+                else:
+                    try:
+                        append_row(PACKING_FILE, {"Date": now_str(), "Prepared_By": who, "Customer": c, "Invoice": "",
+                                                  "Cases_Packed": n, "Status": "Completed (រួចរាល់)"})
+                        audit("packing", f"{c} | {n} cases | by {who}")
+                        flash_and_refresh(f"Packing logged: {c} | {n} cases", reset_prefix="qp_n")
+                    except Exception as err:
+                        bot_log("error", "Save packing", str(err), "-")
+                        st.error(f"Could not save: {err}")
+    if len(show) > 8:
+        st.caption(f"{len(show) - 8} more - use the search box.")
+
+
 def _packing_body():
     st.markdown("### 📦 Bun Preparation & Packing")
     task_view_selector("packing")
@@ -3109,13 +3159,15 @@ def _packing_body():
         st.markdown("**👷 Cases packed per staff (today)**")
         show_df(df_today.groupby("Prepared_By")["Cases_Packed"].sum().reset_index())
         return
-    t_tick, t_up, t_one = st.tabs(["📋 Quick tick list", "📤 Upload a file", "✍️ One customer"])
-    with t_tick:
-        _ticklist_tab()
-    with t_up:
-        _upload_tab()
-    with t_one:
-        packing_form("packing_form")
+    _quick_pack()
+    with st.expander("More packing tools (tick list, upload a file, one customer)"):
+        t_tick, t_up, t_one = st.tabs(["📋 Quick tick list", "📤 Upload a file", "✍️ One customer"])
+        with t_tick:
+            _ticklist_tab()
+        with t_up:
+            _upload_tab()
+        with t_one:
+            packing_form("packing_form")
 
     with st.expander("🛠️ Admin: Fix or Edit Today's Packing"):
         admin_editor(PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, key="pack",
@@ -3810,7 +3862,8 @@ def _dispatch_body():
     if me != "-- Select Staff --":
         st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📌 To send <b>{len(mine)}</b></span>"
                     f"<span class='hk-pill'>⏳ Details to complete <b>{n_wait}</b></span></div>", unsafe_allow_html=True)
-    step = st.selectbox("Delivery step", ["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Complete delivery details", "✍️ One customer", "📊 Today's log"], key="phone_delivery_step")
+    step = st.radio("Delivery step", ["1️⃣ My customers", "2️⃣ Send", "3️⃣ Details", "✍️ One customer", "📊 Log"],
+                    horizontal=True, key="delivery_step_v2", label_visibility="collapsed")
     if me == "-- Select Staff --" and not step.startswith("📊"):
         st.info("Choose your name at the top first.")
         return
