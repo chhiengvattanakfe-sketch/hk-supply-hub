@@ -3280,6 +3280,51 @@ def _claim_tab(me, ctx):
                 st.error(f"⚠️ Could not save: {err}")
 
 
+def _quick_send(me, ctx):
+    """Phone-first send: one card per customer of mine with a big stepper and one button."""
+    if not has_permission("edit") or not has_permission("tasks"):
+        return
+    assigned = ctx["assigned"]
+    recs = [r for r in ctx["recs"] if assigned.get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
+    total_p = sum(int(r["Packed Cases"]) for r in recs)
+    total_s = sum(int(r["Sent Cases"]) for r in recs)
+    pct = int(100 * min(total_s, total_p) / total_p) if total_p else 0
+    st.markdown(f"<div class='hk-card'><div class='hk-top'><b>My run</b><span>{total_s} / {total_p} cases sent</span></div>"
+                f"<div style='height:8px;border-radius:999px;background:rgba(128,128,128,.25);margin-top:8px;overflow:hidden'>"
+                f"<div style='width:{pct}%;height:100%;background:#1A8F5A'></div></div></div>", unsafe_allow_html=True)
+    todo = []
+    for r in recs:
+        ordered = None if pd.isna(r["កេស"]) else int(r["កេស"])
+        packed, sent = int(r["Packed Cases"]), int(r["Sent Cases"])
+        left = (packed - sent) if packed > sent else ((ordered - sent) if (ordered and ordered > sent) else 0)
+        todo.append((r["Customer"], packed, sent, max(0, left)))
+    if not todo:
+        st.info("No customers in your run yet. Use step 1 to choose customers.")
+        return
+    for i, (c, packed, sent, left) in enumerate(todo[:10]):
+        with st.container(border=True):
+            badge = "🟩 sent" if (packed and sent >= packed) else ("🟦 partly sent" if sent else "🟨 packed" if packed else "⬜ not packed")
+            st.markdown(f"**{c}**  \nPacked {packed} · sent {sent} · {badge}")
+            n = st.number_input("Cases sent now", min_value=0, max_value=MAX_CASES, step=1, value=min(left, MAX_CASES),
+                                key=f"qs_n_{i}_{c}")
+            if st.button("Mark sent", key=f"qs_s_{i}_{c}", type="primary", use_container_width=True):
+                if n <= 0:
+                    st.error("Cases must be at least 1.")
+                else:
+                    try:
+                        append_rows(DATA_FILE, [{"Date": now_str(), "Handled_By": me, "Customer": c, "Invoice": "", "Cases": n,
+                                                 "Local_Driver": PENDING_VIA, "Taxi_Station": "-", "Phnom_Penh_Expense": 0,
+                                                 "Taxi_Expense": 0, "Note": "-", "Verified_By": "-",
+                                                 "Expense_Status": expense_status(PENDING_VIA, "", 0, 0)}])
+                        audit("dispatch", f"{c} | {n} cases | by {me}")
+                        flash_and_refresh(f"Sent: {c} | {n} cases (add driver/expenses in step 3)", reset_prefix="qs_n")
+                    except Exception as err:
+                        bot_log("error", "Save dispatch", str(err), "-")
+                        st.error(f"Could not save: {err}")
+    if len(todo) > 10:
+        st.caption(f"{len(todo) - 10} more - use the full list below.")
+
+
 def _send_tab(me, ctx):
     if not has_permission("edit") or not has_permission("tasks"):
         st.warning("Editing delivery tasks is disabled for your account.")
@@ -3870,7 +3915,9 @@ def _dispatch_body():
     if step.startswith("1"):
         _claim_tab(me, ctx)
     elif step.startswith("2"):
-        _send_tab(me, ctx)
+        _quick_send(me, ctx)
+        with st.expander("Full send list (tick several customers, add notes)"):
+            _send_tab(me, ctx)
     elif step.startswith("3"):
         _expense_tab(me)
     elif step.startswith("✍"):
