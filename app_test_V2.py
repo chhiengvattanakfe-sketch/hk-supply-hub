@@ -1020,7 +1020,62 @@ def change_password(user, current, new, new2):
     return None
 
 
+# ===== LANDING PAGE (paste ABOVE def render_login) =====
+import streamlit.components.v1 as components
+
+LANDING_HEIGHT = 600          # one-screen poster cover; raise it if the cover is cut off
+
+LANDING_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&family=Noto+Sans+Khmer:wght@400;700&display=swap">
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:transparent;color:#1B1B1B;font-family:'Bricolage Grotesque','Noto Sans Khmer',system-ui,sans-serif;line-height:1.35}
+.wrap{max-width:1240px;margin:0 auto;padding:6px 8px 18px}
+header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:10px 0 18px}
+.brand{padding:9px 18px;border:3px solid #1B1B1B;border-radius:999px;background:#fff;font-weight:800;font-size:16px}
+.hint{min-height:44px;padding:0 22px;border-radius:999px;background:#1B1B1B;color:#fff;font-weight:800;display:inline-flex;align-items:center;white-space:nowrap}
+.sticker{display:inline-block;transform:rotate(-3deg);padding:8px 16px;border:3px solid #1B1B1B;border-radius:999px;background:#fff;font-weight:700;font-size:17px;margin-bottom:18px}
+h1{margin:0 0 16px;font-size:clamp(40px,8.4vw,104px);line-height:.96;letter-spacing:-.04em;font-weight:800}
+h1 span{display:inline-block;background:#fff;border:3px solid #1B1B1B;border-radius:18px;padding:0 16px}
+.lead{margin:0 0 22px;font-size:clamp(17px,1.9vw,22px);font-weight:600;max-width:620px}
+.chips{display:flex;flex-wrap:wrap;gap:12px}
+.chip{border:3px solid #1B1B1B;border-radius:999px;padding:8px 18px;font-weight:800;font-size:15px;box-shadow:4px 4px 0 #1B1B1B}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">Supply Chain Hub</div>
+    <span class="hint">Log in below &darr;</span>
+  </header>
+  <div class="sticker">នំប៉ាវហុងកុង team only</div>
+  <h1>Pack it. Send it. <span>Track it.</span></h1>
+  <p class="lead">One hub for packing, delivery, orders and customer follow-ups. Everyone sees the same day.</p>
+  <div class="chips">
+    <span class="chip" style="background:#fff">Packing progress</span>
+    <span class="chip" style="background:#9ED0FF">Delivery log</span>
+    <span class="chip" style="background:#FFB3D1">Sale orders</span>
+    <span class="chip" style="background:#A8EBBB">Live dashboard</span>
+    <span class="chip" style="background:#D3C4FF">Customer map</span>
+    <span class="chip" style="background:#fff">Follow-ups</span>
+  </div>
+</div>
+</body>
+</html>"""
+
+
+def render_landing():
+    """Shows the home page. Call it as the first line inside render_login()."""
+    components.html(LANDING_HTML, height=LANDING_HEIGHT, scrolling=True)
+# ===== END LANDING PAGE =====
+
+
 def render_login():
+    render_landing()
     st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
@@ -1256,7 +1311,7 @@ def _write_atomic(path, data):
             os.remove(tmp)
 
 
-def pull(path, force=False, max_age=5.0):
+def pull(path, force=False, max_age=30.0):
     """Makes the local working copy equal to Dropbox (cheap: only downloads when the file changed)."""
     if not USE_DROPBOX:
         return
@@ -1341,7 +1396,7 @@ def _schedule_log_push(path):
         t.start()
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def _list_remote_folder(_token=0):
     dbx, out = _dbx(), []
     res = dbx.files_list_folder(DROPBOX_FOLDER)
@@ -1678,7 +1733,7 @@ def append_rows(path, rows):
     for attempt in range(6):
         try:
             with _sync_state()["lock"]:
-                pull(path, force=True)
+                pull(path, force=attempt > 0, max_age=10.0)      # first try: no extra Dropbox call; a conflict forces a fresh copy
                 _append_local_many(path, rows)
                 push(path)
             return
@@ -1699,7 +1754,7 @@ def modify_csv(path, cols, fn):
     for attempt in range(6):
         try:
             with _sync_state()["lock"], file_lock(path):
-                pull(path, force=True)
+                pull(path, force=attempt > 0, max_age=10.0)      # first try: no extra Dropbox call; a conflict forces a fresh copy
                 df = _csv_read(path, cols)
                 save_csv(path, fn(df))
             return
@@ -2339,6 +2394,94 @@ footer {visibility: hidden;}
   h1 {font-size: 1.45rem !important;}
   h3 {font-size: 1.15rem !important;}
   .hk-pill {font-size: .85rem; padding: 3px 9px;}
+}
+</style>
+"""
+
+
+POSTER_CSS = r"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&family=Noto+Sans+Khmer:wght@400;700&display=swap');
+:root {--ink:#1B1B1B; --sun:#FFD23F; --paper:#FFFFFF;}
+.stApp {background: var(--sun); color: var(--ink); color-scheme: light;
+    font-family: 'Bricolage Grotesque','Noto Sans Khmer',system-ui,sans-serif;}
+.stApp button, .stApp input, .stApp textarea {font-family: inherit;}
+header[data-testid="stHeader"] {background: transparent;}
+::selection {background: var(--ink); color: var(--sun);}
+
+/* text */
+.stApp p, .stApp label, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+[data-testid="stCaptionContainer"], [data-testid="stWidgetLabel"] p, [data-testid="stMetricLabel"] p,
+[data-testid="stMetricValue"] {color: var(--ink) !important;}
+.stApp h1, .stApp h2, .stApp h3 {font-weight: 800; letter-spacing: -0.02em;}
+.stApp a {color: var(--ink); text-decoration: underline; text-decoration-thickness: 2px;}
+
+/* buttons */
+.stButton > button, .stDownloadButton > button, div[data-testid="stFormSubmitButton"] > button {
+    background: var(--paper); color: var(--ink); border: 3px solid var(--ink); border-radius: 999px;
+    box-shadow: 4px 4px 0 var(--ink); font-weight: 800; transition: transform .08s, box-shadow .08s;}
+.stButton > button:hover, .stDownloadButton > button:hover, div[data-testid="stFormSubmitButton"] > button:hover {
+    transform: translate(-1px,-1px); box-shadow: 6px 6px 0 var(--ink); border-color: var(--ink); color: var(--ink);}
+.stButton > button:active, .stDownloadButton > button:active, div[data-testid="stFormSubmitButton"] > button:active {
+    transform: translate(3px,3px); box-shadow: 1px 1px 0 var(--ink);}
+.stApp button[kind="primary"], .stApp button[data-testid="stBaseButton-primary"],
+.stApp button[data-testid="stBaseButton-primaryFormSubmit"] {background: var(--ink); color: #FFFFFF;}
+.stApp button[kind="primary"] p, .stApp button[data-testid="stBaseButton-primary"] p,
+.stApp button[data-testid="stBaseButton-primaryFormSubmit"] p {color: #FFFFFF !important;}
+
+/* inputs */
+[data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div {
+    background: var(--paper) !important; border: 3px solid var(--ink) !important; border-radius: 14px !important;}
+[data-baseweb="input"] > div, [data-baseweb="base-input"] {background: transparent !important; border: 0 !important;}
+.stApp input, .stApp textarea {color: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important;}
+[data-baseweb="select"] div, [data-baseweb="select"] span {color: var(--ink);}
+[data-baseweb="tag"] {background: var(--ink) !important; border-radius: 999px !important;}
+[data-baseweb="tag"] span, [data-baseweb="tag"] svg {color: #FFFFFF !important; fill: #FFFFFF !important;}
+[data-baseweb="popover"] > div {background: var(--paper) !important; border: 3px solid var(--ink); border-radius: 14px;}
+[data-baseweb="popover"] li, [data-baseweb="popover"] li * {color: var(--ink) !important; background: transparent;}
+[data-baseweb="popover"] li:hover {background: var(--sun) !important;}
+
+/* section chips: radio groups (the main navigation) */
+div[role="radiogroup"] {gap: 4px 0;}
+label[data-baseweb="radio"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 999px;
+    padding: 5px 16px; margin: 4px 8px 4px 0; box-shadow: 3px 3px 0 var(--ink); cursor: pointer;}
+label[data-baseweb="radio"] > div:first-child {display: none;}
+label[data-baseweb="radio"] p {font-weight: 700;}
+label[data-baseweb="radio"]:has(input:checked) {background: var(--ink);}
+label[data-baseweb="radio"]:has(input:checked) *, label[data-baseweb="radio"]:has(input:checked) p {color: #FFFFFF !important;}
+
+/* tabs */
+button[data-baseweb="tab"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 999px;
+    margin-right: 8px; padding: 6px 16px; height: auto;}
+button[data-baseweb="tab"] p {font-weight: 800;}
+button[data-baseweb="tab"][aria-selected="true"] {background: var(--ink);}
+button[data-baseweb="tab"][aria-selected="true"] p {color: #FFFFFF !important;}
+[data-baseweb="tab-highlight"], [data-baseweb="tab-border"] {display: none;}
+div[data-baseweb="tab-list"] {gap: 4px; padding-bottom: 8px;}
+
+/* cards: forms, expanders, metrics, alerts, tables, sidebar */
+[data-testid="stForm"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 22px;
+    box-shadow: 6px 6px 0 var(--ink); padding: 20px;}
+[data-testid="stExpander"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 18px;
+    box-shadow: 5px 5px 0 var(--ink); overflow: hidden;}
+[data-testid="stExpander"] details, [data-testid="stExpander"] summary {background: transparent; border: 0;}
+[data-testid="stExpander"] summary p {font-weight: 800;}
+div[data-testid="stMetric"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 16px;
+    box-shadow: 4px 4px 0 var(--ink); padding: 10px 16px;}
+[data-testid="stAlert"] {border: 3px solid var(--ink); border-radius: 16px;}
+[data-testid="stDataFrame"] {border: 3px solid var(--ink); border-radius: 14px; overflow: hidden; background: var(--paper);}
+section[data-testid="stSidebar"] {background: var(--paper); border-right: 3px solid var(--ink);}
+
+/* the app's own cards and pills */
+.hk-card {background: var(--paper); border: 3px solid var(--ink); border-radius: 16px; box-shadow: 4px 4px 0 var(--ink);}
+.hk-pill {background: var(--paper); border: 2px solid var(--ink); font-weight: 700;}
+.hk-badge {border: 2px solid var(--ink); font-weight: 700;}
+.hk-group {border-bottom: 3px solid var(--ink);}
+.hk-sub {opacity: .85;}
+
+@media (max-width: 640px) {
+  label[data-baseweb="radio"] {padding: 4px 12px; margin-right: 6px;}
+  [data-testid="stForm"] {box-shadow: 4px 4px 0 var(--ink); padding: 14px;}
 }
 </style>
 """
@@ -4017,6 +4160,8 @@ def _reports_only_body():
     show_df(pd.DataFrame(rows))
     if not has_permission("reports"):
         return
+    if not st.checkbox("Prepare Excel report (takes a few seconds)", key="rep_prep_xl"):
+        return
     try:
         st.download_button("📥 Download detailed report (Excel)", data=build_report_excel(df_report, selected_date),
                            file_name=f"Master_Report_{selected_date}.xlsx",
@@ -4103,7 +4248,9 @@ def _dashboard_body():
     display = c2.radio("Display", ["📱 Cards", "🖥️ Table"], horizontal=True, index=0 if mobile else 1, key="dash_display")
     with c3:
         st.write("")
-        if can_reports:
+        if can_reports and not st.checkbox("Prepare Excel report", key="dash_prep_xl"):
+            st.caption("Tick to prepare the Excel report.")
+        elif can_reports:
             try:
                 st.download_button("📥 Download detailed report (Excel)", data=build_report_excel(df_report, selected_date),
                                    file_name=f"Master_Report_{selected_date}.xlsx",
@@ -4245,19 +4392,19 @@ def _update_panel(selected, df_report, selected_date):
                 f"packed {packed_n}  ·  left to send **{max(target_n - sent_n, 0)}**"
                 + (f"   \n✏️ {p_row['Sent Note']}" if p_row["Sent Note"] else "")
                 + (f"   \n✏️ {p_row['Packed Note']}" if p_row["Packed Note"] else ""))
-    t_pack, t_send, t_final, t_hold = st.tabs(["📦 Step 1: Packing (who prepared the buns)",
-                                               "🚚 Step 2: Send (who delivered + verify កេស)",
-                                               "✏️ Edit final packed / sent",
-                                               "📅 Move to tomorrow / ❌ Cancel"])
-    with t_pack:
+    _upd_steps = ["📦 Step 1: Packing (who prepared the buns)", "🚚 Step 2: Send (who delivered + verify កេស)",
+                  "✏️ Edit final packed / sent", "📅 Move to tomorrow / ❌ Cancel"]
+    _upd_pick = st.radio("Update step", _upd_steps, horizontal=True, key=f"upd_step_{selected}")
+    t_pack, t_send, t_final, t_hold = (_upd_pick == name for name in _upd_steps)           # only the chosen one is built
+    if t_pack:
         packing_form(f"dash_pack_{selected}_{pack_default}", fixed_customer=selected, default_cases=pack_default)
-    with t_send:
+    if t_send:
         st.caption("Check the កេស number (you can edit it), choose who verified it, then save.")
         dispatch_form(f"dash_send_{selected}_{send_default}", fixed_customer=selected,
                       default_cases=send_default, verify=True)
-    with t_final:
+    if t_final:
         _final_panel(selected, p_row)
-    with t_hold:
+    if t_hold:
         _hold_panel(selected, p_row, target_n - sent_n)
 
 
@@ -7124,7 +7271,7 @@ def _followup_review_panel(history):
     return report
 
 
-@st.fragment(run_every=60)
+@st.fragment(run_every=300)
 def followup_alert_banner():
     if not (has_permission('view') or has_permission('reports')):return
     try:
@@ -7350,10 +7497,13 @@ def _report_excel_bytes(frames):
     return buf.getvalue()
 
 
-def _si_download(frames, filename):
+def _si_download(frames_fn, filename):
     if not has_permission("reports"):
         return
+    if not st.checkbox("Prepare Excel with all lists (takes a few seconds)", key="si_prep_xl"):
+        return
     try:
+        frames = frames_fn()
         buf = _report_excel_bytes({name: frame.drop(columns=[c for c in ("Key",) if c in frame.columns]) for name, frame in frames.items()})
         st.download_button("📥 Download all lists (Excel)", data=buf, file_name=filename,
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="si_dl")
@@ -7466,10 +7616,12 @@ def _sales_insights_body():
         st.warning("Call recommendations hidden because contact preferences could not be checked: " + str(call_error)[:120])
         care = care.iloc[0:0]
 
-    t_top, t_miss, t_none, t_care, t_hist, t_det = st.tabs(["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
-                                                           "💝 Customer care", "📆 Monthly history", "🔎 Customer detail"])
+    _si_tabs = ["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
+                "💝 Customer care", "📆 Monthly history", "🔎 Customer detail"]
+    _si_tab = st.radio("Insights section", _si_tabs, horizontal=True, key="si_tab")
+    t_top, t_miss, t_none, t_care, t_hist, t_det = (_si_tab == name for name in _si_tabs)   # only the chosen one is built
 
-    with t_top:
+    if t_top:
         c1, c2 = st.columns([2, 2])
         period = c1.selectbox("Period", SI_PERIODS, key="si_period")
         metric_label = c2.radio("Rank by", list(SI_METRICS), horizontal=True, key="si_metric")
@@ -7496,7 +7648,7 @@ def _sales_insights_body():
                 with st.expander("🥟 Pieces by bun type (all customers, this period)"):
                     _si_show(types, money=("Pieces", "Sales ៛"))
 
-    with t_miss:
+    if t_miss:
         st.markdown("Customers who normally order every X days but are **later than usual**. "
                     "Call the 🟢 Regular ones first — their habit is the most reliable.")
         only_regular = st.checkbox("Only regular buyers 🟢", value=False, key="si_regular")
@@ -7512,7 +7664,7 @@ def _sales_insights_body():
                 _si_show(dorm.sort_values("Avg order ៛", ascending=False).drop(columns=["Key", "Status"]),
                          money=("Usual pcs", "Avg order ៛", "Lost pcs (est.)", "Lost sales ៛ (est.)"))
 
-    with t_none:
+    if t_none:
         mode = st.radio("Month", ["This month", "Last month"], horizontal=True, key="si_month")
         if mode == "This month":
             m_start, m_end = this_start, today
@@ -7538,7 +7690,7 @@ def _sales_insights_body():
             with st.expander(f"In the Master List but never ordered in the journal ({len(g3)})"):
                 _si_show(g3[["Customer", "Area"]], height=420)
 
-    with t_care:
+    if t_care:
         if care.empty:
             st.info("No customer-care actions found right now.")
         else:
@@ -7595,7 +7747,7 @@ def _sales_insights_body():
                     "The 'Avg based on' column says how many months. A customer with no finished month yet shows this month so far, based on order days.\n"
                     "- 💡 **Cross-sell**: top-3 best-selling bun types of the last 90 days that this customer did not buy.")
         _si_call_panel(names)
-    with t_hist:
+    if t_hist:
         summ = _si_month_summary(mon)
         if summ.empty:
             st.info("No monthly data yet.")
@@ -7618,7 +7770,7 @@ def _sales_insights_body():
             pick = st.selectbox("Customer trend", list(tot.index), format_func=lambda k: names.get(k, k), key="si_hist_cust")
             series = mon[mon["Key"] == pick].set_index("Month")["Pcs"].reindex(summ["Month"]).fillna(0)
             st.line_chart(series.rename("Bun pcs"))
-    with t_det:
+    if t_det:
         q = st.text_input("🔎 Search customer name (any part, Khmer or English)", key="si_det_q")
         order_keys = list(mon.groupby("Key")["Pcs"].sum().sort_values(ascending=False).index)
         keys = order_keys + [k for k in names if k not in set(order_keys)]
@@ -7674,7 +7826,7 @@ def _sales_insights_body():
             if len(det["orders"]):
                 with st.expander(f"🧾 Recent orders ({len(det['orders'])})"):
                     _si_show(det["orders"], money=("Sales ៛",), height=420)
-    _si_download({"Monthly history": _si_month_summary(mon), "Top 20": top, "Missing from habit": missing,
+    _si_download(lambda: {"Monthly history": _si_month_summary(mon), "Top 20": (top if not top.empty else _si_top(daily, *_si_period("This month", today), "Sales", names, areas, 20, df, codes)[0]), "Missing from habit": missing,
                   "No order this month": no_month, "Customer care": care, "Follow-ups": _followup_export_frame(), "Journal sources": st.session_state.get("si_journal_coverage", pd.DataFrame())}, f"Sales_Insights_{today}.xlsx")
 
 
@@ -7700,6 +7852,7 @@ def health_status():
 st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="wide",
                    initial_sidebar_state="collapsed")
 st.markdown(CSS, unsafe_allow_html=True)
+st.markdown(POSTER_CSS, unsafe_allow_html=True)
 _reset_prefix = st.session_state.pop("reset_form_prefix", None)
 if _reset_prefix:
     for _key in list(st.session_state):
