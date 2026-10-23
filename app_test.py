@@ -1403,9 +1403,38 @@ def _remote_excel_names():
         return []
 
 
+_JOURNAL_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                   "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_JOURNAL_YM_RE = re.compile(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\u200b_\-.]*(20\d\d)")
+
+
+def _journal_ym(name):
+    m = _JOURNAL_YM_RE.search(str(name).lower())
+    return (int(m.group(2)), _JOURNAL_MONTHS[m.group(1)]) if m else None
+
+
+def _pick_by_month(items, name_of, mtime_of):
+    """Current month's journal; else the latest earlier month; never a future month."""
+    if not items:
+        return None
+    t = today_kh()
+    now_ym = (t.year, t.month)
+    dated = [(it, _journal_ym(name_of(it))) for it in items]
+    dated = [(it, ym) for it, ym in dated if ym]
+    cur = [it for it, ym in dated if ym == now_ym]
+    if cur:
+        return max(cur, key=mtime_of)
+    past = [(ym, it) for it, ym in dated if ym < now_ym]
+    if past:
+        best = max(ym for ym, _ in past)
+        return max((it for ym, it in past if ym == best), key=mtime_of)
+    undated = [it for it in items if not _journal_ym(name_of(it))]
+    return max(undated or items, key=mtime_of)
+
+
 def _pick_remote(names, pattern):
     ms = [x for x in names if fnmatch.fnmatchcase(x["name"].lower(), pattern.lower())]
-    return max(ms, key=lambda x: x["mtime"]) if ms else None
+    return _pick_by_month(ms, lambda x: x["name"], lambda x: x["mtime"]) if ms else None
 
 
 def excel_pattern_matches():
@@ -1439,7 +1468,7 @@ def _dropbox_excel():
     except Exception as e:
         bot_log("warn", "Dropbox", f"Cannot fetch the journal: {str(e)[:120]}", "using the saved copy")
         old = [f for f in glob.glob(os.path.join(DATA_DIR, "*.xlsx")) if not os.path.basename(f).startswith("~$")]
-        return max(old, key=os.path.getmtime) if old else None
+        return _pick_by_month(old, os.path.basename, os.path.getmtime) if old else None
 
 
 def resync_now():
@@ -1781,7 +1810,7 @@ def find_excel_file():
     for pat in (EXCEL_PATTERN, EXCEL_FALLBACK_PATTERN):
         fs = _files(pat)
         if fs:
-            return max(fs, key=os.path.getmtime)
+            return _pick_by_month(fs, os.path.basename, os.path.getmtime)
     return None
 
 
@@ -1937,7 +1966,7 @@ def load_snapshot(path, mtime_ns, size):
     return data, "fresh"
 
 
-@st.cache_data(ttl=120, show_spinner="📄 Loading journal (first time only)...", max_entries=4)
+@st.cache_data(show_spinner="📄 Loading journal (first time only)...", max_entries=4)   # keyed by mtime+size, so no TTL reload needed
 def get_snapshot(path, mtime_ns, size):
     return load_snapshot(path, mtime_ns, size)
 
@@ -6458,8 +6487,13 @@ def sync_journal_status_copy(force=False):
                 if not _is_not_found(e):
                     raise
                 output_md = None
-            source_md, response = _dbx().files_download(_rpath(chosen["name"]))
-            source = response.content
+            cached = state.get("src_cache")                 # re-download the journal only when its revision changed
+            if cached and cached[0] == chosen["name"] and cached[1] == chosen["rev"]:
+                source_md, source = cached[2], cached[3]
+            else:
+                source_md, response = _dbx().files_download(_rpath(chosen["name"]))
+                source = response.content
+                state["src_cache"] = (chosen["name"], source_md.rev, source_md, source)
             source_name = chosen["name"]
         else:
             source_path = find_excel_file()
