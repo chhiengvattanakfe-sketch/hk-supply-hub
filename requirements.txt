@@ -1,4 +1,6 @@
-   streamlit
-   pandas
-   openpyxl
-   dropbox
+streamlit>=1.37
+pandas
+openpyxl
+dropbox
+extra-streamlit-components
+pydeck
