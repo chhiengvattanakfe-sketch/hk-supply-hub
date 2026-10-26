@@ -416,6 +416,30 @@ def _build_matchers():
 _MATCHERS = _build_matchers()
 
 
+def cust_key(name):
+    """Matching key for a customer: ignores capital letters, extra spaces and Khmer spelling variants.
+    The journal, packing log, delivery log, holds and assignments are all joined with this key."""
+    return norm_name(_kh(name))
+
+
+class CustomerDict(dict):
+    """A dict whose keys are customer names compared with cust_key (so 'LY MEY' == 'Ly  Mey')."""
+    def __setitem__(self, k, v):
+        super().__setitem__(cust_key(k), v)
+
+    def __getitem__(self, k):
+        return super().__getitem__(cust_key(k))
+
+    def __contains__(self, k):
+        return super().__contains__(cust_key(k))
+
+    def get(self, k, default=None):
+        return super().get(cust_key(k), default)
+
+    def pop(self, k, *default):
+        return super().pop(cust_key(k), *default)
+
+
 def detect_province(name, allow_pp=True):
     """(province, how) read from the customer name. The match that ends last wins (the place is usually written last)."""
     t = _kh(re.sub(r"\s+", " ", str(name)))
@@ -2049,13 +2073,9 @@ def _check_csv(add, key, master, auto_fix):
     notes = []
     if missing:
         notes.append("added optional columns: " + ", ".join(missing))
-    if master:
-        canon = canonical_map(master)
-        corrected = fixed["Customer"].map(lambda n: canon.get(norm_name(n), n))
-        count = int((corrected != fixed["Customer"]).sum())
-        fixed["Customer"] = corrected
-        if count:
-            notes.append(f"normalized spacing/capitalization for {count} customer names")
+    # Customer names are NOT rewritten any more: renaming them to the Master List spelling made saved
+    # packing/delivery rows stop matching the journal spelling, so customers stayed "Pending".
+    # The dashboard now matches names ignoring capitals/spaces, so no rename is needed.
     duplicate_count = int(raw.duplicated(subset=[c for c in cols if c in raw]).sum())
     if duplicate_count:
         add("warn", label, f"{base}: {duplicate_count} exact repeated records", "review possible duplicates; all records retained")
@@ -2445,7 +2465,7 @@ def expense_status(via, station, pp, taxi):
 def current_assignments(day=None):
     """{customer: handler} for a day (the last Assign / Release of each customer wins)."""
     df = rows_for_day(read_raw(ASSIGN_FILE, ASSIGN_COLS), day or today_kh())
-    out = {}
+    out = CustomerDict()
     for r in df.to_dict("records"):
         if r["Action"] == "Assign":
             out[r["Customer"]] = r["Handler"]
@@ -2956,13 +2976,17 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
         if not (include_all or r[check_col]) or r["Status"] == "Skip" or cust not in valid or cases <= 0 or cases > MAX_CASES:
             continue
         if _int(ctx["packed"].get(cust, 0)) != _int(r.get("Already packed", 0)):
-            changed.append(cust)
+            changed.append(cust)        # someone else packed this customer meanwhile: skip it, save the rest
+            continue
         recs.append({"Date": now_str(), "Prepared_By": prepared_by, "Customer": cust, "Invoice": str(r.get("Invoice", "")), "Cases_Packed": cases,
                      "Status": "Completed (រួចរាល់)" if r["Status"] == "Done" else "In Progress (កំពុងធ្វើ)"})
         total += cases
-    if changed:
-        st.error("Packing totals changed for: " + ", ".join(changed[:5]) + ". Reload this list before saving; your current selections are still here.")
+    if changed and not recs:
+        st.error("Not saved — packing totals changed for: " + ", ".join(changed[:5]) + ". Press ↻ Reload this list.")
         return
+    if changed:
+        st.session_state["save_warning"] = ("Saved the others, but SKIPPED (someone else packed them meanwhile - reload and check): "
+                                            + ", ".join(changed[:8]))
     if not recs:
         st.warning("Tick at least one customer with cases above 0, or choose Include every customer shown.")
         return
@@ -3211,7 +3235,7 @@ def _claim_tab(me, ctx):
                     st.error(f"⚠️ Could not save: {err}")
 
     mine = [r["Customer"] for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
-    pool = mine if current_role() != "admin" else [c for c in ctx["assigned"] if c in {r["Customer"] for r in ctx["recs"]}]
+    pool = mine if current_role() != "admin" else [r["Customer"] for r in ctx["recs"] if r["Customer"] in ctx["assigned"]]
     with st.expander(f"↩️ Release customers ({len(mine)} are mine)"):
         with st.form("release_customers", clear_on_submit=False):
             rel = st.multiselect("Customers I will NOT deliver after all", pool, key="claim_release")
@@ -3272,20 +3296,25 @@ def _send_tab(me, ctx):
         submitted = st.form_submit_button("🚚 Save selected deliveries", type="primary")
     if submitted:
         selected_rows = [r for r in edited.to_dict("records") if select_all_send or r["Sent ✅"]]
-        fresh = {r["Customer"]: r for r in ctx["recs"]}
-        blocked = [r["Customer"] for r in selected_rows if r["Customer"] not in fresh
+        fresh = CustomerDict()
+        for _r in ctx["recs"]:
+            fresh[_r["Customer"]] = _r
+        # Only skip a customer when saving it could double-count: someone else already sent it (or part of it),
+        # it was moved/cancelled, or another staff member took it. Packing changes are NOT a reason to block.
+        blocked = {r["Customer"] for r in selected_rows if r["Customer"] not in fresh
                    or fresh[r["Customer"]]["Status"] in NOT_TO_SEND
                    or _int(fresh[r["Customer"]]["Sent Cases"]) != _int(r["Saved sent cases"])
-                   or _int(fresh[r["Customer"]]["Packed Cases"]) != _int(r["Saved packed cases"])
-                   or _int(fresh[r["Customer"]]["កេស"], -1) != _int(r["Saved order cases"], -1)
-                   or (assigned.get(r["Customer"]) not in (None, me) and current_role() != "admin")]
-        if blocked:
-            st.error("These deliveries changed while you were selecting: " + ", ".join(blocked[:5]) + ". Reload this list before saving.")
+                   or (assigned.get(r["Customer"]) not in (None, me) and current_role() != "admin")}
+        if blocked and len(blocked) == len(selected_rows):
+            st.error("Not saved — these customers were already sent / changed by someone else: "
+                     + ", ".join(sorted(blocked)[:5]) + ". Press ↻ Reload this list.")
             return
         out, take, total = [], [], 0
         for r in edited.to_dict("records"):
             cust, cases, via = r["Customer"], _int(r["Cases"]), r["Via"]
             via = default_via if via == "Use default" else via
+            if cust in blocked:
+                continue
             if not (select_all_send or r["Sent ✅"]) or cases <= 0 or cases > MAX_CASES or via not in [PENDING_VIA] + via_options():
                 continue
             station = safe_text(r["Taxi station"] or "")
@@ -3309,6 +3338,9 @@ def _send_tab(me, ctx):
                             "deliveries saved successfully; assignments need review")
                     st.session_state["assignment_warning"] = "Deliveries were saved. Assignment updates failed; ask Admin to review. Do not resend these deliveries."
             waiting = sum(1 for o in out if o["Expense_Status"] == "Pending")
+            if blocked:
+                st.session_state["save_warning"] = ("Saved the others, but SKIPPED (already sent or changed by someone else): "
+                                                    + ", ".join(sorted(blocked)[:8]))
             audit("dispatch_bulk", f"{len(out)} customers, {total} cases, by {me}")
             _reset_draft("send", me)
             flash_and_refresh(f"Saved {len(out)} deliveries ({total} cases). {waiting} need delivery details - complete them in step 3")
@@ -3859,12 +3891,15 @@ def build_report(selected_date):
     except Exception:
         report_map_registry = None
     snap, _, _, err = current_snapshot()
-    scheduled, cases_found = {}, False
+    scheduled, cases_found = CustomerDict(), False
+    names = {}      # matching key -> name shown on screen (the journal spelling wins)
     if snap:
         cases_found = snap["cases_col_found"]
         j = snap["journal"]
         sub = j[j["Date"] == selected_date]
-        for name, g in sub.groupby("Customer", sort=False):
+        for key, g in sub.groupby(sub["Customer"].map(cust_key), sort=False):
+            name = g["Customer"].iloc[0]
+            names[key] = name
             tot = g["Cases"].sum(min_count=1)
             scheduled[name] = {"cases": int(tot) if pd.notna(tot) else None,
                                "invoice": _join_unique(g["Invoice"]),
@@ -3874,9 +3909,11 @@ def build_report(selected_date):
     holds = current_holds(selected_date)
     finals = current_final(selected_date)
     finals_p = current_final(selected_date, "Packed")
-    for cust, h in current_holds(selected_date - timedelta(days=1)).items():
+    for _key, h in current_holds(selected_date - timedelta(days=1)).items():
         if h["action"] != "Tomorrow":
             continue
+        cust = h["name"]
+        names.setdefault(cust_key(cust), cust)
         prev = f"📅 Moved from {selected_date - timedelta(days=1)}" + (f" ({h['reason']})" if h["reason"] not in ("", "-") else "")
         if cust in scheduled:
             scheduled[cust]["remark"] = _join_unique([scheduled[cust]["remark"], prev], sep=" / ")
@@ -3885,15 +3922,17 @@ def build_report(selected_date):
         else:
             scheduled[cust] = {"cases": h["cases"] or None, "invoice": "-", "remark": prev}
 
-    pack_info = {}
+    pack_info = CustomerDict()
     df_pack = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), selected_date)
-    for cust, g in df_pack.groupby("Customer", sort=False):
+    for key, g in df_pack.groupby(df_pack["Customer"].map(cust_key), sort=False):
+        cust = names.setdefault(key, g["Customer"].iloc[0])
         pack_info[cust] = {"cases": int(g["Cases_Packed"].sum()), "by": g["Prepared_By"].iloc[-1],
                            "status": str(g["Status"].iloc[-1])}
 
-    sent_info = {}
+    sent_info = CustomerDict()
     df_disp = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), selected_date)
-    for cust, g in df_disp.groupby("Customer", sort=False):
+    for key, g in df_disp.groupby(df_disp["Customer"].map(cust_key), sort=False):
+        cust = names.setdefault(key, g["Customer"].iloc[0])
         last = g.iloc[-1]
         station = str(last["Taxi_Station"]).strip()
         driver = f"{last['Local_Driver']} ➡️ {station}" if station not in ("-", "") else str(last["Local_Driver"])
@@ -3912,7 +3951,11 @@ def build_report(selected_date):
     master_names = {norm_name(n) for n in snap["customers"]} if snap else set()
     ignore = {norm_name(n) for n in IGNORE_NEW}
     rows = []
-    for cust in set(scheduled) | set(pack_info) | set(sent_info) | set(finals) | set(finals_p):
+    for fd in (finals, finals_p):
+        for key, v in fd.items():
+            names.setdefault(key, v["name"])
+    for key in set(scheduled) | set(pack_info) | set(sent_info) | set(finals) | set(finals_p):
+        cust = names.get(key, key)
         p, s, info = pack_info.get(cust), sent_info.get(cust), scheduled.get(cust)
         area, province, region, _how = resolve_location(cust, areas.get(norm_name(cust)), overrides.get(norm_name(cust)))
         if province in ("Unknown", "Unknown province") and report_map_registry is not None:
@@ -4046,10 +4089,11 @@ def current_final(day, kind="Sent"):
     """{customer: {"cases","reason","by"}} - the FINAL number of កេស sent (kind="Sent") or packed (kind="Packed"),
     set by hand. The last Final<kind> / Final<kind>Reset of each customer wins."""
     df = rows_for_day(read_raw(HOLD_FILE, HOLD_COLS), day)
-    out = {}
+    out = CustomerDict()
     for r in df.to_dict("records"):
         if r["Action"] == f"Final{kind}":
-            out[r["Customer"]] = {"cases": max(_int(r["Cases"]), 0), "reason": str(r["Reason"]), "by": str(r["By"])}
+            out[r["Customer"]] = {"cases": max(_int(r["Cases"]), 0), "reason": str(r["Reason"]), "by": str(r["By"]),
+                                  "name": r["Customer"]}
         elif r["Action"] == ("FinalReset" if kind == "Sent" else f"Final{kind}Reset"):
             out.pop(r["Customer"], None)
     return out
@@ -4058,10 +4102,11 @@ def current_final(day, kind="Sent"):
 def current_holds(day):
     """{customer: {"action","cases","reason","by"}} for a day. The last Tomorrow / Cancel / Restore of each customer wins."""
     df = rows_for_day(read_raw(HOLD_FILE, HOLD_COLS), day)
-    out = {}
+    out = CustomerDict()
     for r in df.to_dict("records"):
         if r["Action"] in ("Tomorrow", "Cancel"):
-            out[r["Customer"]] = {"action": r["Action"], "cases": _int(r["Cases"]), "reason": str(r["Reason"]), "by": str(r["By"])}
+            out[r["Customer"]] = {"action": r["Action"], "cases": _int(r["Cases"]), "reason": str(r["Reason"]), "by": str(r["By"]),
+                                  "name": r["Customer"]}
         elif r["Action"] == "Restore":
             out.pop(r["Customer"], None)
     return out
@@ -6594,6 +6639,9 @@ ROLE = require_login()                     # nothing below runs until the person
 _flash = st.session_state.pop("flash", None)
 if _flash:
     st.toast(_flash, icon="✅")
+_save_warning = st.session_state.pop("save_warning", None)
+if _save_warning:
+    st.warning(_save_warning)
 _assignment_warning = st.session_state.pop("assignment_warning", None)
 if _assignment_warning:
     st.warning(_assignment_warning)
