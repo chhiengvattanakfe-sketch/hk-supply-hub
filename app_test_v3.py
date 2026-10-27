@@ -8295,8 +8295,8 @@ def _visit_zone_picker(zone_map, key, due=None):
     return zone
 
 
-def _visit_map_link(customer, registry, store=None):
-    pin = _visit_pin(customer, registry, store)
+def _visit_map_link(customer, registry, store=None, auto=None):
+    pin = _visit_pin(customer, registry, store, auto if auto is not None else {})
     if pin:
         return f"https://www.google.com/maps/dir/?api=1&destination={pin[0]},{pin[1]}&travelmode=driving", True
     return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(f"{customer} Phnom Penh"), False
@@ -8479,19 +8479,84 @@ def _visit_pin_store():
     return out
 
 
-def _visit_pin_info(customer, registry=None, store=None):
+def _visit_match_key(s):
+    """Name key that ignores spacing, punctuation, zero-width marks and the ្ដ / ្ត spelling difference."""
+    t = unicodedata.normalize("NFC", str(s)).lower()
+    t = re.sub(r"[​‌‍﻿]", "", t).replace("្ដ", "្ត")
+    return re.sub(r"[\s.,()\-_/'\"]+", "", t)
+
+
+def _visit_registry_pins(registry):
+    """Every usable Customer Map pin: list of (location id, map name, lat, lon, province)."""
+    out = []
+    for rec in registry.get("records", {}).values():
+        a = map_record_analysis(rec)
+        if a.get("Map status") == "Ready pin":
+            out.append((rec["id"], rec["customer"], float(a["Latitude"]), float(a["Longitude"]), rec.get("province", "")))
+    return out
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _visit_pin_candidates(name_items, pin_items):
+    """{key: [(score, location id, map name, lat, lon), ...best 3]} and {key: candidate} for the safe automatic links.
+    Safe = same name after cleaning, or ≥ 90% alike and clearly better than the next pin."""
+    import difflib
+    pins = [(pid, pname, lat, lon, _visit_match_key(pname)) for pid, pname, lat, lon, _p in pin_items]
+    cands, auto, claimed = {}, {}, Counter()
+    for k, name in name_items:
+        nk = _visit_match_key(name)
+        if len(nk) < 3:
+            continue
+        scored = []
+        for pid, pname, lat, lon, pk in pins:
+            sm = difflib.SequenceMatcher(None, nk, pk)
+            if sm.real_quick_ratio() < 0.5 or sm.quick_ratio() < 0.5:
+                continue
+            r = sm.ratio()
+            if len(pk) >= 4 and (nk.startswith(pk) or pk.startswith(nk)):
+                r = max(r, 0.86)                      # "LY MEY" vs "LY MEY បឹងស្នោរ"
+            if pk == nk:
+                r = 1.0
+            if r >= 0.6:
+                scored.append((round(r, 3), pid, pname, lat, lon))
+        scored.sort(reverse=True)
+        if scored:
+            cands[k] = scored[:3]
+            best = scored[0][0]
+            second = scored[1][0] if len(scored) > 1 else 0
+            if best == 1.0 or (best >= 0.9 and best - second >= 0.08):
+                auto[k] = scored[0]
+                claimed[scored[0][1]] += 1
+    auto = {k: c for k, c in auto.items() if claimed[c[1]] == 1}      # one pin can't belong to two shops
+    return cands, auto
+
+
+def _visit_candidates_for(names, registry):
+    pins = tuple(_visit_registry_pins(registry))
+    return _visit_pin_candidates(tuple(sorted(names.items())), pins)
+
+
+def _visit_pin_info(customer, registry=None, store=None, auto=None):
     """(lat, lon, where it came from) or None. A pin saved at the shop by staff is newer than the Customer Map, so it wins."""
     store = _visit_pin_store() if store is None else store
     k = norm_name(customer)
     if k in store:
         p = store[k]
-        where = "saved at the shop" if str(p["source"]).startswith("GPS") else "saved from a Google Maps link"
+        src = str(p["source"])
+        where = ("saved at the shop" if src.startswith("GPS") else
+                 "from 📍 Customer Map, confirmed" if src.startswith("Customer Map") else "saved from a Google Maps link")
         return p["lat"], p["lon"], f"{where} by {p['by']} on {str(p['date'])[:10]}" + (" (pin moved)" if "moved" in str(p["source"]) else "")
     try:
-        m = customer_map_match(customer, registry if registry is not None else load_map_registry())
+        registry = registry if registry is not None else load_map_registry()
+        m = customer_map_match(customer, registry)
         lat, lon = m.get("Latitude"), m.get("Longitude")
         if lat is not None and lon is not None and math.isfinite(float(lat)) and math.isfinite(float(lon)):
             return float(lat), float(lon), "from 📍 Customer Map"
+        if auto is None:
+            auto = _visit_candidates_for({k: customer}, registry)[1]
+        if k in auto:
+            c = auto[k]
+            return c[3], c[4], f"from 📍 Customer Map (spelled “{c[2]}” there)"
     except Exception:
         pass
     return None
@@ -8506,9 +8571,9 @@ def _visit_pin_save(customer, lat, lon, acc, source, note="-"):
     audit("shop pin saved", f"{customer} | {lat:.5f},{lon:.5f} | {source}")
 
 
-def _visit_pin(customer, registry=None, store=None):
+def _visit_pin(customer, registry=None, store=None, auto=None):
     """(lat, lon) of the shop, or None."""
-    info = _visit_pin_info(customer, registry, store)
+    info = _visit_pin_info(customer, registry, store, auto)
     return (info[0], info[1]) if info else None
 
 
@@ -8781,7 +8846,11 @@ def _visit_new_form(visits, stats, names):
         registry = load_map_registry()
     except Exception:
         pass
-    pin_info = _visit_pin_info(customer, registry)
+    try:
+        cands, auto = _visit_candidates_for(names, registry or {"records": {}, "bindings": {}})
+    except Exception:
+        cands, auto = {}, {}
+    pin_info = _visit_pin_info(customer, registry, None, auto)
     pin = (pin_info[0], pin_info[1]) if pin_info else None
 
     # ---- shop card
@@ -8808,6 +8877,22 @@ def _visit_new_form(visits, stats, names):
     if not pin:
         st.markdown("**2️⃣ Save this shop's location first**")
         st.error("📍 This shop has no map location yet. You must save it before you can start the visit.")
+        options = cands.get(key, [])
+        if options:
+            st.markdown("**Is the shop one of these pins from 📍 Customer Map?** (the name there is spelled differently)")
+            for i, (score, pid, pname, lat, lon) in enumerate(options):
+                with st.container(border=True):
+                    o1, o2, o3 = st.columns([3, 1, 1])
+                    o1.markdown(f"**{pname}**  \n<span style='color:#6B7280'>{score * 100:.0f}% same name</span>", unsafe_allow_html=True)
+                    o2.link_button("🗺️ Look", f"https://www.google.com/maps?q={lat},{lon}", use_container_width=True)
+                    if o3.button("✅ This one", key=f"visit_cand_{i}", use_container_width=True):
+                        try:
+                            _visit_pin_save(customer, lat, lon, None, "Customer Map pin (confirmed)", f"map name: {pname}"[:150])
+                            st.session_state["flash"] = "📍 Map pin linked to this shop"
+                            st.rerun()
+                        except Exception as e:
+                            st.error("Could not save: " + str(e)[:150])
+            st.markdown("**None of them? Save the real location:**")
         _visit_checkin_button(customer, "pin", "📍 I am at the shop — save my GPS as the shop location", "#2E7D4F")
         st.caption(f"Stand at the shop door. The phone GPS must be within ±{VISIT_PIN_MAX_ACC} m. This also checks you in.")
         with st.expander("…or paste the shop's Google Maps link"):
@@ -9288,6 +9373,46 @@ def _visit_scorecard_body(visits, daily, names):
     _si_show(trend.sort_values("Month", ascending=False))
 
 
+def _visit_match_admin(names, have, cands):
+    """Shops without a location + the Customer Map pins whose name looks alike. Admin ticks the right one."""
+    rows = []
+    for k, n in sorted(names.items(), key=lambda x: str(x[1]).upper()):
+        if k in have:
+            continue
+        for score, pid, pname, lat, lon in cands.get(k, []):
+            rows.append({"Use": False, "Shop (Master List)": n, "Pin name in Customer Map": pname,
+                         "Same name %": round(score * 100), "Check": f"https://www.google.com/maps?q={lat},{lon}",
+                         "_lat": lat, "_lon": lon})
+    with st.expander(f"🔗 Match Customer Map pins to shops ({len({r['Shop (Master List)'] for r in rows})} shops have a likely pin)",
+                     expanded=bool(rows)):
+        if not rows:
+            st.caption("No more likely matches. Shops left without a location must be saved at the shop.")
+            return
+        st.caption("These pins are in 📍 Customer Map but their name is spelled differently from the Master List. "
+                   "Tick **Use** on the correct pin (one per shop) and press Save. Open **Check** if you are not sure.")
+        frame = pd.DataFrame(rows)
+        edited = st.data_editor(frame.drop(columns=["_lat", "_lon"]), hide_index=True, use_container_width=True, key="vmatch_editor",
+                                disabled=["Shop (Master List)", "Pin name in Customer Map", "Same name %", "Check"],
+                                column_config={"Use": st.column_config.CheckboxColumn("Use"),
+                                               "Check": st.column_config.LinkColumn("Check", display_text="open map")},
+                                height=min(520, 60 + 35 * len(frame)))
+        picked = frame[edited["Use"].fillna(False).astype(bool).values]
+        dup = picked["Shop (Master List)"].duplicated(keep=False)
+        if dup.any():
+            st.error("Tick only one pin per shop: " + ", ".join(sorted(set(picked.loc[dup, "Shop (Master List)"]))))
+        elif st.button(f"💾 Save {len(picked)} match(es)", type="primary", disabled=picked.empty, key="vmatch_save"):
+            try:
+                rows_out = [{"Date": now_str(), "Customer": r["Shop (Master List)"], "Lat": f"{r['_lat']:.6f}", "Lon": f"{r['_lon']:.6f}",
+                             "Accuracy m": "-", "Source": "Customer Map pin (confirmed)", "By": current_user() or "-",
+                             "Status": "Active", "Note": f"map name: {r['Pin name in Customer Map']}"[:150]} for _, r in picked.iterrows()]
+                append_rows(VISIT_PIN_FILE, rows_out)
+                audit("shop pins matched", f"{len(rows_out)} shops")
+                st.session_state["flash"] = f"Linked {len(rows_out)} shop(s) to their map pin"
+                st.rerun()
+            except Exception as e:
+                st.error("Could not save: " + str(e)[:150])
+
+
 def _visit_pins_admin(names):
     st.markdown("#### 📍 Shop locations")
     try:
@@ -9295,11 +9420,14 @@ def _visit_pins_admin(names):
     except Exception:
         registry = {"records": {}, "bindings": {}}
     store = _visit_pin_store()
-    have = {k for k, n in names.items() if _visit_pin(n, registry, store)}
-    p1, p2, p3 = st.columns(3)
+    cands, auto = _visit_candidates_for(names, registry)
+    have = {k for k, n in names.items() if _visit_pin(n, registry, store, auto)}
+    p1, p2, p3, p4 = st.columns(4)
     p1.metric("Phnom Penh shops with a location", f"{len(have)} / {len(names)}")
-    p2.metric("Saved by staff at the shop", f"{sum(1 for k in names if k in store):,}")
-    p3.metric("Still missing", f"{len(names) - len(have):,}")
+    p2.metric("Linked automatically (spelling)", f"{sum(1 for k in auto if k in have and k not in store):,}")
+    p3.metric("Saved / confirmed by staff", f"{sum(1 for k in names if k in store):,}")
+    p4.metric("Still missing", f"{len(names) - len(have):,}")
+    _visit_match_admin(names, have, cands)
     st.caption("A visit cannot start without a location. Staff save it at the shop with GPS (or a Google Maps link); "
                "a location saved at the shop is used before the 📍 Customer Map pin. Remove a location here if it is wrong.")
     try:
@@ -9385,6 +9513,10 @@ def tab_shop_visits():
         except Exception:
             registry = {"records": {}, "bindings": {}}
         pin_store = _visit_pin_store()
+        try:
+            _c, auto_pins = _visit_candidates_for(names, registry)
+        except Exception:
+            auto_pins = {}
         done_today = set(visits.loc[visits["_dt"].dt.date == today_kh(), "Customer"].map(norm_name)) if not visits.empty else set()
         todo = route[~route["Customer"].map(norm_name).isin(done_today)]
         st.markdown(f"**⭐ Suggested {VISIT_DAILY_TARGET} for today** — the most important shops in this zone")
@@ -9393,7 +9525,7 @@ def tab_shop_visits():
         for n, (i, row) in enumerate(r.head(VISIT_DAILY_TARGET + 12).iterrows()):
             if n == VISIT_DAILY_TARGET and not q.strip():
                 st.markdown("**More shops in this zone**")
-            link, exact = _visit_map_link(row["Customer"], registry, pin_store)
+            link, exact = _visit_map_link(row["Customer"], registry, pin_store, auto_pins)
             with st.container(border=True):
                 c1, c2, c3 = st.columns([4, 1, 1])
                 c1.markdown(f"**{'⭐ ' if n < VISIT_DAILY_TARGET and not q.strip() else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
