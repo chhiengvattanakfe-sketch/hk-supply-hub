@@ -96,6 +96,7 @@ CALLS_FILE = os.path.join(DATA_DIR, "customer_call_history.csv")
 VISITS_FILE = os.path.join(DATA_DIR, "shop_visits.csv")             # staff visits to customer shops
 VISIT_ZONE_FILE = os.path.join(DATA_DIR, "visit_zones.csv")         # Phnom Penh zone per shop, set by Admin
 VISIT_PIN_FILE = os.path.join(DATA_DIR, "shop_pins.csv")            # shop locations saved at the shop by staff
+LEADS_FILE = os.path.join(DATA_DIR, "new_customers_leads.csv")      # NPHK Leads Report rows imported in Shop Visits
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache_" + _APP_SCOPE)       # outside Dropbox = faster
@@ -1586,7 +1587,7 @@ def daily_backup_once(day_str):
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE,
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
                  os.path.join(DATA_DIR, "visit_settings.json"))
         if USE_DROPBOX:
             try:
@@ -8552,6 +8553,9 @@ def _visit_pin_info(customer, registry=None, store=None, auto=None):
         lat, lon = m.get("Latitude"), m.get("Longitude")
         if lat is not None and lon is not None and math.isfinite(float(lat)) and math.isfinite(float(lon)):
             return float(lat), float(lon), "from 📍 Customer Map"
+        nv = (st.session_state.get("_visit_new", {}) or {}).get(k)
+        if nv and nv.get("lat") is not None:
+            return nv["lat"], nv["lon"], f"from the leads report map link (sold {nv['date']:%d %b})"
         if auto is None:
             auto = _visit_candidates_for({k: customer}, registry)[1]
         if k in auto:
@@ -8725,6 +8729,14 @@ def _visit_customer_stats():
     names = {k: n for k, n in names.items()
              if areas.get(k) == VISIT_AREA and str(n).strip().upper() not in SI_IGNORE_NAMES}
     areas = {k: a for k, a in areas.items() if k in names}
+    try:                                   # new customers from the leads report (even before they are in the Master List)
+        new = {k: v for k, v in _lead_active(_lead_read(), _lead_master_index(snap)).items() if v["pp"]}
+    except Exception:
+        new = {}
+    st.session_state["_visit_new"] = new
+    for k, v in new.items():
+        if k not in names:
+            names[k], areas[k] = v["name"], VISIT_AREA
     if daily.empty:
         st.session_state["_visit_daily"] = pd.DataFrame()
         return pd.DataFrame(), names, areas
@@ -8764,6 +8776,7 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
     keys = set(names)
     if zone:
         keys = {k for k in keys if (zone_map or {}).get(k) == zone}
+    new = st.session_state.get("_visit_new", {}) or {}
     rows = []
     for k in keys:
         s = stats.loc[k] if (not stats.empty and k in stats.index) else None
@@ -8774,9 +8787,15 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
         days_v = (today - pd.Timestamp(lv).normalize()).days if lv is not None and pd.notna(lv) else None
         if open_prob.get(k):
             score += 6; why.append(f"🔴 {open_prob[k]} open problem")
+        nv = new.get(k)
+        first_visit = bool(nv) and not (lv is not None and pd.notna(lv) and pd.Timestamp(lv) >= nv["date"])
+        if first_visit:
+            age = (today - nv["date"]).days
+            score += 8 + (3 if age > LEAD_FIRST_VISIT_DAYS else 0) + min(age // 7, 3)
+            why.append(f"🆕 new customer, sold {nv['date']:%d %b} — first visit" + (f" ({age} d, late)" if age > LEAD_FIRST_VISIT_DAYS else ""))
         if every is None:
-            due_in = None
-            if not open_prob.get(k):
+            due_in = 0 if first_visit else None
+            if not open_prob.get(k) and not first_visit:
                 continue                                   # no orders and no problem: not on the visit plan
         elif days_v is None:
             due_in = 0
@@ -8936,6 +8955,12 @@ def _visit_new_form(visits, stats, names):
 
     # ---- 3. the visit form
     shop_type = _visit_type_map({key: customer}).get(key, VISIT_TYPE_OTHER)
+    nv = (st.session_state.get("_visit_new", {}) or {}).get(key)
+    is_first_visit = bool(nv) and not (len(past) and past.iloc[0]["_dt"] >= nv["date"])
+    if is_first_visit:
+        st.info(f"🆕 **First visit after the sale on {nv['date']:%d %b}.** Check the fridge is installed, stickers are up "
+                "and the owner knows how to sell and heat the buns." + ("" if nv["in_master"] else
+                " ⚠️ This shop is not in the Master List yet — ask Admin to add it."))
     cfg = _visit_settings()
     size, _every = _visit_size(float(s["Pcs 28d"]) if s is not None else 0, cfg)
     st.caption(f"Shop type: **{shop_type}** · size: **{size}**" + (" — Admin can change the type in ⚙️ Shops & zones." if current_role() == "admin" else ""))
@@ -8958,7 +8983,9 @@ def _visit_new_form(visits, stats, names):
         changed = b3.number_input("Stickers changed today", 0, 100, 0, 1)
         fridge_fixed = st.checkbox("🧽 I cleaned / arranged the fridge or display today", key="visit_fridge_fixed")
         st.caption(f"Tick what is OK at this {shop_type.split(' ', 1)[1].lower()}:")
-        type_checks = VISIT_TYPE_CHECKS.get(shop_type, VISIT_TYPE_CHECKS[VISIT_TYPE_OTHER])
+        type_checks = list(VISIT_TYPE_CHECKS.get(shop_type, VISIT_TYPE_CHECKS[VISIT_TYPE_OTHER]))
+        if is_first_visit:
+            type_checks = LEAD_FIRST_VISIT_CHECKS + type_checks
         tc_cols = st.columns(2)
         check_ok = {c: tc_cols[i % 2].checkbox(c, key=f"visit_chk_{i}") for i, c in enumerate(type_checks)}
         st.markdown("**5️⃣ Sales**")
@@ -9048,7 +9075,7 @@ def _visit_new_form(visits, stats, names):
         return
     audit("shop visit", f"{customer} | {label} | {row['Problems']}")
     for k in ["visit_gps", "visit_customer", "visit_customer_box", "visit_cam", "visit_files", "visit_before", "visit_after",
-              "visit_fridge_fixed"] + [f"visit_chk_{i}" for i in range(10)]:
+              "visit_fridge_fixed"] + [f"visit_chk_{i}" for i in range(14)]:
         st.session_state.pop(k, None)
     st.session_state["flash"] = f"Visit saved: {customer}"
     st.rerun()
@@ -9469,6 +9496,284 @@ def _visit_pins_admin(names):
             st.write(", ".join(missing))
 
 
+# ---------- 🆕 new customers from the NPHK Leads Report ----------
+LEAD_COLS = ["Date", "Customer", "Phone", "Channel", "Sales rep", "Province", "Package", "Qty", "Lead status",
+             "Map link", "Lat", "Lon", "Map note", "Notes", "Master name", "Imported at", "Imported by"]
+LEAD_FIRST_VISIT_DAYS = 7          # a new shop should get its first visit within this many days of the sale
+LEAD_NEW_DAYS = 45                 # a sale this recent still counts as "new customer"
+LEAD_HEADER_MAP = {"DATE": "Date", "CUSTOMER NAME": "Customer", "PHONE NUMBER": "Phone", "CHANNEL": "Channel",
+                   "ASSIGNED SALES REP": "Sales rep", "LOCATION / PROVINCE": "Province", "PRODUCT PACKAGE / MODEL": "Package",
+                   "QUANTITY (QTY)": "Qty", "INQUIRY STATUS": "Lead status", "GOOGLE MAPS URL": "Map link",
+                   "NOTES / REMARKS": "Notes"}
+LEAD_FIRST_VISIT_CHECKS = ["Fridge installed & plugged in", "Stickers / poster put up",
+                           "Owner knows prices & how to heat buns", "Owner has our phone / Telegram"]
+
+
+def _lead_is_pp(province):
+    p = unicodedata.normalize("NFC", str(province or "")).replace(" ", "")
+    return p in ("ភ្នំពេញ", "PhnomPenh", "PHNOMPENH")
+
+
+def _lead_is_sale(status):
+    s = str(status or "").upper()
+    return "CLOSED" in s or "CONFIRM" in s or "ទិញ" in s
+
+
+def _lead_parse_report(data):
+    """NPHK Leads Report .xlsx -> DataFrame with LEAD_COLS fields (header row found by 'CUSTOMER NAME')."""
+    raw = pd.read_excel(io.BytesIO(data), header=None, dtype=object)
+    hdr = None
+    for i in range(min(15, len(raw))):
+        cells = [str(v).strip().upper() for v in raw.iloc[i].tolist()]
+        if "CUSTOMER NAME" in cells:
+            hdr = i
+            break
+    if hdr is None:
+        raise ValueError("this is not a Leads Report: no 'CUSTOMER NAME' column found")
+    cols = [str(v).strip().upper() for v in raw.iloc[hdr].tolist()]
+    df = raw.iloc[hdr + 1:].copy()
+    df.columns = cols
+    out = pd.DataFrame({new: df[old] if old in df else "" for old, new in LEAD_HEADER_MAP.items()})
+    out = out[out["Customer"].notna() & out["Customer"].astype(str).str.strip().ne("")]
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out["Qty"] = pd.to_numeric(out["Qty"], errors="coerce").fillna(0).astype(int).astype(str)
+    for c in out.columns:
+        out[c] = out[c].map(lambda v: "-" if v is None or (isinstance(v, float) and math.isnan(v)) or str(v).strip() in ("", "nan", "NaT") else re.sub(r"\s+", " ", str(v)).strip())
+    return out.reset_index(drop=True)
+
+
+def _lead_read():
+    try:
+        return read_raw(LEADS_FILE, LEAD_COLS)
+    except Exception as e:
+        st.warning("New customer list could not be read: " + str(e)[:150])
+        return pd.DataFrame(columns=LEAD_COLS + ["_dt"])
+
+
+def _lead_master_index(snap):
+    """{match key: (Master List name, area)} for every customer in the Master List."""
+    areas = (snap or {}).get("areas", {}) or {}
+    return {_visit_match_key(n): (n, areas.get(n, "Unknown")) for n in (snap or {}).get("customers", [])}
+
+
+def _lead_best_master(name, mindex):
+    import difflib
+    k = _visit_match_key(name)
+    if k in mindex:
+        return mindex[k][0], 1.0
+    best, score = None, 0.0
+    for mk, (mn, _a) in mindex.items():
+        sm = difflib.SequenceMatcher(None, k, mk)
+        if sm.real_quick_ratio() < 0.6 or sm.quick_ratio() < 0.6:
+            continue
+        r = sm.ratio()
+        if len(k) >= 4 and (mk.startswith(k) or k.startswith(mk)):
+            r = max(r, 0.86)
+        if r > score:
+            best, score = mn, r
+    return best, score
+
+
+def _lead_map_coords(url, allow_network=True):
+    """(lat, lon, note) from a Google Maps link; short links are opened when allowed."""
+    if not url or url == "-":
+        return None, None, "no map link"
+    try:
+        a = analyse_map_link(url)
+        if a.get("Map status") != "Ready pin" and allow_network and trusted_map_url(url):
+            a = analyse_map_link(resolve_map_link(url))
+        if a.get("Map status") == "Ready pin":
+            lat, lon = float(a["Latitude"]), float(a["Longitude"])
+            if 10 <= lat <= 15 and 102 <= lon <= 108:
+                return lat, lon, "ok"
+            return None, None, "outside Cambodia"
+        return None, None, a.get("Map status", "no pin")
+    except Exception as e:
+        return None, None, "link could not be opened: " + str(e)[:60]
+
+
+def _lead_active(leads, mindex=None):
+    """New customers that count for visits: confirmed sales in the last LEAD_NEW_DAYS days.
+    -> {norm key of the name used in the visit list: dict(name, date, pp, lat, lon)}"""
+    out = {}
+    if leads is None or leads.empty:
+        return out
+    cut = pd.Timestamp(today_kh()) - pd.Timedelta(days=LEAD_NEW_DAYS)
+    for _, r in leads.iterrows():
+        d = pd.to_datetime(r["Date"], errors="coerce")
+        if pd.isna(d) or d < cut or not _lead_is_sale(r["Lead status"]):
+            continue
+        name = r["Master name"] if r["Master name"] not in ("-", "") else r["Customer"]
+        area = (mindex or {}).get(_visit_match_key(name), (None, None))[1]
+        pp = (area == PP) if area in (PP, "Province") else _lead_is_pp(r["Province"])
+        try:
+            lat, lon = float(r["Lat"]), float(r["Lon"])
+        except Exception:
+            lat = lon = None
+        k = norm_name(name)
+        if k not in out or d > out[k]["date"]:
+            out[k] = {"name": name, "date": d, "pp": pp, "lat": lat, "lon": lon, "lead": r["Customer"],
+                      "in_master": r["Master name"] not in ("-", "")}
+    return out
+
+
+def _lead_checks(leads, mindex):
+    """Problems a person should fix in the Master List or the leads report."""
+    rows = []
+    if leads.empty:
+        return pd.DataFrame(columns=["Problem", "Customer", "Date", "Detail"])
+    seen = {}
+    for _, r in leads.iterrows():
+        name, master = r["Customer"], r["Master name"]
+        if master in ("-", ""):
+            best, sc = _lead_best_master(name, mindex)
+            rows.append({"Problem": "❗ Not in Master List", "Customer": name, "Date": r["Date"],
+                         "Detail": f"closest: {best} ({sc * 100:.0f}%)" if best and sc >= 0.6 else "add this shop to the Master List"})
+        else:
+            area = mindex.get(_visit_match_key(master), (None, None))[1]
+            lp = r["Province"]
+            if lp not in ("-", "") and area in (PP, "Province") and (_lead_is_pp(lp) != (area == PP)):
+                rows.append({"Problem": "⚠️ Province differs", "Customer": name, "Date": r["Date"],
+                             "Detail": f"leads report: {lp} · Master List: {area}"})
+            if _visit_match_key(master) != _visit_match_key(name):
+                rows.append({"Problem": "ℹ️ Spelled differently", "Customer": name, "Date": r["Date"],
+                             "Detail": f"Master List: {master}"})
+        if r["Province"] in ("-", ""):
+            rows.append({"Problem": "⚠️ No province", "Customer": name, "Date": r["Date"], "Detail": "fill LOCATION / PROVINCE"})
+        if r["Map link"] in ("-", ""):
+            rows.append({"Problem": "⚠️ No map link", "Customer": name, "Date": r["Date"], "Detail": "add the shop's Google Maps link"})
+        elif r["Lat"] in ("-", ""):
+            rows.append({"Problem": "⚠️ Map link has no pin", "Customer": name, "Date": r["Date"], "Detail": r["Map note"]})
+        k = _visit_match_key(r["Master name"] if r["Master name"] not in ("-", "") else name)
+        if k in seen:
+            rows.append({"Problem": "⚠️ Listed twice", "Customer": name, "Date": r["Date"], "Detail": f"also on {seen[k]}"})
+        seen[k] = r["Date"]
+    import difflib
+    keys = [(_visit_match_key(n), n) for n in leads["Customer"].unique()]
+    for i, (a, an) in enumerate(keys):
+        for b, bn in keys[i + 1:]:
+            if a != b and difflib.SequenceMatcher(None, a, b).ratio() >= 0.9:
+                rows.append({"Problem": "⚠️ Maybe the same shop", "Customer": an, "Date": "", "Detail": f"and “{bn}”"})
+    return pd.DataFrame(rows)
+
+
+def _lead_import_body(snap, visits):
+    st.markdown("#### 🆕 New customers (from the NPHK Leads Report)")
+    leads = _lead_read()
+    mindex = _lead_master_index(snap)
+    if has_permission("edit"):
+        up = st.file_uploader("Upload the Leads Report (.xlsx)", type=["xlsx"], key="lead_upload",
+                              help="The daily report from Sales & Marketing. Rows already imported are updated, not doubled.")
+        if up is not None:
+            try:
+                new = _lead_parse_report(up.getvalue())
+            except Exception as e:
+                st.error("Could not read the file: " + str(e)[:160])
+                new = None
+            if new is not None:
+                sales = new[new["Lead status"].map(_lead_is_sale)]
+                st.caption(f"{len(new)} rows in the file · {len(sales)} confirmed sales.")
+                if st.button(f"⬆️ Import {len(new)} rows", type="primary", key="lead_import_btn"):
+                    with st.spinner("Matching names and opening map links…"):
+                        old = {(_visit_match_key(c), d): r for (c, d), r in
+                               zip(zip(leads["Customer"], leads["Date"]), leads.to_dict("records"))} if not leads.empty else {}
+                        rows = []
+                        for _, r in new.iterrows():
+                            prev = old.get((_visit_match_key(r["Customer"]), r["Date"]))
+                            master, sc = _lead_best_master(r["Customer"], mindex)
+                            master = master if sc >= 0.999 else (prev["Master name"] if prev else "-")
+                            if prev and prev["Map link"] == r["Map link"] and prev["Lat"] not in ("-", ""):
+                                lat, lon, note = prev["Lat"], prev["Lon"], prev["Map note"]
+                            else:
+                                la, lo, note = _lead_map_coords(r["Map link"])
+                                lat, lon = (f"{la:.6f}", f"{lo:.6f}") if la is not None else ("-", "-")
+                            rows.append({**r.to_dict(), "Lat": lat, "Lon": lon, "Map note": note, "Master name": master or "-",
+                                         "Imported at": now_str(), "Imported by": current_user() or "-"})
+                        keys_new = {(_visit_match_key(r["Customer"]), r["Date"]) for r in rows}
+
+                        def _merge(df, rows=rows, keys_new=keys_new):
+                            df = df.drop(columns=[c for c in ("_dt",) if c in df])
+                            keep = df[[(_visit_match_key(c), d) not in keys_new for c, d in zip(df["Customer"], df["Date"])]]
+                            return pd.concat([keep, pd.DataFrame(rows)], ignore_index=True)
+                        try:
+                            modify_csv(LEADS_FILE, LEAD_COLS, _merge)
+                            audit("leads imported", f"{len(rows)} rows from {up.name}")
+                            st.session_state["flash"] = f"Imported {len(rows)} new-customer rows"
+                            st.session_state.pop("lead_upload", None)
+                            st.rerun()
+                        except Exception as e:
+                            st.error("Could not save: " + str(e)[:160])
+    if leads.empty:
+        st.info("No leads imported yet. Upload the NPHK Leads Report above.")
+        return
+    active = _lead_active(leads, mindex)
+    visited = {}
+    if not visits.empty:
+        vv = visits.assign(Key=visits["Customer"].map(norm_name))
+        visited = vv.groupby("Key")["_dt"].max().to_dict()
+    pp = {k: v for k, v in active.items() if v["pp"]}
+    waiting = {k: v for k, v in pp.items() if not (k in visited and visited[k] >= v["date"])}
+    late = {k: v for k, v in waiting.items() if (pd.Timestamp(today_kh()) - v["date"]).days > LEAD_FIRST_VISIT_DAYS}
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("New customers (last 45 days)", f"{len(active):,}", f"{len(pp)} in Phnom Penh", delta_color="off")
+    k2.metric("Phnom Penh: first visit done", f"{len(pp) - len(waiting)} / {len(pp)}")
+    k3.metric(f"First visit late (> {LEAD_FIRST_VISIT_DAYS} days)", f"{len(late):,}")
+    k4.metric("Not in Master List", f"{int(leads['Master name'].isin(['-', '']).sum()):,}")
+
+    # ---- link names to the Master List
+    unl = leads[leads["Master name"].isin(["-", ""])].copy()
+    if not unl.empty and has_permission("edit"):
+        with st.expander(f"🔗 Link {len(unl)} leads to their Master List name", expanded=True):
+            st.caption("Choose the same shop's name in the Master List. Leave empty if the shop is not in the Master List yet "
+                       "(add it there first). Linked shops get their sales history, zone and map location.")
+            options = [""] + sorted(n for n, _a in mindex.values())
+            unl["Master List name"] = [(lambda b: b[0] if b[0] and b[1] >= 0.86 else "")(_lead_best_master(n, mindex)) for n in unl["Customer"]]
+            view = unl[["Date", "Customer", "Province", "Master List name"]].reset_index()
+            ed = st.data_editor(view, hide_index=True, use_container_width=True, key="lead_link_editor",
+                                disabled=["index", "Date", "Customer", "Province"],
+                                column_config={"index": None, "Master List name": st.column_config.SelectboxColumn(
+                                    "Master List name", options=options, help="Suggested when the names are very close — check it")},
+                                height=min(480, 60 + 35 * len(view)))
+            chosen = ed[ed["Master List name"].fillna("").ne("")]
+            if st.button(f"💾 Save {len(chosen)} link(s)", type="primary", disabled=chosen.empty, key="lead_link_save"):
+                pairs = {(r["Customer"], r["Date"]): r["Master List name"] for _, r in chosen.iterrows()}
+
+                def _link(df, pairs=pairs):
+                    for (c, d), m in pairs.items():
+                        df.loc[df["Customer"].eq(c) & df["Date"].eq(d), "Master name"] = m
+                    return df
+                try:
+                    modify_csv(LEADS_FILE, LEAD_COLS, _link)
+                    audit("leads linked", f"{len(pairs)}")
+                    st.session_state["flash"] = f"Linked {len(pairs)} lead(s)"
+                    st.rerun()
+                except Exception as e:
+                    st.error("Could not save: " + str(e)[:150])
+
+    st.markdown("**🗓️ First visit for new Phnom Penh shops**")
+    if pp:
+        rows = []
+        for k, v in sorted(pp.items(), key=lambda x: x[1]["date"]):
+            days = (pd.Timestamp(today_kh()) - v["date"]).days
+            done = k in visited and visited[k] >= v["date"]
+            rows.append({"Sold on": f"{v['date']:%d %b}", "Shop": v["name"], "Days since sale": days,
+                         "First visit": f"✅ {visited[k]:%d %b}" if done else ("🔴 late" if days > LEAD_FIRST_VISIT_DAYS else "⏳ to do"),
+                         "Map": "📍 yes" if v["lat"] is not None else "⚠️ no pin",
+                         "In Master List": "yes" if v["in_master"] else "❗ no"})
+        _si_show(pd.DataFrame(rows))
+    else:
+        st.caption("No new Phnom Penh customers in the last 45 days.")
+    st.markdown("**🧹 Things to fix in the Master List / leads report**")
+    chk = _lead_checks(leads, mindex)
+    if chk.empty:
+        st.success("Everything matches. 🎉")
+    else:
+        st.caption(" · ".join(f"{p}: {n}" for p, n in chk["Problem"].value_counts().items()))
+        _si_show(chk, height=min(460, 60 + 35 * len(chk)))
+    with st.expander("All imported leads"):
+        _si_show(leads.drop(columns=["_dt"], errors="ignore"))
+
+
 @st.fragment(run_every=30)
 def _visit_report_live():
     st.caption(f"Live · updated {now_kh():%H:%M:%S}")
@@ -9477,7 +9782,7 @@ def _visit_report_live():
 
 def tab_shop_visits():
     st.markdown("### 🏪 Shop Visits")
-    views = ["📋 Today's plan", "📝 New visit"]
+    views = ["📋 Today's plan", "📝 New visit", "🆕 New customers"]
     if has_permission("reports"):
         views += ["📊 Visit report", "🔴 Open problems", "📈 Did it help?", "🏅 Scorecard"]
     if current_role() == "admin":
@@ -9548,6 +9853,10 @@ def tab_shop_visits():
         _visit_pins_admin(names)
         st.divider()
         _visit_zones_admin(names, visits)
+    elif view == "🆕 New customers":
+        snap, _src, _path, _err = current_snapshot()
+        _visit_customer_stats()
+        _lead_import_body(snap or {}, visits)
     elif view == "📈 Did it help?":
         _s, names, _a = _visit_customer_stats()
         _visit_effect_body(visits, st.session_state.get("_visit_daily", pd.DataFrame()))
