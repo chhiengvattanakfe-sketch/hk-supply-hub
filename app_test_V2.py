@@ -1047,45 +1047,49 @@ def change_password(user, current, new, new2):
 # ===== LANDING PAGE (paste ABOVE def render_login) =====
 import streamlit.components.v1 as components
 
-LANDING_HEIGHT = 600          # one-screen poster cover; raise it if the cover is cut off
+LANDING_HEIGHT = 520          # one-screen poster cover; raise it if the cover is cut off
 
 LANDING_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&family=Noto+Sans+Khmer:wght@400;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Noto+Sans+Khmer:wght@400;700&display=swap">
 <style>
 *{box-sizing:border-box}
-body{margin:0;background:transparent;color:#1B1B1B;font-family:'Bricolage Grotesque','Noto Sans Khmer',system-ui,sans-serif;line-height:1.35}
-.wrap{max-width:1240px;margin:0 auto;padding:6px 8px 18px}
-header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:10px 0 18px}
-.brand{padding:9px 18px;border:3px solid #1B1B1B;border-radius:999px;background:#fff;font-weight:800;font-size:16px}
-.hint{min-height:44px;padding:0 22px;border-radius:999px;background:#1B1B1B;color:#fff;font-weight:800;display:inline-flex;align-items:center;white-space:nowrap}
-.sticker{display:inline-block;transform:rotate(-3deg);padding:8px 16px;border:3px solid #1B1B1B;border-radius:999px;background:#fff;font-weight:700;font-size:17px;margin-bottom:18px}
-h1{margin:0 0 16px;font-size:clamp(40px,8.4vw,104px);line-height:.96;letter-spacing:-.04em;font-weight:800}
-h1 span{display:inline-block;background:#fff;border:3px solid #1B1B1B;border-radius:18px;padding:0 16px}
-.lead{margin:0 0 22px;font-size:clamp(17px,1.9vw,22px);font-weight:600;max-width:620px}
-.chips{display:flex;flex-wrap:wrap;gap:12px}
-.chip{border:3px solid #1B1B1B;border-radius:999px;padding:8px 18px;font-weight:800;font-size:15px;box-shadow:4px 4px 0 #1B1B1B}
+:root{--ink:#1E2328;--muted:#6B7280;--line:#E6E0D6;--accent:#B3261E;--soft:#FBEAE8}
+body{margin:0;background:transparent;color:var(--ink);font-family:'Inter','Noto Sans Khmer',system-ui,sans-serif;line-height:1.4}
+.wrap{max-width:1180px;margin:0 auto;padding:8px 8px 20px}
+header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:8px 0 28px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px}
+.dot{width:30px;height:30px;border-radius:9px;background:var(--accent);color:#fff;display:grid;place-items:center;font-size:16px}
+.hint{padding:8px 16px;border-radius:999px;border:1px solid var(--line);background:#fff;color:var(--muted);font-weight:600;font-size:14px}
+.tag{display:inline-block;padding:5px 12px;border-radius:999px;background:var(--soft);color:var(--accent);font-weight:700;font-size:13px;margin-bottom:16px}
+h1{margin:0 0 14px;font-size:clamp(34px,6.2vw,72px);line-height:1.02;letter-spacing:-.035em;font-weight:800}
+h1 span{color:var(--accent)}
+.lead{margin:0 0 26px;font-size:clamp(16px,1.7vw,19px);color:var(--muted);max-width:600px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px 16px;box-shadow:0 1px 2px rgba(30,35,40,.05),0 4px 14px rgba(30,35,40,.05)}
+.card b{display:block;font-size:15px;margin-top:6px}
+.card small{color:var(--muted);font-size:13px}
+.ic{font-size:20px}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <div class="brand">Supply Chain Hub</div>
+    <div class="brand"><span class="dot">包</span>នំប៉ាវហុងកុង Supply Chain Hub</div>
     <span class="hint">Log in below &darr;</span>
   </header>
-  <div class="sticker">នំប៉ាវហុងកុង team only</div>
+  <span class="tag">Team only</span>
   <h1>Pack it. Send it. <span>Track it.</span></h1>
-  <p class="lead">One hub for packing, delivery, orders and customer follow-ups. Everyone sees the same day.</p>
-  <div class="chips">
-    <span class="chip" style="background:#fff">Packing progress</span>
-    <span class="chip" style="background:#9ED0FF">Delivery log</span>
-    <span class="chip" style="background:#FFB3D1">Sale orders</span>
-    <span class="chip" style="background:#A8EBBB">Live dashboard</span>
-    <span class="chip" style="background:#D3C4FF">Customer map</span>
-    <span class="chip" style="background:#fff">Follow-ups</span>
+  <p class="lead">One place for packing, delivery, orders and customer follow-ups. Everyone sees the same day.</p>
+  <div class="grid">
+    <div class="card"><span class="ic">📦</span><b>Packing</b><small>Who packed what, live</small></div>
+    <div class="card"><span class="ic">🚚</span><b>Delivery</b><small>Sent cases &amp; expenses</small></div>
+    <div class="card"><span class="ic">📝</span><b>Sale orders</b><small>Typed once, synced</small></div>
+    <div class="card"><span class="ic">📊</span><b>Dashboard</b><small>Status of every customer</small></div>
+    <div class="card"><span class="ic">🎯</span><b>Sales insights</b><small>Habits, care, data check</small></div>
   </div>
 </div>
 </body>
@@ -2434,87 +2438,98 @@ footer {visibility: hidden;}
 
 POSTER_CSS = r"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&family=Noto+Sans+Khmer:wght@400;700&display=swap');
-:root {--ink:#1B1B1B; --sun:#FFD23F; --paper:#FFFFFF;}
-.stApp {background: var(--sun); color: var(--ink); color-scheme: light;
-    font-family: 'Bricolage Grotesque','Noto Sans Khmer',system-ui,sans-serif;}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+Khmer:wght@400;600;700&display=swap');
+:root {
+  --bg:#F7F4EE; --card:#FFFFFF; --ink:#1E2328; --muted:#6B7280; --line:#E6E0D6;
+  --accent:#B3261E; --accent-soft:#FBEAE8; --ok:#2E7D4F; --ok-soft:#E5F4EA; --shadow:0 1px 2px rgba(30,35,40,.06), 0 4px 14px rgba(30,35,40,.06);
+}
+.stApp {background: var(--bg); color: var(--ink); color-scheme: light;
+    font-family: 'Inter','Noto Sans Khmer',system-ui,-apple-system,sans-serif;}
 .stApp button, .stApp input, .stApp textarea {font-family: inherit;}
 header[data-testid="stHeader"] {background: transparent;}
-::selection {background: var(--ink); color: var(--sun);}
+::selection {background: var(--accent-soft); color: var(--ink);}
 
 /* text */
 .stApp p, .stApp label, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
-[data-testid="stCaptionContainer"], [data-testid="stWidgetLabel"] p, [data-testid="stMetricLabel"] p,
-[data-testid="stMetricValue"] {color: var(--ink) !important;}
-.stApp h1, .stApp h2, .stApp h3 {font-weight: 800; letter-spacing: -0.02em;}
-.stApp a {color: var(--ink); text-decoration: underline; text-decoration-thickness: 2px;}
+[data-testid="stWidgetLabel"] p, [data-testid="stMetricValue"] {color: var(--ink) !important;}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p, [data-testid="stMetricLabel"] p {color: var(--muted) !important;}
+.stApp h1 {font-weight: 700; letter-spacing: -0.02em;}
+.stApp h2, .stApp h3, .stApp h4 {font-weight: 650; letter-spacing: -0.01em;}
+.stApp a {color: var(--accent); text-decoration: none; font-weight: 600;}
+.stApp a:hover {text-decoration: underline;}
 
 /* buttons */
-.stButton > button, .stDownloadButton > button, div[data-testid="stFormSubmitButton"] > button {
-    background: var(--paper); color: var(--ink); border: 3px solid var(--ink); border-radius: 999px;
-    box-shadow: 4px 4px 0 var(--ink); font-weight: 800; transition: transform .08s, box-shadow .08s;}
-.stButton > button:hover, .stDownloadButton > button:hover, div[data-testid="stFormSubmitButton"] > button:hover {
-    transform: translate(-1px,-1px); box-shadow: 6px 6px 0 var(--ink); border-color: var(--ink); color: var(--ink);}
-.stButton > button:active, .stDownloadButton > button:active, div[data-testid="stFormSubmitButton"] > button:active {
-    transform: translate(3px,3px); box-shadow: 1px 1px 0 var(--ink);}
+.stButton > button, .stDownloadButton > button, div[data-testid="stFormSubmitButton"] > button, .stLinkButton > a {
+    background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 1px 2px rgba(30,35,40,.05); font-weight: 600; transition: background .15s, border-color .15s, box-shadow .15s;}
+.stButton > button:hover, .stDownloadButton > button:hover, div[data-testid="stFormSubmitButton"] > button:hover, .stLinkButton > a:hover {
+    border-color: var(--accent); color: var(--accent); background: var(--card); box-shadow: var(--shadow);}
+.stButton > button:active, .stDownloadButton > button:active {transform: translateY(1px);}
 .stApp button[kind="primary"], .stApp button[data-testid="stBaseButton-primary"],
-.stApp button[data-testid="stBaseButton-primaryFormSubmit"] {background: var(--ink); color: #FFFFFF;}
+.stApp button[data-testid="stBaseButton-primaryFormSubmit"] {background: var(--accent); border-color: var(--accent); color: #FFFFFF;}
+.stApp button[kind="primary"]:hover, .stApp button[data-testid="stBaseButton-primary"]:hover,
+.stApp button[data-testid="stBaseButton-primaryFormSubmit"]:hover {background: #951F18; border-color: #951F18; color:#FFFFFF;}
 .stApp button[kind="primary"] p, .stApp button[data-testid="stBaseButton-primary"] p,
 .stApp button[data-testid="stBaseButton-primaryFormSubmit"] p {color: #FFFFFF !important;}
+.stApp button:disabled {opacity: .45;}
 
 /* inputs */
 [data-baseweb="input"], [data-baseweb="textarea"], [data-baseweb="select"] > div {
-    background: var(--paper) !important; border: 3px solid var(--ink) !important; border-radius: 14px !important;}
+    background: var(--card) !important; border: 1px solid var(--line) !important; border-radius: 10px !important;}
+[data-baseweb="input"]:focus-within, [data-baseweb="textarea"]:focus-within, [data-baseweb="select"] > div:focus-within {
+    border-color: var(--accent) !important; box-shadow: 0 0 0 3px var(--accent-soft) !important;}
 [data-baseweb="input"] > div, [data-baseweb="base-input"] {background: transparent !important; border: 0 !important;}
 .stApp input, .stApp textarea {color: var(--ink) !important; -webkit-text-fill-color: var(--ink) !important;}
 [data-baseweb="select"] div, [data-baseweb="select"] span {color: var(--ink);}
-[data-baseweb="tag"] {background: var(--ink) !important; border-radius: 999px !important;}
-[data-baseweb="tag"] span, [data-baseweb="tag"] svg {color: #FFFFFF !important; fill: #FFFFFF !important;}
-[data-baseweb="popover"] > div {background: var(--paper) !important; border: 3px solid var(--ink); border-radius: 14px;}
+[data-baseweb="tag"] {background: var(--accent-soft) !important; border-radius: 999px !important;}
+[data-baseweb="tag"] span, [data-baseweb="tag"] svg {color: var(--accent) !important; fill: var(--accent) !important;}
+[data-baseweb="popover"] > div {background: var(--card) !important; border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow);}
 [data-baseweb="popover"] li, [data-baseweb="popover"] li * {color: var(--ink) !important; background: transparent;}
-[data-baseweb="popover"] li:hover {background: var(--sun) !important;}
+[data-baseweb="popover"] li:hover {background: var(--bg) !important;}
 
-/* section chips: radio groups (the main navigation) */
-div[role="radiogroup"] {gap: 4px 0;}
-label[data-baseweb="radio"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 999px;
-    padding: 5px 16px; margin: 4px 8px 4px 0; box-shadow: 3px 3px 0 var(--ink); cursor: pointer;}
+/* section chips (radio groups = navigation) */
+div[role="radiogroup"] {gap: 2px 0;}
+label[data-baseweb="radio"] {background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+    padding: 6px 14px; margin: 3px 6px 3px 0; cursor: pointer; transition: border-color .15s, background .15s;}
+label[data-baseweb="radio"]:hover {border-color: var(--accent);}
 label[data-baseweb="radio"] > div:first-child {display: none;}
-label[data-baseweb="radio"] p {font-weight: 700;}
-label[data-baseweb="radio"]:has(input:checked) {background: var(--ink);}
+label[data-baseweb="radio"] p {font-weight: 600; font-size: .92rem;}
+label[data-baseweb="radio"]:has(input:checked) {background: var(--ink); border-color: var(--ink);}
 label[data-baseweb="radio"]:has(input:checked) *, label[data-baseweb="radio"]:has(input:checked) p {color: #FFFFFF !important;}
 
 /* tabs */
-button[data-baseweb="tab"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 999px;
-    margin-right: 8px; padding: 6px 16px; height: auto;}
-button[data-baseweb="tab"] p {font-weight: 800;}
-button[data-baseweb="tab"][aria-selected="true"] {background: var(--ink);}
-button[data-baseweb="tab"][aria-selected="true"] p {color: #FFFFFF !important;}
-[data-baseweb="tab-highlight"], [data-baseweb="tab-border"] {display: none;}
-div[data-baseweb="tab-list"] {gap: 4px; padding-bottom: 8px;}
+button[data-baseweb="tab"] {background: transparent; border-radius: 8px 8px 0 0; padding: 8px 14px; height: auto;}
+button[data-baseweb="tab"] p {font-weight: 600; color: var(--muted) !important;}
+button[data-baseweb="tab"][aria-selected="true"] p {color: var(--ink) !important;}
+[data-baseweb="tab-highlight"] {background: var(--accent) !important; height: 3px;}
+[data-baseweb="tab-border"] {background: var(--line) !important;}
 
 /* cards: forms, expanders, metrics, alerts, tables, sidebar */
-[data-testid="stForm"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 22px;
-    box-shadow: 6px 6px 0 var(--ink); padding: 20px;}
-[data-testid="stExpander"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 18px;
-    box-shadow: 5px 5px 0 var(--ink); overflow: hidden;}
+[data-testid="stForm"] {background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+    box-shadow: var(--shadow); padding: 20px;}
+[data-testid="stExpander"] {background: var(--card); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden;}
 [data-testid="stExpander"] details, [data-testid="stExpander"] summary {background: transparent; border: 0;}
-[data-testid="stExpander"] summary p {font-weight: 800;}
-div[data-testid="stMetric"] {background: var(--paper); border: 3px solid var(--ink); border-radius: 16px;
-    box-shadow: 4px 4px 0 var(--ink); padding: 10px 16px;}
-[data-testid="stAlert"] {border: 3px solid var(--ink); border-radius: 16px;}
-[data-testid="stDataFrame"] {border: 3px solid var(--ink); border-radius: 14px; overflow: hidden; background: var(--paper);}
-section[data-testid="stSidebar"] {background: var(--paper); border-right: 3px solid var(--ink);}
+[data-testid="stExpander"] summary p {font-weight: 600;}
+div[data-testid="stMetric"] {background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+    border-radius: 12px; box-shadow: var(--shadow); padding: 12px 16px;}
+[data-testid="stMetricValue"] {font-weight: 700; font-size: 1.6rem;}
+[data-testid="stAlert"] {border-radius: 12px; border: 1px solid var(--line);}
+[data-testid="stDataFrame"] {border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--card); box-shadow: var(--shadow);}
+section[data-testid="stSidebar"] {background: var(--card); border-right: 1px solid var(--line);}
+[data-testid="stVerticalBlockBorderWrapper"]:has(> div > [data-testid="stVerticalBlock"]) {border-radius: 14px;}
+hr {border-color: var(--line) !important;}
 
 /* the app's own cards and pills */
-.hk-card {background: var(--paper); border: 3px solid var(--ink); border-radius: 16px; box-shadow: 4px 4px 0 var(--ink);}
-.hk-pill {background: var(--paper); border: 2px solid var(--ink); font-weight: 700;}
-.hk-badge {border: 2px solid var(--ink); font-weight: 700;}
-.hk-group {border-bottom: 3px solid var(--ink);}
-.hk-sub {opacity: .85;}
+.hk-card {background: var(--card); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);}
+.hk-pill {background: var(--card); border: 1px solid var(--line); font-weight: 600; color: var(--ink);}
+.hk-badge {font-weight: 600;}
+.hk-group {border-bottom: 2px solid var(--line); color: var(--ink);}
+.hk-sub {color: var(--muted); opacity: 1;}
 
 @media (max-width: 640px) {
-  label[data-baseweb="radio"] {padding: 4px 12px; margin-right: 6px;}
-  [data-testid="stForm"] {box-shadow: 4px 4px 0 var(--ink); padding: 14px;}
+  label[data-baseweb="radio"] {padding: 5px 11px; margin-right: 4px;}
+  [data-testid="stForm"] {padding: 14px;}
+  [data-testid="stMetricValue"] {font-size: 1.3rem;}
 }
 </style>
 """
@@ -7737,8 +7752,8 @@ def _si_health_strip(coverage, counts):
             icon, txt = "🔴", "missing"
         chips.append(f"<span class='hk-pill'>{icon} <b>{_e(mname)}</b> {_e(txt)}</span>")
     fix, rev = counts["fix"], counts["review"]
-    chips.append(f"<span class='hk-pill' style='background:{'#ffd6d6' if fix else '#d8f5df'}'>❗ <b>{fix}</b> to fix</span>")
-    chips.append(f"<span class='hk-pill' style='background:{'#fff1c2' if rev else '#d8f5df'}'>⚠️ <b>{rev}</b> to review</span>")
+    chips.append(f"<span class='hk-pill' style='background:{'#FBEAE8' if fix else '#E5F4EA'}'>❗ <b>{fix}</b> to fix</span>")
+    chips.append(f"<span class='hk-pill' style='background:{'#FFF4D6' if rev else '#E5F4EA'}'>⚠️ <b>{rev}</b> to review</span>")
     return "<div class='hk-kpis'>" + "".join(chips) + "</div>"
 
 
