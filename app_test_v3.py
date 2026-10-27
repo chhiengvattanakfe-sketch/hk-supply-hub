@@ -8180,6 +8180,7 @@ VISIT_COLS = ["Date", "VisitID", "Staff", "Customer", "Check-in", "Minutes", "La
               "Stickers changed", "Customer says sales", "Sales reason", "Competitor", "App trend %",
               "Problems", "Priority", "Follow-up by", "Notes", "Customer request", "Satisfaction",
               "Photos", "Status", "Fixed by", "Fixed at", "Fix note"]
+VISIT_AREA = AREA_LABEL[PP]       # only Phnom Penh customers are visited
 VISIT_AT_SHOP_M = 200            # check-in within this distance of the map pin = "At shop"
 VISIT_GPS_MAX_AGE_S = 900        # a check-in older than 15 minutes must be done again
 VISIT_PHOTO_DIR = "visit_photos"
@@ -8344,11 +8345,20 @@ def _visit_customer_stats():
         if not snap:
             return pd.DataFrame(), {}, {}
         daily, _df, _codes = _si_prepare(snap)
-        names, areas = _si_names_areas(snap, daily) if not daily.empty else ({norm_name(n): n for n in snap.get("customers", [])}, {})
+        if daily.empty:
+            names = {norm_name(n): n for n in snap.get("customers", [])}
+            amap = areas_lookup(snap)
+            areas = {k: AREA_LABEL.get(amap.get(k, "Unknown"), AREA_LABEL["Unknown"]) for k in names}
+        else:
+            names, areas = _si_names_areas(snap, daily)
     except Exception:
         return pd.DataFrame(), {}, {}
+    # Shop visits are for Phnom Penh shops only.
+    names = {k: n for k, n in names.items() if areas.get(k) == VISIT_AREA}
+    areas = {k: a for k, a in areas.items() if k in names}
     if daily.empty:
         return pd.DataFrame(), names, areas
+    daily = daily[daily["Key"].isin(names)]
     today = pd.Timestamp(today_kh())
     d = daily[daily["D"] <= today]
     last28 = d[d["D"] > today - pd.Timedelta(days=28)].groupby("Key")["Pcs"].sum()
@@ -8419,14 +8429,14 @@ def _visit_new_form(visits, stats, names):
     user = current_user() or "-"
     customers = sorted(set(names.values()), key=lambda x: str(x).upper())
     if not customers:
-        st.info("No customers found in the Master List yet.")
+        st.info("No Phnom Penh customers found. Check the zone in the Master List or set the province in 📍 Customer Map.")
         return
     err = st.session_state.pop("visit_gps_error", None)
     if err:
         st.error(err)
     pre = st.session_state.get("visit_customer")
     idx = customers.index(pre) if pre in customers else None
-    customer = st.selectbox("1️⃣ Which shop are you visiting?", customers, index=idx, key="visit_customer_box",
+    customer = st.selectbox("1️⃣ Which shop are you visiting? (Phnom Penh)", customers, index=idx, key="visit_customer_box",
                             placeholder="Type the shop name…")
     if not customer:
         st.caption("Tip: open **📋 Who to visit** to see the shops that need you most.")
@@ -8715,15 +8725,11 @@ def tab_shop_visits():
         if route.empty:
             st.success("No shop needs a visit right now.")
             return
-        q1, q2 = st.columns([2, 1])
-        q = q1.text_input("🔎 Search shop / area", key="vroute_q", max_chars=60)
-        area = q2.selectbox("Area", ["All"] + sorted(route["Area"].dropna().unique()), key="vroute_area")
+        q = st.text_input("🔎 Search shop", key="vroute_q", max_chars=60)
         r = route
-        if area != "All":
-            r = r[r["Area"].eq(area)]
         if q.strip():
             r = r[r["Customer"].str.contains(q.strip(), case=False, regex=False)]
-        st.caption("Higher priority first: open problems, sales going down, late orders, shops not visited for a month.")
+        st.caption("Phnom Penh shops only. Higher priority first: open problems, sales going down, late orders, shops not visited for a month.")
         for i, row in r.head(25).iterrows():
             with st.container(border=True):
                 c1, c2 = st.columns([4, 1])
