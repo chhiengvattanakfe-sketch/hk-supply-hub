@@ -1585,7 +1585,8 @@ def daily_backup_once(day_str):
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, VISITS_FILE, VISIT_ZONE_FILE)
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, VISITS_FILE, VISIT_ZONE_FILE,
+                 os.path.join(DATA_DIR, "visit_settings.json"))
         if USE_DROPBOX:
             try:
                 _dbx().files_create_folder_v2(_remote_backup_dir())
@@ -8180,7 +8181,8 @@ VISIT_COLS = ["Date", "VisitID", "Staff", "Customer", "Check-in", "Minutes", "La
               "Distance m", "Location check", "Fridge", "Display FIFO", "Old/damaged pcs", "Sticker",
               "Stickers changed", "Customer says sales", "Sales reason", "Competitor", "App trend %",
               "Problems", "Priority", "Follow-up by", "Notes", "Customer request", "Satisfaction",
-              "Photos", "Status", "Fixed by", "Fixed at", "Fix note", "Zone"]
+              "Photos", "Status", "Fixed by", "Fixed at", "Fix note", "Zone",
+              "Shop type", "Checks", "Check score %", "Size", "Fix done"]
 VISIT_AREA = AREA_LABEL[PP]       # only Phnom Penh customers are visited
 VISIT_AT_SHOP_M = 200            # check-in within this distance of the map pin = "At shop"
 VISIT_GPS_MAX_AGE_S = 900        # a check-in older than 15 minutes must be done again
@@ -8237,13 +8239,24 @@ def _visit_zone_auto(name):
     return VISIT_ZONE_NOT_SET
 
 
+def _visit_shop_settings():
+    try:
+        return read_raw(VISIT_ZONE_FILE, VISIT_SET_COLS)
+    except Exception:
+        return pd.DataFrame(columns=VISIT_SET_COLS)
+
+
 def _visit_zone_overrides():
     """{normalised customer: zone} set by Admin."""
-    try:
-        df = read_raw(VISIT_ZONE_FILE, ["Date", "Customer", "Zone", "By"])
-    except Exception:
-        return {}
+    df = _visit_shop_settings()
     return {norm_name(c): z for c, z in zip(df["Customer"], df["Zone"]) if z in VISIT_ZONE_NAMES}
+
+
+def _visit_type_map(names):
+    """{key: shop type}: Admin's choice first, then the guess from the name."""
+    df = _visit_shop_settings()
+    over = {norm_name(c): t for c, t in zip(df["Customer"], df["Type"]) if t in VISIT_TYPE_NAMES}
+    return {k: over.get(k) or _visit_type_auto(n) for k, n in names.items()}
 
 
 def _visit_zone_map(names):
@@ -8266,16 +8279,17 @@ def _visit_progress(visits, user):
                 text=f"Today: {done} / {VISIT_DAILY_TARGET} shops visited" + (" 🎉 target done" if not left else f" · {left} to go"))
 
 
-def _visit_zone_picker(zone_map, key):
-    """Zone selector, remembered for the day so staff pick it once."""
+def _visit_zone_picker(zone_map, key, due=None):
+    """Zone selector, remembered for the day so staff pick it once. due = Counter(zone -> shops due now)."""
     counts = Counter(zone_map.values())
+    due = due or Counter()
     options = [z for z in VISIT_ZONE_NAMES if counts.get(z)]
     if not options:
         return None
     mem = st.session_state.get("visit_zone_today")
     if st.session_state.get(key) not in options:
         st.session_state[key] = mem if mem in options else options[0]
-    zone = st.selectbox("🗺️ My zone today", options, key=key, format_func=lambda z: f"{z}  ({counts.get(z, 0)} shops)")
+    zone = st.selectbox("🗺️ My zone today", options, key=key, format_func=lambda z: f"{z}  ({counts.get(z, 0)} shops" + (f" · {due[z]} due" if due.get(z) else "") + ")")
     st.session_state["visit_zone_today"] = zone
     return zone
 
@@ -8288,16 +8302,17 @@ def _visit_map_link(customer, registry):
 
 
 def _visit_zones_admin(names, visits):
-    st.markdown("#### 🗺️ Phnom Penh zones")
-    st.caption("The app guesses each shop's zone from the area written in its name. Change the **Zone** cell for any shop "
+    st.markdown("#### 🗺️ Zones & shop types")
+    st.caption("The app guesses each shop's zone and type from its name. Change the **Zone** or **Type** cell for any shop "
                "that is wrong or ❓ not set, then press Save. Your choice always wins over the guess.")
     over = _visit_zone_overrides()
     last = {}
     if not visits.empty:
         v = visits.assign(Key=visits["Customer"].map(norm_name))
         last = v.groupby("Key")["_dt"].max().to_dict()
+    tmap = _visit_type_map(names)
     rows = [{"Customer": n, "Guess": _visit_zone_auto(n), "Zone": over.get(k) or _visit_zone_auto(n),
-             "Set by admin": k in over,
+             "Type": tmap.get(k, VISIT_TYPE_OTHER), "Set by admin": k in over,
              "Last visit": f"{last[k]:%d %b}" if k in last else "never"} for k, n in names.items()]
     frame = pd.DataFrame(rows).sort_values(["Zone", "Customer"]).reset_index(drop=True)
     summary = frame.groupby("Zone").agg(Shops=("Customer", "size"),
@@ -8314,23 +8329,115 @@ def _visit_zones_admin(names, visits):
         view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
     edited = st.data_editor(view, hide_index=True, use_container_width=True, key="vz_editor",
                             disabled=["Customer", "Guess", "Set by admin", "Last visit"],
-                            column_config={"Zone": st.column_config.SelectboxColumn("Zone", options=VISIT_ZONE_NAMES, required=True)},
+                            column_config={"Zone": st.column_config.SelectboxColumn("Zone", options=VISIT_ZONE_NAMES, required=True),
+                                           "Type": st.column_config.SelectboxColumn("Type", options=VISIT_TYPE_NAMES, required=True)},
                             height=min(520, 60 + 35 * max(1, len(view))))
-    changed = edited[edited["Zone"] != view["Zone"]]
-    if st.button(f"💾 Save {len(changed)} zone change(s)", type="primary", disabled=changed.empty, key="vz_save"):
+    changed = edited[(edited["Zone"] != view["Zone"]) | (edited["Type"] != view["Type"])]
+    if st.button(f"💾 Save {len(changed)} change(s)", type="primary", disabled=changed.empty, key="vz_save"):
         who, at = current_user() or "-", now_str()
 
         def _apply(df):
             df = df[df["Customer"].map(norm_name).isin(set(changed["Customer"].map(norm_name))) == False].copy()
-            add = pd.DataFrame({"Date": at, "Customer": changed["Customer"], "Zone": changed["Zone"], "By": who})
+            add = pd.DataFrame({"Date": at, "Customer": changed["Customer"], "Zone": changed["Zone"], "By": who,
+                                "Type": changed["Type"]})
             return pd.concat([df.drop(columns=[c for c in ("_dt",) if c in df]), add], ignore_index=True)
         try:
-            modify_csv(VISIT_ZONE_FILE, ["Date", "Customer", "Zone", "By"], _apply)
+            modify_csv(VISIT_ZONE_FILE, VISIT_SET_COLS, _apply)
             audit("visit zones", f"{len(changed)} changed")
             st.session_state["flash"] = f"Saved {len(changed)} zone change(s)"
             st.rerun()
         except Exception as e:
             st.error("Could not save: " + str(e)[:150])
+
+
+# ---------- shop types, size & visit frequency ----------
+VISIT_SETTINGS_FILE = os.path.join(DATA_DIR, "visit_settings.json")
+VISIT_WORK_DAYS = 26                      # working days per month, for the capacity check
+VISIT_SETTINGS_DEFAULT = {"big_pcs": 1000, "medium_pcs": 400, "big_days": 30, "medium_days": 90, "small_days": 180,
+                          "staff": 1}
+VISIT_TYPES = {     # type -> (words in the name, extra checks for that type)
+    "☕ Coffee shop": (["COFFEE", "CAFE", "CAFÉ", "COFF", "កាហ្វេ", "TEA", "តែ"],
+                      ["Buns visible at the counter", "Steamer / microwave working", "Menu or poster shows our buns",
+                       "Shop staff know how to heat buns"]),
+    "⛽ Gas station": (["TOTAL", "CALTEX", "PTT", "TELA", "តេលា", "SOKIMEX", "STATION"],
+                      ["Fridge at the front, easy to see", "Price tag shown", "Our buns not hidden by competitors",
+                       "Poster / sign outside"]),
+    "🛒 Mart / shop": (["MART", "ម៉ាត", "STORE", "SHOP", "MALL", "MINI", "ផ្សារទំនើប", "TOYS", "AEON", "MAXVALU",
+                      "SUPERMARKET", "LUCKY", "CHIP MONG", "RETAIL", "7-ELEVEN", "7 ELEVEN", "CIRCLE K", "STAR MART"],
+                     ["Fridge at the front, easy to see", "Price tag shown", "Our buns not hidden by competitors",
+                      "Fridge / shelf full enough"]),
+    "🏫 School / canteen": (["សាលា", "វិទ្យាល័យ", "SCHOOL", "កង់ទីន", "CANTEEN", "សាកលវិទ្យាល័យ", "UNIVERSITY"],
+                          ["Fridge near the canteen", "Enough stock for break time", "Price fits students",
+                           "Buns kept away from sun / dust"]),
+    "🏛️ Office / ministry / hospital": (["ក្រសួង", "មន្ទីរ", "អគ្គ", "ពេទ្យ", "HOSPITAL", "OFFICE"],
+                                       ["Delivery time fits break time", "Steamer / microwave working",
+                                        "Display clean"]),
+    "🥖 Bakery / food shop": (["នំបុ័ង", "BAKERY", "RESTAURANT", "ភោជនីយ", "នំបញ្ចុក", "នំបញ្ខុក", "អាហារ", "ចុងភៅ"],
+                             ["Display clean", "Price tag shown", "Our buns placed well"]),
+    "🏪 Market stall": (["ផ្សារ", "MARKET"],
+                       ["Covered from sun / dust", "Steamer working", "Price sign shown"]),
+}
+VISIT_TYPE_OTHER = "📦 Other"
+VISIT_TYPE_NAMES = list(VISIT_TYPES) + [VISIT_TYPE_OTHER]
+VISIT_TYPE_CHECKS = {**{t: c for t, (_w, c) in VISIT_TYPES.items()}, VISIT_TYPE_OTHER: ["Display clean", "Price tag shown"]}
+VISIT_SET_COLS = ["Date", "Customer", "Zone", "By", "Type"]
+VISIT_PHOTO_MAX_AGE_H = 3                 # a before/after photo taken longer ago than this is refused
+
+
+def _visit_settings():
+    out = dict(VISIT_SETTINGS_DEFAULT)
+    try:
+        if USE_DROPBOX:
+            pull(VISIT_SETTINGS_FILE)
+        if os.path.exists(VISIT_SETTINGS_FILE):
+            with open(VISIT_SETTINGS_FILE, encoding="utf-8") as f:
+                saved = json.load(f)
+            out.update({k: int(v) for k, v in saved.items() if k in out})
+    except Exception:
+        pass
+    return out
+
+
+def _visit_settings_save(values):
+    with _sync_state()["lock"], file_lock(VISIT_SETTINGS_FILE):
+        if USE_DROPBOX:
+            try:
+                pull(VISIT_SETTINGS_FILE, force=True)
+            except Exception:
+                pass
+        _write_atomic(VISIT_SETTINGS_FILE, json.dumps(values, indent=2).encode("utf-8"))
+        if USE_DROPBOX:
+            push(VISIT_SETTINGS_FILE)
+
+
+def _visit_type_auto(name):
+    t = unicodedata.normalize("NFC", str(name)).upper().replace("​", "")
+    for typ, (words, _c) in VISIT_TYPES.items():
+        if any(w.upper() in t for w in words):
+            return typ
+    return VISIT_TYPE_OTHER
+
+
+def _visit_size(pcs28, cfg):
+    """-> (size label, visit every N days)."""
+    if pcs28 is None or pd.isna(pcs28) or pcs28 <= 0:
+        return "💤 No orders (28 d)", None
+    if pcs28 >= cfg["big_pcs"]:
+        return "🟢 Big", cfg["big_days"]
+    if pcs28 >= cfg["medium_pcs"]:
+        return "🟡 Medium", cfg["medium_days"]
+    return "⚪ Small", cfg["small_days"]
+
+
+def _visit_photo_taken_at(data):
+    """When the phone camera took the photo (EXIF), or None when the photo carries no date."""
+    try:
+        from PIL import Image
+        exif = Image.open(io.BytesIO(data)).getexif()
+        raw = exif.get_ifd(0x8769).get(36867) or exif.get(306)
+        return datetime.strptime(str(raw).strip()[:19], "%Y:%m:%d %H:%M:%S") if raw else None
+    except Exception:
+        return None
 
 
 def _visit_read():
@@ -8499,8 +8606,10 @@ def _visit_customer_stats():
              if areas.get(k) == VISIT_AREA and str(n).strip().upper() not in SI_IGNORE_NAMES}
     areas = {k: a for k, a in areas.items() if k in names}
     if daily.empty:
+        st.session_state["_visit_daily"] = pd.DataFrame()
         return pd.DataFrame(), names, areas
     daily = daily[daily["Key"].isin(names)]
+    st.session_state["_visit_daily"] = daily[["Key", "D", "Pcs", "Sales"]]
     today = pd.Timestamp(today_kh())
     d = daily[daily["D"] <= today]
     last28 = d[d["D"] > today - pd.Timedelta(days=28)].groupby("Key")["Pcs"].sum()
@@ -8521,8 +8630,9 @@ def _visit_trend_text(pct):
     return f"{'⬆️' if pct >= 10 else ('⬇️' if pct <= -10 else '➡️')} {pct:+.0f}% (last 28 days vs the 28 before)"
 
 
-def _visit_route(visits, stats, names, areas, zone_map=None, zone=None):
-    """Shops of the zone, most important first, with the reasons. Shops visited in the last 7 days go to the bottom."""
+def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None):
+    """Shops of the zone, most important first. Each shop is due again after N days, N set by its size."""
+    cfg = cfg or _visit_settings()
     today = pd.Timestamp(today_kh())
     last_visit = {}
     open_prob = Counter()
@@ -8537,38 +8647,53 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None):
     rows = []
     for k in keys:
         s = stats.loc[k] if (not stats.empty and k in stats.index) else None
-        if s is not None and s["Days since order"] > 90:
-            continue                                   # long-lost shops belong to the follow-up call list
+        pcs28 = float(s["Pcs 28d"]) if s is not None and pd.notna(s["Pcs 28d"]) else 0.0
+        size, every = _visit_size(pcs28, cfg)
         score, why = 0, []
-        if open_prob.get(k):
-            score += 4; why.append(f"🔴 {open_prob[k]} open problem")
         lv = last_visit.get(k)
         days_v = (today - pd.Timestamp(lv).normalize()).days if lv is not None and pd.notna(lv) else None
-        if days_v is None:
-            score += 2; why.append("🆕 never visited")
-        elif days_v > 30:
-            score += 2; why.append(f"🕒 last visit {days_v} days ago")
-        elif days_v <= 7:
-            score -= 5; why.append(f"✅ visited {days_v} d ago")
+        if open_prob.get(k):
+            score += 6; why.append(f"🔴 {open_prob[k]} open problem")
+        if every is None:
+            due_in = None
+            if not open_prob.get(k):
+                continue                                   # no orders and no problem: not on the visit plan
+        elif days_v is None:
+            due_in = 0
+            score += 3; why.append("🆕 never visited")
+        else:
+            due_in = every - days_v
+            if due_in <= 0:
+                score += 3 + min(-due_in // 7, 3)
+                why.append(f"📅 due (every {every} d)" + (f" · {-due_in} d late" if due_in < 0 else ""))
+            else:
+                score -= 6
         if s is not None:
             if pd.notna(s["Trend %"]) and s["Trend %"] <= -20:
                 score += 3; why.append(f"⬇️ sales {s['Trend %']:+.0f}%")
             gap = s["Usual gap"]
             if pd.notna(gap) and gap > 0 and s["Days since order"] > 2 * gap and s["Order days"] >= 3:
                 score += 2; why.append(f"⏰ no order {int(s['Days since order'])} days (usually {gap:.0f})")
-            if s["Pcs 28d"] >= 2000:
-                score += 1; why.append("⭐ big customer")
-        if not why:
-            why.append("🔁 routine visit")
+        if size.startswith("🟢"):
+            score += 1
+        if due_in is not None and due_in > 0 and not why:
+            why.append(f"next visit in {due_in} d")
         rows.append({"Priority": score, "Customer": names.get(k, k), "Area": (zone_map or {}).get(k, areas.get(k, "")),
+                     "Size": size, "Every (days)": every, "Due in (days)": due_in,
                      "Why visit": " · ".join(why),
                      "Last visit": "never" if days_v is None else f"{days_v} d ago",
-                     "Pcs 28 days": int(s["Pcs 28d"]) if s is not None and pd.notna(s["Pcs 28d"]) else 0,
-                     "Trend %": s["Trend %"] if s is not None else None})
+                     "Pcs 28 days": int(pcs28), "Trend %": s["Trend %"] if s is not None else None})
     out = pd.DataFrame(rows)
     if out.empty:
         return out
     return out.sort_values(["Priority", "Pcs 28 days"], ascending=False).reset_index(drop=True)
+
+
+def _visit_is_due(route):
+    """Rows that need a visit now: due/late, never visited, or with an open problem."""
+    if route.empty:
+        return route.iloc[0:0]
+    return route[route["Due in (days)"].fillna(0).le(0) | route["Why visit"].str.contains("🔴")]
 
 
 def _visit_new_form(visits, stats, names):
@@ -8639,12 +8764,20 @@ def _visit_new_form(visits, stats, names):
         st.caption("The page reloads once after the check-in. You can still save without GPS, but the visit is marked ❓.")
 
     # ---- 3. the visit form
+    shop_type = _visit_type_map({key: customer}).get(key, VISIT_TYPE_OTHER)
+    cfg = _visit_settings()
+    size, _every = _visit_size(float(s["Pcs 28d"]) if s is not None else 0, cfg)
+    st.caption(f"Shop type: **{shop_type}** · size: **{size}**" + (" — Admin can change the type in ⚙️ Shops & zones." if current_role() == "admin" else ""))
     with st.form("visit_form", clear_on_submit=False):
         st.markdown("**3️⃣ Photos** — shop front is required")
         front = st.camera_input("📸 Shop front (take it now)", key="visit_cam")
-        extra = st.file_uploader("More photos: fridge, display, sticker before/after (max 4)",
-                                 type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key="visit_files")
-        st.markdown("**4️⃣ Shop check**")
+        ph1, ph2 = st.columns(2)
+        before = ph1.file_uploader("🅱️ BEFORE: fridge / display as you found it", type=["jpg", "jpeg", "png", "webp"], key="visit_before",
+                                   help="Take it with the camera when you arrive. Needed when you fix something.")
+        after = ph2.file_uploader("🅰️ AFTER: the same place after you fixed it", type=["jpg", "jpeg", "png", "webp"], key="visit_after",
+                                  help="Same angle as BEFORE, so the change is easy to see.")
+        extra = st.file_uploader("Other photos (max 2)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key="visit_files")
+        st.markdown(f"**4️⃣ Shop check** · {shop_type}")
         a1, a2 = st.columns(2)
         fridge = a1.radio("🧊 Fridge", ["Clean & cold", "Dirty", "Not cold", "Broken", "No fridge"], horizontal=True)
         fifo = a2.radio("🥟 Display / old buns in front (FIFO)", ["Good", "Needs fixing", "Fixed today"], horizontal=True)
@@ -8652,6 +8785,11 @@ def _visit_new_form(visits, stats, names):
         old_pcs = b1.number_input("Old / damaged buns found (pcs)", 0, 5000, 0, 1)
         sticker = b2.radio("🏷️ Sticker", ["Good", "Old / faded", "Missing"], horizontal=True)
         changed = b3.number_input("Stickers changed today", 0, 100, 0, 1)
+        fridge_fixed = st.checkbox("🧽 I cleaned / arranged the fridge or display today", key="visit_fridge_fixed")
+        st.caption(f"Tick what is OK at this {shop_type.split(' ', 1)[1].lower()}:")
+        type_checks = VISIT_TYPE_CHECKS.get(shop_type, VISIT_TYPE_CHECKS[VISIT_TYPE_OTHER])
+        tc_cols = st.columns(2)
+        check_ok = {c: tc_cols[i % 2].checkbox(c, key=f"visit_chk_{i}") for i, c in enumerate(type_checks)}
         st.markdown("**5️⃣ Sales**")
         app_pct = s["Trend %"] if s is not None else None
         st.caption("Our journal says: " + _visit_trend_text(app_pct))
@@ -8674,9 +8812,23 @@ def _visit_new_form(visits, stats, names):
     if front is None:
         st.error("Please take the shop front photo first.")
         return
-    if len(extra or []) > 4:
-        st.error("Choose at most 4 extra photos.")
+    if len(extra or []) > 2:
+        st.error("Choose at most 2 other photos.")
         return
+    fixes = [x for x, on in (("Sticker changed", changed > 0), ("FIFO fixed", fifo == "Fixed today"),
+                             ("Fridge/display cleaned", fridge_fixed)) if on]
+    if fixes and (before is None or after is None):
+        st.error("You fixed something (" + ", ".join(fixes) + "). Please add both the 🅱️ BEFORE and 🅰️ AFTER photos.")
+        return
+    if (before is None) != (after is None):
+        st.error("Add both BEFORE and AFTER photos, or neither.")
+        return
+    for label_, f in (("BEFORE", before), ("AFTER", after)):
+        if f is not None:
+            taken = _visit_photo_taken_at(f.getvalue())
+            if taken and (now_kh().replace(tzinfo=None) - taken).total_seconds() > VISIT_PHOTO_MAX_AGE_H * 3600:
+                st.error(f"The {label_} photo was taken on {taken:%d %b %H:%M}. Please take a new photo now.")
+                return
     gps = st.session_state.get("visit_gps")
     if gps and norm_name(gps.get("customer", "")) != key:
         gps = None
@@ -8688,9 +8840,11 @@ def _visit_new_form(visits, stats, names):
     names_saved = []
     with st.spinner("Saving photos…"):
         try:
-            for i, f in enumerate([front] + list(extra or []), start=1):
-                data = _visit_photo_prepare(f.getvalue(), stamp)
-                name = f"{vid}_{i}.jpg"
+            shots = [("front", front)] + ([("before", before), ("after", after)] if before is not None else []) \
+                + [(f"x{i}", f) for i, f in enumerate(extra or [], start=1)]
+            for role, f in shots:
+                data = _visit_photo_prepare(f.getvalue(), stamp + [role.upper()])
+                name = f"{vid}_{role}.jpg"
                 _visit_photo_save(name, data)
                 names_saved.append(name)
         except Exception as e:
@@ -8712,14 +8866,18 @@ def _visit_new_form(visits, stats, names):
            "Problems": "; ".join(p.split(" ", 1)[1] for p in problems) or "-", "Priority": priority,
            "Follow-up by": follow, "Notes": notes or "-", "Customer request": request or "-", "Satisfaction": sat.split()[-1],
            "Photos": ";".join(names_saved), "Status": "Open" if problems else "No problem",
-           "Fixed by": "-", "Fixed at": "-", "Fix note": "-", "Zone": zone_map.get(key, VISIT_ZONE_NOT_SET)}
+           "Fixed by": "-", "Fixed at": "-", "Fix note": "-", "Zone": zone_map.get(key, VISIT_ZONE_NOT_SET),
+           "Shop type": shop_type, "Checks": "; ".join(f"{c}: {'OK' if ok else 'NO'}" for c, ok in check_ok.items()),
+           "Check score %": round(100 * sum(check_ok.values()) / max(1, len(check_ok))), "Size": size,
+           "Fix done": "; ".join(fixes) or "-"}
     try:
         append_row(VISITS_FILE, row)
     except Exception as e:
         st.error("The visit could not be saved: " + str(e)[:160] + ". Your answers are still here; press Save again.")
         return
     audit("shop visit", f"{customer} | {label} | {row['Problems']}")
-    for k in ("visit_gps", "visit_customer", "visit_customer_box", "visit_cam", "visit_files"):
+    for k in ["visit_gps", "visit_customer", "visit_customer_box", "visit_cam", "visit_files", "visit_before", "visit_after",
+              "visit_fridge_fixed"] + [f"visit_chk_{i}" for i in range(10)]:
         st.session_state.pop(k, None)
     st.session_state["flash"] = f"Visit saved: {customer}"
     st.rerun()
@@ -8797,13 +8955,8 @@ def _visit_report_body(visits):
                         key="vr_photo_pick")
     if pick != "-":
         r = v.head(60).iloc[[f"{x['_dt']:%d %b %H:%M} · {x['Customer']} · {x['Staff']}" for _, x in v.head(60).iterrows()].index(pick)]
-        files = [p for p in str(r["Photos"]).split(";") if p and p != "-"]
-        cols = st.columns(min(3, max(1, len(files))))
-        for i, name in enumerate(files):
-            try:
-                cols[i % len(cols)].image(_visit_photo_load(name), use_container_width=True, caption=name)
-            except Exception as e:
-                cols[i % len(cols)].warning(f"{name}: {str(e)[:80]}")
+        st.caption(f"Checks: {r.get('Checks', '-')} · Fix done: {r.get('Fix done', '-')}")
+        _visit_show_photos(r["Photos"], "vr")
     if has_permission("reports"):
         try:
             st.download_button("📥 Download visits (Excel)", data=_report_excel_bytes({"Visits": v.drop(columns=["_dt"]), "By staff": per}),
@@ -8854,6 +9007,201 @@ def _visit_problems_body(visits):
                         st.error("Could not save: " + str(e)[:150])
 
 
+def _visit_show_photos(photos, key_prefix):
+    """Shop front first, then BEFORE | AFTER side by side, then the rest."""
+    files = [p for p in str(photos).split(";") if p and p != "-"]
+    role = lambda n: n.rsplit("_", 1)[-1].split(".")[0]
+    label = {"front": "📸 Shop front", "before": "🅱️ BEFORE", "after": "🅰️ AFTER"}
+    order = {"front": 0, "before": 1, "after": 2}
+    files.sort(key=lambda n: order.get(role(n), 3))
+    pair = [f for f in files if role(f) in ("before", "after")]
+    others = [f for f in files if f not in pair]
+
+    def _img(col, name):
+        try:
+            col.image(_visit_photo_load(name), use_container_width=True, caption=label.get(role(name), "Photo"))
+        except Exception as e:
+            col.warning(f"{name}: {str(e)[:80]}")
+    if others[:1]:
+        _img(st.columns([2, 1])[0], others[0])
+    if pair:
+        cols = st.columns(2)
+        for i, name in enumerate(pair[:2]):
+            _img(cols[i], name)
+    rest = others[1:]
+    if rest:
+        cols = st.columns(min(3, len(rest)))
+        for i, name in enumerate(rest):
+            _img(cols[i % len(cols)], name)
+
+
+def _visit_settings_admin(route):
+    st.markdown("#### 📅 How often to visit")
+    cfg = _visit_settings()
+    with st.form("visit_cfg"):
+        c1, c2 = st.columns(2)
+        big_pcs = c1.number_input("🟢 Big shop = at least this many pcs in 28 days", 100, 20000, cfg["big_pcs"], 50)
+        medium_pcs = c2.number_input("🟡 Medium shop = at least this many pcs in 28 days", 1, 20000, cfg["medium_pcs"], 50)
+        d1, d2, d3, d4 = st.columns(4)
+        big_days = d1.number_input("Visit 🟢 Big every (days)", 7, 365, cfg["big_days"], 1)
+        medium_days = d2.number_input("Visit 🟡 Medium every (days)", 7, 365, cfg["medium_days"], 1)
+        small_days = d3.number_input("Visit ⚪ Small every (days)", 7, 365, cfg["small_days"], 1)
+        staff_n = d4.number_input("Staff doing visits", 1, 20, cfg["staff"], 1)
+        save = st.form_submit_button("💾 Save", type="primary")
+    if save:
+        if medium_pcs >= big_pcs:
+            st.error("Medium must be smaller than Big.")
+        else:
+            try:
+                _visit_settings_save({"big_pcs": int(big_pcs), "medium_pcs": int(medium_pcs), "big_days": int(big_days),
+                                      "medium_days": int(medium_days), "small_days": int(small_days), "staff": int(staff_n)})
+                audit("visit settings", f"{big_pcs}/{medium_pcs} pcs, {big_days}/{medium_days}/{small_days} days, {staff_n} staff")
+                st.session_state["flash"] = "Visit frequency saved"
+                st.rerun()
+            except Exception as e:
+                st.error("Could not save: " + str(e)[:150])
+    if not route.empty:
+        sizes = route.groupby("Size").agg(Shops=("Customer", "size"), Every=("Every (days)", "first")).reset_index()
+        sizes["Visits needed / month"] = (sizes["Shops"] * 30 / sizes["Every"]).round(0)
+        need = int(sizes["Visits needed / month"].fillna(0).sum())
+        cap = VISIT_DAILY_TARGET * VISIT_WORK_DAYS * cfg["staff"]
+        _si_show(sizes.rename(columns={"Every": "Every (days)"}))
+        msg = (f"Needs about **{need} visits a month**. {cfg['staff']} staff × {VISIT_DAILY_TARGET} a day × {VISIT_WORK_DAYS} days "
+               f"= **{cap}**.")
+        if need > cap:
+            st.warning(msg + f" That is {need - cap} too many: visit Small or Medium shops less often, or do "
+                             f"{math.ceil(need / VISIT_WORK_DAYS / cfg['staff'])} visits a day.")
+        else:
+            st.success(msg + " The plan fits. 👍")
+        st.caption("Shops with no orders in 28 days are not scheduled; they appear only when they have an open problem.")
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _visit_effect(sig, _visits, _daily, window=14):
+    """Bun pcs in the 14 days before vs after each visit, compared with all Phnom Penh shops in the same days."""
+    visits, daily = _visits, _daily
+    if visits.empty or daily.empty:
+        return pd.DataFrame()
+    today = pd.Timestamp(today_kh())
+    tot = daily.groupby("D")["Pcs"].sum()
+    by_key = {k: g.set_index("D")["Pcs"] for k, g in daily.groupby("Key")}
+    rows = []
+    for _, r in visits.iterrows():
+        d = pd.Timestamp(r["_dt"]).normalize()
+        k = norm_name(r["Customer"])
+        ser = by_key.get(k, pd.Series(dtype=float))
+        b0, b1, a0, a1 = d - pd.Timedelta(days=window), d - pd.Timedelta(days=1), d + pd.Timedelta(days=1), d + pd.Timedelta(days=window)
+        ready = a1 <= today
+        before = float(ser[(ser.index >= b0) & (ser.index <= b1)].sum())
+        after = float(ser[(ser.index >= a0) & (ser.index <= min(a1, today))].sum())
+        days_after = max(0, (min(a1, today) - d).days)
+        tb = float(tot[(tot.index >= b0) & (tot.index <= b1)].sum())
+        ta = float(tot[(tot.index >= a0) & (tot.index <= min(a1, today))].sum())
+        # compare like with like while the 14 days after are not finished yet
+        scale = window / days_after if days_after else None
+        after_full, ta_full = (after * scale, ta * scale) if scale else (None, None)
+        shop_pct = (after_full - before) / before * 100 if (scale and before > 0) else None
+        all_pct = (ta_full - tb) / tb * 100 if (scale and tb > 0) else None
+        actions = [a for a in str(r.get("Fix done", "-")).split("; ") if a and a != "-"]
+        if str(r.get("Status")) == "Fixed":
+            actions.append("Problem fixed later")
+        rows.append({"Date": f"{d:%Y-%m-%d}", "Staff": r["Staff"], "Customer": r["Customer"], "Zone": r.get("Zone", "-"),
+                     "Actions": ", ".join(actions) or "Visit only",
+                     "Pcs 14 d before": int(before), "Pcs 14 d after": int(after),
+                     "Shop change %": None if shop_pct is None else round(shop_pct),
+                     "All PP shops %": None if all_pct is None else round(all_pct),
+                     "Lift %": None if (shop_pct is None or all_pct is None) else round(shop_pct - all_pct),
+                     "Result": "✅ 14 days done" if ready else (f"⏳ {days_after} of 14 days" if days_after else "⏳ waiting")})
+    return pd.DataFrame(rows)
+
+
+def _visit_effect_body(visits, daily):
+    st.markdown("#### 📈 Did the visit help?")
+    st.caption("For each visit: the shop's bun pcs in the 14 days **before** vs the 14 days **after**. "
+               "**Lift** removes the normal ups and downs by comparing with all Phnom Penh shops in the same days: "
+               "Lift +15% = this shop grew 15 points more than the market.")
+    eff = _visit_effect(_si_frame_sig(visits) + _si_frame_sig(daily), visits, daily)
+    if eff.empty:
+        st.info("No visits yet, or no sales data.")
+        return
+    done = eff[eff["Result"].str.startswith("✅") & eff["Lift %"].notna()]
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Visits with 14 days of results", f"{len(done):,}", f"{len(eff) - len(done)} still waiting", delta_color="off")
+    k2.metric("Average lift", f"{done['Lift %'].mean():+.0f}%" if len(done) else "—")
+    k3.metric("Shops that grew more than the market", f"{(done['Lift %'] > 0).mean() * 100:.0f}%" if len(done) else "—")
+    if len(done):
+        st.markdown("**By action** — which work raises sales")
+        act = done.assign(Action=done["Actions"].str.split(", ")).explode("Action")
+        _si_show(act.groupby("Action").agg(Visits=("Customer", "size"), **{"Avg lift %": ("Lift %", "mean"),
+                 "Grew more than market": ("Lift %", lambda s: f"{(s > 0).mean() * 100:.0f}%")}).round(1)
+                 .sort_values("Avg lift %", ascending=False).reset_index())
+        st.markdown("**By staff**")
+        _si_show(done.groupby("Staff").agg(Visits=("Customer", "size"), **{"Avg lift %": ("Lift %", "mean")}).round(1).reset_index())
+    else:
+        st.info("Results appear 14 days after each visit.")
+    st.markdown("**Every visit**")
+    _si_show(eff.sort_values("Date", ascending=False).reset_index(drop=True), money=("Pcs 14 d before", "Pcs 14 d after"),
+             height=min(460, 60 + 36 * len(eff)))
+
+
+def _visit_scorecard_body(visits, daily, names):
+    st.markdown("#### 🏅 Monthly scorecard")
+    if visits.empty:
+        st.info("No visits yet.")
+        return
+    months = sorted(visits["_dt"].dt.strftime("%Y-%m").unique(), reverse=True)
+    c1, c2 = st.columns(2)
+    month = c1.selectbox("Month", months, key="vs_month")
+    staff_all = sorted(visits["Staff"].unique())
+    who = c2.selectbox("Staff", staff_all, key="vs_staff") if len(staff_all) > 1 else staff_all[0]
+    m0 = pd.Timestamp(month + "-01")
+    m1 = m0 + pd.offsets.MonthEnd(0)
+    v = visits[(visits["_dt"] >= m0) & (visits["_dt"] <= m1 + pd.Timedelta(hours=23, minutes=59)) & (visits["Staff"] == who)].copy()
+    for c in ("Minutes", "Stickers changed", "Check score %", "Satisfaction"):
+        v[c] = pd.to_numeric(v[c], errors="coerce")
+    day_counts = v.assign(Day=v["_dt"].dt.date, Key=v["Customer"].map(norm_name)).groupby("Day")["Key"].nunique()
+    fixed = visits[(visits["Fixed by"] != "-") & pd.to_datetime(visits["Fixed at"], errors="coerce").between(m0, m1 + pd.Timedelta(days=1))]
+    eff = _visit_effect(_si_frame_sig(visits) + _si_frame_sig(daily), visits, daily)
+    eff_m = eff[(eff["Staff"] == who) & eff["Date"].str.startswith(month) & eff["Lift %"].notna()] if not eff.empty else eff
+    zone_chg = None
+    if not daily.empty:
+        p0, p1 = m0 - pd.offsets.MonthBegin(1), m0 - pd.Timedelta(days=1)
+        last_day = min(m1, pd.Timestamp(today_kh()))
+        n_days = (last_day - m0).days + 1
+        cur = daily[(daily["D"] >= m0) & (daily["D"] <= last_day)]["Pcs"].sum()
+        prev = daily[(daily["D"] >= p0) & (daily["D"] <= min(p1, p0 + pd.Timedelta(days=n_days - 1)))]["Pcs"].sum()
+        zone_chg = (cur - prev) / prev * 100 if prev > 0 else None
+    st.markdown(f"**{who} · {m0:%B %Y}**")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Visits", f"{len(v):,}", f"{v['Customer'].nunique()} shops", delta_color="off")
+    a2.metric("Visits per working day", f"{day_counts.mean():.1f}" if len(day_counts) else "—",
+              f"{int((day_counts >= VISIT_DAILY_TARGET).sum())} / {len(day_counts)} days hit {VISIT_DAILY_TARGET}", delta_color="off")
+    a3.metric("Confirmed at shop", f"{v['Location check'].str.startswith('✅').mean() * 100:.0f}%" if len(v) else "—")
+    a4.metric("Avg minutes per shop", f"{v['Minutes'].mean():.0f}" if v["Minutes"].notna().any() else "—")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Stickers changed", f"{int(v['Stickers changed'].fillna(0).sum()):,}")
+    b2.metric("Problems found / fixed", f"{int((v['Problems'] != '-').sum())} / {len(fixed)}")
+    b3.metric("Shop check score", f"{v['Check score %'].mean():.0f}%" if v["Check score %"].notna().any() else "—")
+    b4.metric("Lift of visited shops", f"{eff_m['Lift %'].mean():+.0f}%" if len(eff_m) else "⏳ wait 14 d")
+    covered = visits.assign(Key=visits["Customer"].map(norm_name))
+    covered = covered[covered["_dt"] >= pd.Timestamp(today_kh()) - pd.Timedelta(days=90)]["Key"].nunique()
+    st.caption(f"Phnom Penh bun pcs this month: {('%+.0f%%' % zone_chg) if zone_chg is not None else '—'} vs the same days last month · "
+               f"shops visited in the last 90 days: {covered} of {len(names)}.")
+    st.markdown("**Month by month**")
+    hist = visits[visits["Staff"] == who].assign(Month=visits["_dt"].dt.strftime("%Y-%m"), Key=visits["Customer"].map(norm_name),
+                                                Day=visits["_dt"].dt.date)
+    hist["Stickers changed"] = pd.to_numeric(hist["Stickers changed"], errors="coerce").fillna(0)
+    trend = hist.groupby("Month").agg(Visits=("VisitID", "size"), Shops=("Key", "nunique"), Days=("Day", "nunique"),
+                                      **{"At shop %": ("Location check", lambda s: round(s.str.startswith("✅").mean() * 100)),
+                                         "Stickers": ("Stickers changed", "sum"),
+                                         "Problems found": ("Problems", lambda s: int((s != "-").sum()))}).reset_index()
+    trend["Visits / day"] = (trend["Visits"] / trend["Days"]).round(1)
+    if not eff.empty:
+        lift = eff[(eff["Staff"] == who) & eff["Lift %"].notna()].assign(Month=lambda f: f["Date"].str[:7]).groupby("Month")["Lift %"].mean().round(0)
+        trend["Avg lift %"] = trend["Month"].map(lift)
+    _si_show(trend.sort_values("Month", ascending=False))
+
+
 @st.fragment(run_every=30)
 def _visit_report_live():
     st.caption(f"Live · updated {now_kh():%H:%M:%S}")
@@ -8864,9 +9212,9 @@ def tab_shop_visits():
     st.markdown("### 🏪 Shop Visits")
     views = ["📋 Today's plan", "📝 New visit"]
     if has_permission("reports"):
-        views += ["📊 Visit report", "🔴 Open problems"]
+        views += ["📊 Visit report", "🔴 Open problems", "📈 Did it help?", "🏅 Scorecard"]
     if current_role() == "admin":
-        views.append("🗺️ Zones")
+        views.append("⚙️ Shops & zones")
     if st.session_state.get("visit_view") not in views:
         st.session_state["visit_view"] = views[0]
     view = st.radio("Shop visit section", views, horizontal=True, key="visit_view", label_visibility="collapsed")
@@ -8885,8 +9233,11 @@ def tab_shop_visits():
             return
         _visit_progress(visits, user)
         zone_map = _visit_zone_map(names)
-        zone = _visit_zone_picker(zone_map, "visit_zone_plan")
-        route = _visit_route(visits, stats, names, areas, zone_map, zone)
+        all_route = _visit_route(visits, stats, names, areas, zone_map)
+        due_all = _visit_is_due(all_route)
+        zone = _visit_zone_picker(zone_map, "visit_zone_plan", Counter(due_all["Area"]))
+        route = all_route[all_route["Area"].eq(zone)].reset_index(drop=True) if zone else all_route
+        st.caption(f"📅 {len(due_all)} Phnom Penh shops need a visit now · {len(_visit_is_due(route))} of them in this zone.")
         if route.empty:
             st.info("No shops in this zone yet.")
             return
@@ -8906,7 +9257,7 @@ def tab_shop_visits():
             with st.container(border=True):
                 c1, c2, c3 = st.columns([4, 1, 1])
                 c1.markdown(f"**{'⭐ ' if n < VISIT_DAILY_TARGET and not q.strip() else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
-                            f"<span style='color:#6B7280'>Last visit {row['Last visit']} · {row['Pcs 28 days']:,} pcs in 28 days</span>",
+                            f"<span style='color:#6B7280'>{row['Size']} · last visit {row['Last visit']} · {row['Pcs 28 days']:,} pcs in 28 days</span>",
                             unsafe_allow_html=True)
                 c2.link_button("🧭 Go" if exact else "🔎 Map", link, use_container_width=True,
                                help="Directions to the saved pin" if exact else "No saved pin: searches the shop name on Google Maps")
@@ -8917,9 +9268,17 @@ def tab_shop_visits():
                     st.rerun()
         if done_today & set(route["Customer"].map(norm_name)):
             st.caption("✅ Already visited today (by anyone): " + ", ".join(route.loc[route["Customer"].map(norm_name).isin(done_today), "Customer"]))
-    elif view == "🗺️ Zones":
-        _s, names, _a = _visit_customer_stats()
+    elif view == "⚙️ Shops & zones":
+        stats, names, areas = _visit_customer_stats()
+        _visit_settings_admin(_visit_route(visits, stats, names, areas, _visit_zone_map(names)))
+        st.divider()
         _visit_zones_admin(names, visits)
+    elif view == "📈 Did it help?":
+        _s, names, _a = _visit_customer_stats()
+        _visit_effect_body(visits, st.session_state.get("_visit_daily", pd.DataFrame()))
+    elif view == "🏅 Scorecard":
+        _s, names, _a = _visit_customer_stats()
+        _visit_scorecard_body(visits, st.session_state.get("_visit_daily", pd.DataFrame()), names)
     elif view == "📊 Visit report":
         live = st.toggle("🔄 Live (refresh every 30 s)", key="vr_live")
         if live:
