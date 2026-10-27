@@ -113,8 +113,30 @@ JOURNAL_REMARK_HEADER = "ចំណាំ"          # journal column: remark / no
 INVOICE_PREFIX = "NP"                  # if the invoice column is empty, the first cell starting with this is used
 URGENT_WORDS = ["ប្រញាប់", "URGENT"]    # a remark containing one of these gets a 🔥
 JOURNAL_PAY_HEADER = "ការទូទាត់"        # journal column: payment (AR / FOC ...). FOC rows = free buns
-BUN_CODE_RE = re.compile(r"^N\d+$")  # journal columns N1, N2, N21 ... N43
-SNAPSHOT_VERSION = 6                   # change this number to force the journal to be re-read
+BUN_CODE_RE = re.compile(r"^N\d+$")
+CUSTOMER_CODE_RE = re.compile(r"^NPHK-\d+$", re.I)   # customer code column, never an invoice number
+PROMO_REMARK_RE = re.compile(r"^\s*\d+\s*\+\s*\d+\s*$")  # "5+1", "10+2": bonus buns written on their own line
+
+
+def free_reason(pay, remark, pcs, sales):
+    """Why a journal row is free (not a paid sale), or "" when it is paid.
+    - payment FOC (also the common typo F0C with a zero)
+    - remark starting with FOC ("FOC ទូស្អាត", "FOC នំខូច")
+    - a promotion bonus line ("5+1", "15+3") that has buns but 0 riel"""
+    p = str(pay or "").strip().upper().replace("0", "O")
+    r = str(remark or "").strip().upper()
+    if p == "FOC":
+        return "Payment FOC" if str(pay).strip().upper() == "FOC" else "Payment F0C (typo)"
+    if r.startswith("FOC"):
+        return "Remark FOC"
+    try:
+        no_riel = sales is not None and not pd.isna(sales) and float(sales) == 0
+    except Exception:
+        no_riel = False
+    if PROMO_REMARK_RE.match(r) and no_riel and (pcs or 0) > 0:
+        return "Promo bonus " + r.replace(" ", "")
+    return ""  # journal columns N1, N2, N21 ... N43
+SNAPSHOT_VERSION = 7                   # change this number to force the journal to be re-read
 
 TZ = ZoneInfo("Asia/Phnom_Penh")
 DAYFIRST = True                        # only used for ambiguous TEXT dates with no other hint
@@ -293,6 +315,8 @@ def cell_to_date(v, dominant=None):
         return v.date()
     if isinstance(v, date):
         return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return None                    # a plain number (summary rows like "31") is never a journal date
     s = str(v).strip()
     if not s:
         return None
@@ -1817,7 +1841,7 @@ def _find_invoice(row, inv_col):
         v = row[c_i]
         if isinstance(v, str):
             s = v.strip()
-            if s.upper().startswith(pre) and len(s) > len(pre):
+            if s.upper().startswith(pre) and len(s) > len(pre) and not CUSTOMER_CODE_RE.match(s):
                 return s
     return "-"
 
@@ -1918,7 +1942,7 @@ def _read_excel_snapshot(path):
             buns = [row[ci] if ci < len(row) else None for ci in bun_cols.values()]
             pay = str(row[pay_col]).strip().upper() if (pay_col is not None and pay_col < len(row) and row[pay_col] is not None) else ""
             actual_sales = row[sales_col] if sales_col is not None and sales_col < len(row) else None
-            raw_rows.append((row[0], name, qty, inv, rem or "-", buns, pay == "FOC" or rem.strip().upper() == "FOC", actual_sales))
+            raw_rows.append((row[0], name, qty, inv, rem or "-", buns, pay, actual_sales, r_i + 1))
     finally:
         wb.close()
     # bun names (row above the header), sell price and cost per piece (rows labelled SELL/PCS and NET/PCS)
@@ -1942,22 +1966,31 @@ def _read_excel_snapshot(path):
 
     months = Counter((r[0].year, r[0].month) for r in raw_rows if isinstance(r[0], datetime))
     dominant = months.most_common(1)[0][0] if months else None
-    out = []
-    for v, name, qty, inv, rem, buns, foc, actual_sales in raw_rows:
+    out, skipped = [], []
+    for v, name, qty, inv, rem, buns, pay, actual_sales, xl_row in raw_rows:
         d = cell_to_date(v, dominant)
+        pcs = float(sum(x for x in pd.to_numeric(pd.Series(buns, dtype=object), errors="coerce").fillna(0)))
+        sales = pd.to_numeric(actual_sales, errors="coerce")
         if d is None:
+            # A row with a customer AND buns / an invoice but no readable date is real data the app cannot use.
+            real_invoice = bool(re.match(r"^" + INVOICE_PREFIX + r"\d", str(inv), re.I))
+            if (pcs > 0 or real_invoice) and (pay or real_invoice):
+                skipped.append({"Excel row": xl_row, "Date cell": _cell_text(v) or "(empty)", "Customer": name,
+                                "Invoice": inv, "Bun pcs": int(pcs), "Payment": pay or "-"})
             continue
         try:
             q = pd.to_numeric(qty, errors="coerce")
             q = None if pd.isna(q) else float(q)
         except Exception:
             q = None
-        out.append((d, name, q, inv, rem, foc, pd.to_numeric(actual_sales, errors="coerce"), *buns))
-    journal = pd.DataFrame(out, columns=["Date", "Customer", "Cases", "Invoice", "Remark", "FOC", "SalesActual"] + list(bun_cols))
+        reason = free_reason(pay, rem, pcs, sales)
+        out.append((d, name, q, inv, rem, bool(reason), sales, pay or "-", reason, xl_row, *buns))
+    journal = pd.DataFrame(out, columns=["Date", "Customer", "Cases", "Invoice", "Remark", "FOC", "SalesActual",
+                                         "Pay", "FreeReason", "ExcelRow"] + list(bun_cols))
     for _c in bun_cols:
         journal[_c] = pd.to_numeric(journal[_c], errors="coerce").fillna(0)
     journal["Cases"] = pd.to_numeric(journal["Cases"], errors="coerce")
-    return {"customers": customers, "journal": journal, "cases_col_found": cases_col is not None,
+    return {"customers": customers, "journal": journal, "skipped": skipped, "cases_col_found": cases_col is not None,
             "invoice_col_found": inv_col is not None, "areas": areas, "area_col_found": bool(areas),
             "buns": bun_info}
 
@@ -6635,24 +6668,38 @@ def _si_merge_month_sources(sources, live, today):
             # September workbooks may contain a few October rows. They must not replace October's journal.
             owns_month = month == primary
             if month not in months or owns_month or not months[month][2]:
-                months[month]=(label,g.drop(columns='_month').copy(),owns_month)
+                months[month]=(label,g.drop(columns='_month').assign(Source=label),owns_month)
     coverage=[]
-    for month in sorted(set(months)|{'2026-09','2026-10','2026-11','2026-12'}):
+    expected=pd.period_range('2026-09',max(pd.Period(today,'M'),pd.Period('2026-12','M')),freq='M').strftime('%Y-%m')
+    for month in sorted(set(months)|set(expected)):
         if month in months:
             label,g,_=months[month]
             dated=g[g['Date']<=today]
             coverage.append({'Month':month,'Data status':'Available through '+str(dated['Date'].max()) if not dated.empty else 'Future-dated records only',
                              'Source':label,'Journal rows':len(g),'Last recorded date':str(g['Date'].max())})
+        elif month>today.strftime('%Y-%m'):coverage.append({'Month':month,'Data status':'Not started yet','Source':'','Journal rows':0,'Last recorded date':''})
         else:coverage.append({'Month':month,'Data status':'Not loaded — not zero sales','Source':'','Journal rows':0,'Last recorded date':''})
     parts=[g for _,g,_ in months.values()]
     combined=pd.concat(parts,ignore_index=True,sort=False) if parts else live.iloc[0:0].copy()
     for c in codes:combined[c]=pd.to_numeric(combined[c],errors='coerce').fillna(0)
     if 'FOC' in combined:combined['FOC']=combined['FOC'].map(lambda v: str(v).strip().lower() in ('true','1','yes'))
+    else:combined['FOC']=False
+    # Saved history was written with the old rule; apply the current free-row rule to every row.
+    for c in ('Pay','Remark','FreeReason'):
+        if c not in combined:combined[c]=''
+    combined[['Pay','Remark','FreeReason']]=combined[['Pay','Remark','FreeReason']].fillna('').astype(str)
+    if not combined.empty:
+        pcs=combined[codes].sum(axis=1) if codes else pd.Series(0.0,index=combined.index)
+        sales=pd.to_numeric(combined.get('SalesActual',pd.Series(index=combined.index,dtype=float)),errors='coerce')
+        again=[free_reason(p,r,n,v) for p,r,n,v in zip(combined['Pay'],combined['Remark'],pcs,sales)]
+        old_rule=combined['FOC'] & combined['FreeReason'].isin(['','nan'])
+        combined['FreeReason']=[a or (f if f not in ('','nan') else ('FOC (saved history)' if o else '')) for a,f,o in zip(again,combined['FreeReason'],old_rule)]
+        combined['FOC']=combined['FreeReason'].ne('')
     return combined,codes,pd.DataFrame(coverage)
 
 
 def _si_collect_journals(snap):
-    sources=[];warnings_out=[]
+    sources=[];warnings_out=[];skipped=[]
     seed=_si_read_hist(SI_JOURNAL_HISTORY_FILE)
     if not seed.empty and {'Date','Customer','Cases','Invoice'} <= set(seed):
         if 'Source_File' in seed:
@@ -6684,6 +6731,7 @@ def _si_collect_journals(snap):
                 info=os.stat(local)
                 archive=_si_archive_snapshot(local,info.st_mtime_ns,info.st_size)
                 sources.append((item['name'],archive['journal']))
+                skipped+=[dict(r,Source=item['name']) for r in archive.get('skipped',[])]
             except Exception as error:
                 warnings_out.append(item['name']+': '+str(error)[:100])
     except Exception as error:
@@ -6692,8 +6740,11 @@ def _si_collect_journals(snap):
     # Add unposted site orders only after merging every month's invoices.
     combined_snap=dict(snap,journal=merged,buns=dict(snap.get('buns',{}),codes=codes))
     combined=journal_plus_orders(combined_snap)
+    skipped+=[dict(r,Source='Live journal') for r in snap.get('skipped',[])]
     st.session_state['si_journal_coverage']=coverage
     st.session_state['si_journal_warnings']=warnings_out
+    st.session_state['si_skipped']=pd.DataFrame(skipped)
+    st.session_state['si_combined']=combined          # used by the Data check section
     return combined,codes
 
 
@@ -6733,8 +6784,9 @@ def _si_prepare_cached(j, codes, history_daily, history_monthly, sell, as_of):
         df["Sales"] = actual.fillna(df["Sales"])
     else:
         df["Sales basis"] = "Estimated from product prices"
-    # Future orders are not treated as actual historical sales.
-    df = df[df["D"] <= pd.Timestamp(as_of)].copy()
+    # Future orders are not treated as actual historical sales. Lines without buns (fridge, umbrella,
+    # deposit...) are not bun orders: they would add riel and a fake "order day". Data check lists them.
+    df = df[(df["D"] <= pd.Timestamp(as_of)) & (df["Pcs"] > 0)].copy()
     df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
     daily = df.groupby(["Key", "D"], as_index=False).agg(
         Customer=("Customer", "first"), Cases=("Cases", "sum"), Sales=("Sales", "sum"), Pcs=("Pcs", "sum"))
@@ -7523,8 +7575,241 @@ def _si_bar(frame, label_col, value_col):
     st.bar_chart(data.set_index(label_col))
 
 
+# ---------- 🧪 DATA CHECK: double-check what the app read from the journals ----------
+SI_DC_SPECS = [
+    # key, icon+title, severity, why it matters, how to fix
+    ("skipped", "Rows skipped: date unreadable", "fix",
+     "These rows have a customer and buns/invoice but the date cell could not be read, so the app does not count them at all.",
+     "Type a real date in the កាលបរិច្ឆេទ cell of that Excel row (same format as the rows above)."),
+    ("dup_line", "Same invoice entered twice", "fix",
+     "The same customer, day and invoice appear on 2+ lines. If it is a copy, buns and riel are counted twice.",
+     "Delete the copied line, or give the second line its own invoice number (e.g. NP…​.1)."),
+    ("paid_no_riel", "Paid row with 0 riel", "fix",
+     "Buns are written but the riel amount is empty / 0 and the row is not FOC. Sales ៛ are too low.",
+     "Fill the price (or write FOC / 5+1 in ចំណាំ if the buns were free)."),
+    ("invoice_shared", "One invoice number, different customers", "review",
+     "Two different customers use the same invoice number. Usually a typing mistake; follow-ups and checks by invoice get mixed up.",
+     "Correct the invoice number on the wrong line."),
+    ("no_cases", "Buns but no cases (កេស)", "review",
+     "Packing and delivery use the case count. Empty cases make 'left to send' and case totals wrong.",
+     "Type the number of cases in កេស."),
+    ("odd_cases", "Cases look wrong for the buns", "review",
+     "Pieces per case is far from normal (under 15 or over 80). Often a typo in កេស or a bun column.",
+     "Check the case count and the bun numbers on that line."),
+    ("pay_code", "Unknown payment code", "review",
+     "Payment is not AR / FOC (e.g. 'F0C' with a zero, lower case, empty). The app guesses, but reports by payment can be off.",
+     "Write AR or FOC in ការទូទាត់."),
+    ("not_master", "Customer not in Master List", "review",
+     "The name in the journal is not in the Master List (new customer or spelling). Area, map and history may not match.",
+     "Add the customer to the Master List, or fix the spelling to match it."),
+    ("free_rows", "Free rows (FOC / bonus) — not counted as sales", "info",
+     "These buns are free, so they are left out of paid pcs, ៛ and 'order days'. Check the list is right.",
+     "If a row here was really paid, remove FOC / 5+1 from the remark or payment."),
+    ("no_buns", "Riel without buns (fridge, umbrella, deposit…)", "info",
+     "These lines have riel but no buns. They are kept out of bun sales and habits.",
+     "Nothing to do if correct. If buns are missing, fill the N columns."),
+    ("future", "Future-dated rows (pre-orders)", "info",
+     "Rows dated after today are pre-orders. They are not counted until their day.",
+     "Nothing to do unless the date is a typo."),
+]
+SI_DC_SEV = {"fix": ("❗", "Needs fixing"), "review": ("⚠️", "Please review"), "info": ("ℹ️", "For your information")}
+
+
+def _si_frame_sig(frame):
+    """Cheap fingerprint of a DataFrame, used to cache heavy calculations until the data really changes."""
+    if frame is None or len(frame) == 0:
+        return "empty"
+    try:
+        return f"{len(frame)}-{int(pd.util.hash_pandas_object(frame.astype(str), index=False).sum())}"
+    except Exception:
+        return f"{len(frame)}-{frame.shape}-{hash(tuple(map(str, frame.columns)))}"
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _si_data_check(sig, today, _combined, _codes, _master, _skipped):
+    """(issues {key: DataFrame}, month totals DataFrame). sig + today decide the cache."""
+    j = _combined.copy() if _combined is not None else pd.DataFrame()
+    issues = {k: pd.DataFrame() for k, *_ in SI_DC_SPECS}
+    if _skipped is not None and len(_skipped):
+        issues["skipped"] = _skipped.copy()
+    if j.empty:
+        return issues, pd.DataFrame()
+    codes = [c for c in _codes if c in j.columns]
+    j["D"] = pd.to_datetime(j["Date"], errors="coerce")
+    j["Bun pcs"] = j[codes].sum(axis=1) if codes else 0.0
+    j["Riel"] = pd.to_numeric(j.get("SalesActual"), errors="coerce")
+    j["Cases"] = pd.to_numeric(j.get("Cases"), errors="coerce")
+    for c in ("Invoice", "Remark", "Pay", "FreeReason", "Source"):
+        j[c] = j[c].fillna("").astype(str) if c in j else ""
+    if "_site" in j:
+        j.loc[j["_site"].fillna(False).astype(bool), "Source"] = "📝 Site order"
+    j["Excel row"] = pd.to_numeric(j.get("ExcelRow"), errors="coerce").astype("Int64")
+    j["Free"] = j["FreeReason"].ne("") & j["FreeReason"].ne("nan")
+    j["Date"] = j["D"].dt.strftime("%Y-%m-%d")
+    staff = j["Customer"].astype(str).str.strip().str.upper().isin(SI_IGNORE_NAMES)
+    past = j["D"] <= pd.Timestamp(today)
+    real = past & ~staff
+    base = ["Date", "Customer", "Invoice", "Bun pcs", "Cases", "Riel", "Remark", "Pay", "Source", "Excel row"]
+
+    def pick(mask, cols=base):
+        return j.loc[mask, cols].sort_values(["Date", "Customer"]).reset_index(drop=True)
+
+    inv = j["Invoice"].str.strip()
+    real_inv = inv.str.match(r"^" + INVOICE_PREFIX + r"\d", case=False)
+    d = j[real & real_inv & (j["Bun pcs"] > 0)]
+    dup = d.duplicated(["Date", "Customer", "Invoice"], keep=False)
+    issues["dup_line"] = pick(j.index.isin(d.index[dup]))
+    issues["paid_no_riel"] = pick(real & ~j["Free"] & (j["Bun pcs"] > 0) & j["Riel"].fillna(0).eq(0) & ~j["Source"].eq("📝 Site order"))
+    n_cust = j[real & real_inv].assign(_k=j["Customer"].map(norm_name)).groupby(inv)["_k"].nunique()
+    shared = set(n_cust[n_cust > 1].index)
+    if shared:
+        x = pick(real & inv.isin(shared))
+        issues["invoice_shared"] = x.sort_values(["Invoice", "Date"]).reset_index(drop=True)
+    issues["no_cases"] = pick(real & ~j["Free"] & (j["Bun pcs"] > 0) & j["Cases"].fillna(0).le(0))
+    ppc = j["Bun pcs"] / j["Cases"].where(j["Cases"] > 0)
+    issues["odd_cases"] = pick(real & ~j["Free"] & ((ppc < 15) | (ppc > 80))).assign(**{"Pcs per case": lambda f: (f["Bun pcs"] / f["Cases"]).round(0)})
+    pay = j["Pay"].str.strip()
+    # Saved history has no payment column, so only workbooks read today are checked.
+    issues["pay_code"] = pick(real & ~j["Source"].eq("📝 Site order") & ~j["Source"].str.startswith("Saved history")
+                              & ~pay.isin(["AR", "FOC"]))
+    if _master:
+        mset = {norm_name(n) for n in _master}
+        nm = j[real & (j["Bun pcs"] > 0) & ~j["Customer"].map(norm_name).isin(mset)]
+        if len(nm):
+            issues["not_master"] = (nm.groupby("Customer").agg(**{"Lines": ("Date", "size"), "First": ("Date", "min"),
+                                    "Last": ("Date", "max"), "Bun pcs": ("Bun pcs", "sum")})
+                                    .reset_index().sort_values("Bun pcs", ascending=False).reset_index(drop=True))
+    issues["free_rows"] = pick(past & j["Free"], base + ["FreeReason"]).rename(columns={"FreeReason": "Why free"})
+    issues["no_buns"] = pick(real & (j["Bun pcs"] <= 0) & j["Riel"].fillna(0).gt(0))
+    issues["future"] = pick(~past & ~staff)
+
+    # month totals to compare with the Excel totals row
+    m = j[past].copy()
+    m["Month"] = m["D"].dt.strftime("%Y-%m")
+    m["Paid pcs"] = m["Bun pcs"].where(~m["Free"] & ~staff[past], 0)
+    m["Free pcs"] = m["Bun pcs"].where(m["Free"], 0)
+    m["Bun riel"] = m["Riel"].where(m["Bun pcs"] > 0, 0).fillna(0)
+    m["Other riel"] = m["Riel"].where(m["Bun pcs"] <= 0, 0).fillna(0)
+    m["No riel"] = (~m["Free"] & (m["Bun pcs"] > 0) & m["Riel"].isna()).astype(int)
+    totals = m.groupby("Month").agg(**{
+        "Source": ("Source", lambda s: " + ".join(sorted(set(x for x in s if x)))),
+        "Lines": ("Customer", "size"), "Days": ("D", "nunique"), "Paid bun pcs": ("Paid pcs", "sum"),
+        "Free pcs": ("Free pcs", "sum"), "Cases": ("Cases", "sum"), "Bun ៛ (journal)": ("Bun riel", "sum"),
+        "Other items ៛": ("Other riel", "sum"), "Lines without ៛": ("No riel", "sum"), "Last day": ("Date", "max")}).reset_index()
+    for c in ("Paid bun pcs", "Free pcs", "Cases", "Bun ៛ (journal)", "Other items ៛"):
+        totals[c] = totals[c].round(0).astype("int64")
+
+    def _gaps(month):
+        have = set(m.loc[m["Month"] == month, "D"].dt.day)
+        last = int(m.loc[m["Month"] == month, "D"].dt.day.max())
+        miss = [d for d in range(1, last + 1) if d not in have]
+        return ", ".join(map(str, miss)) if miss else "none"
+    totals.insert(3, "Days with no rows", totals["Month"].map(_gaps))
+    return issues, totals
+
+
+def _si_dc_counts(issues):
+    out = {"fix": 0, "review": 0, "info": 0}
+    for key, _t, sev, *_ in SI_DC_SPECS:
+        out[sev] += len(issues.get(key, ()))
+    return out
+
+
+def _si_open_data_check():
+    st.session_state["si_tab"] = "🧪 Data check"
+
+
+def _si_health_strip(coverage, counts):
+    """One easy-to-read line: which months are loaded and how many data problems there are."""
+    chips = []
+    for r in (coverage.to_dict("records") if coverage is not None and len(coverage) else []):
+        mname = pd.Timestamp(r["Month"] + "-01").strftime("%b %Y")
+        status = str(r["Data status"])
+        if status.startswith("Available"):
+            upto = pd.to_datetime(status.split()[-1], errors="coerce")
+            upto = upto.strftime("%d %b") if pd.notna(upto) else status.split()[-1]
+            icon, txt = ("🟢", "live, to " + upto) if r["Source"] == "Live journal" else ("✅", "to " + upto)
+        elif status.startswith("Not started"):
+            icon, txt = "⚪", "not started"
+        elif status.startswith("Future"):
+            icon, txt = "⚪", "pre-orders only"
+        else:
+            icon, txt = "🔴", "missing"
+        chips.append(f"<span class='hk-pill'>{icon} <b>{_e(mname)}</b> {_e(txt)}</span>")
+    fix, rev = counts["fix"], counts["review"]
+    chips.append(f"<span class='hk-pill' style='background:{'#ffd6d6' if fix else '#d8f5df'}'>❗ <b>{fix}</b> to fix</span>")
+    chips.append(f"<span class='hk-pill' style='background:{'#fff1c2' if rev else '#d8f5df'}'>⚠️ <b>{rev}</b> to review</span>")
+    return "<div class='hk-kpis'>" + "".join(chips) + "</div>"
+
+
+def _si_data_check_section(issues, totals, coverage):
+    st.markdown("#### 🧪 Data check — compare with your Excel")
+    st.caption("1) Compare the month totals below with the totals row of each journal. 2) Fix the red items in Excel "
+               "(the Excel row number is shown), save, wait for Dropbox, then press 🔄 Refresh.")
+    st.markdown("**📅 Months loaded**")
+    if coverage is not None and len(coverage):
+        _si_show(coverage)
+    for message in st.session_state.get("si_journal_warnings", []):
+        st.warning(message)
+    st.markdown("**🧮 Month totals (up to today)**")
+    if totals.empty:
+        st.info("No journal rows yet.")
+    else:
+        _si_show(totals, money=("Paid bun pcs", "Free pcs", "Cases", "Bun ៛ (journal)", "Other items ៛"))
+        st.caption("Paid bun pcs leaves out FOC / bonus rows and STAFF/GENERAL. Bun ៛ is the riel written in the journal; "
+                   "Other items ៛ are lines with riel but no buns. Lines without ៛ use the price list instead.")
+    st.markdown("**🔍 Problems found** — tap a card to see the rows")
+    sel = st.session_state.get("si_dc_sel")
+    cards = [(k, t, sev) for k, t, sev, *_ in SI_DC_SPECS]
+    for i in range(0, len(cards), 3):
+        for col, (k, t, sev) in zip(st.columns(3), cards[i:i + 3]):
+            n = len(issues.get(k, ()))
+            icon = SI_DC_SEV[sev][0] if n else "✅"
+            col.button(f"{icon} {t} · {n}", key=f"si_dc_{k}", use_container_width=True,
+                       type="primary" if sel == k else "secondary", disabled=(n == 0),
+                       on_click=lambda k=k: st.session_state.update(si_dc_sel=None if st.session_state.get("si_dc_sel") == k else k))
+    if sel and len(issues.get(sel, ())):
+        _k, title, sev, why, fix = next(x for x in SI_DC_SPECS if x[0] == sel)
+        frame = issues[sel]
+        st.markdown(f"##### {SI_DC_SEV[sev][0]} {title} ({len(frame)})")
+        st.markdown(f"**Why it matters:** {why}  \n**How to fix:** {fix}")
+        q = st.text_input("🔎 Filter these rows (customer / invoice)", key=f"si_dc_q_{sel}", max_chars=60)
+        if q.strip():
+            hay = frame.astype(str).agg(" ".join, axis=1)
+            frame = frame[hay.str.contains(q.strip(), case=False, regex=False)]
+        _si_show(frame, money=("Bun pcs", "Riel"), height=min(520, 60 + 36 * max(len(frame), 1)))
+    if has_permission("reports"):
+        try:
+            frames = {"Month totals": totals, "Months loaded": coverage if coverage is not None else pd.DataFrame()}
+            for k, t, sev, *_ in SI_DC_SPECS:
+                if len(issues.get(k, ())):
+                    frames[t[:31]] = issues[k]
+            st.download_button("📥 Download data check (Excel)", data=_report_excel_bytes(frames),
+                               file_name=f"Data_Check_{today_kh()}.xlsx", key="si_dc_dl",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.warning(f"Could not build the Excel file: {e}")
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def _si_derived(sig, today, lookback, min_orders, factor, dormant_factor, _daily, _mon, _names, _areas):
+    """The slow per-customer calculations, cached until the data or the settings change."""
+    habits = _si_habits(_daily, today, min_orders, lookback, factor, dormant_factor, _names, _areas)
+    avgs = _si_month_avgs(_mon, _daily, today)
+    no_month = _si_no_order(_daily, _names, _areas, today.replace(day=1), today, today, avgs)
+    return habits, avgs, no_month
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def _si_care_cached(sig, today, measure, _daily, _df, _codes, _habits, _names, _areas, _avgs):
+    return _si_care(_daily, _df, _codes, _habits, _names, _areas, today, today.replace(day=1), _avgs, measure)
+
+
 def _sales_insights_body():
-    if st.button("🔄 Refresh latest data", key="si_refresh_latest"):
+    h1, h2 = st.columns([5, 1])
+    h1.markdown("### 🎯 Sales Insights")
+    if h2.button("🔄 Refresh", key="si_refresh_latest", use_container_width=True,
+                 help="Read the newest journal and orders from Dropbox"):
         try:
             if USE_DROPBOX:
                 _list_remote_folder.clear()
@@ -7541,18 +7826,24 @@ def _sales_insights_body():
     today = today_kh()
     if _src == "stale":
         st.warning("The journal could not be read. These figures use the last readable copy; today's orders may be missing.")
-    daily, df, codes = _si_prepare(snap)
-    st.caption(f"Data checked: {now_str()} · Journal: {os.path.basename(_path or '')}. Save Excel and wait for Dropbox to finish syncing before refreshing.")
-    with st.expander("Journal sources: September → December and onward", expanded=True):
-        coverage = st.session_state.get("si_journal_coverage", pd.DataFrame())
-        if not coverage.empty: st.dataframe(coverage, hide_index=True, use_container_width=True)
-        st.caption("September and October use journal records. November/December appear when their journals are added to the same data folder. Missing months are not zero sales. Current-month figures are month-to-date, not a forecast.")
-        for message in st.session_state.get("si_journal_warnings", []): st.warning(message)
-        if not df.empty and "Sales basis" in df:
-            estimated = int(df["Sales basis"].eq("Estimated from product prices").sum())
-            st.caption(f"Revenue uses each journal's recorded riel amount; {estimated} rows use estimated product prices because recorded amounts are unavailable. Free (FOC) rows are excluded from paid-sales insights.")
+    with st.spinner("Reading journals…"):
+        daily, df, codes = _si_prepare(snap)
+    combined = st.session_state.get("si_combined", pd.DataFrame())
+    coverage = st.session_state.get("si_journal_coverage", pd.DataFrame())
+    skipped = st.session_state.get("si_skipped", pd.DataFrame())
+    master = tuple(snap.get("customers", []))
+    issues, totals = _si_data_check(f"{_si_frame_sig(combined)}|{_si_frame_sig(skipped)}|{len(master)}", today,
+                                    combined, codes, master, skipped)
+    counts = _si_dc_counts(issues)
+    st.caption(f"Updated {now_kh():%d %b %Y, %I:%M %p} · Journal: {os.path.basename(_path or '')} · "
+               "Save Excel and let Dropbox finish syncing before you refresh.")
+    s1, s2 = st.columns([5, 1])
+    s1.markdown(_si_health_strip(coverage, counts), unsafe_allow_html=True)
+    s2.button("🧪 Data check", key="si_open_dc", on_click=_si_open_data_check, use_container_width=True,
+              type="primary" if counts["fix"] else "secondary")
     if daily.empty:
         st.info("No paid orders found in the journal yet. Customer follow-ups remain available below.")
+        _si_data_check_section(issues, totals, coverage)
         _si_call_panel({norm_name(n): n for n in snap.get("customers", [])})
         return
     names, areas = _si_names_areas(snap, daily)
@@ -7564,8 +7855,6 @@ def _sales_insights_body():
             if areas.get(k, AREA_LABEL["Unknown"]) == AREA_LABEL["Unknown"]:
                 areas[k] = AREA_LABEL[PP] if str(z).strip() == "ភ្នំពេញ" else AREA_LABEL["Province"]
     span = (daily["D"].max() - daily["D"].min()).days + 1
-    st.caption(f"Data: {daily['D'].min():%Y-%m-%d} → {daily['D'].max():%Y-%m-%d} ({span} days, "
-               f"{daily['Key'].nunique()} customers with orders). Free (FOC) rows are not counted as orders.")
 
     with st.expander("⚙️ Settings for 'missing from habit'"):
         c1, c2, c3, c4 = st.columns(4)
@@ -7576,31 +7865,35 @@ def _sales_insights_body():
         if span < 60:
             st.info("The journal covers less than 60 days, so habits are still rough. They get better as more days are added.")
 
-    habits = _si_habits(daily, today, min_orders, lookback, factor, dormant_factor, names, areas)
+    sig = _si_frame_sig(daily) + "|" + _si_frame_sig(mon)
+    habits, avgs, no_month = _si_derived(sig, today, lookback, min_orders, factor, dormant_factor, daily, mon, names, areas)
     this_start = today.replace(day=1)
     d_mtd = daily[(daily["D"] >= pd.Timestamp(this_start)) & (daily["D"] <= pd.Timestamp(today))]
     last_end = this_start - timedelta(days=1)
     last_start = last_end.replace(day=1)
     same_end = min(last_start + timedelta(days=today.day - 1), last_end)
     d_prev = daily[(daily["D"] >= pd.Timestamp(last_start)) & (daily["D"] <= pd.Timestamp(same_end))]
-    avgs = _si_month_avgs(mon, daily, today)
-    no_month = _si_no_order(daily, names, areas, this_start, today, today, avgs)
     lost_month = no_month[no_month["Group"] == "Ordered last month"] if not no_month.empty else no_month
     missing = habits[habits["Status"] == "Missing"] if not habits.empty else habits
 
-    k1, k2, k6, k3, k4, k5 = st.columns(6)
-    kpi(k1, "Customers ordered this month", f"{d_mtd['Key'].nunique():,}")
+    def _delta(now, prev):
+        return f"{(now - prev) / prev * 100:+.0f}% vs same days last month" if prev > 0 else None
+
     s_now, s_prev = d_mtd["Sales"].sum(), d_prev["Sales"].sum()
-    kpi(k2, "Sales this month ៛", f"{s_now:,.0f}" + (f"  ({(s_now - s_prev) / s_prev * 100:+.0f}%)" if s_prev > 0 else ""))
     p_now, p_prev = d_mtd["Pcs"].sum(), d_prev["Pcs"].sum()
-    kpi(k6, "Bun pcs this month", f"{p_now:,.0f}" + (f"  ({(p_now - p_prev) / p_prev * 100:+.0f}%)" if p_prev > 0 else ""))
-    kpi(k3, "Missing from habit", f"{len(missing):,}")
-    kpi(k4, "Ordered last month, not yet this month", f"{len(lost_month):,}")
-    kpi(k5, "Lost sales risk ៛ (est.)", f"{int(missing['Lost sales ៛ (est.)'].sum()) if len(missing) else 0:,}")
-    st.caption("Sales % compares with the same days of last month.")
+    st.markdown(f"**This month so far** · {this_start:%d %b} → {today:%d %b}")
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Customers who ordered", f"{d_mtd['Key'].nunique():,}", _delta(d_mtd["Key"].nunique(), d_prev["Key"].nunique()))
+    k2.metric("Paid bun pcs", f"{p_now:,.0f}", _delta(p_now, p_prev))
+    k3.metric("Bun sales ៛", f"{s_now:,.0f}", _delta(s_now, s_prev))
+    st.markdown("**Customers to watch**")
+    k4, k5, k6 = st.columns(3)
+    k4.metric("Late vs their habit", f"{len(missing):,}")
+    k5.metric("Bought last month, not yet now", f"{len(lost_month):,}")
+    k6.metric("Sales at risk ៛ (est.)", f"{int(missing['Lost sales ៛ (est.)'].sum()) if len(missing) else 0:,}")
 
     care_measure = "Sales" if str(st.session_state.get("si_care_measure", "")).startswith("💵") else "Pcs"
-    care = _si_care(daily, df, codes, habits, names, areas, today, this_start, avgs, care_measure)
+    care = _si_care_cached(sig + "|" + _si_frame_sig(habits), today, care_measure, daily, df, codes, habits, names, areas, avgs)
     care_unit = "pcs" if care_measure == "Pcs" else "៛"
     top = pd.DataFrame()
     # A sales risk can still appear in analytical reports, but not as a call recommendation.
@@ -7617,9 +7910,13 @@ def _sales_insights_body():
         care = care.iloc[0:0]
 
     _si_tabs = ["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
-                "💝 Customer care", "📆 Monthly history", "🔎 Customer detail"]
-    _si_tab = st.radio("Insights section", _si_tabs, horizontal=True, key="si_tab")
-    t_top, t_miss, t_none, t_care, t_hist, t_det = (_si_tab == name for name in _si_tabs)   # only the chosen one is built
+                "💝 Customer care", "📆 Monthly history", "🔎 Customer detail", "🧪 Data check"]
+    if st.session_state.get("si_tab") not in _si_tabs:
+        st.session_state["si_tab"] = _si_tabs[0]
+    _si_tab = st.radio("Insights section", _si_tabs, horizontal=True, key="si_tab", label_visibility="collapsed")
+    t_top, t_miss, t_none, t_care, t_hist, t_det, t_dc = (_si_tab == name for name in _si_tabs)   # only the chosen one is built
+    if t_dc:
+        _si_data_check_section(issues, totals, coverage)
 
     if t_top:
         c1, c2 = st.columns([2, 2])
