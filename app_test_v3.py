@@ -95,6 +95,7 @@ MAP_REGISTRY_FILE = os.path.join(DATA_DIR, "customer_map_registry.json")
 CALLS_FILE = os.path.join(DATA_DIR, "customer_call_history.csv")
 VISITS_FILE = os.path.join(DATA_DIR, "shop_visits.csv")             # staff visits to customer shops
 VISIT_ZONE_FILE = os.path.join(DATA_DIR, "visit_zones.csv")         # Phnom Penh zone per shop, set by Admin
+VISIT_PIN_FILE = os.path.join(DATA_DIR, "shop_pins.csv")            # shop locations saved at the shop by staff
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache_" + _APP_SCOPE)       # outside Dropbox = faster
@@ -1585,7 +1586,7 @@ def daily_backup_once(day_str):
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, VISITS_FILE, VISIT_ZONE_FILE,
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE,
                  os.path.join(DATA_DIR, "visit_settings.json"))
         if USE_DROPBOX:
             try:
@@ -8294,8 +8295,8 @@ def _visit_zone_picker(zone_map, key, due=None):
     return zone
 
 
-def _visit_map_link(customer, registry):
-    pin = _visit_pin(customer, registry)
+def _visit_map_link(customer, registry, store=None):
+    pin = _visit_pin(customer, registry, store)
     if pin:
         return f"https://www.google.com/maps/dir/?api=1&destination={pin[0]},{pin[1]}&travelmode=driving", True
     return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(f"{customer} Phnom Penh"), False
@@ -8456,16 +8457,59 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
 
-def _visit_pin(customer, registry=None):
-    """(lat, lon) of the customer's map pin, or None."""
+# ---------- shop map pins saved by staff (used when Customer Map has no pin, or the pin was wrong) ----------
+VISIT_PIN_COLS = ["Date", "Customer", "Lat", "Lon", "Accuracy m", "Source", "By", "Status", "Note"]
+VISIT_PIN_MAX_ACC = 80            # metres: a GPS fix worse than this is not good enough to save as a shop location
+
+
+def _visit_pin_store():
+    """{key: {...}} newest active pin saved by staff per shop."""
+    try:
+        df = read_raw(VISIT_PIN_FILE, VISIT_PIN_COLS)
+    except Exception:
+        return {}
+    out = {}
+    for _, r in df[df["Status"].eq("Active")].sort_values("_dt").iterrows():
+        k = norm_name(r["Customer"])
+        try:
+            out[k] = {"lat": float(r["Lat"]), "lon": float(r["Lon"]), "acc": r["Accuracy m"], "source": r["Source"],
+                      "by": r["By"], "date": r["Date"]}
+        except Exception:
+            continue
+    return out
+
+
+def _visit_pin_info(customer, registry=None, store=None):
+    """(lat, lon, where it came from) or None. A pin saved at the shop by staff is newer than the Customer Map, so it wins."""
+    store = _visit_pin_store() if store is None else store
+    k = norm_name(customer)
+    if k in store:
+        p = store[k]
+        where = "saved at the shop" if str(p["source"]).startswith("GPS") else "saved from a Google Maps link"
+        return p["lat"], p["lon"], f"{where} by {p['by']} on {str(p['date'])[:10]}" + (" (pin moved)" if "moved" in str(p["source"]) else "")
     try:
         m = customer_map_match(customer, registry if registry is not None else load_map_registry())
         lat, lon = m.get("Latitude"), m.get("Longitude")
         if lat is not None and lon is not None and math.isfinite(float(lat)) and math.isfinite(float(lon)):
-            return float(lat), float(lon)
+            return float(lat), float(lon), "from 📍 Customer Map"
     except Exception:
         pass
     return None
+
+
+def _visit_pin_save(customer, lat, lon, acc, source, note="-"):
+    if not (10 <= lat <= 15 and 102 <= lon <= 108):
+        raise ValueError("this location is outside Cambodia")
+    append_row(VISIT_PIN_FILE, {"Date": now_str(), "Customer": customer, "Lat": f"{lat:.6f}", "Lon": f"{lon:.6f}",
+                                "Accuracy m": "-" if acc in (None, "") else f"{float(acc):.0f}", "Source": source,
+                                "By": current_user() or "-", "Status": "Active", "Note": note or "-"})
+    audit("shop pin saved", f"{customer} | {lat:.5f},{lon:.5f} | {source}")
+
+
+def _visit_pin(customer, registry=None, store=None):
+    """(lat, lon) of the shop, or None."""
+    info = _visit_pin_info(customer, registry, store)
+    return (info[0], info[1]) if info else None
 
 
 def _visit_location_check(gps, pin):
@@ -8490,13 +8534,21 @@ def _visit_read_gps_params():
             return
         lat, lon, acc, ms = (float(x) for x in str(raw).split(","))
         age = time.time() - ms / 1000.0
+        mode = str(qp.get("vmode") or "checkin")
+        cust = str(qp.get("vcust") or "")
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError("bad coordinates")
         if age > VISIT_GPS_MAX_AGE_S or age < -120:
             st.session_state["visit_gps_error"] = "Check-in is too old. Press 📍 Check in again at the shop."
+        elif mode in ("pin", "move") and acc > VISIT_PIN_MAX_ACC:
+            st.session_state["visit_gps_error"] = (f"GPS is not exact enough (±{acc:.0f} m, need ±{VISIT_PIN_MAX_ACC} m or better). "
+                                                   "Stand outside the shop door, wait 20 seconds and press the button again.")
         else:
-            st.session_state["visit_gps"] = {"lat": lat, "lon": lon, "acc": acc, "at": now_str(),
-                                             "customer": str(qp.get("vcust") or "")}
+            if mode in ("pin", "move") and cust:
+                note = "first location of this shop" if mode == "pin" else "staff moved the pin: old pin was wrong"
+                _visit_pin_save(cust, lat, lon, acc, "GPS at shop" if mode == "pin" else "GPS at shop (moved)", note)
+                st.session_state["flash"] = "📍 Shop location saved"
+            st.session_state["visit_gps"] = {"lat": lat, "lon": lon, "acc": acc, "at": now_str(), "customer": cust}
         st.session_state["main_section"] = "🏪 Shop Visits"
         st.session_state["visit_view"] = "📝 New visit"
         if qp.get("vcust"):
@@ -8504,7 +8556,7 @@ def _visit_read_gps_params():
     except Exception:
         st.session_state["visit_gps_error"] = "The location could not be read. Press 📍 Check in again."
     finally:
-        for k in ("vgps", "vcust", "vgpserr"):
+        for k in ("vgps", "vcust", "vgpserr", "vmode"):
             try:
                 if k in st.query_params:
                     del st.query_params[k]
@@ -8512,15 +8564,17 @@ def _visit_read_gps_params():
                 pass
 
 
-def _visit_checkin_button(customer):
-    """A button that asks the phone for GPS, then reloads the app with the position in the address."""
+def _visit_checkin_button(customer, mode="checkin", text="📍 Check in at this shop", color="#B3261E"):
+    """A button that asks the phone for GPS, then reloads the app with the position in the address.
+    mode: checkin | pin (save the shop's first location) | move (replace a wrong pin)."""
     cust = json.dumps(customer)
+    text = html.escape(text)
     st.components.v1.html(f"""
 <style>
-button{{width:100%;padding:12px 14px;border-radius:10px;border:0;background:#B3261E;color:#fff;font:600 16px Inter,system-ui,sans-serif;cursor:pointer}}
+button{{width:100%;padding:12px 14px;border-radius:10px;border:0;background:{color};color:#fff;font:600 16px Inter,system-ui,sans-serif;cursor:pointer}}
 button:disabled{{opacity:.6}} #m{{font:13px system-ui,sans-serif;color:#6B7280;margin-top:6px}}
 </style>
-<button id="b">📍 Check in at this shop</button><div id="m">Allow location when the phone asks.</div>
+<button id="b">{text}</button><div id="m">Allow location when the phone asks.</div>
 <script>
 const b=document.getElementById('b'), m=document.getElementById('m');
 b.onclick=function(){{
@@ -8531,6 +8585,7 @@ b.onclick=function(){{
       const u=new URL(window.parent.location.href);
       u.searchParams.set('vgps',[p.coords.latitude.toFixed(6),p.coords.longitude.toFixed(6),Math.round(p.coords.accuracy),Date.now()].join(','));
       u.searchParams.set('vcust',{cust});
+      u.searchParams.set('vmode','{mode}');
       window.parent.location.href=u.toString();
   }},function(e){{b.disabled=false; m.textContent='Location blocked: '+e.message+'. Turn on GPS and allow location for this site.';}},
   {{enableHighAccuracy:true,timeout:20000,maximumAge:0}});
@@ -8726,7 +8781,8 @@ def _visit_new_form(visits, stats, names):
         registry = load_map_registry()
     except Exception:
         pass
-    pin = _visit_pin(customer, registry)
+    pin_info = _visit_pin_info(customer, registry)
+    pin = (pin_info[0], pin_info[1]) if pin_info else None
 
     # ---- shop card
     s = stats.loc[key] if (not stats.empty and key in stats.index) else None
@@ -8744,24 +8800,54 @@ def _visit_new_form(visits, stats, names):
             st.warning(f"Open problem from {r['_dt']:%d %b} ({r['Staff']}): {r['Problems']} — {r['Notes']}")
         if len(past) and str(past.iloc[0]["Notes"]) not in ("-", ""):
             st.caption(f"Last visit note: {past.iloc[0]['Notes']}")
-        if not pin:
-            st.caption("This shop has no map pin, so the check-in cannot confirm the distance. Admin can add it in 📍 Customer Map.")
 
-    # ---- 2. check-in
+    # ---- 2. shop location (must be real) + check-in
     gps = st.session_state.get("visit_gps")
     if gps and norm_name(gps.get("customer", "")) != key:
         gps = None
+    if not pin:
+        st.markdown("**2️⃣ Save this shop's location first**")
+        st.error("📍 This shop has no map location yet. You must save it before you can start the visit.")
+        _visit_checkin_button(customer, "pin", "📍 I am at the shop — save my GPS as the shop location", "#2E7D4F")
+        st.caption(f"Stand at the shop door. The phone GPS must be within ±{VISIT_PIN_MAX_ACC} m. This also checks you in.")
+        with st.expander("…or paste the shop's Google Maps link"):
+            link = st.text_input("Google Maps link (open the shop in Google Maps → Share → Copy link)", key="visit_pin_link",
+                                 max_chars=600, placeholder="https://maps.app.goo.gl/…")
+            if st.button("💾 Save location from link", key="visit_pin_link_save", disabled=not link.strip()):
+                try:
+                    with st.spinner("Opening the link…"):
+                        final = resolve_map_link(link.strip())
+                    info = analyse_map_link(final)
+                    if info.get("Map status") != "Ready pin":
+                        raise ValueError("the link has no exact pin; drop a pin on the shop and share that")
+                    _visit_pin_save(customer, float(info["Latitude"]), float(info["Longitude"]), None, "Google Maps link", link.strip()[:150])
+                    st.session_state["flash"] = "📍 Shop location saved from the link"
+                    st.rerun()
+                except Exception as e:
+                    st.error("Could not use this link: " + str(e)[:160])
+        return
+    directions = f"https://www.google.com/maps/dir/?api=1&destination={pin[0]},{pin[1]}&travelmode=driving"
+    m1, m2 = st.columns([3, 1])
+    m1.caption(f"📍 Shop location {pin_info[2]}")
+    m2.link_button("🧭 Directions", directions, use_container_width=True)
     st.markdown("**2️⃣ Check in when you arrive**")
-    if gps:
-        label, dist = _visit_location_check(gps, pin)
-        (st.success if label.startswith("✅") else st.warning)(
-            f"{label} · checked in {gps['at'][11:16]} · GPS ±{gps['acc']:.0f} m")
-        if st.button("↻ Check in again", key="visit_recheck"):
-            st.session_state.pop("visit_gps", None)
-            st.rerun()
-    else:
+    if not gps:
         _visit_checkin_button(customer)
-        st.caption("The page reloads once after the check-in. You can still save without GPS, but the visit is marked ❓.")
+        st.caption("The page reloads once after the check-in. The visit form opens after you check in.")
+        return
+    label, dist = _visit_location_check(gps, pin)
+    (st.success if label.startswith("✅") else st.warning)(
+        f"{label} · checked in {gps['at'][11:16]} · GPS ±{gps['acc']:.0f} m")
+    b1, b2 = st.columns(2)
+    if b1.button("↻ Check in again", key="visit_recheck", use_container_width=True):
+        st.session_state.pop("visit_gps", None)
+        st.rerun()
+    if not label.startswith("✅"):
+        with b2:
+            with st.popover("📌 The map pin is wrong", use_container_width=True):
+                st.caption("Only if you are standing at the real shop and the saved pin points somewhere else. "
+                           "Admin will see that you moved it.")
+                _visit_checkin_button(customer, "move", "📌 Move the shop pin to where I am", "#B3261E")
 
     # ---- 3. the visit form
     shop_type = _visit_type_map({key: customer}).get(key, VISIT_TYPE_OTHER)
@@ -9202,6 +9288,59 @@ def _visit_scorecard_body(visits, daily, names):
     _si_show(trend.sort_values("Month", ascending=False))
 
 
+def _visit_pins_admin(names):
+    st.markdown("#### 📍 Shop locations")
+    try:
+        registry = load_map_registry()
+    except Exception:
+        registry = {"records": {}, "bindings": {}}
+    store = _visit_pin_store()
+    have = {k for k, n in names.items() if _visit_pin(n, registry, store)}
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Phnom Penh shops with a location", f"{len(have)} / {len(names)}")
+    p2.metric("Saved by staff at the shop", f"{sum(1 for k in names if k in store):,}")
+    p3.metric("Still missing", f"{len(names) - len(have):,}")
+    st.caption("A visit cannot start without a location. Staff save it at the shop with GPS (or a Google Maps link); "
+               "a location saved at the shop is used before the 📍 Customer Map pin. Remove a location here if it is wrong.")
+    try:
+        df = read_raw(VISIT_PIN_FILE, VISIT_PIN_COLS)
+    except Exception as e:
+        st.warning("Shop locations could not be read: " + str(e)[:120])
+        return
+    act = df[df["Status"].eq("Active")].sort_values("_dt", ascending=False)
+    if act.empty:
+        st.info("No locations saved by staff yet.")
+    else:
+        show = act.assign(Map=[f"https://www.google.com/maps?q={a},{b}" for a, b in zip(act["Lat"], act["Lon"])])[
+            ["Date", "Customer", "Source", "Accuracy m", "By", "Note", "Map"]].reset_index(drop=True)
+        try:
+            st.dataframe(show, hide_index=True, use_container_width=True,
+                         column_config={"Map": st.column_config.LinkColumn("Map", display_text="open")},
+                         height=min(420, 60 + 35 * len(show)))
+        except Exception:
+            st.dataframe(show, hide_index=True, use_container_width=True)
+        pick = st.selectbox("Remove a wrong location", ["-"] + [f"{r['Date']} · {r['Customer']}" for _, r in act.iterrows()], key="vpin_rm")
+        if pick != "-" and st.button("🗑️ Remove this location", key="vpin_rm_btn"):
+            d, c = pick.split(" · ", 1)
+
+            def _rm(frame, d=d, c=c):
+                m = frame["Date"].eq(d) & frame["Customer"].eq(c) & frame["Status"].eq("Active")
+                frame.loc[m, "Status"] = "Removed"
+                frame.loc[m, "Note"] = safe_text(f"removed by {current_user() or '-'} {now_str()}", 120)
+                return frame
+            try:
+                modify_csv(VISIT_PIN_FILE, VISIT_PIN_COLS, _rm)
+                audit("shop pin removed", pick)
+                st.session_state["flash"] = "Location removed"
+                st.rerun()
+            except Exception as e:
+                st.error("Could not remove: " + str(e)[:150])
+    missing = sorted(n for k, n in names.items() if k not in have)
+    if missing:
+        with st.expander(f"Shops still without a location ({len(missing)})"):
+            st.write(", ".join(missing))
+
+
 @st.fragment(run_every=30)
 def _visit_report_live():
     st.caption(f"Live · updated {now_kh():%H:%M:%S}")
@@ -9245,6 +9384,7 @@ def tab_shop_visits():
             registry = load_map_registry()
         except Exception:
             registry = {"records": {}, "bindings": {}}
+        pin_store = _visit_pin_store()
         done_today = set(visits.loc[visits["_dt"].dt.date == today_kh(), "Customer"].map(norm_name)) if not visits.empty else set()
         todo = route[~route["Customer"].map(norm_name).isin(done_today)]
         st.markdown(f"**⭐ Suggested {VISIT_DAILY_TARGET} for today** — the most important shops in this zone")
@@ -9253,14 +9393,15 @@ def tab_shop_visits():
         for n, (i, row) in enumerate(r.head(VISIT_DAILY_TARGET + 12).iterrows()):
             if n == VISIT_DAILY_TARGET and not q.strip():
                 st.markdown("**More shops in this zone**")
-            link, exact = _visit_map_link(row["Customer"], registry)
+            link, exact = _visit_map_link(row["Customer"], registry, pin_store)
             with st.container(border=True):
                 c1, c2, c3 = st.columns([4, 1, 1])
                 c1.markdown(f"**{'⭐ ' if n < VISIT_DAILY_TARGET and not q.strip() else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
                             f"<span style='color:#6B7280'>{row['Size']} · last visit {row['Last visit']} · {row['Pcs 28 days']:,} pcs in 28 days</span>",
                             unsafe_allow_html=True)
-                c2.link_button("🧭 Go" if exact else "🔎 Map", link, use_container_width=True,
-                               help="Directions to the saved pin" if exact else "No saved pin: searches the shop name on Google Maps")
+                c2.link_button("🧭 Go" if exact else "⚠️ No pin", link, use_container_width=True,
+                               help="Directions to the shop's saved location" if exact
+                               else "No saved location yet: this searches the name on Google Maps. Save the real location at the shop.")
                 if c3.button("Start ▶", key=f"vstart_{i}", use_container_width=True):
                     st.session_state["visit_customer"] = row["Customer"]
                     st.session_state.pop("visit_customer_box", None)
@@ -9271,6 +9412,8 @@ def tab_shop_visits():
     elif view == "⚙️ Shops & zones":
         stats, names, areas = _visit_customer_stats()
         _visit_settings_admin(_visit_route(visits, stats, names, areas, _visit_zone_map(names)))
+        st.divider()
+        _visit_pins_admin(names)
         st.divider()
         _visit_zones_admin(names, visits)
     elif view == "📈 Did it help?":
