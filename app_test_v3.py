@@ -1702,11 +1702,12 @@ def _csv_cached(path, mtime_ns, size, cols):
     return _csv_read(path, list(cols))
 
 
-def read_raw(path, cols):
-    """Cleaned DataFrame of a CSV (with hidden `_dt` datetime column). Fast: cached until the file changes."""
+def read_raw(path, cols, max_age=30.0):
+    """Cleaned DataFrame of a CSV (with hidden `_dt` datetime column). Fast: cached until the file changes.
+    max_age: seconds before Dropbox is asked again whether the file changed."""
     if USE_DROPBOX:
         try:
-            pull(path)                                   # cheap check, downloads only if Dropbox changed
+            pull(path, max_age=max_age)                  # cheap check, downloads only if Dropbox changed
         except Exception as e:
             bot_log("warn", "Dropbox", f"Could not refresh {os.path.basename(path)}: {str(e)[:100]}", "using the saved copy")
     try:
@@ -8245,7 +8246,7 @@ def _visit_zone_auto(name):
 
 def _visit_shop_settings():
     try:
-        return read_raw(VISIT_ZONE_FILE, VISIT_SET_COLS)
+        return read_raw(VISIT_ZONE_FILE, VISIT_SET_COLS, max_age=300)
     except Exception:
         return pd.DataFrame(columns=VISIT_SET_COLS)
 
@@ -8349,7 +8350,7 @@ def _visit_zones_admin(names, visits):
             modify_csv(VISIT_ZONE_FILE, VISIT_SET_COLS, _apply)
             audit("visit zones", f"{len(changed)} changed")
             st.session_state["flash"] = f"Saved {len(changed)} zone change(s)"
-            st.rerun()
+            _frag_rerun()
         except Exception as e:
             st.error("Could not save: " + str(e)[:150])
 
@@ -8392,7 +8393,7 @@ def _visit_settings():
     out = dict(VISIT_SETTINGS_DEFAULT)
     try:
         if USE_DROPBOX:
-            pull(VISIT_SETTINGS_FILE)
+            pull(VISIT_SETTINGS_FILE, max_age=300)
         if os.path.exists(VISIT_SETTINGS_FILE):
             with open(VISIT_SETTINGS_FILE, encoding="utf-8") as f:
                 saved = json.load(f)
@@ -8455,7 +8456,7 @@ def _visits_path():
 
 def _visit_read():
     try:
-        return read_raw(_visits_path(), VISIT_COLS)
+        return read_raw(_visits_path(), VISIT_COLS, max_age=60)
     except Exception as e:
         st.warning("Visit log could not be read: " + str(e)[:150])
         return pd.DataFrame(columns=VISIT_COLS + ["_dt"])
@@ -8474,10 +8475,23 @@ VISIT_PIN_COLS = ["Date", "Customer", "Lat", "Lon", "Accuracy m", "Source", "By"
 VISIT_PIN_MAX_ACC = 80            # metres: a GPS fix worse than this is not good enough to save as a shop location
 
 
+def _visit_registry():
+    """Customer Map registry, reused for 5 minutes inside Shop Visits (it is big and rarely changes)."""
+    hit = st.session_state.get("_visit_registry_cache")
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    try:
+        reg = load_map_registry()
+    except Exception:
+        reg = {"records": {}, "bindings": {}}
+    st.session_state["_visit_registry_cache"] = (time.time(), reg)
+    return reg
+
+
 def _visit_pin_store():
     """{key: {...}} newest active pin saved by staff per shop."""
     try:
-        df = read_raw(VISIT_PIN_FILE, VISIT_PIN_COLS)
+        df = read_raw(VISIT_PIN_FILE, VISIT_PIN_COLS, max_age=120)
     except Exception:
         return {}
     out = {}
@@ -8559,7 +8573,7 @@ def _visit_pin_info(customer, registry=None, store=None, auto=None):
                  "from 📍 Customer Map, confirmed" if src.startswith("Customer Map") else "saved from a Google Maps link")
         return p["lat"], p["lon"], f"{where} by {p['by']} on {str(p['date'])[:10]}" + (" (pin moved)" if "moved" in str(p["source"]) else "")
     try:
-        registry = registry if registry is not None else load_map_registry()
+        registry = registry if registry is not None else _visit_registry()
         m = customer_map_match(customer, registry)
         lat, lon = m.get("Latitude"), m.get("Longitude")
         if lat is not None and lon is not None and math.isfinite(float(lat)) and math.isfinite(float(lon)):
@@ -8873,6 +8887,12 @@ def _visit_is_due(route):
 
 def _visit_new_form(visits, stats, names):
     user = current_user() or "-"
+    fast = st.session_state.get("visit_ctx")
+    if (_visit_phone_mode() and fast and fast.get("customer") == st.session_state.get("visit_customer")
+            and fast["key"] in st.session_state.get("visit_draft", {}) and st.session_state.get("visit_gps")
+            and int(st.session_state["visit_draft"][fast["key"]].get("_step", 0)) > 0):
+        _vf_phone_wizard(fast)        # only the current step is drawn: no shop list, map or Dropbox checks
+        return
     _visit_progress(visits, user)
     zone_map = _visit_zone_map(names)
     pre = st.session_state.get("visit_customer")
@@ -8896,11 +8916,7 @@ def _visit_new_form(visits, stats, names):
         return
     st.session_state["visit_customer"] = customer
     key = norm_name(customer)
-    registry = None
-    try:
-        registry = load_map_registry()
-    except Exception:
-        pass
+    registry = _visit_registry()
     try:
         cands, auto = _visit_candidates_for(names, registry or {"records": {}, "bindings": {}})
     except Exception:
@@ -8941,11 +8957,11 @@ def _visit_new_form(visits, stats, names):
             if t1.button("🧪 Pretend I'm at the shop", key="visit_test_here", use_container_width=True, type="primary"):
                 st.session_state["visit_gps"] = {"lat": pin[0] + 0.0002, "lon": pin[1] + 0.0002, "acc": 12,
                                                  "at": (now_kh() - timedelta(minutes=12)).strftime("%Y-%m-%d %H:%M:%S"), "customer": customer}
-                st.rerun()
+                _frag_rerun()
             if t2.button("🧪 Pretend I'm 3 km away", key="visit_test_far", use_container_width=True):
                 st.session_state["visit_gps"] = {"lat": pin[0] + 0.027, "lon": pin[1], "acc": 15,
                                                  "at": (now_kh() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S"), "customer": customer}
-                st.rerun()
+                _frag_rerun()
             st.caption("Or use the real check-in button below to test your phone's GPS.")
             _visit_checkin_button(customer)
             return
@@ -8964,7 +8980,7 @@ def _visit_new_form(visits, stats, names):
                         try:
                             _visit_pin_save(customer, lat, lon, None, "Customer Map pin (confirmed)", f"map name: {pname}"[:150])
                             st.session_state["flash"] = "📍 Map pin linked to this shop"
-                            st.rerun()
+                            _frag_rerun()
                         except Exception as e:
                             st.error("Could not save: " + str(e)[:150])
             st.markdown("**None of them? Save the real location:**")
@@ -8982,7 +8998,7 @@ def _visit_new_form(visits, stats, names):
                         raise ValueError("the link has no exact pin; drop a pin on the shop and share that")
                     _visit_pin_save(customer, float(info["Latitude"]), float(info["Longitude"]), None, "Google Maps link", link.strip()[:150])
                     st.session_state["flash"] = "📍 Shop location saved from the link"
-                    st.rerun()
+                    _frag_rerun()
                 except Exception as e:
                     st.error("Could not use this link: " + str(e)[:160])
         return
@@ -9004,7 +9020,7 @@ def _visit_new_form(visits, stats, names):
     b1, b2 = st.columns(2)
     if b1.button("↻ Check in again", key="visit_recheck", use_container_width=True):
         st.session_state.pop("visit_gps", None)
-        st.rerun()
+        _frag_rerun()
     if not label.startswith("✅") and not test:
         with b2:
             with st.popover("📌 The map pin is wrong", use_container_width=True):
@@ -9029,6 +9045,7 @@ def _visit_new_form(visits, stats, names):
     app_pct = s["Trend %"] if s is not None else None
     ctx = {"customer": customer, "key": key, "pin": pin, "user": user, "zone": zone_map.get(key, VISIT_ZONE_NOT_SET),
            "shop_type": shop_type, "size": size, "app_pct": app_pct, "type_checks": type_checks}
+    st.session_state["visit_ctx"] = ctx
     if not _visit_phone_mode():
         st.caption(f"Shop type: **{shop_type}** · size: **{size}**" + (" — Admin can change the type in ⚙️ Shops & zones." if current_role() == "admin" else ""))
         with st.form("visit_form", clear_on_submit=False):
@@ -9055,16 +9072,53 @@ def _visit_new_form(visits, stats, names):
 
 # ---------- visit form sections (shared by desktop and phone) ----------
 class _Shot:
-    """A photo kept in memory between phone steps."""
-    def __init__(self, data, name="photo.jpg"):
-        self.data, self.name = data, name
+    """A photo kept in memory between phone steps: shrunk once (≈1280 px), with a small thumbnail for the screen
+    and the time the camera took it (so the 3-hour rule still works after shrinking)."""
+    def __init__(self, data, name="photo.jpg", thumb=None, taken=None):
+        self.data, self.name, self.thumb, self.taken = data, name, thumb, taken
 
     def getvalue(self):
         return self.data
 
 
 def _vf_keep(f):
-    return None if f is None else _Shot(f.getvalue(), getattr(f, "name", "photo.jpg"))
+    if f is None:
+        return None
+    raw = f.getvalue()
+    taken = _visit_photo_taken_at(raw)
+    try:
+        from PIL import Image, ImageOps
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+        img.thumbnail((1280, 1280))
+        big = io.BytesIO()
+        img.save(big, "JPEG", quality=80, optimize=True)
+        img.thumbnail((240, 240))
+        small = io.BytesIO()
+        img.save(small, "JPEG", quality=70)
+        return _Shot(big.getvalue(), getattr(f, "name", "photo.jpg"), small.getvalue(), taken)
+    except Exception:
+        return _Shot(raw, getattr(f, "name", "photo.jpg"), None, taken)
+
+
+def _vf_thumb(shot):
+    return shot.thumb if getattr(shot, "thumb", None) else shot.getvalue()
+
+
+def _vf_thumb_row(items):
+    """Small thumbnails side by side (stays in one row on a phone)."""
+    import base64
+    cells = "".join(
+        f"<figure style='margin:0;text-align:center'><img src='data:image/jpeg;base64,{base64.b64encode(_vf_thumb(f)).decode()}' "
+        f"style='height:84px;border-radius:10px;border:1px solid #E6E0D6'><figcaption style='font-size:12px;color:#6B7280'>{_e(lab)}</figcaption></figure>"
+        for lab, f in items)
+    st.markdown(f"<div style='display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 8px'>{cells}</div>", unsafe_allow_html=True)
+
+
+def _frag_rerun():
+    """Redraw only Shop Visits when possible (much faster than the whole app)."""
+    if _in_fragment():
+        st.rerun(scope="fragment")
+    st.rerun()  # keep
 
 
 def _vf_idx(options, value, default=0):
@@ -9086,17 +9140,13 @@ VF_PHOTO_LABEL = {"front": "📸 Shop front", "before": "🅱️ BEFORE", "after
 def _vf_photo_slot(d, k, label, wkey, help_=None):
     """Phone: show the photo already taken, or a big upload box for it. Updates the draft directly."""
     if d.get(k) is not None:
-        c1, c2 = st.columns([1, 2])
-        c1.image(d[k].getvalue(), width=140)
-        c2.markdown(f"**{VF_PHOTO_LABEL.get(k, label)} ✅**")
-        if c2.button("Take again", key=f"{wkey}_redo"):
-            d[k] = None
-            st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+        _vf_thumb_row([(f"{VF_PHOTO_LABEL.get(k, label)} ✅", d[k])])
+        st.button("↻ Take again", key=f"{wkey}_redo", on_click=lambda: d.__setitem__(k, None))
         return
     f = st.file_uploader(label, type=VF_IMG, key=wkey, help=help_ or "Tap → Take Photo")
     if f is not None:
-        d[k] = _Shot(f.getvalue(), getattr(f, "name", "photo.jpg"))
-        st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+        d[k] = _vf_keep(f)
+        st.caption(f"✅ {VF_PHOTO_LABEL.get(k, label)} saved")
 
 
 def _vf_photo_status(d):
@@ -9108,13 +9158,14 @@ def _vf_photos_arrive(d, phone):
     if phone:
         st.caption("Take 2 photos as soon as you arrive, before you touch anything.")
         st.markdown("**1 · 📸 Shop front** (required)")
-        if d.get("front") is not None:
+        if d.get("front") is not None and st.session_state.get("vf_cam") is None:
             _vf_photo_slot(d, "front", "📸 Shop front", "vf_front_up")
         else:
             front = st.camera_input("📸 Shop front", key="vf_cam", label_visibility="collapsed")
             if front is not None:
-                d["front"] = _vf_keep(front)
-                st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+                fid = getattr(front, "file_id", None) or (getattr(front, "name", ""), getattr(front, "size", None))
+                if d.get("front") is None or fid != d.get("_front_id"):
+                    d["front"], d["_front_id"] = _vf_keep(front), fid
         st.markdown("**2 · 🅱️ BEFORE: fridge / display as you found it** (needed if you will fix anything)")
         _vf_photo_slot(d, "before", "🅱️ BEFORE photo", "vf_before")
         return {}
@@ -9132,7 +9183,13 @@ def _vf_photos_after(d, phone):
         st.markdown("**🅰️ AFTER: the same place after you fixed it** (same angle as BEFORE)")
         _vf_photo_slot(d, "after", "🅰️ AFTER photo", "vf_after")
         extra = st.file_uploader("Other photos (optional, max 2)", type=VF_IMG, accept_multiple_files=True, key="vf_extra")
-        return {"extra": [_vf_keep(f) for f in (extra or [])] or d.get("extra", [])}
+        if extra:
+            ids = tuple(getattr(f, "file_id", f.name) for f in extra)
+            if ids != d.get("_extra_ids"):
+                d["extra"], d["_extra_ids"] = [_vf_keep(f) for f in extra], ids
+        elif d.get("extra"):
+            _vf_thumb_row([("Other", f) for f in d["extra"]])
+        return {}
     after = st.file_uploader("🅰️ AFTER: the same place after you fixed it", type=VF_IMG, key="visit_after",
                              help="Same angle as BEFORE, so the change is easy to see.")
     extra = st.file_uploader("Other photos (max 2)", type=VF_IMG, accept_multiple_files=True, key="visit_files")
@@ -9200,7 +9257,7 @@ def _vf_validate(a):
         return "You reported a problem: choose who must follow up."
     for label_, f in (("BEFORE", a.get("before")), ("AFTER", a.get("after"))):
         if f is not None and not _visit_test_mode():
-            taken = _visit_photo_taken_at(f.getvalue())
+            taken = getattr(f, "taken", None) or _visit_photo_taken_at(f.getvalue())
             if taken and (now_kh().replace(tzinfo=None) - taken).total_seconds() > VISIT_PHOTO_MAX_AGE_H * 3600:
                 return f"The {label_} photo was taken on {taken:%d %b %H:%M}. Please take a new photo now."
     return None
@@ -9258,10 +9315,10 @@ def _vf_save(a, ctx):
         return
     audit("shop visit" + (" (TEST)" if _visit_test_mode() else ""), f"{customer} | {label} | {row['Problems']}")
     for k in [k for k in list(st.session_state) if str(k).startswith(("visit_gps", "visit_customer", "visit_cam", "visit_files",
-                                                                     "visit_before", "visit_after", "vf_", "visit_draft"))]:
+                                                                     "visit_before", "visit_after", "vf_", "visit_draft", "visit_ctx"))]:
         st.session_state.pop(k, None)
     st.session_state["flash"] = f"Visit saved: {customer}"
-    st.rerun()
+    _frag_rerun()
 
 
 VF_STEPS = ["📸 Arrive", "🔍 Check", "🛠️ After", "📈 Sales", "⚠️ Problems", "✅ Save"]
@@ -9272,7 +9329,7 @@ def _vf_phone_wizard(ctx):
     drafts = st.session_state.setdefault("visit_draft", {})
     d = drafts.setdefault(ctx["key"], {"_step": 0})
     step = int(d.get("_step", 0))
-    st.progress((step + 1) / len(VF_STEPS), text=f"Step {step + 1} of {len(VF_STEPS)} · {VF_STEPS[step]}")
+    st.progress((step + 1) / len(VF_STEPS), text=f"Step {step + 1} of {len(VF_STEPS)} · {VF_STEPS[step]} · {ctx['customer']}")
     with st.container(border=True):
         if step == 0:
             ans = _vf_photos_arrive(d, True)
@@ -9301,30 +9358,33 @@ def _vf_phone_wizard(ctx):
         err_here = "Because you fixed something, add both BEFORE (step 1) and AFTER photos."
     if step == 4 and d.get("problems") and d.get("follow") in ("-", None):
         err_here = "Choose who must follow up the problem."
-    b1, b2 = st.columns([1, 2])
-    if step > 0 and b1.button("⬅️ Back", key=f"vf_back_{step}", use_container_width=True):
-        d["_step"] = step - 1
-        st.rerun(scope="fragment") if _in_fragment() else st.rerun()
-    if step < len(VF_STEPS) - 1:
-        if b2.button("Next ➡️", key=f"vf_next_{step}", type="primary", use_container_width=True):
+    last = step == len(VF_STEPS) - 1
+    if not last:
+        if st.button(f"Next: {VF_STEPS[step + 1]} ➡️", key=f"vf_next_{step}", type="primary", use_container_width=True):
             if err_here:
                 st.error(err_here)
             else:
                 d["_step"] = step + 1
-                st.rerun(scope="fragment") if _in_fragment() else st.rerun()
-    else:
-        if b2.button("✅ Save visit", key="vf_save", type="primary", use_container_width=True):
-            err = _vf_validate(d)
-            if err:
-                st.error(err)
-            else:
-                _vf_save(d, ctx)
-    if step < len(VF_STEPS) - 1:
-        jump = st.columns(len(VF_STEPS))
-        for i, name in enumerate(VF_STEPS):
-            if i != step and jump[i].button(name.split()[0], key=f"vf_jump_{step}_{i}", help=name, use_container_width=True):
-                d["_step"] = i
-                st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+                _frag_rerun()
+    elif st.button("✅ Save visit", key="vf_save", type="primary", use_container_width=True):
+        err = _vf_validate(d)
+        if err:
+            st.error(err)
+        else:
+            _vf_save(d, ctx)
+    if step > 0 and st.button(f"⬅️ Back: {VF_STEPS[step - 1]}", key=f"vf_back_{step}", use_container_width=True):
+        d["_step"] = step - 1
+        _frag_rerun()
+    with st.expander("Jump to a step / cancel this visit"):
+        go = st.radio("Step", VF_STEPS, index=step, horizontal=True, key=f"vf_jump_{step}", label_visibility="collapsed")
+        if go != VF_STEPS[step]:
+            d["_step"] = VF_STEPS.index(go)
+            _frag_rerun()
+        if st.button("✖ Cancel this visit (answers are deleted)", key=f"vf_cancel_{step}"):
+            st.session_state.get("visit_draft", {}).pop(ctx["key"], None)
+            for k in ("visit_gps", "visit_customer", "visit_customer_box", "visit_ctx"):
+                st.session_state.pop(k, None)
+            _frag_rerun()
 
 
 def _vf_summary(d, ctx):
@@ -9335,9 +9395,7 @@ def _vf_summary(d, ctx):
     thumbs = [(VF_PHOTO_LABEL[k], d[k]) for k in ("front", "before", "after") if d.get(k) is not None] + \
              [("Other", f) for f in (d.get("extra") or [])]
     if thumbs:
-        tc = st.columns(len(thumbs))
-        for col, (lab, f) in zip(tc, thumbs):
-            col.image(f.getvalue(), caption=lab, use_container_width=True)
+        _vf_thumb_row(thumbs)
     st.markdown(f"- 📸 Photos: **{_vf_photo_status(d)}**" + (f" + {len(d.get('extra') or [])} other" if d.get("extra") else "") + "\n"
                 f"- 🧊 Fridge **{d.get('fridge', '-')}** · 🥟 FIFO **{d.get('fifo', '-')}** · old buns **{d.get('old_pcs', 0)}**\n"
                 f"- 🏷️ Sticker **{d.get('sticker', '-')}** · changed **{d.get('changed', 0)}**\n"
@@ -9355,7 +9413,6 @@ def _vf_summary(d, ctx):
             front = st.camera_input("📸 Shop front", key="vf_cam_sum", label_visibility="collapsed")
             if front is not None:
                 d["front"] = _vf_keep(front)
-                st.rerun(scope="fragment") if _in_fragment() else st.rerun()
         else:
             _vf_photo_slot(d, k, f"{VF_PHOTO_LABEL[k]} photo", f"vf_{k}_sum")
     err = _vf_validate(d)
@@ -9509,7 +9566,7 @@ def _visit_problems_body(visits):
                         modify_csv(_visits_path(), VISIT_COLS, _fix)
                         audit("visit problem fixed", f"{r['Customer']} | {vid}")
                         st.session_state["flash"] = f"Marked fixed: {r['Customer']}"
-                        st.rerun()
+                        _frag_rerun()
                     except Exception as e:
                         st.error("Could not save: " + str(e)[:150])
 
@@ -9641,7 +9698,7 @@ def _visit_review_body(visits):
                             modify_csv(_visits_path(), VISIT_COLS, _rev)
                             audit("visit review", f"{r['Customer']} | {verdict} | {vid}")
                             st.session_state["flash"] = f"{verdict}: {r['Customer']}"
-                            st.rerun()
+                            _frag_rerun()
                         except Exception as e:
                             st.error("Could not save: " + str(e)[:150])
 
@@ -9709,7 +9766,7 @@ def _visit_settings_admin(route):
                                       "medium_days": int(medium_days), "small_days": int(small_days), "staff": int(staff_n)})
                 audit("visit settings", f"{big_pcs}/{medium_pcs} pcs, {big_days}/{medium_days}/{small_days} days, {staff_n} staff")
                 st.session_state["flash"] = "Visit frequency saved"
-                st.rerun()
+                _frag_rerun()
             except Exception as e:
                 st.error("Could not save: " + str(e)[:150])
     if not route.empty:
@@ -9889,17 +9946,14 @@ def _visit_match_admin(names, have, cands):
                 append_rows(VISIT_PIN_FILE, rows_out)
                 audit("shop pins matched", f"{len(rows_out)} shops")
                 st.session_state["flash"] = f"Linked {len(rows_out)} shop(s) to their map pin"
-                st.rerun()
+                _frag_rerun()
             except Exception as e:
                 st.error("Could not save: " + str(e)[:150])
 
 
 def _visit_pins_admin(names):
     st.markdown("#### 📍 Shop locations")
-    try:
-        registry = load_map_registry()
-    except Exception:
-        registry = {"records": {}, "bindings": {}}
+    registry = _visit_registry()
     store = _visit_pin_store()
     cands, auto = _visit_candidates_for(names, registry)
     have = {k for k, n in names.items() if _visit_pin(n, registry, store, auto)}
@@ -9941,7 +9995,7 @@ def _visit_pins_admin(names):
                 modify_csv(VISIT_PIN_FILE, VISIT_PIN_COLS, _rm)
                 audit("shop pin removed", pick)
                 st.session_state["flash"] = "Location removed"
-                st.rerun()
+                _frag_rerun()
             except Exception as e:
                 st.error("Could not remove: " + str(e)[:150])
     missing = sorted(n for k, n in names.items() if k not in have)
@@ -9998,7 +10052,7 @@ def _lead_parse_report(data):
 
 def _lead_read():
     try:
-        return read_raw(LEADS_FILE, LEAD_COLS)
+        return read_raw(LEADS_FILE, LEAD_COLS, max_age=300)
     except Exception as e:
         st.warning("New customer list could not be read: " + str(e)[:150])
         return pd.DataFrame(columns=LEAD_COLS + ["_dt"])
@@ -10154,7 +10208,7 @@ def _lead_import_body(snap, visits):
                             audit("leads imported", f"{len(rows)} rows from {up.name}")
                             st.session_state["flash"] = f"Imported {len(rows)} new-customer rows"
                             st.session_state.pop("lead_upload", None)
-                            st.rerun()
+                            _frag_rerun()
                         except Exception as e:
                             st.error("Could not save: " + str(e)[:160])
     if leads.empty:
@@ -10200,7 +10254,7 @@ def _lead_import_body(snap, visits):
                     modify_csv(LEADS_FILE, LEAD_COLS, _link)
                     audit("leads linked", f"{len(pairs)}")
                     st.session_state["flash"] = f"Linked {len(pairs)} lead(s)"
-                    st.rerun()
+                    _frag_rerun()
                 except Exception as e:
                     st.error("Could not save: " + str(e)[:150])
 
@@ -10279,6 +10333,9 @@ def _shop_visits_live():
 
 
 def _shop_visits_body():
+    _flash = st.session_state.pop("flash", None)        # saves redraw only Shop Visits, so show their message here
+    if _flash:
+        st.toast(_flash, icon="✅")
     h1, h2, h3 = st.columns([3, 1.3, 2])
     h1.markdown("### 🏪 Shop Visits")
     _visit_phone_mode()
@@ -10331,10 +10388,7 @@ def _shop_visits_body():
         if route.empty:
             st.info("No shops in this zone yet.")
             return
-        try:
-            registry = load_map_registry()
-        except Exception:
-            registry = {"records": {}, "bindings": {}}
+        registry = _visit_registry()
         pin_store = _visit_pin_store()
         try:
             _c, auto_pins = _visit_candidates_for(names, registry)
