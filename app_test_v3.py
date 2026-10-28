@@ -8184,7 +8184,8 @@ VISIT_COLS = ["Date", "VisitID", "Staff", "Customer", "Check-in", "Minutes", "La
               "Stickers changed", "Customer says sales", "Sales reason", "Competitor", "App trend %",
               "Problems", "Priority", "Follow-up by", "Notes", "Customer request", "Satisfaction",
               "Photos", "Status", "Fixed by", "Fixed at", "Fix note", "Zone",
-              "Shop type", "Checks", "Check score %", "Size", "Fix done"]
+              "Shop type", "Checks", "Check score %", "Size", "Fix done",
+              "Review", "Reviewed by", "Reviewed at", "Review note"]
 VISIT_AREA = AREA_LABEL[PP]       # only Phnom Penh customers are visited
 VISIT_AT_SHOP_M = 200            # check-in within this distance of the map pin = "At shop"
 VISIT_GPS_MAX_AGE_S = 900        # a check-in older than 15 minutes must be done again
@@ -8958,6 +8959,7 @@ def _visit_new_form(visits, stats, names):
     shop_type = _visit_type_map({key: customer}).get(key, VISIT_TYPE_OTHER)
     nv = (st.session_state.get("_visit_new", {}) or {}).get(key)
     is_first_visit = bool(nv) and not (len(past) and past.iloc[0]["_dt"] >= nv["date"])
+    _visit_redo_notice(visits, user, customer)
     if is_first_visit:
         st.info(f"🆕 **First visit after the sale on {nv['date']:%d %b}.** Check the fridge is installed, stickers are up "
                 "and the owner knows how to sell and heat the buns." + ("" if nv["in_master"] else
@@ -9068,7 +9070,7 @@ def _visit_new_form(visits, stats, names):
            "Fixed by": "-", "Fixed at": "-", "Fix note": "-", "Zone": zone_map.get(key, VISIT_ZONE_NOT_SET),
            "Shop type": shop_type, "Checks": "; ".join(f"{c}: {'OK' if ok else 'NO'}" for c, ok in check_ok.items()),
            "Check score %": round(100 * sum(check_ok.values()) / max(1, len(check_ok))), "Size": size,
-           "Fix done": "; ".join(fixes) or "-"}
+           "Fix done": "; ".join(fixes) or "-", "Review": "-", "Reviewed by": "-", "Reviewed at": "-", "Review note": "-"}
     try:
         append_row(VISITS_FILE, row)
     except Exception as e:
@@ -9204,6 +9206,151 @@ def _visit_problems_body(visits):
                         st.rerun()
                     except Exception as e:
                         st.error("Could not save: " + str(e)[:150])
+
+
+VISIT_MIN_MINUTES = 5            # a visit shorter than this is flagged
+
+
+def _visit_flags(r):
+    """Reasons a manager should look closer at a submitted visit."""
+    flags = []
+    loc = str(r.get("Location check", ""))
+    if not loc.startswith("✅"):
+        flags.append("📍 not confirmed at the shop" + (f" ({loc})" if loc and loc != "-" else ""))
+    mins = pd.to_numeric(r.get("Minutes"), errors="coerce")
+    if pd.notna(mins) and mins < VISIT_MIN_MINUTES:
+        flags.append(f"⏱️ only {int(mins)} min at the shop")
+    score = pd.to_numeric(r.get("Check score %"), errors="coerce")
+    if pd.notna(score) and score < 50:
+        flags.append(f"📋 shop check only {int(score)}% OK")
+    photos = [p for p in str(r.get("Photos", "")).split(";") if p and p != "-"]
+    if len(photos) <= 1:
+        flags.append("🖼️ only the shop-front photo")
+    if str(r.get("Fridge")) in ("Dirty", "Not cold", "Broken") and "Fridge" not in str(r.get("Fix done", "")) \
+            and str(r.get("Problems")) in ("-", ""):
+        flags.append(f"🧊 fridge “{r.get('Fridge')}” but no problem reported")
+    if str(r.get("Sticker")) in ("Old / faded", "Missing") and str(r.get("Stickers changed")) in ("0", "-", ""):
+        flags.append(f"🏷️ sticker “{r.get('Sticker')}” but none changed")
+    if str(r.get("Problems")) not in ("-", "") and str(r.get("Follow-up by")) in ("-", ""):
+        flags.append("👤 problem without someone to follow up")
+    if str(r.get("Notes")) in ("-", ""):
+        flags.append("📝 no notes")
+    return flags
+
+
+def _visit_review_state(r):
+    rv = str(r.get("Review", "-"))
+    return rv if rv in ("Approved", "Redo") else "To review"
+
+
+def _visit_sheet(r):
+    """The whole submitted form of one visit, easy to read."""
+    yn = lambda ok: "✅" if ok else "❌"
+    st.markdown(f"**{r['Customer']}** · {r.get('Shop type', '-')} · {r.get('Size', '-')} · {r.get('Zone', '-')}")
+    st.caption(f"By **{r['Staff']}** · saved {r['_dt']:%d %b %Y %H:%M} · check-in {str(r['Check-in'])[11:16] or '-'} · "
+               f"{r['Minutes'] if str(r['Minutes']) not in ('', '-') else '?'} min · visit {r['VisitID']}")
+    loc = str(r["Location check"])
+    (st.success if loc.startswith("✅") else st.warning)(
+        f"{loc} · GPS ±{r['GPS accuracy m']} m" + (f" · {r['Distance m']} m from the pin" if str(r["Distance m"]) not in ("-", "") else ""))
+    if str(r["Lat"]) not in ("-", ""):
+        st.link_button("🗺️ Where the check-in was", f"https://www.google.com/maps?q={r['Lat']},{r['Lon']}")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**🔍 Shop check**")
+        st.markdown(f"- 🧊 Fridge: **{r['Fridge']}**\n- 🥟 Display / FIFO: **{r['Display FIFO']}**\n"
+                    f"- Old / damaged buns: **{r['Old/damaged pcs']} pcs**\n- 🏷️ Sticker: **{r['Sticker']}** · changed **{r['Stickers changed']}**\n"
+                    f"- 🛠️ Fixed today: **{r.get('Fix done', '-')}**")
+        checks = [c.rsplit(": ", 1) for c in str(r.get("Checks", "")).split("; ") if ": " in c]
+        if checks:
+            st.markdown(f"**📋 Checklist** ({r.get('Check score %', '-')}% OK)")
+            st.markdown("\n".join(f"- {yn(v == 'OK')} {k}" for k, v in checks))
+    with c2:
+        st.markdown("**📈 Sales**")
+        st.markdown(f"- Owner says: **{r['Customer says sales']}** · reason: **{r['Sales reason']}**\n"
+                    f"- Journal trend: **{r['App trend %']}%**\n- Competitor: **{r['Competitor']}**")
+        st.markdown("**⚠️ Problems & requests**")
+        st.markdown(f"- Problems: **{r['Problems']}**\n- Priority: **{r['Priority']}** · follow-up: **{r['Follow-up by']}**\n"
+                    f"- Status: **{r['Status']}**\n- Shop happiness: **{r['Satisfaction']} / 5**\n- Request: {r['Customer request']}")
+    st.markdown(f"**📝 Notes:** {r['Notes']}")
+    _visit_show_photos(r["Photos"], f"rv_{r['VisitID']}")
+
+
+def _visit_review_body(visits):
+    st.markdown("#### ✅ Review visits")
+    st.caption("Open each visit to see everything staff filled in. ⚑ marks things to look at. Approve it, or send it back "
+               "with **Redo** and a note — staff see the note in their plan.")
+    if visits.empty:
+        st.info("No visits yet.")
+        return
+    today = today_kh()
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    start = c1.date_input("From", today - timedelta(days=6), key="rv_from")
+    end = c2.date_input("To", today, key="rv_to")
+    staff = c3.selectbox("Staff", ["All"] + sorted(visits["Staff"].unique()), key="rv_staff")
+    state = c4.selectbox("Show", ["To review", "Redo", "Approved", "All"], key="rv_state")
+    v = visits[(visits["_dt"].dt.date >= start) & (visits["_dt"].dt.date <= end)].copy()
+    if staff != "All":
+        v = v[v["Staff"].eq(staff)]
+    v["_state"] = [_visit_review_state(r) for r in v.to_dict("records")]
+    counts = v["_state"].value_counts()
+    st.caption(f"⏳ To review {counts.get('To review', 0)} · 🔁 Redo {counts.get('Redo', 0)} · ✅ Approved {counts.get('Approved', 0)}")
+    if state != "All":
+        v = v[v["_state"].eq(state)]
+    if v.empty:
+        st.success("Nothing here. 🎉")
+        return
+    can = has_permission("edit")
+    icon = {"To review": "⏳", "Redo": "🔁", "Approved": "✅"}
+    for r in v.sort_values("_dt", ascending=False).head(40).to_dict("records"):
+        flags = _visit_flags(r)
+        head = (f"{icon[r['_state']]} {r['_dt']:%d %b %H:%M} · {r['Customer']} · {r['Staff']} · "
+                f"{'📍✅' if str(r['Location check']).startswith('✅') else '📍⚠️'}" + (f" · ⚑ {len(flags)}" if flags else " · all complete"))
+        with st.expander(head):
+            if flags:
+                st.warning("**Look at:** " + " · ".join(flags))
+            if r["_state"] != "To review":
+                st.caption(f"{icon[r['_state']]} {r['_state']} by {r.get('Reviewed by', '-')} on {str(r.get('Reviewed at', '-'))[:16]}"
+                           + (f" — “{r['Review note']}”" if str(r.get("Review note", "-")) not in ("-", "") else ""))
+            _visit_sheet(r)
+            if can:
+                st.divider()
+                n1, n2, n3 = st.columns([3, 1, 1])
+                note = n1.text_input("Note to staff", key=f"rvn_{r['VisitID']}", max_chars=150,
+                                     placeholder="e.g. take the AFTER photo from the same angle", label_visibility="collapsed")
+                for col, verdict, label, kind in ((n2, "Approved", "✅ Approve", "primary"), (n3, "Redo", "🔁 Redo", "secondary")):
+                    if col.button(label, key=f"rv_{verdict}_{r['VisitID']}", use_container_width=True, type=kind):
+                        if verdict == "Redo" and not note.strip():
+                            st.error("Write what staff must redo.")
+                            continue
+                        vid, by, at = r["VisitID"], current_user() or "-", now_str()
+
+                        def _rev(df, vid=vid, verdict=verdict, by=by, at=at, note=note):
+                            for c in ("Review", "Reviewed by", "Reviewed at", "Review note"):
+                                if c not in df:
+                                    df[c] = "-"
+                            df.loc[df["VisitID"].eq(vid), ["Review", "Reviewed by", "Reviewed at", "Review note"]] = \
+                                [verdict, by, at, safe_text(note or "-", 150)]
+                            return df
+                        try:
+                            modify_csv(VISITS_FILE, VISIT_COLS, _rev)
+                            audit("visit review", f"{r['Customer']} | {verdict} | {vid}")
+                            st.session_state["flash"] = f"{verdict}: {r['Customer']}"
+                            st.rerun()
+                        except Exception as e:
+                            st.error("Could not save: " + str(e)[:150])
+
+
+def _visit_redo_notice(visits, user, customer=None):
+    """Staff see the visits a manager sent back."""
+    if visits.empty or "Review" not in visits:
+        return
+    redo = visits[visits["Review"].eq("Redo") & visits["Staff"].eq(user)].sort_values("_dt", ascending=False)
+    if customer is not None:
+        redo = redo[redo["Customer"].map(norm_name) == norm_name(customer)]
+    for r in redo.head(5).to_dict("records"):
+        later = visits[(visits["Customer"].map(norm_name) == norm_name(r["Customer"])) & (visits["_dt"] > r["_dt"])]
+        if later.empty:
+            st.error(f"🔁 Redo **{r['Customer']}** (visit {r['_dt']:%d %b}) — {r.get('Reviewed by', 'Admin')}: “{r.get('Review note', '')}”")
 
 
 def _visit_show_photos(photos, key_prefix):
@@ -9793,7 +9940,7 @@ def tab_shop_visits():
     st.markdown("### 🏪 Shop Visits")
     views = ["📋 Today's plan", "📝 New visit", "🆕 New customers"]
     if has_permission("reports"):
-        views += ["📊 Visit report", "🔴 Open problems", "📈 Did it help?", "🏅 Scorecard"]
+        views += ["✅ Review visits", "📊 Visit report", "🔴 Open problems", "📈 Did it help?", "🏅 Scorecard"]
     if current_role() == "admin":
         views.append("⚙️ Shops & zones")
     if st.session_state.get("visit_view") not in views:
@@ -9813,6 +9960,7 @@ def tab_shop_visits():
             st.info("No Phnom Penh customers found. Check the zone in the Master List.")
             return
         _visit_progress(visits, user)
+        _visit_redo_notice(visits, user)
         zone_map = _visit_zone_map(names)
         all_route = _visit_route(visits, stats, names, areas, zone_map)
         due_all = _visit_is_due(all_route)
@@ -9859,6 +10007,8 @@ def tab_shop_visits():
         _visit_pins_admin(names)
         st.divider()
         _visit_zones_admin(names, visits)
+    elif view == "✅ Review visits":
+        _visit_review_body(visits)
     elif view == "🆕 New customers":
         snap, _src, _path, _err = current_snapshot()
         _visit_customer_stats()
