@@ -8622,6 +8622,7 @@ def _visit_read_gps_params():
         st.session_state["visit_view"] = "📝 New visit"
         if qp.get("vcust"):
             st.session_state["visit_customer"] = str(qp.get("vcust"))
+            st.session_state["visit_zone_force"] = True
     except Exception:
         st.session_state["visit_gps_error"] = "The location could not be read. Press 📍 Check in again."
     finally:
@@ -8840,8 +8841,8 @@ def _visit_new_form(visits, stats, names):
     _visit_progress(visits, user)
     zone_map = _visit_zone_map(names)
     pre = st.session_state.get("visit_customer")
-    if pre and norm_name(pre) in zone_map and st.session_state.get("visit_zone_form") != zone_map[norm_name(pre)]:
-        st.session_state["visit_zone_form"] = zone_map[norm_name(pre)]       # "Start ▶" opens the shop's own zone
+    if st.session_state.pop("visit_zone_force", False) and pre and norm_name(pre) in zone_map:
+        st.session_state["visit_zone_form"] = zone_map[norm_name(pre)]       # "Start ▶" opens the shop's own zone (once)
     zone = _visit_zone_picker(zone_map, "visit_zone_form")
     pool = {k: n for k, n in names.items() if zone is None or zone_map.get(k) == zone}
     customers = sorted(set(pool.values()), key=lambda x: str(x).upper())
@@ -9780,6 +9781,14 @@ def _visit_report_live():
     _visit_report_body(_visit_read())
 
 
+def _visit_start(customer):
+    """Button callback: runs before the page is drawn again, so it may switch the section."""
+    st.session_state["visit_customer"] = customer
+    st.session_state.pop("visit_customer_box", None)
+    st.session_state["visit_zone_force"] = True
+    st.session_state["visit_view"] = "📝 New visit"
+
+
 def tab_shop_visits():
     st.markdown("### 🏪 Shop Visits")
     views = ["📋 Today's plan", "📝 New visit", "🆕 New customers"]
@@ -9839,11 +9848,8 @@ def tab_shop_visits():
                 c2.link_button("🧭 Go" if exact else "⚠️ No pin", link, use_container_width=True,
                                help="Directions to the shop's saved location" if exact
                                else "No saved location yet: this searches the name on Google Maps. Save the real location at the shop.")
-                if c3.button("Start ▶", key=f"vstart_{i}", use_container_width=True):
-                    st.session_state["visit_customer"] = row["Customer"]
-                    st.session_state.pop("visit_customer_box", None)
-                    st.session_state["visit_view"] = "📝 New visit"
-                    st.rerun()
+                c3.button("Start ▶", key=f"vstart_{i}", use_container_width=True,
+                          on_click=_visit_start, args=(row["Customer"],))
         if done_today & set(route["Customer"].map(norm_name)):
             st.caption("✅ Already visited today (by anyone): " + ", ".join(route.loc[route["Customer"].map(norm_name).isin(done_today), "Customer"]))
     elif view == "⚙️ Shops & zones":
