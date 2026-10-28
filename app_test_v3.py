@@ -8725,6 +8725,28 @@ def _visit_photo_load(name):
 
 
 def _visit_customer_stats():
+    """Cached wrapper: the sales calculation is heavy, so it is reused for 3 minutes or until a file changes."""
+    def _mt(path):
+        try:
+            return os.stat(path).st_mtime_ns
+        except Exception:
+            return 0
+    try:
+        _snap, _src, path, _err = current_snapshot()
+    except Exception:
+        path = None
+    sig = (str(path), _mt(path) if path else 0, _mt(LEADS_FILE), str(today_kh()), int(time.time() // 180))
+    hit = st.session_state.get("_visit_stats_cache")
+    if hit and hit[0] == sig:
+        st.session_state["_visit_daily"], st.session_state["_visit_new"] = hit[2], hit[3]
+        return hit[1]
+    out = _visit_customer_stats_compute()
+    st.session_state["_visit_stats_cache"] = (sig, out, st.session_state.get("_visit_daily", pd.DataFrame()),
+                                              st.session_state.get("_visit_new", {}))
+    return out
+
+
+def _visit_customer_stats_compute():
     """Per customer: last order, pcs last 28 days vs the 28 before, usual gap. Uses the same data as Sales Insights."""
     try:
         snap, _src, _path, _err = current_snapshot()
@@ -8990,7 +9012,7 @@ def _visit_new_form(visits, stats, names):
                            "Admin will see that you moved it.")
                 _visit_checkin_button(customer, "move", "📌 Move the shop pin to where I am", "#B3261E")
 
-    # ---- 3. the visit form
+    # ---- 3. the visit form (desktop: one page · phone: step by step)
     shop_type = _visit_type_map({key: customer}).get(key, VISIT_TYPE_OTHER)
     nv = (st.session_state.get("_visit_new", {}) or {}).get(key)
     is_first_visit = bool(nv) and not (len(past) and past.iloc[0]["_dt"] >= nv["date"])
@@ -9001,70 +9023,161 @@ def _visit_new_form(visits, stats, names):
                 " ⚠️ This shop is not in the Master List yet — ask Admin to add it."))
     cfg = _visit_settings()
     size, _every = _visit_size(float(s["Pcs 28d"]) if s is not None else 0, cfg)
-    st.caption(f"Shop type: **{shop_type}** · size: **{size}**" + (" — Admin can change the type in ⚙️ Shops & zones." if current_role() == "admin" else ""))
-    with st.form("visit_form", clear_on_submit=False):
-        st.markdown("**3️⃣ Photos** — shop front is required")
-        front = st.camera_input("📸 Shop front (take it now)", key="visit_cam")
-        ph1, ph2 = st.columns(2)
-        before = ph1.file_uploader("🅱️ BEFORE: fridge / display as you found it", type=["jpg", "jpeg", "png", "webp"], key="visit_before",
-                                   help="Take it with the camera when you arrive. Needed when you fix something.")
-        after = ph2.file_uploader("🅰️ AFTER: the same place after you fixed it", type=["jpg", "jpeg", "png", "webp"], key="visit_after",
-                                  help="Same angle as BEFORE, so the change is easy to see.")
-        extra = st.file_uploader("Other photos (max 2)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True, key="visit_files")
-        st.markdown(f"**4️⃣ Shop check** · {shop_type}")
-        a1, a2 = st.columns(2)
-        fridge = a1.radio("🧊 Fridge", ["Clean & cold", "Dirty", "Not cold", "Broken", "No fridge"], horizontal=True)
-        fifo = a2.radio("🥟 Display / old buns in front (FIFO)", ["Good", "Needs fixing", "Fixed today"], horizontal=True)
-        b1, b2, b3 = st.columns(3)
-        old_pcs = b1.number_input("Old / damaged buns found (pcs)", 0, 5000, 0, 1)
-        sticker = b2.radio("🏷️ Sticker", ["Good", "Old / faded", "Missing"], horizontal=True)
-        changed = b3.number_input("Stickers changed today", 0, 100, 0, 1)
-        fridge_fixed = st.checkbox("🧽 I cleaned / arranged the fridge or display today", key="visit_fridge_fixed")
-        st.caption(f"Tick what is OK at this {shop_type.split(' ', 1)[1].lower()}:")
-        type_checks = list(VISIT_TYPE_CHECKS.get(shop_type, VISIT_TYPE_CHECKS[VISIT_TYPE_OTHER]))
-        if is_first_visit:
-            type_checks = LEAD_FIRST_VISIT_CHECKS + type_checks
-        tc_cols = st.columns(2)
-        check_ok = {c: tc_cols[i % 2].checkbox(c, key=f"visit_chk_{i}") for i, c in enumerate(type_checks)}
-        st.markdown("**5️⃣ Sales**")
-        app_pct = s["Trend %"] if s is not None else None
-        st.caption("Our journal says: " + _visit_trend_text(app_pct))
-        s1, s2, s3 = st.columns(3)
-        says = s1.radio("Shop owner says sales are", ["⬆️ Up", "➡️ Same", "⬇️ Down"], index=1, horizontal=True)
-        reason = s2.selectbox("Main reason", VISIT_REASONS)
-        competitor = s3.text_input("Competitor brand seen (if any)", max_chars=60)
-        st.markdown("**6️⃣ Problems & requests**")
-        problems = st.multiselect("Problems found", VISIT_PROBLEMS, placeholder="None — leave empty if all good")
-        p1, p2, p3 = st.columns(3)
-        priority = p1.radio("Priority", ["Low", "Normal", "Urgent"], index=1, horizontal=True)
-        follow = p2.selectbox("Who must follow up", VISIT_FOLLOWUP)
-        sat = p3.select_slider("Shop happiness", ["😠 1", "🙁 2", "😐 3", "🙂 4", "😍 5"], value="🙂 4")
-        notes = st.text_area("Notes (what you saw, what you did)", max_chars=200, height=80)
-        request = st.text_input("Customer request (more of which bun, next order, promotion…)", max_chars=150)
-        submitted = st.form_submit_button("✅ Save visit", type="primary", use_container_width=True)
+    type_checks = list(VISIT_TYPE_CHECKS.get(shop_type, VISIT_TYPE_CHECKS[VISIT_TYPE_OTHER]))
+    if is_first_visit:
+        type_checks = LEAD_FIRST_VISIT_CHECKS + type_checks
+    app_pct = s["Trend %"] if s is not None else None
+    ctx = {"customer": customer, "key": key, "pin": pin, "user": user, "zone": zone_map.get(key, VISIT_ZONE_NOT_SET),
+           "shop_type": shop_type, "size": size, "app_pct": app_pct, "type_checks": type_checks}
+    if not _visit_phone_mode():
+        st.caption(f"Shop type: **{shop_type}** · size: **{size}**" + (" — Admin can change the type in ⚙️ Shops & zones." if current_role() == "admin" else ""))
+        with st.form("visit_form", clear_on_submit=False):
+            a = {}
+            st.markdown("**3️⃣ Photos** — shop front is required")
+            a.update(_vf_photos_arrive({}, False))
+            a.update(_vf_photos_after({}, False))
+            st.markdown(f"**4️⃣ Shop check** · {shop_type}")
+            a.update(_vf_check({}, ctx, False))
+            st.markdown("**5️⃣ Sales**")
+            a.update(_vf_sales({}, ctx, False))
+            st.markdown("**6️⃣ Problems & requests**")
+            a.update(_vf_problems({}, False))
+            submitted = st.form_submit_button("✅ Save visit", type="primary", use_container_width=True)
+        if submitted:
+            err = _vf_validate(a)
+            if err:
+                st.error(err)
+            else:
+                _vf_save(a, ctx)
+        return
+    _vf_phone_wizard(ctx)
 
-    if not submitted:
-        return
-    if front is None:
-        st.error("Please take the shop front photo first.")
-        return
-    if len(extra or []) > 2:
-        st.error("Choose at most 2 other photos.")
-        return
-    fixes = [x for x, on in (("Sticker changed", changed > 0), ("FIFO fixed", fifo == "Fixed today"),
-                             ("Fridge/display cleaned", fridge_fixed)) if on]
-    if fixes and (before is None or after is None):
-        st.error("You fixed something (" + ", ".join(fixes) + "). Please add both the 🅱️ BEFORE and 🅰️ AFTER photos.")
-        return
-    if (before is None) != (after is None):
-        st.error("Add both BEFORE and AFTER photos, or neither.")
-        return
-    for label_, f in (("BEFORE", before), ("AFTER", after)):
+
+# ---------- visit form sections (shared by desktop and phone) ----------
+class _Shot:
+    """A photo kept in memory between phone steps."""
+    def __init__(self, data, name="photo.jpg"):
+        self.data, self.name = data, name
+
+    def getvalue(self):
+        return self.data
+
+
+def _vf_keep(f):
+    return None if f is None else _Shot(f.getvalue(), getattr(f, "name", "photo.jpg"))
+
+
+def _vf_idx(options, value, default=0):
+    return options.index(value) if value in options else default
+
+
+VF_FRIDGE = ["Clean & cold", "Dirty", "Not cold", "Broken", "No fridge"]
+VF_FIFO = ["Good", "Needs fixing", "Fixed today"]
+VF_STICKER = ["Good", "Old / faded", "Missing"]
+VF_SAYS = ["⬆️ Up", "➡️ Same", "⬇️ Down"]
+VF_PRIORITY = ["Low", "Normal", "Urgent"]
+VF_SAT = ["😠 1", "🙁 2", "😐 3", "🙂 4", "😍 5"]
+VF_IMG = ["jpg", "jpeg", "png", "webp"]
+
+
+def _vf_photos_arrive(d, phone):
+    if phone:
+        st.caption("Take these as soon as you arrive, before you touch anything.")
+        if d.get("front") is not None:
+            st.image(d["front"].getvalue(), caption="📸 Shop front ✅", width=220)
+        front = st.camera_input("📸 Shop front" + (" (take again to replace)" if d.get("front") else ""), key="vf_cam")
+        if d.get("before") is not None:
+            st.image(d["before"].getvalue(), caption="🅱️ BEFORE ✅", width=220)
+        before = st.file_uploader("🅱️ BEFORE: fridge / display as you found it", type=VF_IMG, key="vf_before",
+                                  help="Tap → Camera. Needed if you will fix anything.")
+        return {"front": _vf_keep(front) or d.get("front"), "before": _vf_keep(before) or d.get("before")}
+    front = st.camera_input("📸 Shop front (take it now)", key="visit_cam")
+    before = st.file_uploader("🅱️ BEFORE: fridge / display as you found it", type=VF_IMG, key="visit_before",
+                              help="Take it with the camera when you arrive. Needed when you fix something.")
+    return {"front": front, "before": before}
+
+
+def _vf_photos_after(d, phone):
+    if phone:
+        if d.get("after") is not None:
+            st.image(d["after"].getvalue(), caption="🅰️ AFTER ✅", width=220)
+        after = st.file_uploader("🅰️ AFTER: the same place after you fixed it", type=VF_IMG, key="vf_after",
+                                 help="Same angle as BEFORE.")
+        extra = st.file_uploader("Other photos (max 2)", type=VF_IMG, accept_multiple_files=True, key="vf_extra")
+        return {"after": _vf_keep(after) or d.get("after"),
+                "extra": [_vf_keep(f) for f in (extra or [])] or d.get("extra", [])}
+    after = st.file_uploader("🅰️ AFTER: the same place after you fixed it", type=VF_IMG, key="visit_after",
+                             help="Same angle as BEFORE, so the change is easy to see.")
+    extra = st.file_uploader("Other photos (max 2)", type=VF_IMG, accept_multiple_files=True, key="visit_files")
+    return {"after": after, "extra": extra or []}
+
+
+def _vf_check(d, ctx, phone):
+    cols = (st, st, st, st, st) if phone else (*st.columns(2), *st.columns(3))
+    fridge = cols[0].radio("🧊 Fridge", VF_FRIDGE, index=_vf_idx(VF_FRIDGE, d.get("fridge")), horizontal=True, key="vf_fridge")
+    fifo = cols[1].radio("🥟 Display / old buns in front (FIFO)", VF_FIFO, index=_vf_idx(VF_FIFO, d.get("fifo")), horizontal=True, key="vf_fifo")
+    old_pcs = cols[2].number_input("Old / damaged buns found (pcs)", 0, 5000, int(d.get("old_pcs", 0)), 1, key="vf_old")
+    sticker = cols[3].radio("🏷️ Sticker", VF_STICKER, index=_vf_idx(VF_STICKER, d.get("sticker")), horizontal=True, key="vf_sticker")
+    changed = cols[4].number_input("Stickers changed today", 0, 100, int(d.get("changed", 0)), 1, key="vf_changed")
+    fridge_fixed = st.checkbox("🧽 I cleaned / arranged the fridge or display today", value=bool(d.get("fridge_fixed")), key="vf_ffix")
+    st.caption(f"Tick what is OK at this {ctx['shop_type'].split(' ', 1)[1].lower()}:")
+    prev = d.get("checks", {})
+    grid = [st] if phone else st.columns(2)
+    checks = {c: grid[i % len(grid)].checkbox(c, value=bool(prev.get(c)), key=f"vf_chk_{i}") for i, c in enumerate(ctx["type_checks"])}
+    return {"fridge": fridge, "fifo": fifo, "old_pcs": old_pcs, "sticker": sticker, "changed": changed,
+            "fridge_fixed": fridge_fixed, "checks": checks}
+
+
+def _vf_sales(d, ctx, phone):
+    st.caption("Our journal says: " + _visit_trend_text(ctx["app_pct"]))
+    cols = (st, st, st) if phone else st.columns(3)
+    says = cols[0].radio("Shop owner says sales are", VF_SAYS, index=_vf_idx(VF_SAYS, d.get("says"), 1), horizontal=True, key="vf_says")
+    reason = cols[1].selectbox("Main reason", VISIT_REASONS, index=_vf_idx(VISIT_REASONS, d.get("reason")), key="vf_reason")
+    competitor = cols[2].text_input("Competitor brand seen (if any)", value=d.get("competitor", ""), max_chars=60, key="vf_comp")
+    return {"says": says, "reason": reason, "competitor": competitor}
+
+
+def _vf_problems(d, phone):
+    problems = st.multiselect("Problems found", VISIT_PROBLEMS, default=[p for p in d.get("problems", []) if p in VISIT_PROBLEMS],
+                              placeholder="None — leave empty if all good", key="vf_probs")
+    cols = (st, st, st) if phone else st.columns(3)
+    priority = cols[0].radio("Priority", VF_PRIORITY, index=_vf_idx(VF_PRIORITY, d.get("priority"), 1), horizontal=True, key="vf_prio")
+    follow = cols[1].selectbox("Who must follow up", VISIT_FOLLOWUP, index=_vf_idx(VISIT_FOLLOWUP, d.get("follow")), key="vf_follow")
+    sat = cols[2].select_slider("Shop happiness", VF_SAT, value=d.get("sat", "🙂 4"), key="vf_sat")
+    notes = st.text_area("Notes (what you saw, what you did)", value=d.get("notes", ""), max_chars=200, height=80, key="vf_notes")
+    request = st.text_input("Customer request (more of which bun, next order, promotion…)", value=d.get("request", ""),
+                            max_chars=150, key="vf_req")
+    return {"problems": problems, "priority": priority, "follow": follow, "sat": sat, "notes": notes, "request": request}
+
+
+def _vf_fixes(a):
+    return [x for x, on in (("Sticker changed", (a.get("changed") or 0) > 0), ("FIFO fixed", a.get("fifo") == "Fixed today"),
+                            ("Fridge/display cleaned", bool(a.get("fridge_fixed")))) if on]
+
+
+def _vf_validate(a):
+    """Error text, or None when the visit can be saved."""
+    if a.get("front") is None:
+        return "Please take the shop front photo first."
+    if len(a.get("extra") or []) > 2:
+        return "Choose at most 2 other photos."
+    fixes = _vf_fixes(a)
+    if fixes and (a.get("before") is None or a.get("after") is None):
+        return "You fixed something (" + ", ".join(fixes) + "). Please add both the 🅱️ BEFORE and 🅰️ AFTER photos."
+    if (a.get("before") is None) != (a.get("after") is None):
+        return "Add both BEFORE and AFTER photos, or neither."
+    if a.get("problems") and a.get("follow") in ("-", None):
+        return "You reported a problem: choose who must follow up."
+    for label_, f in (("BEFORE", a.get("before")), ("AFTER", a.get("after"))):
         if f is not None and not _visit_test_mode():
             taken = _visit_photo_taken_at(f.getvalue())
             if taken and (now_kh().replace(tzinfo=None) - taken).total_seconds() > VISIT_PHOTO_MAX_AGE_H * 3600:
-                st.error(f"The {label_} photo was taken on {taken:%d %b %H:%M}. Please take a new photo now.")
-                return
+                return f"The {label_} photo was taken on {taken:%d %b %H:%M}. Please take a new photo now."
+    return None
+
+
+def _vf_save(a, ctx):
+    customer, key, pin, user = ctx["customer"], ctx["key"], ctx["pin"], ctx["user"]
     gps = st.session_state.get("visit_gps")
     if gps and norm_name(gps.get("customer", "")) != key:
         gps = None
@@ -9076,8 +9189,8 @@ def _visit_new_form(visits, stats, names):
     names_saved = []
     with st.spinner("Saving photos…"):
         try:
-            shots = [("front", front)] + ([("before", before), ("after", after)] if before is not None else []) \
-                + [(f"x{i}", f) for i, f in enumerate(extra or [], start=1)]
+            shots = [("front", a["front"])] + ([("before", a["before"]), ("after", a["after"])] if a.get("before") is not None else []) \
+                + [(f"x{i}", f) for i, f in enumerate(a.get("extra") or [], start=1)]
             for role, f in shots:
                 data = _visit_photo_prepare(f.getvalue(), stamp + [role.upper()])
                 name = f"{vid}_{role}.jpg"
@@ -9092,19 +9205,21 @@ def _visit_new_form(visits, stats, names):
             minutes = max(0, round((now.replace(tzinfo=None) - datetime.strptime(gps["at"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 60))
         except Exception:
             minutes = ""
+    fixes, checks, app_pct = _vf_fixes(a), a.get("checks", {}), ctx["app_pct"]
+    problems = a.get("problems") or []
     row = {"Date": now_str(), "VisitID": vid, "Staff": user, "Customer": customer,
            "Check-in": gps["at"] if gps else "-", "Minutes": minutes,
            "Lat": f"{gps['lat']:.6f}" if gps else "-", "Lon": f"{gps['lon']:.6f}" if gps else "-",
            "GPS accuracy m": f"{gps['acc']:.0f}" if gps else "-", "Distance m": f"{dist:.0f}" if dist is not None else "-",
-           "Location check": label, "Fridge": fridge, "Display FIFO": fifo, "Old/damaged pcs": int(old_pcs),
-           "Sticker": sticker, "Stickers changed": int(changed), "Customer says sales": says, "Sales reason": reason,
-           "Competitor": competitor or "-", "App trend %": "-" if app_pct is None or pd.isna(app_pct) else f"{app_pct:.0f}",
-           "Problems": "; ".join(p.split(" ", 1)[1] for p in problems) or "-", "Priority": priority,
-           "Follow-up by": follow, "Notes": notes or "-", "Customer request": request or "-", "Satisfaction": sat.split()[-1],
-           "Photos": ";".join(names_saved), "Status": "Open" if problems else "No problem",
-           "Fixed by": "-", "Fixed at": "-", "Fix note": "-", "Zone": zone_map.get(key, VISIT_ZONE_NOT_SET),
-           "Shop type": shop_type, "Checks": "; ".join(f"{c}: {'OK' if ok else 'NO'}" for c, ok in check_ok.items()),
-           "Check score %": round(100 * sum(check_ok.values()) / max(1, len(check_ok))), "Size": size,
+           "Location check": label, "Fridge": a["fridge"], "Display FIFO": a["fifo"], "Old/damaged pcs": int(a["old_pcs"]),
+           "Sticker": a["sticker"], "Stickers changed": int(a["changed"]), "Customer says sales": a["says"], "Sales reason": a["reason"],
+           "Competitor": a.get("competitor") or "-", "App trend %": "-" if app_pct is None or pd.isna(app_pct) else f"{app_pct:.0f}",
+           "Problems": "; ".join(p.split(" ", 1)[1] for p in problems) or "-", "Priority": a["priority"],
+           "Follow-up by": a["follow"], "Notes": a.get("notes") or "-", "Customer request": a.get("request") or "-",
+           "Satisfaction": a["sat"].split()[-1], "Photos": ";".join(names_saved), "Status": "Open" if problems else "No problem",
+           "Fixed by": "-", "Fixed at": "-", "Fix note": "-", "Zone": ctx["zone"],
+           "Shop type": ctx["shop_type"], "Checks": "; ".join(f"{c}: {'OK' if ok else 'NO'}" for c, ok in checks.items()),
+           "Check score %": round(100 * sum(checks.values()) / max(1, len(checks))), "Size": ctx["size"],
            "Fix done": "; ".join(fixes) or "-", "Review": "-", "Reviewed by": "-", "Reviewed at": "-", "Review note": "-"}
     try:
         append_row(_visits_path(), row)
@@ -9112,11 +9227,120 @@ def _visit_new_form(visits, stats, names):
         st.error("The visit could not be saved: " + str(e)[:160] + ". Your answers are still here; press Save again.")
         return
     audit("shop visit" + (" (TEST)" if _visit_test_mode() else ""), f"{customer} | {label} | {row['Problems']}")
-    for k in ["visit_gps", "visit_customer", "visit_customer_box", "visit_cam", "visit_files", "visit_before", "visit_after",
-              "visit_fridge_fixed"] + [f"visit_chk_{i}" for i in range(14)]:
+    for k in [k for k in list(st.session_state) if str(k).startswith(("visit_gps", "visit_customer", "visit_cam", "visit_files",
+                                                                     "visit_before", "visit_after", "vf_", "visit_draft"))]:
         st.session_state.pop(k, None)
     st.session_state["flash"] = f"Visit saved: {customer}"
     st.rerun()
+
+
+VF_STEPS = ["📸 Arrive", "🔍 Check", "🛠️ After", "📈 Sales", "⚠️ Problems", "✅ Save"]
+
+
+def _vf_phone_wizard(ctx):
+    """One block of questions per screen, big buttons, answers kept when going back."""
+    drafts = st.session_state.setdefault("visit_draft", {})
+    d = drafts.setdefault(ctx["key"], {"_step": 0})
+    step = int(d.get("_step", 0))
+    st.progress((step + 1) / len(VF_STEPS), text=f"Step {step + 1} of {len(VF_STEPS)} · {VF_STEPS[step]}")
+    with st.container(border=True):
+        if step == 0:
+            ans = _vf_photos_arrive(d, True)
+        elif step == 1:
+            st.caption(f"{ctx['shop_type']} · {ctx['size']}")
+            ans = _vf_check(d, ctx, True)
+        elif step == 2:
+            fixes = _vf_fixes(d)
+            if fixes:
+                st.info("You fixed: **" + ", ".join(fixes) + "** → take the 🅰️ AFTER photo from the same angle as BEFORE.")
+            else:
+                st.caption("Nothing fixed? You can skip the AFTER photo (only needed if you took a BEFORE photo).")
+            ans = _vf_photos_after(d, True)
+        elif step == 3:
+            ans = _vf_sales(d, ctx, True)
+        elif step == 4:
+            ans = _vf_problems(d, True)
+        else:
+            ans = {}
+            _vf_summary(d, ctx)
+    d.update(ans)
+    err_here = None
+    if step == 0 and d.get("front") is None:
+        err_here = "Take the shop front photo to continue."
+    if step == 2 and _vf_fixes(d) and (d.get("before") is None or d.get("after") is None):
+        err_here = "Because you fixed something, add both BEFORE (step 1) and AFTER photos."
+    if step == 4 and d.get("problems") and d.get("follow") in ("-", None):
+        err_here = "Choose who must follow up the problem."
+    b1, b2 = st.columns([1, 2])
+    if step > 0 and b1.button("⬅️ Back", key=f"vf_back_{step}", use_container_width=True):
+        d["_step"] = step - 1
+        st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+    if step < len(VF_STEPS) - 1:
+        if b2.button("Next ➡️", key=f"vf_next_{step}", type="primary", use_container_width=True):
+            if err_here:
+                st.error(err_here)
+            else:
+                d["_step"] = step + 1
+                st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+    else:
+        if b2.button("✅ Save visit", key="vf_save", type="primary", use_container_width=True):
+            err = _vf_validate(d)
+            if err:
+                st.error(err)
+            else:
+                _vf_save(d, ctx)
+    if step < len(VF_STEPS) - 1:
+        jump = st.columns(len(VF_STEPS))
+        for i, name in enumerate(VF_STEPS):
+            if i != step and jump[i].button(name.split()[0], key=f"vf_jump_{step}_{i}", help=name, use_container_width=True):
+                d["_step"] = i
+                st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+
+
+def _vf_summary(d, ctx):
+    fixes = _vf_fixes(d)
+    checks = d.get("checks", {})
+    photos = [n for n, k in (("front", "front"), ("before", "before"), ("after", "after")) if d.get(k) is not None]
+    st.markdown(f"**{ctx['customer']}**")
+    st.markdown(f"- 📸 Photos: **{', '.join(photos) or 'none'}**" + (f" + {len(d.get('extra') or [])} other" if d.get("extra") else "") + "\n"
+                f"- 🧊 Fridge **{d.get('fridge', '-')}** · 🥟 FIFO **{d.get('fifo', '-')}** · old buns **{d.get('old_pcs', 0)}**\n"
+                f"- 🏷️ Sticker **{d.get('sticker', '-')}** · changed **{d.get('changed', 0)}**\n"
+                f"- 🛠️ Fixed: **{', '.join(fixes) or 'nothing'}**\n"
+                f"- 📋 Checklist: **{sum(checks.values())} / {len(checks)} OK**\n"
+                f"- 📈 Owner says **{d.get('says', '-')}** · {d.get('reason', '-')}\n"
+                f"- ⚠️ Problems: **{', '.join(p.split(' ', 1)[1] for p in d.get('problems', [])) or 'none'}**"
+                + (f" · follow-up {d.get('follow')}" if d.get("problems") else "") + "\n"
+                f"- 😊 Happiness **{d.get('sat', '-')}** · 📝 {d.get('notes') or 'no notes'}")
+    err = _vf_validate(d)
+    if err:
+        st.error(err)
+    else:
+        st.success("Everything is filled in. Press **✅ Save visit**.")
+
+
+def _in_fragment():
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        return bool(ctx and getattr(ctx, "current_fragment_id", None))
+    except Exception:
+        return False
+
+
+def _visit_phone_mode():
+    if "visit_phone" not in st.session_state:
+        st.session_state["visit_phone"] = is_mobile()
+    return bool(st.session_state.get("visit_phone"))
+
+
+VISIT_PHONE_CSS = """<style>
+.stButton > button, .stDownloadButton > button, .stLinkButton > a {min-height: 50px; font-size: 1.02rem; border-radius: 12px;}
+div[data-testid="stCameraInput"] button {min-height: 50px;}
+[data-baseweb="input"], [data-baseweb="select"] > div, [data-baseweb="textarea"] {min-height: 46px; font-size: 1rem;}
+label[data-baseweb="radio"] {padding: 9px 14px; margin: 4px 6px 4px 0;}
+label[data-baseweb="checkbox"] {padding: 6px 0;}
+[data-testid="stProgress"] p {font-weight: 700;}
+</style>"""
 
 
 def _visit_report_frame(visits, start, end, staff):
@@ -9957,12 +10181,6 @@ def _lead_import_body(snap, visits):
         _si_show(leads.drop(columns=["_dt"], errors="ignore"))
 
 
-@st.fragment(run_every=30)
-def _visit_report_live():
-    st.caption(f"Live · updated {now_kh():%H:%M:%S}")
-    _visit_report_body(_visit_read())
-
-
 def _visit_start(customer):
     """Button callback: runs before the page is drawn again, so it may switch the section."""
     st.session_state["visit_customer"] = customer
@@ -9991,11 +10209,38 @@ def _visit_test_clear():
 
 
 def tab_shop_visits():
-    h1, h2 = st.columns([3, 2])
+    """Shop Visits runs as a fragment: tapping inside it redraws only this section, not the whole app."""
+    want_live = (st.session_state.get("visit_view") == "📊 Visit report" and bool(st.session_state.get("vr_live")))
+    st.session_state["_visit_live_wrapper"] = want_live
+    try:
+        (_shop_visits_live if want_live else _shop_visits_fragment)()
+    except Exception as e:
+        if "fragment" in str(e).lower():
+            _shop_visits_body()           # older Streamlit without fragments
+        else:
+            raise
+
+
+@st.fragment
+def _shop_visits_fragment():
+    _shop_visits_body()
+
+
+@st.fragment(run_every=30)
+def _shop_visits_live():
+    _shop_visits_body()
+
+
+def _shop_visits_body():
+    h1, h2, h3 = st.columns([3, 1.3, 2])
     h1.markdown("### 🏪 Shop Visits")
+    _visit_phone_mode()
+    h2.toggle("📱 Phone mode", key="visit_phone", help="Big buttons and the visit form step by step. Turns on by itself on a phone.")
+    if _visit_phone_mode():
+        st.markdown(VISIT_PHONE_CSS, unsafe_allow_html=True)
     if current_role() == "admin":
-        h2.toggle("🧪 Test mode (practice — not in real reports)", key="visit_test_mode",
-                  on_change=lambda: [st.session_state.pop(k, None) for k in ("visit_gps", "visit_customer", "visit_customer_box")])
+        h3.toggle("🧪 Test mode (practice — not in real reports)", key="visit_test_mode",
+                  on_change=lambda: [st.session_state.pop(k, None) for k in ("visit_gps", "visit_customer", "visit_customer_box", "visit_draft")])
     if _visit_test_mode():
         b1, b2 = st.columns([4, 1])
         b1.warning("🧪 **TEST MODE.** You can fill in visits from anywhere: no real GPS or shop location needed, any photo is "
@@ -10009,7 +10254,12 @@ def tab_shop_visits():
         views.append("⚙️ Shops & zones")
     if st.session_state.get("visit_view") not in views:
         st.session_state["visit_view"] = views[0]
-    view = st.radio("Shop visit section", views, horizontal=True, key="visit_view", label_visibility="collapsed")
+    if _visit_phone_mode():
+        view = st.selectbox("Section", views, key="visit_view", label_visibility="collapsed")
+    else:
+        view = st.radio("Shop visit section", views, horizontal=True, key="visit_view", label_visibility="collapsed")
+    if (view == "📊 Visit report" and bool(st.session_state.get("vr_live"))) != st.session_state.get("_visit_live_wrapper", False):
+        st.rerun()                        # switch between the normal and the auto-refresh wrapper
     visits = _visit_read()
     if view == "📝 New visit":
         if not has_permission("edit"):
@@ -10085,10 +10335,11 @@ def tab_shop_visits():
         _visit_scorecard_body(visits, st.session_state.get("_visit_daily", pd.DataFrame()), names)
     elif view == "📊 Visit report":
         live = st.toggle("🔄 Live (refresh every 30 s)", key="vr_live")
+        if live != st.session_state.get("_visit_live_wrapper", False):
+            st.rerun()
         if live:
-            _visit_report_live()
-        else:
-            _visit_report_body(visits)
+            st.caption(f"Live · updated {now_kh():%H:%M:%S}")
+        _visit_report_body(visits)
     elif view == "🔴 Open problems":
         _visit_problems_body(visits)
 
@@ -10205,3 +10456,4 @@ elif _label.startswith("🏪"):
     tab_shop_visits()
 else:
     tab_bot()
+    
