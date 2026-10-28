@@ -8411,7 +8411,7 @@ VISIT_TYPE_OTHER = "📦 Other"
 VISIT_TYPE_NAMES = list(VISIT_TYPES) + [VISIT_TYPE_OTHER]
 VISIT_TYPE_CHECKS = {**{t: c for t, (_w, c) in VISIT_TYPES.items()}, VISIT_TYPE_OTHER: ["Display clean", "Price tag shown"]}
 VISIT_SET_COLS = ["Date", "Customer", "Zone", "By", "Type"]
-VISIT_PHOTO_MAX_AGE_H = 3                 # a before/after photo taken longer ago than this is refused
+VISIT_PHOTO_MAX_AGE_H = 0                 # 0 = no limit: photos may come from the gallery (check-in is the proof)
 
 
 def _visit_settings():
@@ -9098,7 +9098,7 @@ def _visit_new_form(visits, stats, names):
 # ---------- visit form sections (shared by desktop and phone) ----------
 class _Shot:
     """A photo kept in memory between phone steps: shrunk once (≈1280 px), with a small thumbnail for the screen
-    and the time the camera took it (so the 3-hour rule still works after shrinking)."""
+    and the time the camera took it (shown in reports)."""
     def __init__(self, data, name="photo.jpg", thumb=None, taken=None):
         self.data, self.name, self.thumb, self.taken = data, name, thumb, taken
 
@@ -9181,22 +9181,16 @@ def _vf_photo_status(d):
 
 def _vf_photos_arrive(d, phone):
     if phone:
-        st.caption("Take 2 photos as soon as you arrive, before you touch anything.")
+        st.caption("Add 2 photos: take them with the camera or choose them from the gallery.")
         st.markdown("**1 · 📸 Shop front** (required)")
-        if d.get("front") is not None and st.session_state.get("vf_cam") is None:
-            _vf_photo_slot(d, "front", "📸 Shop front", "vf_front_up")
-        else:
-            front = st.camera_input("📸 Shop front", key="vf_cam", label_visibility="collapsed")
-            if front is not None:
-                fid = getattr(front, "file_id", None) or (getattr(front, "name", ""), getattr(front, "size", None))
-                if d.get("front") is None or fid != d.get("_front_id"):
-                    d["front"], d["_front_id"] = _vf_keep(front), fid
+        _vf_photo_slot(d, "front", "📸 Shop front photo", "vf_front_up", "Tap → Take Photo or Photo Library")
         st.markdown("**2 · 🅱️ BEFORE: fridge / display as you found it** (needed if you will fix anything)")
         _vf_photo_slot(d, "before", "🅱️ BEFORE photo", "vf_before")
         return {}
-    front = st.camera_input("📸 Shop front (take it now)", key="visit_cam")
+    front = st.file_uploader("📸 Shop front (required)", type=VF_IMG, key="visit_cam",
+                             help="Take it with the camera or choose it from the gallery.")
     before = st.file_uploader("🅱️ BEFORE: fridge / display as you found it", type=VF_IMG, key="visit_before",
-                              help="Take it with the camera when you arrive. Needed when you fix something.")
+                              help="Needed when you fix something.")
     return {"front": front, "before": before}
 
 
@@ -9280,12 +9274,7 @@ def _vf_validate(a):
         return "Add both BEFORE and AFTER photos, or neither."
     if a.get("problems") and a.get("follow") in ("-", None):
         return "You reported a problem: choose who must follow up."
-    for label_, f in (("BEFORE", a.get("before")), ("AFTER", a.get("after"))):
-        if f is not None and not _visit_test_mode():
-            taken = getattr(f, "taken", None) or _visit_photo_taken_at(f.getvalue())
-            if taken and (now_kh().replace(tzinfo=None) - taken).total_seconds() > VISIT_PHOTO_MAX_AGE_H * 3600:
-                return f"The {label_} photo was taken on {taken:%d %b %H:%M}. Please take a new photo now."
-    return None
+    return None                       # photos may come from the gallery: the GPS check-in proves the visit
 
 
 def _vf_save(a, ctx):
@@ -9516,12 +9505,7 @@ def _vf_summary(d, ctx):
                (k == "front" or _vf_fixes(d) or d.get("before") is not None or d.get("after") is not None)]
     for k in missing:
         st.warning(f"{VF_PHOTO_LABEL[k]} photo is missing — add it here:")
-        if k == "front":
-            front = st.camera_input("📸 Shop front", key="vf_cam_sum", label_visibility="collapsed")
-            if front is not None:
-                d["front"] = _vf_keep(front)
-        else:
-            _vf_photo_slot(d, k, f"{VF_PHOTO_LABEL[k]} photo", f"vf_{k}_sum")
+        _vf_photo_slot(d, k, f"{VF_PHOTO_LABEL[k]} photo", f"vf_{k}_sum")
     err = _vf_validate(d)
     if err and not missing:
         st.error(err)
