@@ -94,6 +94,7 @@ HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers m
 MAP_REGISTRY_FILE = os.path.join(DATA_DIR, "customer_map_registry.json")
 CALLS_FILE = os.path.join(DATA_DIR, "customer_call_history.csv")
 VISITS_FILE = os.path.join(DATA_DIR, "shop_visits.csv")             # staff visits to customer shops
+VISITS_TEST_FILE = os.path.join(DATA_DIR, "shop_visits_TEST.csv")   # admin practice visits (never in real reports)
 VISIT_ZONE_FILE = os.path.join(DATA_DIR, "visit_zones.csv")         # Phnom Penh zone per shop, set by Admin
 VISIT_PIN_FILE = os.path.join(DATA_DIR, "shop_pins.csv")            # shop locations saved at the shop by staff
 LEADS_FILE = os.path.join(DATA_DIR, "new_customers_leads.csv")      # NPHK Leads Report rows imported in Shop Visits
@@ -8443,9 +8444,18 @@ def _visit_photo_taken_at(data):
         return None
 
 
+def _visit_test_mode():
+    return current_role() == "admin" and bool(st.session_state.get("visit_test_mode"))
+
+
+def _visits_path():
+    """Real visit log, or the practice log while Admin has 🧪 Test mode on."""
+    return VISITS_TEST_FILE if _visit_test_mode() else VISITS_FILE
+
+
 def _visit_read():
     try:
-        return read_raw(VISITS_FILE, VISIT_COLS)
+        return read_raw(_visits_path(), VISIT_COLS)
     except Exception as e:
         st.warning("Visit log could not be read: " + str(e)[:150])
         return pd.DataFrame(columns=VISIT_COLS + ["_dt"])
@@ -8687,6 +8697,8 @@ def _visit_photo_prepare(data, stamp_lines):
 
 
 def _visit_photo_path(name):
+    if name.startswith("T"):                                 # practice photos from 🧪 Test mode
+        return f"{VISIT_PHOTO_DIR}/TEST/{name}"
     month = name[1:7] if name.startswith("V") else "misc"     # V202610…
     return f"{VISIT_PHOTO_DIR}/{month[:4]}-{month[4:6]}/{name}"
 
@@ -8895,7 +8907,27 @@ def _visit_new_form(visits, stats, names):
     gps = st.session_state.get("visit_gps")
     if gps and norm_name(gps.get("customer", "")) != key:
         gps = None
-    if not pin:
+    test = _visit_test_mode()
+    if test:
+        st.markdown("**2️⃣ Check in** · 🧪 test mode")
+        if not pin:
+            st.caption("Real staff would have to save this shop's location first. In test mode a pretend pin is used.")
+            pin = (11.5564, 104.9282)
+            pin_info = (pin[0], pin[1], "🧪 pretend pin (test mode)")
+        if not gps:
+            t1, t2 = st.columns(2)
+            if t1.button("🧪 Pretend I'm at the shop", key="visit_test_here", use_container_width=True, type="primary"):
+                st.session_state["visit_gps"] = {"lat": pin[0] + 0.0002, "lon": pin[1] + 0.0002, "acc": 12,
+                                                 "at": (now_kh() - timedelta(minutes=12)).strftime("%Y-%m-%d %H:%M:%S"), "customer": customer}
+                st.rerun()
+            if t2.button("🧪 Pretend I'm 3 km away", key="visit_test_far", use_container_width=True):
+                st.session_state["visit_gps"] = {"lat": pin[0] + 0.027, "lon": pin[1], "acc": 15,
+                                                 "at": (now_kh() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S"), "customer": customer}
+                st.rerun()
+            st.caption("Or use the real check-in button below to test your phone's GPS.")
+            _visit_checkin_button(customer)
+            return
+    if not test and not pin:
         st.markdown("**2️⃣ Save this shop's location first**")
         st.error("📍 This shop has no map location yet. You must save it before you can start the visit.")
         options = cands.get(key, [])
@@ -8932,11 +8964,14 @@ def _visit_new_form(visits, stats, names):
                 except Exception as e:
                     st.error("Could not use this link: " + str(e)[:160])
         return
+    if test:
+        gps = st.session_state.get("visit_gps")
     directions = f"https://www.google.com/maps/dir/?api=1&destination={pin[0]},{pin[1]}&travelmode=driving"
     m1, m2 = st.columns([3, 1])
     m1.caption(f"📍 Shop location {pin_info[2]}")
     m2.link_button("🧭 Directions", directions, use_container_width=True)
-    st.markdown("**2️⃣ Check in when you arrive**")
+    if not test:
+        st.markdown("**2️⃣ Check in when you arrive**")
     if not gps:
         _visit_checkin_button(customer)
         st.caption("The page reloads once after the check-in. The visit form opens after you check in.")
@@ -8948,7 +8983,7 @@ def _visit_new_form(visits, stats, names):
     if b1.button("↻ Check in again", key="visit_recheck", use_container_width=True):
         st.session_state.pop("visit_gps", None)
         st.rerun()
-    if not label.startswith("✅"):
+    if not label.startswith("✅") and not test:
         with b2:
             with st.popover("📌 The map pin is wrong", use_container_width=True):
                 st.caption("Only if you are standing at the real shop and the saved pin points somewhere else. "
@@ -9025,7 +9060,7 @@ def _visit_new_form(visits, stats, names):
         st.error("Add both BEFORE and AFTER photos, or neither.")
         return
     for label_, f in (("BEFORE", before), ("AFTER", after)):
-        if f is not None:
+        if f is not None and not _visit_test_mode():
             taken = _visit_photo_taken_at(f.getvalue())
             if taken and (now_kh().replace(tzinfo=None) - taken).total_seconds() > VISIT_PHOTO_MAX_AGE_H * 3600:
                 st.error(f"The {label_} photo was taken on {taken:%d %b %H:%M}. Please take a new photo now.")
@@ -9035,7 +9070,7 @@ def _visit_new_form(visits, stats, names):
         gps = None
     label, dist = _visit_location_check(gps, pin)
     now = now_kh()
-    vid = f"V{now:%Y%m%d-%H%M%S}-{pysecrets.token_hex(2)}"
+    vid = f"{'T' if _visit_test_mode() else 'V'}{now:%Y%m%d-%H%M%S}-{pysecrets.token_hex(2)}"
     stamp = [f"{now:%Y-%m-%d %H:%M}  {user}", (f"GPS {gps['lat']:.5f},{gps['lon']:.5f} ±{gps['acc']:.0f}m" if gps else "No GPS"),
              f"{vid}  {label.encode('ascii', 'ignore').decode().strip()}"]
     names_saved = []
@@ -9072,11 +9107,11 @@ def _visit_new_form(visits, stats, names):
            "Check score %": round(100 * sum(check_ok.values()) / max(1, len(check_ok))), "Size": size,
            "Fix done": "; ".join(fixes) or "-", "Review": "-", "Reviewed by": "-", "Reviewed at": "-", "Review note": "-"}
     try:
-        append_row(VISITS_FILE, row)
+        append_row(_visits_path(), row)
     except Exception as e:
         st.error("The visit could not be saved: " + str(e)[:160] + ". Your answers are still here; press Save again.")
         return
-    audit("shop visit", f"{customer} | {label} | {row['Problems']}")
+    audit("shop visit" + (" (TEST)" if _visit_test_mode() else ""), f"{customer} | {label} | {row['Problems']}")
     for k in ["visit_gps", "visit_customer", "visit_customer_box", "visit_cam", "visit_files", "visit_before", "visit_after",
               "visit_fridge_fixed"] + [f"visit_chk_{i}" for i in range(14)]:
         st.session_state.pop(k, None)
@@ -9200,7 +9235,7 @@ def _visit_problems_body(visits):
                         df.loc[m, ["Status", "Fixed by", "Fixed at", "Fix note"]] = ["Fixed", by, at, safe_text(note or "-", 120)]
                         return df
                     try:
-                        modify_csv(VISITS_FILE, VISIT_COLS, _fix)
+                        modify_csv(_visits_path(), VISIT_COLS, _fix)
                         audit("visit problem fixed", f"{r['Customer']} | {vid}")
                         st.session_state["flash"] = f"Marked fixed: {r['Customer']}"
                         st.rerun()
@@ -9332,7 +9367,7 @@ def _visit_review_body(visits):
                                 [verdict, by, at, safe_text(note or "-", 150)]
                             return df
                         try:
-                            modify_csv(VISITS_FILE, VISIT_COLS, _rev)
+                            modify_csv(_visits_path(), VISIT_COLS, _rev)
                             audit("visit review", f"{r['Customer']} | {verdict} | {vid}")
                             st.session_state["flash"] = f"{verdict}: {r['Customer']}"
                             st.rerun()
@@ -9936,8 +9971,37 @@ def _visit_start(customer):
     st.session_state["visit_view"] = "📝 New visit"
 
 
+def _visit_test_clear():
+    try:
+        with _sync_state()["lock"], file_lock(VISITS_TEST_FILE):
+            _write_atomic(VISITS_TEST_FILE, (",".join(VISIT_COLS) + "\n").encode("utf-8-sig"))
+            if USE_DROPBOX:
+                try:
+                    pull(VISITS_TEST_FILE, force=True)
+                except Exception:
+                    pass
+                _write_atomic(VISITS_TEST_FILE, (",".join(VISIT_COLS) + "\n").encode("utf-8-sig"))
+                push(VISITS_TEST_FILE)
+        for k in [k for k in st.session_state if str(k).startswith(("visit_gps", "visit_customer"))]:
+            st.session_state.pop(k, None)
+        audit("shop visit TEST cleared")
+        st.session_state["flash"] = "🧪 Test visits deleted"
+    except Exception as e:
+        st.session_state["visit_gps_error"] = "Could not clear test visits: " + str(e)[:120]
+
+
 def tab_shop_visits():
-    st.markdown("### 🏪 Shop Visits")
+    h1, h2 = st.columns([3, 2])
+    h1.markdown("### 🏪 Shop Visits")
+    if current_role() == "admin":
+        h2.toggle("🧪 Test mode (practice — not in real reports)", key="visit_test_mode",
+                  on_change=lambda: [st.session_state.pop(k, None) for k in ("visit_gps", "visit_customer", "visit_customer_box")])
+    if _visit_test_mode():
+        b1, b2 = st.columns([4, 1])
+        b1.warning("🧪 **TEST MODE.** You can fill in visits from anywhere: no real GPS or shop location needed, any photo is "
+                   "accepted. Test visits are saved separately and never appear in the real plan, reports or scorecard. "
+                   "Switch it off to see real data again.")
+        b2.button("🗑️ Delete all test visits", key="visit_test_clear", on_click=_visit_test_clear, use_container_width=True)
     views = ["📋 Today's plan", "📝 New visit", "🆕 New customers"]
     if has_permission("reports"):
         views += ["✅ Review visits", "📊 Visit report", "🔴 Open problems", "📈 Did it help?", "🏅 Scorecard"]
