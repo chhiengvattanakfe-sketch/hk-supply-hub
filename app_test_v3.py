@@ -8204,6 +8204,97 @@ if _reset_prefix:
             st.session_state.pop(_key, None)
 
 # ==========================================
+# ---------- Khmer on screen (saved values stay English so reports and history keep working) ----------
+KM = {
+    # fridge / FIFO / sticker / sales / priority
+    "Clean & cold": "ស្អាត និងត្រជាក់", "Dirty": "កខ្វក់", "Not cold": "មិនត្រជាក់", "Broken": "ខូច", "No fridge": "គ្មានទូទឹកកក",
+    "Good": "ល្អ", "Needs fixing": "ត្រូវរៀបចំ", "Fixed today": "បានរៀបចំថ្ងៃនេះ",
+    "Old / faded": "ចាស់ / ស្រអាប់", "Missing": "គ្មាន",
+    "⬆️ Up": "⬆️ កើនឡើង", "➡️ Same": "➡️ ដដែល", "⬇️ Down": "⬇️ ធ្លាក់ចុះ",
+    "Low": "ទាប", "Normal": "ធម្មតា", "Urgent": "បន្ទាន់",
+    # reasons
+    "Season / weather": "រដូវ / អាកាសធាតុ", "Competitor": "គូប្រជែង", "Price": "តម្លៃ", "Bun quality": "គុណភាពនំ",
+    "Delivery late / missing": "ដឹកយឺត / ខ្វះ", "Fewer customers at the area": "ភ្ញៀវក្នុងតំបន់តិច",
+    "Shop moved / renovating": "ហាងប្តូរទីតាំង / កំពុងជួសជុល", "New promotion worked": "ប្រូម៉ូសិនថ្មីមានប្រសិទ្ធភាព",
+    "Good display / new fridge": "តាំងល្អ / ទូទឹកកកថ្មី", "Other": "ផ្សេងៗ",
+    # who follows up
+    "Admin": "Admin", "Sales": "ផ្នែកលក់ (Sales)", "Delivery": "ផ្នែកដឹកជញ្ជូន", "Production": "ផ្នែកផលិត",
+    # problems (with and without emoji)
+    "🧊 Fridge broken / not cold": "🧊 ទូទឹកកកខូច / មិនត្រជាក់", "🏷️ Sticker old / missing": "🏷️ ស្ទីគ័រចាស់ / គ្មាន",
+    "🚚 Delivery late": "🚚 ដឹកយឺត", "🥟 Bun quality / taste": "🥟 គុណភាព / រសជាតិនំ", "📦 Wrong or short order": "📦 ដឹកខុស ឬខ្វះ",
+    "💵 Price / payment": "💵 តម្លៃ / ការទូទាត់", "🆚 Competitor pushing": "🆚 គូប្រជែងប្រជែងខ្លាំង",
+    "🗓️ Old buns not rotated (FIFO)": "🗓️ នំចាស់មិនបានរៀបមុន (FIFO)", "➕ Wants a new item": "➕ ចង់បានមុខទំនិញថ្មី", "❓ Other": "❓ ផ្សេងៗ",
+    # checklist items
+    "Buns visible at the counter": "នំដាក់មើលឃើញនៅបញ្ជរ", "Steamer / microwave working": "ឆ្នាំងចំហុយ / មីក្រូវ៉េវដំណើរការ",
+    "Menu or poster shows our buns": "មានម៉ឺនុយ ឬផ្ទាំងរូបភាពនំយើង", "Shop staff know how to heat buns": "បុគ្គលិកហាងចេះកំដៅនំ",
+    "Fridge at the front, easy to see": "ទូទឹកកកនៅខាងមុខ ងាយមើលឃើញ", "Price tag shown": "មានស្លាកតម្លៃ",
+    "Our buns not hidden by competitors": "នំយើងមិនត្រូវគូប្រជែងបាំង", "Poster / sign outside": "មានផ្ទាំងរូបភាព / ស្លាកខាងក្រៅ",
+    "Fridge / shelf full enough": "ទូ / ធ្នើមាននំគ្រប់គ្រាន់", "Fridge near the canteen": "ទូទឹកកកនៅជិតអាហារដ្ឋាន",
+    "Enough stock for break time": "ស្តុកគ្រប់សម្រាប់ម៉ោងសម្រាក", "Price fits students": "តម្លៃសមរម្យសម្រាប់សិស្ស",
+    "Buns kept away from sun / dust": "នំការពារពីកម្តៅថ្ងៃ / ធូលី", "Delivery time fits break time": "ម៉ោងដឹកត្រូវនឹងម៉ោងសម្រាក",
+    "Display clean": "កន្លែងតាំងស្អាត", "Our buns placed well": "នំយើងតាំងបានល្អ",
+    "Covered from sun / dust": "មានគម្របការពារកម្តៅថ្ងៃ / ធូលី", "Steamer working": "ឆ្នាំងចំហុយដំណើរការ", "Price sign shown": "មានស្លាកតម្លៃ",
+    "Fridge installed & plugged in": "ទូទឹកកកបានដំឡើង និងដោតភ្លើង", "Stickers / poster put up": "បានបិទស្ទីគ័រ / ផ្ទាំងរូបភាព",
+    "Owner knows prices & how to heat buns": "ម្ចាស់ហាងដឹងតម្លៃ និងរបៀបកំដៅនំ", "Owner has our phone / Telegram": "ម្ចាស់ហាងមានលេខទូរស័ព្ទ / Telegram យើង",
+    # shop types and sizes
+    "☕ Coffee shop": "☕ ហាងកាហ្វេ", "⛽ Gas station": "⛽ ស្ថានីយប្រេង", "🛒 Mart / shop": "🛒 ម៉ាត / ហាង",
+    "🏫 School / canteen": "🏫 សាលា / អាហារដ្ឋាន", "🏛️ Office / ministry / hospital": "🏛️ ការិយាល័យ / ក្រសួង / មន្ទីរពេទ្យ",
+    "🥖 Bakery / food shop": "🥖 ហាងនំបុ័ង / អាហារ", "🏪 Market stall": "🏪 តូបផ្សារ", "📦 Other": "📦 ផ្សេងៗ",
+    "🟢 Big": "🟢 ធំ", "🟡 Medium": "🟡 មធ្យម", "⚪ Small": "⚪ តូច", "💤 No orders (28 d)": "💤 គ្មានការបញ្ជាទិញ (២៨ ថ្ងៃ)",
+    # zones
+    "1 · Center (Daun Penh · 7 Makara · BKK)": "1 · កណ្ដាលក្រុង (ដូនពេញ · ៧មករា · BKK)", "2 · Tuol Kouk": "2 · ទួលគោក",
+    "3 · North (Russey Keo · Chroy Changvar · Prek Pnov)": "3 · ខាងជើង (ឫស្សីកែវ · ជ្រោយចង្វារ · ព្រែកព្នៅ)",
+    "4 · West (Sen Sok · Phnom Penh Thmey)": "4 · ខាងលិច (សែនសុខ · ភ្នំពេញថ្មី)",
+    "5 · South-west (Pou Senchey · Kamboul · Airport)": "5 · និរតី (ពោធិ៍សែនជ័យ · កំបូល · អាកាសយានដ្ឋាន)",
+    "6 · South (Chamkarmon · Mean Chey · Dangkao)": "6 · ខាងត្បូង (ចំការមន · មានជ័យ · ដង្កោ)",
+    "7 · East (Chbar Ampov · Boeng Snor · Prek Eng)": "7 · ខាងកើត (ច្បារអំពៅ · បឹងស្នោរ · ព្រែកឯង)",
+    "8 · Takhmao edge": "8 · ជាយក្រុងតាខ្មៅ", "❓ Zone not set": "❓ មិនទាន់កំណត់តំបន់",
+    # what was fixed, status, review
+    "Sticker changed": "បានប្តូរស្ទីគ័រ", "FIFO fixed": "បានរៀប FIFO", "Fridge/display cleaned": "បានសម្អាត / រៀបទូ",
+    "Open": "មិនទាន់ដោះស្រាយ", "No problem": "គ្មានបញ្ហា", "Fixed": "បានដោះស្រាយ",
+    "To review": "រង់ចាំពិនិត្យ", "Redo": "ត្រូវធ្វើឡើងវិញ", "Approved": "បានអនុម័ត", "All": "ទាំងអស់",
+    # sections
+    "📋 Today's plan": "📋 ផែនការថ្ងៃនេះ", "📝 New visit": "📝 ចុះហាងថ្មី", "🆕 New customers": "🆕 អតិថិជនថ្មី",
+    "✅ Review visits": "✅ ពិនិត្យរបាយការណ៍", "📊 Visit report": "📊 របាយការណ៍ចុះហាង", "🔴 Open problems": "🔴 បញ្ហាមិនទាន់ដោះស្រាយ",
+    "📈 Did it help?": "📈 មានប្រសិទ្ធភាពទេ?", "🏅 Scorecard": "🏅 តារាងពិន្ទុ", "⚙️ Shops & zones": "⚙️ ហាង និងតំបន់",
+}
+KM_PLAIN_PROBLEM = {p.split(" ", 1)[1]: KM[p].split(" ", 1)[1] for p in [
+    "🧊 Fridge broken / not cold", "🏷️ Sticker old / missing", "🚚 Delivery late", "🥟 Bun quality / taste", "📦 Wrong or short order",
+    "💵 Price / payment", "🆚 Competitor pushing", "🗓️ Old buns not rotated (FIFO)", "➕ Wants a new item", "❓ Other"]}
+
+
+def _km(v):
+    """Khmer text for a saved English value (unknown values are shown as they are)."""
+    return KM.get(v, v) if isinstance(v, str) else v
+
+
+def _km_list(text, sep="; "):
+    """'Sticker old / missing; Delivery late' -> Khmer, part by part."""
+    if str(text) in ("-", "", "nan"):
+        return "-"
+    return ", ".join(KM_PLAIN_PROBLEM.get(p, KM.get(p, p)) for p in str(text).split(sep))
+
+
+def _km_loc(label):
+    """Location check label in Khmer."""
+    t = str(label)
+    if t.startswith("✅"):
+        return "✅ នៅហាង"
+    if t.startswith("❓"):
+        return "❓ គ្មាន GPS"
+    if t.startswith("📍 GPS saved"):
+        return "📍 រក្សាទុក GPS (ហាងមិនទាន់មានទីតាំងលើផែនទី)"
+    m = re.match(r"⚠️ (.+) from shop", t)
+    return f"⚠️ ឆ្ងាយពីហាង {m.group(1)}" if m else t
+
+
+def _km_days(text):
+    t = str(text)
+    if t == "never":
+        return "មិនធ្លាប់"
+    return re.sub(r"(\d+) d ago", r"\1 ថ្ងៃមុន", t)
+
+
 # 🏪 SHOP VISITS: staff visit customer shops (check-in GPS, photos, checklist, problems, report)
 # ==========================================
 VISIT_COLS = ["Date", "VisitID", "Staff", "Customer", "Check-in", "Minutes", "Lat", "Lon", "GPS accuracy m",
@@ -8306,7 +8397,7 @@ def _visit_progress(visits, user):
     done = _visit_today_count(visits, user)
     left = max(0, VISIT_DAILY_TARGET - done)
     st.progress(min(1.0, done / VISIT_DAILY_TARGET),
-                text=f"Today: {done} / {VISIT_DAILY_TARGET} shops visited" + (" 🎉 target done" if not left else f" · {left} to go"))
+                text=f"ថ្ងៃនេះ: បានចុះ {done} / {VISIT_DAILY_TARGET} ហាង" + (" 🎉 ដល់គោលដៅហើយ" if not left else f" · នៅសល់ {left}"))
 
 
 def _visit_zone_picker(zone_map, key, due=None):
@@ -8319,7 +8410,7 @@ def _visit_zone_picker(zone_map, key, due=None):
     mem = st.session_state.get("visit_zone_today")
     if st.session_state.get(key) not in options:
         st.session_state[key] = mem if mem in options else options[0]
-    zone = st.selectbox("🗺️ My zone today", options, key=key, format_func=lambda z: f"{z}  ({counts.get(z, 0)} shops" + (f" · {due[z]} due" if due.get(z) else "") + ")")
+    zone = st.selectbox("🗺️ តំបន់របស់ខ្ញុំថ្ងៃនេះ", options, key=key, format_func=lambda z: f"{_km(z)}  ({counts.get(z, 0)} ហាង" + (f" · ត្រូវចុះ {due[z]}" if due.get(z) else "") + ")")
     st.session_state["visit_zone_today"] = zone
     return zone
 
@@ -8377,7 +8468,7 @@ def _visit_zones_admin(names, visits):
             st.session_state["flash"] = f"Saved {len(changed)} zone change(s)"
             _frag_rerun()
         except Exception as e:
-            st.error("Could not save: " + str(e)[:150])
+            st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
 
 
 # ---------- shop types, size & visit frequency ----------
@@ -8644,37 +8735,42 @@ def _visit_location_check(gps, pin):
     return f"⚠️ {d / 1000:.1f} km from shop" if d >= 1000 else f"⚠️ {d:.0f} m from shop", d
 
 
+def _visit_apply_gps(lat, lon, acc, ms, mode, cust, navigate=True):
+    """Use one phone location: check in, or save / move the shop pin. navigate=True only before any widget is drawn."""
+    age = time.time() - ms / 1000.0
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError("bad coordinates")
+    if age > VISIT_GPS_MAX_AGE_S or age < -120:
+        st.session_state["visit_gps_error"] = "Check-in ចាស់ពេក។ សូមចុច 📍 Check-in ម្តងទៀតនៅហាង។"
+    elif mode in ("pin", "move") and acc > VISIT_PIN_MAX_ACC:
+        st.session_state["visit_gps_error"] = (f"GPS មិនទាន់ច្បាស់គ្រប់គ្រាន់ (±{acc:.0f} m ត្រូវការ ±{VISIT_PIN_MAX_ACC} m ឬតិចជាងនេះ)។ "
+                                               "សូមឈរនៅមុខទ្វារហាង រង់ចាំ 20 វិនាទី ហើយចុចម្តងទៀត។")
+    else:
+        if mode in ("pin", "move") and cust:
+            note = "first location of this shop" if mode == "pin" else "staff moved the pin: old pin was wrong"
+            _visit_pin_save(cust, lat, lon, acc, "GPS at shop" if mode == "pin" else "GPS at shop (moved)", note)
+            st.session_state["flash"] = "📍 បានរក្សាទុកទីតាំងហាង"
+            st.session_state.pop("_visit_registry_cache", None)
+        st.session_state["visit_gps"] = {"lat": lat, "lon": lon, "acc": acc, "at": now_str(), "customer": cust}
+    if navigate:
+        st.session_state["main_section"] = "🏪 Shop Visits"
+        st.session_state["visit_view"] = "📝 New visit"
+        if cust:
+            st.session_state["visit_customer"] = cust
+            st.session_state["visit_zone_force"] = True
+
+
 def _visit_read_gps_params():
-    """The check-in button reloads the page with ?vgps=lat,lon,acc,ms&vcust=...; keep it, then clean the URL."""
+    """Backup path: the check-in button reloads the page with ?vgps=lat,lon,acc,ms&vcust=...; keep it, then clean the URL."""
     try:
         qp = st.query_params
         raw = qp.get("vgps")
         if not raw:
             return
         lat, lon, acc, ms = (float(x) for x in str(raw).split(","))
-        age = time.time() - ms / 1000.0
-        mode = str(qp.get("vmode") or "checkin")
-        cust = str(qp.get("vcust") or "")
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            raise ValueError("bad coordinates")
-        if age > VISIT_GPS_MAX_AGE_S or age < -120:
-            st.session_state["visit_gps_error"] = "Check-in is too old. Press 📍 Check in again at the shop."
-        elif mode in ("pin", "move") and acc > VISIT_PIN_MAX_ACC:
-            st.session_state["visit_gps_error"] = (f"GPS is not exact enough (±{acc:.0f} m, need ±{VISIT_PIN_MAX_ACC} m or better). "
-                                                   "Stand outside the shop door, wait 20 seconds and press the button again.")
-        else:
-            if mode in ("pin", "move") and cust:
-                note = "first location of this shop" if mode == "pin" else "staff moved the pin: old pin was wrong"
-                _visit_pin_save(cust, lat, lon, acc, "GPS at shop" if mode == "pin" else "GPS at shop (moved)", note)
-                st.session_state["flash"] = "📍 Shop location saved"
-            st.session_state["visit_gps"] = {"lat": lat, "lon": lon, "acc": acc, "at": now_str(), "customer": cust}
-        st.session_state["main_section"] = "🏪 Shop Visits"
-        st.session_state["visit_view"] = "📝 New visit"
-        if qp.get("vcust"):
-            st.session_state["visit_customer"] = str(qp.get("vcust"))
-            st.session_state["visit_zone_force"] = True
+        _visit_apply_gps(lat, lon, acc, ms, str(qp.get("vmode") or "checkin"), str(qp.get("vcust") or ""), navigate=True)
     except Exception:
-        st.session_state["visit_gps_error"] = "The location could not be read. Press 📍 Check in again."
+        st.session_state["visit_gps_error"] = "មិនអាចអានទីតាំងបានទេ។ សូមចុច 📍 Check-in ម្តងទៀត។"
     finally:
         for k in ("vgps", "vcust", "vgpserr", "vmode"):
             try:
@@ -8684,31 +8780,78 @@ def _visit_read_gps_params():
                 pass
 
 
-def _visit_checkin_button(customer, mode="checkin", text="📍 Check in at this shop", color="#B3261E"):
-    """A button that asks the phone for GPS, then reloads the app with the position in the address.
-    mode: checkin | pin (save the shop's first location) | move (replace a wrong pin)."""
+VISIT_GPS_BRIDGE = "vgps_bridge"
+
+
+def _visit_gps_bridge():
+    """Hidden box the check-in button writes the phone location into: Shop Visits redraws, no page reload."""
+    n = st.session_state.get("_vgps_n", 0)
+    st.markdown(f"""<style>div[data-testid="stTextInput"]:has(input[aria-label="{VISIT_GPS_BRIDGE}"])
+        {{position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0}}</style>""", unsafe_allow_html=True)
+    raw = st.text_input(VISIT_GPS_BRIDGE, key=f"vgps_bridge_{n}", label_visibility="collapsed")
+    if not raw:
+        return
+    st.session_state["_vgps_n"] = n + 1                    # next time a fresh, empty box
+    try:
+        v = json.loads(raw)
+        _visit_apply_gps(float(v["lat"]), float(v["lon"]), float(v["acc"]), float(v["ms"]), str(v.get("mode", "checkin")),
+                         str(v.get("cust", "")), navigate=False)
+        if v.get("cust"):
+            st.session_state["visit_customer"] = str(v["cust"])
+    except Exception:
+        st.session_state["visit_gps_error"] = "មិនអាចអានទីតាំងបានទេ។ សូមចុច 📍 Check-in ម្តងទៀត។"
+    _frag_rerun()
+
+
+def _visit_checkin_button(customer, mode="checkin", text="📍 Check-in នៅហាងនេះ", color="#B3261E"):
+    """Asks the phone for its location, takes the first one that is good enough (or the best within 8 s),
+    then hands it to the app without reloading the page. mode: checkin | pin | move."""
     cust = json.dumps(customer)
     text = html.escape(text)
+    good = 60 if mode == "checkin" else VISIT_PIN_MAX_ACC
     st.components.v1.html(f"""
 <style>
-button{{width:100%;padding:12px 14px;border-radius:10px;border:0;background:{color};color:#fff;font:600 16px Inter,system-ui,sans-serif;cursor:pointer}}
-button:disabled{{opacity:.6}} #m{{font:13px system-ui,sans-serif;color:#6B7280;margin-top:6px}}
+button{{width:100%;padding:13px 14px;border-radius:12px;border:0;background:{color};color:#fff;font:600 16px Inter,system-ui,sans-serif;cursor:pointer}}
+button:disabled{{opacity:.7}} #m{{font:13px system-ui,sans-serif;color:#6B7280;margin-top:6px}}
 </style>
-<button id="b">{text}</button><div id="m">Allow location when the phone asks.</div>
+<button id="b">{text}</button><div id="m">សូមអនុញ្ញាតទីតាំង (Location) ពេលទូរស័ព្ទសួរ។</div>
 <script>
 const b=document.getElementById('b'), m=document.getElementById('m');
+const GOOD={good}, MAXWAIT=8000, CUST={cust}, MODE='{mode}';
+function deliver(p){{
+  const v={{lat:+p.coords.latitude.toFixed(6), lon:+p.coords.longitude.toFixed(6), acc:Math.round(p.coords.accuracy),
+           ms:Date.now(), mode:MODE, cust:CUST}};
+  m.textContent='✅ រកឃើញទីតាំង (±'+v.acc+' m)។ កំពុងរក្សាទុក…';
+  try {{
+    const doc=window.parent.document;
+    const el=doc.querySelector('input[aria-label="{VISIT_GPS_BRIDGE}"]');
+    if(!el) throw 'no box';
+    const set=Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype,'value').set;
+    set.call(el, JSON.stringify(v));
+    el.dispatchEvent(new Event('input',{{bubbles:true}}));
+    ['keydown','keypress','keyup'].forEach(t=>el.dispatchEvent(new KeyboardEvent(t,{{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}})));
+    el.dispatchEvent(new Event('blur',{{bubbles:true}})); el.dispatchEvent(new FocusEvent('focusout',{{bubbles:true}}));
+  }} catch(e) {{                                   // backup: reload the page with the location in the address
+    const u=new URL(window.parent.location.href);
+    u.searchParams.set('vgps',[v.lat,v.lon,v.acc,v.ms].join(','));
+    u.searchParams.set('vcust',CUST); u.searchParams.set('vmode',MODE);
+    window.parent.location.href=u.toString();
+  }}
+}}
 b.onclick=function(){{
   const nav=(window.parent&&window.parent.navigator&&window.parent.navigator.geolocation)?window.parent.navigator.geolocation:navigator.geolocation;
-  if(!nav){{m.textContent='This phone/browser has no GPS.';return;}}
-  b.disabled=true; m.textContent='Finding your location…';
-  nav.getCurrentPosition(function(p){{
-      const u=new URL(window.parent.location.href);
-      u.searchParams.set('vgps',[p.coords.latitude.toFixed(6),p.coords.longitude.toFixed(6),Math.round(p.coords.accuracy),Date.now()].join(','));
-      u.searchParams.set('vcust',{cust});
-      u.searchParams.set('vmode','{mode}');
-      window.parent.location.href=u.toString();
-  }},function(e){{b.disabled=false; m.textContent='Location blocked: '+e.message+'. Turn on GPS and allow location for this site.';}},
-  {{enableHighAccuracy:true,timeout:20000,maximumAge:0}});
+  if(!nav){{m.textContent='ទូរស័ព្ទ / browser នេះគ្មាន GPS។';return;}}
+  b.disabled=true; m.textContent='កំពុងរកទីតាំង…';
+  let best=null, done=false, id=null;
+  const finish=function(){{ if(done) return; done=true; if(id!==null) nav.clearWatch(id);
+      if(best) deliver(best); else {{ b.disabled=false; m.textContent='មិនទាន់មានសញ្ញា GPS។ សូមចេញមកខាងក្រៅ ហើយចុចម្តងទៀត។'; }} }};
+  id=nav.watchPosition(function(p){{
+      if(!best || p.coords.accuracy < best.coords.accuracy) best=p;
+      m.textContent='កំពុងរកទីតាំង… ±'+Math.round(best.coords.accuracy)+' m';
+      if(best.coords.accuracy <= GOOD) finish();
+  }}, function(e){{ if(e.code===1){{ done=true; b.disabled=false; m.textContent='ទីតាំងត្រូវបានបិទ។ សូមបើក Location សម្រាប់គេហទំព័រនេះក្នុង Settings របស់ browser។'; }} }},
+  {{enableHighAccuracy:true, maximumAge:20000, timeout:MAXWAIT}});
+  setTimeout(finish, MAXWAIT);
 }};
 </script>""", height=86)
 
@@ -8833,8 +8976,8 @@ def _visit_customer_stats_compute():
 
 def _visit_trend_text(pct):
     if pct is None or pd.isna(pct):
-        return "new / not enough data"
-    return f"{'⬆️' if pct >= 10 else ('⬇️' if pct <= -10 else '➡️')} {pct:+.0f}% (last 28 days vs the 28 before)"
+        return "ថ្មី / ទិន្នន័យមិនទាន់គ្រប់"
+    return f"{'⬆️' if pct >= 10 else ('⬇️' if pct <= -10 else '➡️')} {pct:+.0f}% (២៨ ថ្ងៃចុងក្រោយ ធៀបនឹង ២៨ ថ្ងៃមុន)"
 
 
 def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None):
@@ -8861,37 +9004,37 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
         lv = last_visit.get(k)
         days_v = (today - pd.Timestamp(lv).normalize()).days if lv is not None and pd.notna(lv) else None
         if open_prob.get(k):
-            score += 6; why.append(f"🔴 {open_prob[k]} open problem")
+            score += 6; why.append(f"🔴 បញ្ហាមិនទាន់ដោះស្រាយ {open_prob[k]}")
         nv = new.get(k)
         first_visit = bool(nv) and not (lv is not None and pd.notna(lv) and pd.Timestamp(lv) >= nv["date"])
         if first_visit:
             age = (today - nv["date"]).days
             score += 8 + (3 if age > LEAD_FIRST_VISIT_DAYS else 0) + min(age // 7, 3)
-            why.append(f"🆕 new customer, sold {nv['date']:%d %b} — first visit" + (f" ({age} d, late)" if age > LEAD_FIRST_VISIT_DAYS else ""))
+            why.append(f"🆕 អតិថិជនថ្មី លក់ថ្ងៃ {nv['date']:%d %b} — ចុះលើកដំបូង" + (f" ({age} ថ្ងៃ យឺត)" if age > LEAD_FIRST_VISIT_DAYS else ""))
         if every is None:
             due_in = 0 if first_visit else None
             if not open_prob.get(k) and not first_visit:
                 continue                                   # no orders and no problem: not on the visit plan
         elif days_v is None:
             due_in = 0
-            score += 3; why.append("🆕 never visited")
+            score += 3; why.append("🆕 មិនធ្លាប់ចុះ")
         else:
             due_in = every - days_v
             if due_in <= 0:
                 score += 3 + min(-due_in // 7, 3)
-                why.append(f"📅 due (every {every} d)" + (f" · {-due_in} d late" if due_in < 0 else ""))
+                why.append(f"📅 ដល់ពេលចុះ (រៀងរាល់ {every} ថ្ងៃ)" + (f" · យឺត {-due_in} ថ្ងៃ" if due_in < 0 else ""))
             else:
                 score -= 6
         if s is not None:
             if pd.notna(s["Trend %"]) and s["Trend %"] <= -20:
-                score += 3; why.append(f"⬇️ sales {s['Trend %']:+.0f}%")
+                score += 3; why.append(f"⬇️ ការលក់ {s['Trend %']:+.0f}%")
             gap = s["Usual gap"]
             if pd.notna(gap) and gap > 0 and s["Days since order"] > 2 * gap and s["Order days"] >= 3:
-                score += 2; why.append(f"⏰ no order {int(s['Days since order'])} days (usually {gap:.0f})")
+                score += 2; why.append(f"⏰ មិនបញ្ជាទិញ {int(s['Days since order'])} ថ្ងៃ (ធម្មតា {gap:.0f})")
         if size.startswith("🟢"):
             score += 1
         if due_in is not None and due_in > 0 and not why:
-            why.append(f"next visit in {due_in} d")
+            why.append(f"ចុះលើកក្រោយក្នុង {due_in} ថ្ងៃ")
         rows.append({"Priority": score, "Customer": names.get(k, k), "Area": (zone_map or {}).get(k, areas.get(k, "")),
                      "Size": size, "Every (days)": every, "Due in (days)": due_in,
                      "Why visit": " · ".join(why),
@@ -8912,6 +9055,7 @@ def _visit_is_due(route):
 
 def _visit_new_form(visits, stats, names):
     user = current_user() or "-"
+    _visit_gps_bridge()
     fast = st.session_state.get("visit_ctx")
     if (_visit_phone_mode() and fast and fast.get("customer") == st.session_state.get("visit_customer")
             and fast["key"] in st.session_state.get("visit_draft", {}) and st.session_state.get("visit_gps")
@@ -8927,17 +9071,17 @@ def _visit_new_form(visits, stats, names):
     pool = {k: n for k, n in names.items() if zone is None or zone_map.get(k) == zone}
     customers = sorted(set(pool.values()), key=lambda x: str(x).upper())
     if not customers:
-        st.info("No Phnom Penh customers found. Check the zone in the Master List or set the province in 📍 Customer Map.")
+        st.info("រកមិនឃើញអតិថិជននៅភ្នំពេញទេ។ សូមពិនិត្យតំបន់ក្នុង Master List ឬកំណត់ខេត្តក្នុង 📍 Customer Map។")
         return
     err = st.session_state.pop("visit_gps_error", None)
     if err:
         st.error(err)
     pre = st.session_state.get("visit_customer")
     idx = customers.index(pre) if pre in customers else None
-    customer = st.selectbox("1️⃣ Which shop are you visiting? (Phnom Penh)", customers, index=idx, key="visit_customer_box",
-                            placeholder="Type the shop name…")
+    customer = st.selectbox("1️⃣ តើអ្នកកំពុងចុះហាងណា? (ភ្នំពេញ)", customers, index=idx, key="visit_customer_box",
+                            placeholder="វាយឈ្មោះហាង…")
     if not customer:
-        st.caption("Tip: open **📋 Today's plan** to see the 3 shops that need you most in your zone.")
+        st.caption("គន្លឹះ: បើក **📋 ផែនការថ្ងៃនេះ** ដើម្បីមើលហាងសំខាន់ៗ 3 ក្នុងតំបន់របស់អ្នក។")
         return
     st.session_state["visit_customer"] = customer
     key = norm_name(customer)
@@ -8954,17 +9098,17 @@ def _visit_new_form(visits, stats, names):
     past = visits[visits["Customer"].map(norm_name) == key].sort_values("_dt", ascending=False) if not visits.empty else visits
     with st.container(border=True):
         c1, c2, c3 = st.columns(3)
-        c1.metric("Last order", f"{s['Last order']:%d %b}" if s is not None else "—",
-                  f"{int(s['Days since order'])} days ago" if s is not None else None, delta_color="off")
-        c2.metric("Bun pcs last 28 days", f"{int(s['Pcs 28d']):,}" if s is not None else "—",
+        c1.metric("បញ្ជាទិញចុងក្រោយ", f"{s['Last order']:%d %b}" if s is not None else "—",
+                  f"{int(s['Days since order'])} ថ្ងៃមុន" if s is not None else None, delta_color="off")
+        c2.metric("ចំនួននំ ២៨ ថ្ងៃចុងក្រោយ", f"{int(s['Pcs 28d']):,}" if s is not None else "—",
                   f"{s['Trend %']:+.0f}%" if s is not None and pd.notna(s["Trend %"]) else None)
-        c3.metric("Last visit", f"{past.iloc[0]['_dt']:%d %b}" if len(past) else "never",
+        c3.metric("ចុះហាងចុងក្រោយ", f"{past.iloc[0]['_dt']:%d %b}" if len(past) else "មិនធ្លាប់",
                   past.iloc[0]["Staff"] if len(past) else None, delta_color="off")
         open_p = past[past["Status"].eq("Open")] if len(past) else past
         for _, r in open_p.head(3).iterrows():
-            st.warning(f"Open problem from {r['_dt']:%d %b} ({r['Staff']}): {r['Problems']} — {r['Notes']}")
+            st.warning(f"បញ្ហាមិនទាន់ដោះស្រាយ ថ្ងៃ {r['_dt']:%d %b} ({r['Staff']}): {_km_list(r['Problems'])} — {r['Notes']}")
         if len(past) and str(past.iloc[0]["Notes"]) not in ("-", ""):
-            st.caption(f"Last visit note: {past.iloc[0]['Notes']}")
+            st.caption(f"កំណត់ចំណាំពេលចុះហាងចុងក្រោយ: {past.iloc[0]['Notes']}")
 
     # ---- 2. shop location (must be real) + check-in
     gps = st.session_state.get("visit_gps")
@@ -8972,86 +9116,86 @@ def _visit_new_form(visits, stats, names):
         gps = None
     test = _visit_test_mode()
     if test:
-        st.markdown("**2️⃣ Check in** · 🧪 test mode")
+        st.markdown("**2️⃣ Check-in** · 🧪 Test mode")
         if not pin:
-            st.caption("Real staff would have to save this shop's location first. In test mode a pretend pin is used.")
+            st.caption("បុគ្គលិកពិតត្រូវរក្សាទុកទីតាំងហាងនេះជាមុនសិន។ ក្នុង Test mode ប្រើទីតាំងសាកល្បង។")
             pin = (11.5564, 104.9282)
-            pin_info = (pin[0], pin[1], "🧪 pretend pin (test mode)")
+            pin_info = (pin[0], pin[1], "🧪 ទីតាំងសាកល្បង (Test mode)")
         if not gps:
             t1, t2 = st.columns(2)
-            if t1.button("🧪 Pretend I'm at the shop", key="visit_test_here", use_container_width=True, type="primary"):
+            if t1.button("🧪 សាកល្បង៖ ខ្ញុំនៅហាង", key="visit_test_here", use_container_width=True, type="primary"):
                 st.session_state["visit_gps"] = {"lat": pin[0] + 0.0002, "lon": pin[1] + 0.0002, "acc": 12,
                                                  "at": (now_kh() - timedelta(minutes=12)).strftime("%Y-%m-%d %H:%M:%S"), "customer": customer}
                 _frag_rerun()
-            if t2.button("🧪 Pretend I'm 3 km away", key="visit_test_far", use_container_width=True):
+            if t2.button("🧪 សាកល្បង៖ ខ្ញុំនៅឆ្ងាយ 3 km", key="visit_test_far", use_container_width=True):
                 st.session_state["visit_gps"] = {"lat": pin[0] + 0.027, "lon": pin[1], "acc": 15,
                                                  "at": (now_kh() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S"), "customer": customer}
                 _frag_rerun()
-            st.caption("Or use the real check-in button below to test your phone's GPS.")
+            st.caption("ឬប្រើប៊ូតុង Check-in ពិតខាងក្រោម ដើម្បីសាកល្បង GPS ទូរស័ព្ទ។")
             _visit_checkin_button(customer)
             return
     if not test and not pin:
-        st.markdown("**2️⃣ Save this shop's location first**")
-        st.error("📍 This shop has no map location yet. You must save it before you can start the visit.")
+        st.markdown("**2️⃣ រក្សាទុកទីតាំងហាងនេះជាមុនសិន**")
+        st.error("📍 ហាងនេះមិនទាន់មានទីតាំងលើផែនទី។ ត្រូវរក្សាទុកទីតាំងជាមុនសិន ទើបអាចចាប់ផ្តើមចុះហាងបាន។")
         options = cands.get(key, [])
         if options:
-            st.markdown("**Is the shop one of these pins from 📍 Customer Map?** (the name there is spelled differently)")
+            st.markdown("**តើហាងនេះជាទីតាំងមួយក្នុងចំណោមទីតាំងទាំងនេះពី 📍 Customer Map ឬទេ?** (ឈ្មោះនៅទីនោះសរសេរខុសគ្នាបន្តិច)")
             for i, (score, pid, pname, lat, lon) in enumerate(options):
                 with st.container(border=True):
                     o1, o2, o3 = st.columns([3, 1, 1])
-                    o1.markdown(f"**{pname}**  \n<span style='color:#6B7280'>{score * 100:.0f}% same name</span>", unsafe_allow_html=True)
-                    o2.link_button("🗺️ Look", f"https://www.google.com/maps?q={lat},{lon}", use_container_width=True)
-                    if o3.button("✅ This one", key=f"visit_cand_{i}", use_container_width=True):
+                    o1.markdown(f"**{pname}**  \n<span style='color:#6B7280'>{score * 100:.0f}% ឈ្មោះដូចគ្នា</span>", unsafe_allow_html=True)
+                    o2.link_button("🗺️ មើល", f"https://www.google.com/maps?q={lat},{lon}", use_container_width=True)
+                    if o3.button("✅ គឺហាងនេះ", key=f"visit_cand_{i}", use_container_width=True):
                         try:
                             _visit_pin_save(customer, lat, lon, None, "Customer Map pin (confirmed)", f"map name: {pname}"[:150])
-                            st.session_state["flash"] = "📍 Map pin linked to this shop"
+                            st.session_state["flash"] = "📍 បានភ្ជាប់ទីតាំងផែនទីទៅហាងនេះ"
                             _frag_rerun()
                         except Exception as e:
-                            st.error("Could not save: " + str(e)[:150])
-            st.markdown("**None of them? Save the real location:**")
-        _visit_checkin_button(customer, "pin", "📍 I am at the shop — save my GPS as the shop location", "#2E7D4F")
-        st.caption(f"Stand at the shop door. The phone GPS must be within ±{VISIT_PIN_MAX_ACC} m. This also checks you in.")
-        with st.expander("…or paste the shop's Google Maps link"):
-            link = st.text_input("Google Maps link (open the shop in Google Maps → Share → Copy link)", key="visit_pin_link",
+                            st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+            st.markdown("**មិនមែនទាំងអស់នេះទេ? រក្សាទុកទីតាំងពិត:**")
+        _visit_checkin_button(customer, "pin", "📍 ខ្ញុំនៅហាង — រក្សាទុក GPS ជាទីតាំងហាង", "#2E7D4F")
+        st.caption(f"សូមឈរនៅមុខទ្វារហាង។ GPS ទូរស័ព្ទត្រូវច្បាស់ក្នុង ±{VISIT_PIN_MAX_ACC} m។ វានឹង Check-in ឱ្យអ្នកផងដែរ។")
+        with st.expander("…ឬបិទភ្ជាប់ Google Maps link របស់ហាង"):
+            link = st.text_input("Google Maps link (បើកហាងក្នុង Google Maps → Share → Copy link)", key="visit_pin_link",
                                  max_chars=600, placeholder="https://maps.app.goo.gl/…")
-            if st.button("💾 Save location from link", key="visit_pin_link_save", disabled=not link.strip()):
+            if st.button("💾 រក្សាទុកទីតាំងពី link", key="visit_pin_link_save", disabled=not link.strip()):
                 try:
-                    with st.spinner("Opening the link…"):
+                    with st.spinner("កំពុងបើក link…"):
                         final = resolve_map_link(link.strip())
                     info = analyse_map_link(final)
                     if info.get("Map status") != "Ready pin":
-                        raise ValueError("the link has no exact pin; drop a pin on the shop and share that")
+                        raise ValueError("link នេះគ្មានទីតាំងច្បាស់ទេ។ សូមដាក់ pin លើហាង ហើយ Share វា")
                     _visit_pin_save(customer, float(info["Latitude"]), float(info["Longitude"]), None, "Google Maps link", link.strip()[:150])
-                    st.session_state["flash"] = "📍 Shop location saved from the link"
+                    st.session_state["flash"] = "📍 បានរក្សាទុកទីតាំងហាងពី link"
                     _frag_rerun()
                 except Exception as e:
-                    st.error("Could not use this link: " + str(e)[:160])
+                    st.error("មិនអាចប្រើ link នេះបានទេ: " + str(e)[:160])
         return
     if test:
         gps = st.session_state.get("visit_gps")
     directions = f"https://www.google.com/maps/dir/?api=1&destination={pin[0]},{pin[1]}&travelmode=driving"
     m1, m2 = st.columns([3, 1])
-    m1.caption(f"📍 Shop location {pin_info[2]}")
-    m2.link_button("🧭 Directions", directions, use_container_width=True)
+    m1.caption(f"📍 ទីតាំងហាង {pin_info[2]}")
+    m2.link_button("🧭 ផ្លូវទៅហាង", directions, use_container_width=True)
     if not test:
-        st.markdown("**2️⃣ Check in when you arrive**")
+        st.markdown("**2️⃣ Check-in ពេលមកដល់ហាង**")
     if not gps:
         _visit_checkin_button(customer)
-        st.caption("The page reloads once after the check-in. The visit form opens after you check in.")
+        st.caption("ទម្រង់ចុះហាងនឹងបើកបន្ទាប់ពី Check-in។")
         return
     label, dist = _visit_location_check(gps, pin)
     (st.success if label.startswith("✅") else st.warning)(
-        f"{label} · checked in {gps['at'][11:16]} · GPS ±{gps['acc']:.0f} m")
+        f"{_km_loc(label)} · Check-in ម៉ោង {gps['at'][11:16]} · GPS ±{gps['acc']:.0f} m")
     b1, b2 = st.columns(2)
-    if b1.button("↻ Check in again", key="visit_recheck", use_container_width=True):
+    if b1.button("↻ Check-in ម្តងទៀត", key="visit_recheck", use_container_width=True):
         st.session_state.pop("visit_gps", None)
         _frag_rerun()
     if not label.startswith("✅") and not test:
         with b2:
-            with st.popover("📌 The map pin is wrong", use_container_width=True):
-                st.caption("Only if you are standing at the real shop and the saved pin points somewhere else. "
-                           "Admin will see that you moved it.")
-                _visit_checkin_button(customer, "move", "📌 Move the shop pin to where I am", "#B3261E")
+            with st.popover("📌 ទីតាំងលើផែនទីខុស", use_container_width=True):
+                st.caption("ប្រើតែពេលអ្នកកំពុងឈរនៅហាងពិត ហើយទីតាំងដែលបានរក្សាទុកចង្អុលទៅកន្លែងផ្សេង។ "
+                           "Admin នឹងឃើញថាអ្នកបានផ្លាស់ទីតាំង។")
+                _visit_checkin_button(customer, "move", "📌 ផ្លាស់ទីតាំងហាងមកកន្លែងខ្ញុំឈរ", "#B3261E")
 
     # ---- 3. the visit form (desktop: one page · phone: step by step)
     shop_type = _visit_type_map({key: customer}).get(key, VISIT_TYPE_OTHER)
@@ -9059,9 +9203,9 @@ def _visit_new_form(visits, stats, names):
     is_first_visit = bool(nv) and not (len(past) and past.iloc[0]["_dt"] >= nv["date"])
     _visit_redo_notice(visits, user, customer)
     if is_first_visit:
-        st.info(f"🆕 **First visit after the sale on {nv['date']:%d %b}.** Check the fridge is installed, stickers are up "
-                "and the owner knows how to sell and heat the buns." + ("" if nv["in_master"] else
-                " ⚠️ This shop is not in the Master List yet — ask Admin to add it."))
+        st.info(f"🆕 **ចុះហាងលើកដំបូងក្រោយលក់ថ្ងៃ {nv['date']:%d %b}។** ពិនិត្យថាទូទឹកកកបានដំឡើង បិទស្ទីគ័ររួច "
+                "ហើយម្ចាស់ហាងដឹងពីរបៀបលក់ និងកំដៅនំ។" + ("" if nv["in_master"] else
+                " ⚠️ ហាងនេះមិនទាន់មានក្នុង Master List — សូមប្រាប់ Admin ឱ្យបន្ថែម។"))
     cfg = _visit_settings()
     size, _every = _visit_size(float(s["Pcs 28d"]) if s is not None else 0, cfg)
     type_checks = list(VISIT_TYPE_CHECKS.get(shop_type, VISIT_TYPE_CHECKS[VISIT_TYPE_OTHER]))
@@ -9072,19 +9216,19 @@ def _visit_new_form(visits, stats, names):
            "shop_type": shop_type, "size": size, "app_pct": app_pct, "type_checks": type_checks}
     st.session_state["visit_ctx"] = ctx
     if not _visit_phone_mode():
-        st.caption(f"Shop type: **{shop_type}** · size: **{size}**" + (" — Admin can change the type in ⚙️ Shops & zones." if current_role() == "admin" else ""))
+        st.caption(f"ប្រភេទហាង: **{_km(shop_type)}** · ទំហំ: **{_km(size)}**" + (" — Admin អាចប្តូរប្រភេទក្នុង ⚙️ ហាង និងតំបន់។" if current_role() == "admin" else ""))
         with st.form("visit_form", clear_on_submit=False):
             a = {}
-            st.markdown("**3️⃣ Photos** — shop front is required")
+            st.markdown("**3️⃣ រូបថត** — ត្រូវមានរូបមុខហាង")
             a.update(_vf_photos_arrive({}, False))
             a.update(_vf_photos_after({}, False))
-            st.markdown(f"**4️⃣ Shop check** · {shop_type}")
+            st.markdown(f"**4️⃣ ពិនិត្យហាង** · {_km(shop_type)}")
             a.update(_vf_check({}, ctx, False))
-            st.markdown("**5️⃣ Sales**")
+            st.markdown("**5️⃣ ការលក់**")
             a.update(_vf_sales({}, ctx, False))
-            st.markdown("**6️⃣ Problems & requests**")
+            st.markdown("**6️⃣ បញ្ហា និងសំណើ**")
             a.update(_vf_problems({}, False))
-            submitted = st.form_submit_button("✅ Save visit", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("✅ រក្សាទុករបាយការណ៍", type="primary", use_container_width=True)
         if submitted:
             err = _vf_validate(a)
             if err:
@@ -9159,19 +9303,19 @@ VF_SAT = ["😠 1", "🙁 2", "😐 3", "🙂 4", "😍 5"]
 VF_IMG = ["jpg", "jpeg", "png", "webp"]
 
 
-VF_PHOTO_LABEL = {"front": "📸 Shop front", "before": "🅱️ BEFORE", "after": "🅰️ AFTER"}
+VF_PHOTO_LABEL = {"front": "📸 មុខហាង", "before": "🅱️ BEFORE", "after": "🅰️ AFTER"}
 
 
 def _vf_photo_slot(d, k, label, wkey, help_=None):
     """Phone: show the photo already taken, or a big upload box for it. Updates the draft directly."""
     if d.get(k) is not None:
         _vf_thumb_row([(f"{VF_PHOTO_LABEL.get(k, label)} ✅", d[k])])
-        st.button("↻ Take again", key=f"{wkey}_redo", on_click=lambda: d.__setitem__(k, None))
+        st.button("↻ ថតម្តងទៀត", key=f"{wkey}_redo", on_click=lambda: d.__setitem__(k, None))
         return
-    f = st.file_uploader(label, type=VF_IMG, key=wkey, help=help_ or "Tap → Take Photo")
+    f = st.file_uploader(label, type=VF_IMG, key=wkey, help=help_ or "ចុច → ថតរូប ឬជ្រើសពី Gallery")
     if f is not None:
         d[k] = _vf_keep(f)
-        st.caption(f"✅ {VF_PHOTO_LABEL.get(k, label)} saved")
+        st.caption(f"✅ បានរក្សាទុក {VF_PHOTO_LABEL.get(k, label)}")
 
 
 def _vf_photo_status(d):
@@ -9181,74 +9325,74 @@ def _vf_photo_status(d):
 
 def _vf_photos_arrive(d, phone):
     if phone:
-        st.caption("Add 2 photos: take them with the camera or choose them from the gallery.")
-        st.markdown("**1 · 📸 Shop front** (required)")
-        _vf_photo_slot(d, "front", "📸 Shop front photo", "vf_front_up", "Tap → Take Photo or Photo Library")
-        st.markdown("**2 · 🅱️ BEFORE: fridge / display as you found it** (needed if you will fix anything)")
-        _vf_photo_slot(d, "before", "🅱️ BEFORE photo", "vf_before")
+        st.caption("បន្ថែមរូប 2: ថតដោយកាមេរ៉ា ឬជ្រើសពី Gallery។")
+        st.markdown("**1 · 📸 រូបមុខហាង** (ចាំបាច់)")
+        _vf_photo_slot(d, "front", "📸 រូបមុខហាង", "vf_front_up", "ចុច → ថតរូប ឬជ្រើសពី Gallery")
+        st.markdown("**2 · 🅱️ BEFORE: ទូទឹកកក / កន្លែងតាំង ពេលមកដល់** (ត្រូវការ បើអ្នកនឹងជួសជុលអ្វីមួយ)")
+        _vf_photo_slot(d, "before", "🅱️ រូប BEFORE", "vf_before")
         return {}
-    front = st.file_uploader("📸 Shop front (required)", type=VF_IMG, key="visit_cam",
-                             help="Take it with the camera or choose it from the gallery.")
-    before = st.file_uploader("🅱️ BEFORE: fridge / display as you found it", type=VF_IMG, key="visit_before",
-                              help="Needed when you fix something.")
+    front = st.file_uploader("📸 រូបមុខហាង (ចាំបាច់)", type=VF_IMG, key="visit_cam",
+                             help="ថតដោយកាមេរ៉ា ឬជ្រើសពី Gallery។")
+    before = st.file_uploader("🅱️ BEFORE: ទូទឹកកក / កន្លែងតាំង ពេលមកដល់", type=VF_IMG, key="visit_before",
+                              help="ត្រូវការ ពេលអ្នកជួសជុលអ្វីមួយ។")
     return {"front": front, "before": before}
 
 
 def _vf_photos_after(d, phone):
     if phone:
         if d.get("before") is None and (_vf_fixes(d) or d.get("after") is not None):
-            st.markdown("**🅱️ BEFORE is missing** — add it here")
-            _vf_photo_slot(d, "before", "🅱️ BEFORE photo", "vf_before2")
-        st.markdown("**🅰️ AFTER: the same place after you fixed it** (same angle as BEFORE)")
-        _vf_photo_slot(d, "after", "🅰️ AFTER photo", "vf_after")
-        extra = st.file_uploader("Other photos (optional, max 2)", type=VF_IMG, accept_multiple_files=True, key="vf_extra")
+            st.markdown("**🅱️ ខ្វះរូប BEFORE** — បន្ថែមនៅទីនេះ")
+            _vf_photo_slot(d, "before", "🅱️ រូប BEFORE", "vf_before2")
+        st.markdown("**🅰️ AFTER: កន្លែងដដែលក្រោយជួសជុល** (មុំដូច BEFORE)")
+        _vf_photo_slot(d, "after", "🅰️ រូប AFTER", "vf_after")
+        extra = st.file_uploader("រូបផ្សេងទៀត (មិនចាំបាច់ អតិបរមា 2)", type=VF_IMG, accept_multiple_files=True, key="vf_extra")
         if extra:
             ids = tuple(getattr(f, "file_id", f.name) for f in extra)
             if ids != d.get("_extra_ids"):
                 d["extra"], d["_extra_ids"] = [_vf_keep(f) for f in extra], ids
         elif d.get("extra"):
-            _vf_thumb_row([("Other", f) for f in d["extra"]])
+            _vf_thumb_row([("ផ្សេងៗ", f) for f in d["extra"]])
         return {}
-    after = st.file_uploader("🅰️ AFTER: the same place after you fixed it", type=VF_IMG, key="visit_after",
-                             help="Same angle as BEFORE, so the change is easy to see.")
-    extra = st.file_uploader("Other photos (max 2)", type=VF_IMG, accept_multiple_files=True, key="visit_files")
+    after = st.file_uploader("🅰️ AFTER: កន្លែងដដែលក្រោយជួសជុល", type=VF_IMG, key="visit_after",
+                             help="មុំដូច BEFORE ដើម្បីងាយមើលការផ្លាស់ប្តូរ។")
+    extra = st.file_uploader("រូបផ្សេងទៀត (អតិបរមា 2)", type=VF_IMG, accept_multiple_files=True, key="visit_files")
     return {"after": after, "extra": extra or []}
 
 
 def _vf_check(d, ctx, phone):
     cols = (st, st, st, st, st) if phone else (*st.columns(2), *st.columns(3))
-    fridge = cols[0].radio("🧊 Fridge", VF_FRIDGE, index=_vf_idx(VF_FRIDGE, d.get("fridge")), horizontal=True, key="vf_fridge")
-    fifo = cols[1].radio("🥟 Display / old buns in front (FIFO)", VF_FIFO, index=_vf_idx(VF_FIFO, d.get("fifo")), horizontal=True, key="vf_fifo")
-    old_pcs = cols[2].number_input("Old / damaged buns found (pcs)", 0, 5000, int(d.get("old_pcs", 0)), 1, key="vf_old")
-    sticker = cols[3].radio("🏷️ Sticker", VF_STICKER, index=_vf_idx(VF_STICKER, d.get("sticker")), horizontal=True, key="vf_sticker")
-    changed = cols[4].number_input("Stickers changed today", 0, 100, int(d.get("changed", 0)), 1, key="vf_changed")
-    fridge_fixed = st.checkbox("🧽 I cleaned / arranged the fridge or display today", value=bool(d.get("fridge_fixed")), key="vf_ffix")
-    st.caption(f"Tick what is OK at this {ctx['shop_type'].split(' ', 1)[1].lower()}:")
+    fridge = cols[0].radio("🧊 ទូទឹកកក", VF_FRIDGE, format_func=_km, index=_vf_idx(VF_FRIDGE, d.get("fridge")), horizontal=True, key="vf_fridge")
+    fifo = cols[1].radio("🥟 ការតាំង / នំចាស់នៅខាងមុខ (FIFO)", VF_FIFO, format_func=_km, index=_vf_idx(VF_FIFO, d.get("fifo")), horizontal=True, key="vf_fifo")
+    old_pcs = cols[2].number_input("នំចាស់ / ខូច ដែលរកឃើញ (pcs)", 0, 5000, int(d.get("old_pcs", 0)), 1, key="vf_old")
+    sticker = cols[3].radio("🏷️ ស្ទីគ័រ", VF_STICKER, format_func=_km, index=_vf_idx(VF_STICKER, d.get("sticker")), horizontal=True, key="vf_sticker")
+    changed = cols[4].number_input("ស្ទីគ័របានប្តូរថ្ងៃនេះ", 0, 100, int(d.get("changed", 0)), 1, key="vf_changed")
+    fridge_fixed = st.checkbox("🧽 ខ្ញុំបានសម្អាត / រៀបទូទឹកកក ឬកន្លែងតាំងថ្ងៃនេះ", value=bool(d.get("fridge_fixed")), key="vf_ffix")
+    st.caption(f"គូសធីកអ្វីដែលល្អនៅ {_km(ctx['shop_type'])}:")
     prev = d.get("checks", {})
     grid = [st] if phone else st.columns(2)
-    checks = {c: grid[i % len(grid)].checkbox(c, value=bool(prev.get(c)), key=f"vf_chk_{i}") for i, c in enumerate(ctx["type_checks"])}
+    checks = {c: grid[i % len(grid)].checkbox(_km(c), value=bool(prev.get(c)), key=f"vf_chk_{i}") for i, c in enumerate(ctx["type_checks"])}
     return {"fridge": fridge, "fifo": fifo, "old_pcs": old_pcs, "sticker": sticker, "changed": changed,
             "fridge_fixed": fridge_fixed, "checks": checks}
 
 
 def _vf_sales(d, ctx, phone):
-    st.caption("Our journal says: " + _visit_trend_text(ctx["app_pct"]))
+    st.caption("តាម Sale Journal: " + _visit_trend_text(ctx["app_pct"]))
     cols = (st, st, st) if phone else st.columns(3)
-    says = cols[0].radio("Shop owner says sales are", VF_SAYS, index=_vf_idx(VF_SAYS, d.get("says"), 1), horizontal=True, key="vf_says")
-    reason = cols[1].selectbox("Main reason", VISIT_REASONS, index=_vf_idx(VISIT_REASONS, d.get("reason")), key="vf_reason")
-    competitor = cols[2].text_input("Competitor brand seen (if any)", value=d.get("competitor", ""), max_chars=60, key="vf_comp")
+    says = cols[0].radio("ម្ចាស់ហាងថាការលក់", VF_SAYS, format_func=_km, index=_vf_idx(VF_SAYS, d.get("says"), 1), horizontal=True, key="vf_says")
+    reason = cols[1].selectbox("មូលហេតុចម្បង", VISIT_REASONS, format_func=_km, index=_vf_idx(VISIT_REASONS, d.get("reason")), key="vf_reason")
+    competitor = cols[2].text_input("ម៉ាកគូប្រជែងដែលឃើញ (បើមាន)", value=d.get("competitor", ""), max_chars=60, key="vf_comp")
     return {"says": says, "reason": reason, "competitor": competitor}
 
 
 def _vf_problems(d, phone):
-    problems = st.multiselect("Problems found", VISIT_PROBLEMS, default=[p for p in d.get("problems", []) if p in VISIT_PROBLEMS],
-                              placeholder="None — leave empty if all good", key="vf_probs")
+    problems = st.multiselect("បញ្ហាដែលរកឃើញ", VISIT_PROBLEMS, format_func=_km, default=[p for p in d.get("problems", []) if p in VISIT_PROBLEMS],
+                              placeholder="គ្មាន — ទុកទទេ បើគ្រប់យ៉ាងល្អ", key="vf_probs")
     cols = (st, st, st) if phone else st.columns(3)
-    priority = cols[0].radio("Priority", VF_PRIORITY, index=_vf_idx(VF_PRIORITY, d.get("priority"), 1), horizontal=True, key="vf_prio")
-    follow = cols[1].selectbox("Who must follow up", VISIT_FOLLOWUP, index=_vf_idx(VISIT_FOLLOWUP, d.get("follow")), key="vf_follow")
-    sat = cols[2].select_slider("Shop happiness", VF_SAT, value=d.get("sat", "🙂 4"), key="vf_sat")
-    notes = st.text_area("Notes (what you saw, what you did)", value=d.get("notes", ""), max_chars=200, height=80, key="vf_notes")
-    request = st.text_input("Customer request (more of which bun, next order, promotion…)", value=d.get("request", ""),
+    priority = cols[0].radio("អាទិភាព", VF_PRIORITY, format_func=_km, index=_vf_idx(VF_PRIORITY, d.get("priority"), 1), horizontal=True, key="vf_prio")
+    follow = cols[1].selectbox("អ្នកទទួលបន្ត", VISIT_FOLLOWUP, format_func=_km, index=_vf_idx(VISIT_FOLLOWUP, d.get("follow")), key="vf_follow")
+    sat = cols[2].select_slider("ការពេញចិត្តរបស់ហាង", VF_SAT, value=d.get("sat", "🙂 4"), key="vf_sat")
+    notes = st.text_area("កំណត់ចំណាំ (អ្វីដែលឃើញ អ្វីដែលបានធ្វើ)", value=d.get("notes", ""), max_chars=200, height=80, key="vf_notes")
+    request = st.text_input("សំណើរបស់អតិថិជន (ចង់បាននំប្រភេទណាបន្ថែម ការបញ្ជាទិញបន្ទាប់ ប្រូម៉ូសិន…)", value=d.get("request", ""),
                             max_chars=150, key="vf_req")
     return {"problems": problems, "priority": priority, "follow": follow, "sat": sat, "notes": notes, "request": request}
 
@@ -9260,20 +9404,20 @@ def _vf_fixes(a):
 
 def _vf_validate(a):
     """Error text, or None when the visit can be saved."""
-    skipped = [n for n, k in (("🔍 Check", "fridge"), ("📈 Sales", "says"), ("⚠️ Problems", "priority")) if k not in a]
+    skipped = [n for n, k in (("🔍 ពិនិត្យ", "fridge"), ("📈 ការលក់", "says"), ("⚠️ បញ្ហា", "priority")) if k not in a]
     if skipped:
-        return "Please open and fill these steps first: " + ", ".join(skipped) + "."
+        return "សូមបើក និងបំពេញជំហានទាំងនេះជាមុនសិន: " + ", ".join(skipped) + "។"
     if a.get("front") is None:
-        return "Please take the shop front photo first."
+        return "សូមបន្ថែមរូបមុខហាងជាមុនសិន។"
     if len(a.get("extra") or []) > 2:
-        return "Choose at most 2 other photos."
+        return "ជ្រើសរូបផ្សេងទៀតបានច្រើនបំផុត 2។"
     fixes = _vf_fixes(a)
     if fixes and (a.get("before") is None or a.get("after") is None):
-        return "You fixed something (" + ", ".join(fixes) + "). Please add both the 🅱️ BEFORE and 🅰️ AFTER photos."
+        return "អ្នកបានជួសជុល (" + ", ".join(_km(x) for x in fixes) + ")។ សូមបន្ថែមទាំងរូប 🅱️ BEFORE និង 🅰️ AFTER។"
     if (a.get("before") is None) != (a.get("after") is None):
-        return "Add both BEFORE and AFTER photos, or neither."
+        return "សូមបន្ថែមទាំងរូប BEFORE និង AFTER ឬកុំបន្ថែមទាំងពីរ។"
     if a.get("problems") and a.get("follow") in ("-", None):
-        return "You reported a problem: choose who must follow up."
+        return "អ្នកបានរាយការណ៍បញ្ហា: សូមជ្រើសអ្នកទទួលបន្ត។"
     return None                       # photos may come from the gallery: the GPS check-in proves the visit
 
 
@@ -9288,7 +9432,7 @@ def _vf_save(a, ctx):
     stamp = [f"{now:%Y-%m-%d %H:%M}  {user}", (f"GPS {gps['lat']:.5f},{gps['lon']:.5f} ±{gps['acc']:.0f}m" if gps else "No GPS"),
              f"{vid}  {label.encode('ascii', 'ignore').decode().strip()}"]
     names_saved = []
-    with st.spinner("Saving photos…"):
+    with st.spinner("កំពុងរក្សាទុករូបថត…"):
         try:
             shots = [("front", a["front"])] + ([("before", a["before"]), ("after", a["after"])] if a.get("before") is not None else []) \
                 + [(f"x{i}", f) for i, f in enumerate(a.get("extra") or [], start=1)]
@@ -9298,7 +9442,7 @@ def _vf_save(a, ctx):
                 _visit_photo_save(name, data)
                 names_saved.append(name)
         except Exception as e:
-            st.error("A photo could not be saved: " + str(e)[:150] + ". Nothing was recorded; please try again.")
+            st.error("មិនអាចរក្សាទុករូបថតបានទេ: " + str(e)[:150] + "។ មិនទាន់កត់ត្រាអ្វីទេ សូមព្យាយាមម្តងទៀត។")
             return
     minutes = ""
     if gps:
@@ -9325,18 +9469,18 @@ def _vf_save(a, ctx):
     try:
         append_row(_visits_path(), row)
     except Exception as e:
-        st.error("The visit could not be saved: " + str(e)[:160] + ". Your answers are still here; press Save again.")
+        st.error("មិនអាចរក្សាទុករបាយការណ៍បានទេ: " + str(e)[:160] + "។ ចម្លើយរបស់អ្នកនៅដដែល សូមចុចរក្សាទុកម្តងទៀត។")
         return
     audit("shop visit" + (" (TEST)" if _visit_test_mode() else ""), f"{customer} | {label} | {row['Problems']}")
     _vf_draft_delete()
     for k in [k for k in list(st.session_state) if str(k).startswith(("visit_gps", "visit_customer", "visit_cam", "visit_files",
                                                                      "visit_before", "visit_after", "vf_", "visit_draft", "visit_ctx"))]:
         st.session_state.pop(k, None)
-    st.session_state["flash"] = f"Visit saved: {customer}"
+    st.session_state["flash"] = f"បានរក្សាទុករបាយការណ៍: {customer}"
     _frag_rerun()
 
 
-VF_STEPS = ["📸 Arrive", "🔍 Check", "🛠️ After", "📈 Sales", "⚠️ Problems", "✅ Save"]
+VF_STEPS = ["📸 មកដល់", "🔍 ពិនិត្យ", "🛠️ ក្រោយជួសជុល", "📈 ការលក់", "⚠️ បញ្ហា", "✅ រក្សាទុក"]
 
 
 def _vf_phone_wizard(ctx):
@@ -9344,19 +9488,19 @@ def _vf_phone_wizard(ctx):
     drafts = st.session_state.setdefault("visit_draft", {})
     d = drafts.setdefault(ctx["key"], {"_step": 0})
     step = int(d.get("_step", 0))
-    st.progress((step + 1) / len(VF_STEPS), text=f"Step {step + 1} of {len(VF_STEPS)} · {VF_STEPS[step]} · {ctx['customer']}")
+    st.progress((step + 1) / len(VF_STEPS), text=f"ជំហាន {step + 1} នៃ {len(VF_STEPS)} · {VF_STEPS[step]} · {ctx['customer']}")
     with st.container(border=True):
         if step == 0:
             ans = _vf_photos_arrive(d, True)
         elif step == 1:
-            st.caption(f"{ctx['shop_type']} · {ctx['size']}")
+            st.caption(f"{_km(ctx['shop_type'])} · {_km(ctx['size'])}")
             ans = _vf_check(d, ctx, True)
         elif step == 2:
             fixes = _vf_fixes(d)
             if fixes:
-                st.info("You fixed: **" + ", ".join(fixes) + "** → take the 🅰️ AFTER photo from the same angle as BEFORE.")
+                st.info("អ្នកបានជួសជុល: **" + ", ".join(_km(x) for x in fixes) + "** → ថតរូប 🅰️ AFTER មុំដូច BEFORE។")
             else:
-                st.caption("Nothing fixed? You can skip the AFTER photo (only needed if you took a BEFORE photo).")
+                st.caption("មិនបានជួសជុលអ្វីទេ? អាចរំលងរូប AFTER បាន (ត្រូវការតែពេលមានរូប BEFORE)។")
             ans = _vf_photos_after(d, True)
         elif step == 3:
             ans = _vf_sales(d, ctx, True)
@@ -9368,35 +9512,35 @@ def _vf_phone_wizard(ctx):
     d.update(ans)
     err_here = None
     if step == 0 and d.get("front") is None:
-        err_here = "Take the shop front photo to continue."
+        err_here = "សូមបន្ថែមរូបមុខហាងដើម្បីបន្ត។"
     if step == 2 and _vf_fixes(d) and (d.get("before") is None or d.get("after") is None):
-        err_here = "Because you fixed something, add both BEFORE (step 1) and AFTER photos."
+        err_here = "ដោយសារអ្នកបានជួសជុល សូមបន្ថែមរូប BEFORE (ជំហាន 1) និង AFTER។"
     if step == 4 and d.get("problems") and d.get("follow") in ("-", None):
-        err_here = "Choose who must follow up the problem."
+        err_here = "សូមជ្រើសអ្នកទទួលបន្តបញ្ហានេះ។"
     last = step == len(VF_STEPS) - 1
     if not last:
-        if st.button(f"Next: {VF_STEPS[step + 1]} ➡️", key=f"vf_next_{step}", type="primary", use_container_width=True):
+        if st.button(f"បន្ទាប់: {VF_STEPS[step + 1]} ➡️", key=f"vf_next_{step}", type="primary", use_container_width=True):
             if err_here:
                 st.error(err_here)
             else:
                 d["_step"] = step + 1
                 _vf_draft_save()
                 _frag_rerun()
-    elif st.button("✅ Save visit", key="vf_save", type="primary", use_container_width=True):
+    elif st.button("✅ រក្សាទុករបាយការណ៍", key="vf_save", type="primary", use_container_width=True):
         err = _vf_validate(d)
         if err:
             st.error(err)
         else:
             _vf_save(d, ctx)
-    if step > 0 and st.button(f"⬅️ Back: {VF_STEPS[step - 1]}", key=f"vf_back_{step}", use_container_width=True):
+    if step > 0 and st.button(f"⬅️ ថយក្រោយ: {VF_STEPS[step - 1]}", key=f"vf_back_{step}", use_container_width=True):
         d["_step"] = step - 1
         _frag_rerun()
-    with st.expander("Jump to a step / cancel this visit"):
+    with st.expander("លោតទៅជំហាន / បោះបង់ការចុះហាងនេះ"):
         go = st.radio("Step", VF_STEPS, index=step, horizontal=True, key=f"vf_jump_{step}", label_visibility="collapsed")
         if go != VF_STEPS[step]:
             d["_step"] = VF_STEPS.index(go)
             _frag_rerun()
-        if st.button("✖ Cancel this visit (answers are deleted)", key=f"vf_cancel_{step}"):
+        if st.button("✖ បោះបង់ការចុះហាងនេះ (ចម្លើយនឹងត្រូវលុប)", key=f"vf_cancel_{step}"):
             st.session_state.get("visit_draft", {}).pop(ctx["key"], None)
             for k in ("visit_gps", "visit_customer", "visit_customer_box", "visit_ctx"):
                 st.session_state.pop(k, None)
@@ -9489,28 +9633,28 @@ def _vf_summary(d, ctx):
     photos = [n for n, k in (("front", "front"), ("before", "before"), ("after", "after")) if d.get(k) is not None]
     st.markdown(f"**{ctx['customer']}**")
     thumbs = [(VF_PHOTO_LABEL[k], d[k]) for k in ("front", "before", "after") if d.get(k) is not None] + \
-             [("Other", f) for f in (d.get("extra") or [])]
+             [("ផ្សេងៗ", f) for f in (d.get("extra") or [])]
     if thumbs:
         _vf_thumb_row(thumbs)
-    st.markdown(f"- 📸 Photos: **{_vf_photo_status(d)}**" + (f" + {len(d.get('extra') or [])} other" if d.get("extra") else "") + "\n"
-                f"- 🧊 Fridge **{d.get('fridge', '-')}** · 🥟 FIFO **{d.get('fifo', '-')}** · old buns **{d.get('old_pcs', 0)}**\n"
-                f"- 🏷️ Sticker **{d.get('sticker', '-')}** · changed **{d.get('changed', 0)}**\n"
-                f"- 🛠️ Fixed: **{', '.join(fixes) or 'nothing'}**\n"
-                f"- 📋 Checklist: **{sum(checks.values())} / {len(checks)} OK**\n"
-                f"- 📈 Owner says **{d.get('says', '-')}** · {d.get('reason', '-')}\n"
-                f"- ⚠️ Problems: **{', '.join(p.split(' ', 1)[1] for p in d.get('problems', [])) or 'none'}**"
-                + (f" · follow-up {d.get('follow')}" if d.get("problems") else "") + "\n"
-                f"- 😊 Happiness **{d.get('sat', '-')}** · 📝 {d.get('notes') or 'no notes'}")
+    st.markdown(f"- 📸 រូបថត: **{_vf_photo_status(d)}**" + (f" + ផ្សេងទៀត {len(d.get('extra') or [])}" if d.get("extra") else "") + "\n"
+                f"- 🧊 ទូទឹកកក **{_km(d.get('fridge', '-'))}** · 🥟 FIFO **{_km(d.get('fifo', '-'))}** · នំចាស់ **{d.get('old_pcs', 0)}**\n"
+                f"- 🏷️ ស្ទីគ័រ **{_km(d.get('sticker', '-'))}** · បានប្តូរ **{d.get('changed', 0)}**\n"
+                f"- 🛠️ បានជួសជុល: **{', '.join(_km(x) for x in fixes) or 'គ្មាន'}**\n"
+                f"- 📋 បញ្ជីពិនិត្យ: **ល្អ {sum(checks.values())} / {len(checks)}**\n"
+                f"- 📈 ម្ចាស់ហាងថា **{_km(d.get('says', '-'))}** · {_km(d.get('reason', '-'))}\n"
+                f"- ⚠️ បញ្ហា: **{', '.join(_km(p) for p in d.get('problems', [])) or 'គ្មាន'}**"
+                + (f" · អ្នកទទួលបន្ត {_km(d.get('follow'))}" if d.get("problems") else "") + "\n"
+                f"- 😊 ការពេញចិត្ត **{d.get('sat', '-')}** · 📝 {d.get('notes') or 'គ្មានកំណត់ចំណាំ'}")
     missing = [k for k in ("front", "before", "after") if d.get(k) is None and
                (k == "front" or _vf_fixes(d) or d.get("before") is not None or d.get("after") is not None)]
     for k in missing:
-        st.warning(f"{VF_PHOTO_LABEL[k]} photo is missing — add it here:")
-        _vf_photo_slot(d, k, f"{VF_PHOTO_LABEL[k]} photo", f"vf_{k}_sum")
+        st.warning(f"ខ្វះ {VF_PHOTO_LABEL[k]} — បន្ថែមនៅទីនេះ:")
+        _vf_photo_slot(d, k, f"{VF_PHOTO_LABEL[k]}", f"vf_{k}_sum")
     err = _vf_validate(d)
     if err and not missing:
         st.error(err)
     elif not err:
-        st.success("Everything is filled in. Press **✅ Save visit**.")
+        st.success("បំពេញគ្រប់ហើយ។ សូមចុច **✅ រក្សាទុករបាយការណ៍**។")
 
 
 def _in_fragment():
@@ -9550,8 +9694,8 @@ def _visit_report_frame(visits, start, end, staff):
 def _visit_report_body(visits):
     today = today_kh()
     c1, c2, c3 = st.columns([1, 1, 2])
-    start = c1.date_input("From", today, key="vr_from")
-    end = c2.date_input("To", today, key="vr_to")
+    start = c1.date_input("ពីថ្ងៃ", today, key="vr_from")
+    end = c2.date_input("ដល់ថ្ងៃ", today, key="vr_to")
     staff_all = sorted(visits["Staff"].unique()) if not visits.empty else []
     staff = c3.multiselect("Staff", staff_all, key="vr_staff", placeholder="All staff")
     v = _visit_report_frame(visits, start, end, staff)
@@ -9659,7 +9803,7 @@ def _visit_problems_body(visits):
                         st.session_state["flash"] = f"Marked fixed: {r['Customer']}"
                         _frag_rerun()
                     except Exception as e:
-                        st.error("Could not save: " + str(e)[:150])
+                        st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
 
 
 VISIT_MIN_MINUTES = 5            # a visit shorter than this is flagged
@@ -9670,25 +9814,25 @@ def _visit_flags(r):
     flags = []
     loc = str(r.get("Location check", ""))
     if not loc.startswith("✅"):
-        flags.append("📍 not confirmed at the shop" + (f" ({loc})" if loc and loc != "-" else ""))
+        flags.append("📍 មិនបានបញ្ជាក់ថានៅហាង" + (f" ({_km_loc(loc)})" if loc and loc != "-" else ""))
     mins = pd.to_numeric(r.get("Minutes"), errors="coerce")
     if pd.notna(mins) and mins < VISIT_MIN_MINUTES:
-        flags.append(f"⏱️ only {int(mins)} min at the shop")
+        flags.append(f"⏱️ នៅហាងតែ {int(mins)} នាទី")
     score = pd.to_numeric(r.get("Check score %"), errors="coerce")
     if pd.notna(score) and score < 50:
-        flags.append(f"📋 shop check only {int(score)}% OK")
+        flags.append(f"📋 ពិនិត្យហាងល្អតែ {int(score)}%")
     photos = [p for p in str(r.get("Photos", "")).split(";") if p and p != "-"]
     if len(photos) <= 1:
-        flags.append("🖼️ only the shop-front photo")
+        flags.append("🖼️ មានតែរូបមុខហាង")
     if str(r.get("Fridge")) in ("Dirty", "Not cold", "Broken") and "Fridge" not in str(r.get("Fix done", "")) \
             and str(r.get("Problems")) in ("-", ""):
-        flags.append(f"🧊 fridge “{r.get('Fridge')}” but no problem reported")
+        flags.append(f"🧊 ទូទឹកកក “{_km(r.get('Fridge'))}” ប៉ុន្តែមិនបានរាយការណ៍បញ្ហា")
     if str(r.get("Sticker")) in ("Old / faded", "Missing") and str(r.get("Stickers changed")) in ("0", "-", ""):
-        flags.append(f"🏷️ sticker “{r.get('Sticker')}” but none changed")
+        flags.append(f"🏷️ ស្ទីគ័រ “{_km(r.get('Sticker'))}” ប៉ុន្តែមិនបានប្តូរ")
     if str(r.get("Problems")) not in ("-", "") and str(r.get("Follow-up by")) in ("-", ""):
-        flags.append("👤 problem without someone to follow up")
+        flags.append("👤 មានបញ្ហា ប៉ុន្តែគ្មានអ្នកទទួលបន្ត")
     if str(r.get("Notes")) in ("-", ""):
-        flags.append("📝 no notes")
+        flags.append("📝 គ្មានកំណត់ចំណាំ")
     return flags
 
 
@@ -9700,81 +9844,81 @@ def _visit_review_state(r):
 def _visit_sheet(r):
     """The whole submitted form of one visit, easy to read."""
     yn = lambda ok: "✅" if ok else "❌"
-    st.markdown(f"**{r['Customer']}** · {r.get('Shop type', '-')} · {r.get('Size', '-')} · {r.get('Zone', '-')}")
-    st.caption(f"By **{r['Staff']}** · saved {r['_dt']:%d %b %Y %H:%M} · check-in {str(r['Check-in'])[11:16] or '-'} · "
-               f"{r['Minutes'] if str(r['Minutes']) not in ('', '-') else '?'} min · visit {r['VisitID']}")
+    st.markdown(f"**{r['Customer']}** · {_km(r.get('Shop type', '-'))} · {_km(r.get('Size', '-'))} · {_km(r.get('Zone', '-'))}")
+    st.caption(f"ដោយ **{r['Staff']}** · រក្សាទុក {r['_dt']:%d %b %Y %H:%M} · Check-in {str(r['Check-in'])[11:16] or '-'} · "
+               f"{r['Minutes'] if str(r['Minutes']) not in ('', '-') else '?'} នាទី · លេខ {r['VisitID']}")
     loc = str(r["Location check"])
     (st.success if loc.startswith("✅") else st.warning)(
-        f"{loc} · GPS ±{r['GPS accuracy m']} m" + (f" · {r['Distance m']} m from the pin" if str(r["Distance m"]) not in ("-", "") else ""))
+        f"{_km_loc(loc)} · GPS ±{r['GPS accuracy m']} m" + (f" · ឆ្ងាយពីទីតាំងហាង {r['Distance m']} m" if str(r["Distance m"]) not in ("-", "") else ""))
     if str(r["Lat"]) not in ("-", ""):
-        st.link_button("🗺️ Where the check-in was", f"https://www.google.com/maps?q={r['Lat']},{r['Lon']}")
+        st.link_button("🗺️ កន្លែងដែល Check-in", f"https://www.google.com/maps?q={r['Lat']},{r['Lon']}")
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("**🔍 Shop check**")
-        st.markdown(f"- 🧊 Fridge: **{r['Fridge']}**\n- 🥟 Display / FIFO: **{r['Display FIFO']}**\n"
-                    f"- Old / damaged buns: **{r['Old/damaged pcs']} pcs**\n- 🏷️ Sticker: **{r['Sticker']}** · changed **{r['Stickers changed']}**\n"
-                    f"- 🛠️ Fixed today: **{r.get('Fix done', '-')}**")
+        st.markdown("**🔍 ពិនិត្យហាង**")
+        st.markdown(f"- 🧊 ទូទឹកកក: **{_km(r['Fridge'])}**\n- 🥟 ការតាំង / FIFO: **{_km(r['Display FIFO'])}**\n"
+                    f"- នំចាស់ / ខូច: **{r['Old/damaged pcs']} pcs**\n- 🏷️ ស្ទីគ័រ: **{_km(r['Sticker'])}** · បានប្តូរ **{r['Stickers changed']}**\n"
+                    f"- 🛠️ បានជួសជុលថ្ងៃនេះ: **{_km_list(r.get('Fix done', '-'))}**")
         checks = [c.rsplit(": ", 1) for c in str(r.get("Checks", "")).split("; ") if ": " in c]
         if checks:
-            st.markdown(f"**📋 Checklist** ({r.get('Check score %', '-')}% OK)")
-            st.markdown("\n".join(f"- {yn(v == 'OK')} {k}" for k, v in checks))
+            st.markdown(f"**📋 បញ្ជីពិនិត្យ** (ល្អ {r.get('Check score %', '-')}%)")
+            st.markdown("\n".join(f"- {yn(v == 'OK')} {_km(k)}" for k, v in checks))
     with c2:
-        st.markdown("**📈 Sales**")
-        st.markdown(f"- Owner says: **{r['Customer says sales']}** · reason: **{r['Sales reason']}**\n"
-                    f"- Journal trend: **{r['App trend %']}%**\n- Competitor: **{r['Competitor']}**")
-        st.markdown("**⚠️ Problems & requests**")
-        st.markdown(f"- Problems: **{r['Problems']}**\n- Priority: **{r['Priority']}** · follow-up: **{r['Follow-up by']}**\n"
-                    f"- Status: **{r['Status']}**\n- Shop happiness: **{r['Satisfaction']} / 5**\n- Request: {r['Customer request']}")
-    st.markdown(f"**📝 Notes:** {r['Notes']}")
+        st.markdown("**📈 ការលក់**")
+        st.markdown(f"- ម្ចាស់ហាងថា: **{_km(r['Customer says sales'])}** · មូលហេតុ: **{_km(r['Sales reason'])}**\n"
+                    f"- តាម Sale Journal: **{r['App trend %']}%**\n- គូប្រជែង: **{r['Competitor']}**")
+        st.markdown("**⚠️ បញ្ហា និងសំណើ**")
+        st.markdown(f"- បញ្ហា: **{_km_list(r['Problems'])}**\n- អាទិភាព: **{_km(r['Priority'])}** · អ្នកទទួលបន្ត: **{_km(r['Follow-up by'])}**\n"
+                    f"- ស្ថានភាព: **{_km(r['Status'])}**\n- ការពេញចិត្តរបស់ហាង: **{r['Satisfaction']} / 5**\n- សំណើ: {r['Customer request']}")
+    st.markdown(f"**📝 កំណត់ចំណាំ:** {r['Notes']}")
     _visit_show_photos(r["Photos"], f"rv_{r['VisitID']}")
 
 
 def _visit_review_body(visits):
-    st.markdown("#### ✅ Review visits")
-    st.caption("Open each visit to see everything staff filled in. ⚑ marks things to look at. Approve it, or send it back "
+    st.markdown("#### ✅ ពិនិត្យរបាយការណ៍ចុះហាង")
+    st.caption("បើករបាយការណ៍នីមួយៗ ដើម្បីមើលអ្វីដែលបុគ្គលិកបានបំពេញ។ ⚑ សម្គាល់ចំណុចត្រូវពិនិត្យ។ អនុម័ត ឬបញ្ជូនត្រឡប់ "
                "with **Redo** and a note — staff see the note in their plan.")
     if visits.empty:
-        st.info("No visits yet.")
+        st.info("មិនទាន់មានការចុះហាងទេ។")
         return
     today = today_kh()
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
-    start = c1.date_input("From", today - timedelta(days=6), key="rv_from")
-    end = c2.date_input("To", today, key="rv_to")
-    staff = c3.selectbox("Staff", ["All"] + sorted(visits["Staff"].unique()), key="rv_staff")
-    state = c4.selectbox("Show", ["To review", "Redo", "Approved", "All"], key="rv_state")
+    start = c1.date_input("ពីថ្ងៃ", today - timedelta(days=6), key="rv_from")
+    end = c2.date_input("ដល់ថ្ងៃ", today, key="rv_to")
+    staff = c3.selectbox("បុគ្គលិក", ["All"] + sorted(visits["Staff"].unique()), key="rv_staff", format_func=_km)
+    state = c4.selectbox("បង្ហាញ", ["To review", "Redo", "Approved", "All"], key="rv_state", format_func=_km)
     v = visits[(visits["_dt"].dt.date >= start) & (visits["_dt"].dt.date <= end)].copy()
     if staff != "All":
         v = v[v["Staff"].eq(staff)]
     v["_state"] = [_visit_review_state(r) for r in v.to_dict("records")]
     counts = v["_state"].value_counts()
-    st.caption(f"⏳ To review {counts.get('To review', 0)} · 🔁 Redo {counts.get('Redo', 0)} · ✅ Approved {counts.get('Approved', 0)}")
+    st.caption(f"⏳ រង់ចាំពិនិត្យ {counts.get('To review', 0)} · 🔁 ត្រូវធ្វើឡើងវិញ {counts.get('Redo', 0)} · ✅ បានអនុម័ត {counts.get('Approved', 0)}")
     if state != "All":
         v = v[v["_state"].eq(state)]
     if v.empty:
-        st.success("Nothing here. 🎉")
+        st.success("គ្មានអ្វីទេ។ 🎉")
         return
     can = has_permission("edit")
     icon = {"To review": "⏳", "Redo": "🔁", "Approved": "✅"}
     for r in v.sort_values("_dt", ascending=False).head(40).to_dict("records"):
         flags = _visit_flags(r)
         head = (f"{icon[r['_state']]} {r['_dt']:%d %b %H:%M} · {r['Customer']} · {r['Staff']} · "
-                f"{'📍✅' if str(r['Location check']).startswith('✅') else '📍⚠️'}" + (f" · ⚑ {len(flags)}" if flags else " · all complete"))
+                f"{'📍✅' if str(r['Location check']).startswith('✅') else '📍⚠️'}" + (f" · ⚑ {len(flags)}" if flags else " · គ្រប់ចំណុច"))
         with st.expander(head):
             if flags:
-                st.warning("**Look at:** " + " · ".join(flags))
+                st.warning("**ត្រូវពិនិត្យ:** " + " · ".join(flags))
             if r["_state"] != "To review":
-                st.caption(f"{icon[r['_state']]} {r['_state']} by {r.get('Reviewed by', '-')} on {str(r.get('Reviewed at', '-'))[:16]}"
+                st.caption(f"{icon[r['_state']]} {_km(r['_state'])} ដោយ {r.get('Reviewed by', '-')} ថ្ងៃ {str(r.get('Reviewed at', '-'))[:16]}"
                            + (f" — “{r['Review note']}”" if str(r.get("Review note", "-")) not in ("-", "") else ""))
             _visit_sheet(r)
             if can:
                 st.divider()
                 n1, n2, n3 = st.columns([3, 1, 1])
-                note = n1.text_input("Note to staff", key=f"rvn_{r['VisitID']}", max_chars=150,
-                                     placeholder="e.g. take the AFTER photo from the same angle", label_visibility="collapsed")
-                for col, verdict, label, kind in ((n2, "Approved", "✅ Approve", "primary"), (n3, "Redo", "🔁 Redo", "secondary")):
+                note = n1.text_input("កំណត់ចំណាំទៅបុគ្គលិក", key=f"rvn_{r['VisitID']}", max_chars=150,
+                                     placeholder="ឧ. ថតរូប AFTER មុំដូច BEFORE", label_visibility="collapsed")
+                for col, verdict, label, kind in ((n2, "Approved", "✅ អនុម័ត", "primary"), (n3, "Redo", "🔁 ធ្វើឡើងវិញ", "secondary")):
                     if col.button(label, key=f"rv_{verdict}_{r['VisitID']}", use_container_width=True, type=kind):
                         if verdict == "Redo" and not note.strip():
-                            st.error("Write what staff must redo.")
+                            st.error("សូមសរសេរអ្វីដែលបុគ្គលិកត្រូវធ្វើឡើងវិញ។")
                             continue
                         vid, by, at = r["VisitID"], current_user() or "-", now_str()
 
@@ -9788,10 +9932,10 @@ def _visit_review_body(visits):
                         try:
                             modify_csv(_visits_path(), VISIT_COLS, _rev)
                             audit("visit review", f"{r['Customer']} | {verdict} | {vid}")
-                            st.session_state["flash"] = f"{verdict}: {r['Customer']}"
+                            st.session_state["flash"] = f"{_km(verdict)}: {r['Customer']}"
                             _frag_rerun()
                         except Exception as e:
-                            st.error("Could not save: " + str(e)[:150])
+                            st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
 
 
 def _visit_redo_notice(visits, user, customer=None):
@@ -9804,14 +9948,14 @@ def _visit_redo_notice(visits, user, customer=None):
     for r in redo.head(5).to_dict("records"):
         later = visits[(visits["Customer"].map(norm_name) == norm_name(r["Customer"])) & (visits["_dt"] > r["_dt"])]
         if later.empty:
-            st.error(f"🔁 Redo **{r['Customer']}** (visit {r['_dt']:%d %b}) — {r.get('Reviewed by', 'Admin')}: “{r.get('Review note', '')}”")
+            st.error(f"🔁 ត្រូវធ្វើឡើងវិញ **{r['Customer']}** (ចុះហាងថ្ងៃ {r['_dt']:%d %b}) — {r.get('Reviewed by', 'Admin')}: “{r.get('Review note', '')}”")
 
 
 def _visit_show_photos(photos, key_prefix):
     """Shop front first, then BEFORE | AFTER side by side, then the rest."""
     files = [p for p in str(photos).split(";") if p and p != "-"]
     role = lambda n: n.rsplit("_", 1)[-1].split(".")[0]
-    label = {"front": "📸 Shop front", "before": "🅱️ BEFORE", "after": "🅰️ AFTER"}
+    label = {"front": "📸 មុខហាង", "before": "🅱️ BEFORE", "after": "🅰️ AFTER"}
     order = {"front": 0, "before": 1, "after": 2}
     files.sort(key=lambda n: order.get(role(n), 3))
     pair = [f for f in files if role(f) in ("before", "after")]
@@ -9819,7 +9963,7 @@ def _visit_show_photos(photos, key_prefix):
 
     def _img(col, name):
         try:
-            col.image(_visit_photo_load(name), use_container_width=True, caption=label.get(role(name), "Photo"))
+            col.image(_visit_photo_load(name), use_container_width=True, caption=label.get(role(name), "រូបថត"))
         except Exception as e:
             col.warning(f"{name}: {str(e)[:80]}")
     if others[:1]:
@@ -9859,7 +10003,7 @@ def _visit_settings_admin(route):
                 st.session_state["flash"] = "Visit frequency saved"
                 _frag_rerun()
             except Exception as e:
-                st.error("Could not save: " + str(e)[:150])
+                st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
     if not route.empty:
         sizes = route.groupby("Size").agg(Shops=("Customer", "size"), Every=("Every (days)", "first")).reset_index()
         sizes["Visits needed / month"] = (sizes["Shops"] * 30 / sizes["Every"]).round(0)
@@ -9947,7 +10091,7 @@ def _visit_effect_body(visits, daily):
 def _visit_scorecard_body(visits, daily, names):
     st.markdown("#### 🏅 Monthly scorecard")
     if visits.empty:
-        st.info("No visits yet.")
+        st.info("មិនទាន់មានការចុះហាងទេ។")
         return
     months = sorted(visits["_dt"].dt.strftime("%Y-%m").unique(), reverse=True)
     c1, c2 = st.columns(2)
@@ -10039,7 +10183,7 @@ def _visit_match_admin(names, have, cands):
                 st.session_state["flash"] = f"Linked {len(rows_out)} shop(s) to their map pin"
                 _frag_rerun()
             except Exception as e:
-                st.error("Could not save: " + str(e)[:150])
+                st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
 
 
 def _visit_pins_admin(names):
@@ -10347,7 +10491,7 @@ def _lead_import_body(snap, visits):
                     st.session_state["flash"] = f"Linked {len(pairs)} lead(s)"
                     _frag_rerun()
                 except Exception as e:
-                    st.error("Could not save: " + str(e)[:150])
+                    st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
 
     st.markdown("**🗓️ First visit for new Phnom Penh shops**")
     if pp:
@@ -10426,14 +10570,14 @@ def _shop_visits_live():
 def _shop_visits_body():
     if _vf_draft_restore():                              # before any switch is drawn (it may turn Test mode on)
         st.session_state["visit_view"] = "📝 New visit"
-        st.toast("Your unfinished visit was brought back. Carry on where you stopped.", icon="↩️")
+        st.toast("បានយករបាយការណ៍ដែលមិនទាន់រួចមកវិញ។ សូមបន្តពីកន្លែងដែលបានឈប់។", icon="↩️")
     _flash = st.session_state.pop("flash", None)        # saves redraw only Shop Visits, so show their message here
     if _flash:
         st.toast(_flash, icon="✅")
     h1, h2, h3 = st.columns([3, 1.3, 2])
-    h1.markdown("### 🏪 Shop Visits")
+    h1.markdown("### 🏪 ចុះជួបហាង (Shop Visits)")
     _visit_phone_mode()
-    h2.toggle("📱 Phone mode", key="visit_phone", help="Big buttons and the visit form step by step. Turns on by itself on a phone.")
+    h2.toggle("📱 Phone mode", key="visit_phone", help="ប៊ូតុងធំ និងទម្រង់ជាជំហានៗ។ បើកដោយស្វ័យប្រវត្តិលើទូរស័ព្ទ។")
     if _visit_phone_mode():
         st.markdown(VISIT_PHONE_CSS, unsafe_allow_html=True)
     if current_role() == "admin":
@@ -10453,15 +10597,15 @@ def _shop_visits_body():
     if st.session_state.get("visit_view") not in views:
         st.session_state["visit_view"] = views[0]
     if _visit_phone_mode():
-        view = st.selectbox("Section", views, key="visit_view", label_visibility="collapsed")
+        view = st.selectbox("ផ្នែក", views, key="visit_view", label_visibility="collapsed", format_func=_km)
     else:
-        view = st.radio("Shop visit section", views, horizontal=True, key="visit_view", label_visibility="collapsed")
+        view = st.radio("ផ្នែក", views, horizontal=True, key="visit_view", label_visibility="collapsed", format_func=_km)
     if (view == "📊 Visit report" and bool(st.session_state.get("vr_live"))) != st.session_state.get("_visit_live_wrapper", False):
         st.rerun()                        # switch between the normal and the auto-refresh wrapper
     visits = _visit_read()
     if view == "📝 New visit":
         if not has_permission("edit"):
-            st.info("Your account can view visits but not record them.")
+            st.info("គណនីរបស់អ្នកអាចមើលបាន ប៉ុន្តែមិនអាចកត់ត្រាការចុះហាងបានទេ។")
             return
         stats, names, _areas = _visit_customer_stats()
         _visit_new_form(visits, stats, names)
@@ -10469,7 +10613,7 @@ def _shop_visits_body():
         user = current_user() or "-"
         stats, names, areas = _visit_customer_stats()
         if not names:
-            st.info("No Phnom Penh customers found. Check the zone in the Master List.")
+            st.info("រកមិនឃើញអតិថិជននៅភ្នំពេញទេ។ សូមពិនិត្យតំបន់ក្នុង Master List។")
             return
         _visit_progress(visits, user)
         _visit_redo_notice(visits, user)
@@ -10478,9 +10622,9 @@ def _shop_visits_body():
         due_all = _visit_is_due(all_route)
         zone = _visit_zone_picker(zone_map, "visit_zone_plan", Counter(due_all["Area"]))
         route = all_route[all_route["Area"].eq(zone)].reset_index(drop=True) if zone else all_route
-        st.caption(f"📅 {len(due_all)} Phnom Penh shops need a visit now · {len(_visit_is_due(route))} of them in this zone.")
+        st.caption(f"📅 ហាងនៅភ្នំពេញ {len(due_all)} ត្រូវចុះឥឡូវ · ក្នុងតំបន់នេះ {len(_visit_is_due(route))}។")
         if route.empty:
-            st.info("No shops in this zone yet.")
+            st.info("មិនទាន់មានហាងក្នុងតំបន់នេះទេ។")
             return
         registry = _visit_registry()
         pin_store = _visit_pin_store()
@@ -10490,25 +10634,25 @@ def _shop_visits_body():
             auto_pins = {}
         done_today = set(visits.loc[visits["_dt"].dt.date == today_kh(), "Customer"].map(norm_name)) if not visits.empty else set()
         todo = route[~route["Customer"].map(norm_name).isin(done_today)]
-        st.markdown(f"**⭐ Suggested {VISIT_DAILY_TARGET} for today** — the most important shops in this zone")
-        q = st.text_input("🔎 Search shop in this zone", key="vroute_q", max_chars=60)
+        st.markdown(f"**⭐ ហាងណែនាំ {VISIT_DAILY_TARGET} សម្រាប់ថ្ងៃនេះ** — ហាងសំខាន់បំផុតក្នុងតំបន់នេះ")
+        q = st.text_input("🔎 ស្វែងរកហាងក្នុងតំបន់នេះ", key="vroute_q", max_chars=60)
         r = todo if not q.strip() else todo[todo["Customer"].str.contains(q.strip(), case=False, regex=False)]
         for n, (i, row) in enumerate(r.head(VISIT_DAILY_TARGET + 12).iterrows()):
             if n == VISIT_DAILY_TARGET and not q.strip():
-                st.markdown("**More shops in this zone**")
+                st.markdown("**ហាងផ្សេងទៀតក្នុងតំបន់នេះ**")
             link, exact = _visit_map_link(row["Customer"], registry, pin_store, auto_pins)
             with st.container(border=True):
                 c1, c2, c3 = st.columns([4, 1, 1])
                 c1.markdown(f"**{'⭐ ' if n < VISIT_DAILY_TARGET and not q.strip() else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
-                            f"<span style='color:#6B7280'>{row['Size']} · last visit {row['Last visit']} · {row['Pcs 28 days']:,} pcs in 28 days</span>",
+                            f"<span style='color:#6B7280'>{_km(row['Size'])} · ចុះហាងចុងក្រោយ {_km_days(row['Last visit'])} · {row['Pcs 28 days']:,} pcs ក្នុង ២៨ ថ្ងៃ</span>",
                             unsafe_allow_html=True)
-                c2.link_button("🧭 Go" if exact else "⚠️ No pin", link, use_container_width=True,
-                               help="Directions to the shop's saved location" if exact
+                c2.link_button("🧭 ទៅ" if exact else "⚠️ គ្មានទីតាំង", link, use_container_width=True,
+                               help="ផ្លូវទៅទីតាំងហាងដែលបានរក្សាទុក" if exact
                                else "No saved location yet: this searches the name on Google Maps. Save the real location at the shop.")
-                c3.button("Start ▶", key=f"vstart_{i}", use_container_width=True,
+                c3.button("ចាប់ផ្តើម ▶", key=f"vstart_{i}", use_container_width=True,
                           on_click=_visit_start, args=(row["Customer"],))
         if done_today & set(route["Customer"].map(norm_name)):
-            st.caption("✅ Already visited today (by anyone): " + ", ".join(route.loc[route["Customer"].map(norm_name).isin(done_today), "Customer"]))
+            st.caption("✅ បានចុះរួចថ្ងៃនេះ (ដោយអ្នកណាម្នាក់): " + ", ".join(route.loc[route["Customer"].map(norm_name).isin(done_today), "Customer"]))
     elif view == "⚙️ Shops & zones":
         stats, names, areas = _visit_customer_stats()
         _visit_settings_admin(_visit_route(visits, stats, names, areas, _visit_zone_map(names)))
