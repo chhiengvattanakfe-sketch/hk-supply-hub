@@ -9080,17 +9080,44 @@ VF_SAT = ["😠 1", "🙁 2", "😐 3", "🙂 4", "😍 5"]
 VF_IMG = ["jpg", "jpeg", "png", "webp"]
 
 
+VF_PHOTO_LABEL = {"front": "📸 Shop front", "before": "🅱️ BEFORE", "after": "🅰️ AFTER"}
+
+
+def _vf_photo_slot(d, k, label, wkey, help_=None):
+    """Phone: show the photo already taken, or a big upload box for it. Updates the draft directly."""
+    if d.get(k) is not None:
+        c1, c2 = st.columns([1, 2])
+        c1.image(d[k].getvalue(), width=140)
+        c2.markdown(f"**{VF_PHOTO_LABEL.get(k, label)} ✅**")
+        if c2.button("Take again", key=f"{wkey}_redo"):
+            d[k] = None
+            st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+        return
+    f = st.file_uploader(label, type=VF_IMG, key=wkey, help=help_ or "Tap → Take Photo")
+    if f is not None:
+        d[k] = _Shot(f.getvalue(), getattr(f, "name", "photo.jpg"))
+        st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+
+
+def _vf_photo_status(d):
+    need = ["front"] + (["before", "after"] if (_vf_fixes(d) or d.get("before") is not None or d.get("after") is not None) else [])
+    return " · ".join(f"{VF_PHOTO_LABEL[k]} {'✅' if d.get(k) is not None else '❌'}" for k in need)
+
+
 def _vf_photos_arrive(d, phone):
     if phone:
-        st.caption("Take these as soon as you arrive, before you touch anything.")
+        st.caption("Take 2 photos as soon as you arrive, before you touch anything.")
+        st.markdown("**1 · 📸 Shop front** (required)")
         if d.get("front") is not None:
-            st.image(d["front"].getvalue(), caption="📸 Shop front ✅", width=220)
-        front = st.camera_input("📸 Shop front" + (" (take again to replace)" if d.get("front") else ""), key="vf_cam")
-        if d.get("before") is not None:
-            st.image(d["before"].getvalue(), caption="🅱️ BEFORE ✅", width=220)
-        before = st.file_uploader("🅱️ BEFORE: fridge / display as you found it", type=VF_IMG, key="vf_before",
-                                  help="Tap → Camera. Needed if you will fix anything.")
-        return {"front": _vf_keep(front) or d.get("front"), "before": _vf_keep(before) or d.get("before")}
+            _vf_photo_slot(d, "front", "📸 Shop front", "vf_front_up")
+        else:
+            front = st.camera_input("📸 Shop front", key="vf_cam", label_visibility="collapsed")
+            if front is not None:
+                d["front"] = _vf_keep(front)
+                st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+        st.markdown("**2 · 🅱️ BEFORE: fridge / display as you found it** (needed if you will fix anything)")
+        _vf_photo_slot(d, "before", "🅱️ BEFORE photo", "vf_before")
+        return {}
     front = st.camera_input("📸 Shop front (take it now)", key="visit_cam")
     before = st.file_uploader("🅱️ BEFORE: fridge / display as you found it", type=VF_IMG, key="visit_before",
                               help="Take it with the camera when you arrive. Needed when you fix something.")
@@ -9099,13 +9126,13 @@ def _vf_photos_arrive(d, phone):
 
 def _vf_photos_after(d, phone):
     if phone:
-        if d.get("after") is not None:
-            st.image(d["after"].getvalue(), caption="🅰️ AFTER ✅", width=220)
-        after = st.file_uploader("🅰️ AFTER: the same place after you fixed it", type=VF_IMG, key="vf_after",
-                                 help="Same angle as BEFORE.")
-        extra = st.file_uploader("Other photos (max 2)", type=VF_IMG, accept_multiple_files=True, key="vf_extra")
-        return {"after": _vf_keep(after) or d.get("after"),
-                "extra": [_vf_keep(f) for f in (extra or [])] or d.get("extra", [])}
+        if d.get("before") is None and (_vf_fixes(d) or d.get("after") is not None):
+            st.markdown("**🅱️ BEFORE is missing** — add it here")
+            _vf_photo_slot(d, "before", "🅱️ BEFORE photo", "vf_before2")
+        st.markdown("**🅰️ AFTER: the same place after you fixed it** (same angle as BEFORE)")
+        _vf_photo_slot(d, "after", "🅰️ AFTER photo", "vf_after")
+        extra = st.file_uploader("Other photos (optional, max 2)", type=VF_IMG, accept_multiple_files=True, key="vf_extra")
+        return {"extra": [_vf_keep(f) for f in (extra or [])] or d.get("extra", [])}
     after = st.file_uploader("🅰️ AFTER: the same place after you fixed it", type=VF_IMG, key="visit_after",
                              help="Same angle as BEFORE, so the change is easy to see.")
     extra = st.file_uploader("Other photos (max 2)", type=VF_IMG, accept_multiple_files=True, key="visit_files")
@@ -9157,6 +9184,9 @@ def _vf_fixes(a):
 
 def _vf_validate(a):
     """Error text, or None when the visit can be saved."""
+    skipped = [n for n, k in (("🔍 Check", "fridge"), ("📈 Sales", "says"), ("⚠️ Problems", "priority")) if k not in a]
+    if skipped:
+        return "Please open and fill these steps first: " + ", ".join(skipped) + "."
     if a.get("front") is None:
         return "Please take the shop front photo first."
     if len(a.get("extra") or []) > 2:
@@ -9302,7 +9332,13 @@ def _vf_summary(d, ctx):
     checks = d.get("checks", {})
     photos = [n for n, k in (("front", "front"), ("before", "before"), ("after", "after")) if d.get(k) is not None]
     st.markdown(f"**{ctx['customer']}**")
-    st.markdown(f"- 📸 Photos: **{', '.join(photos) or 'none'}**" + (f" + {len(d.get('extra') or [])} other" if d.get("extra") else "") + "\n"
+    thumbs = [(VF_PHOTO_LABEL[k], d[k]) for k in ("front", "before", "after") if d.get(k) is not None] + \
+             [("Other", f) for f in (d.get("extra") or [])]
+    if thumbs:
+        tc = st.columns(len(thumbs))
+        for col, (lab, f) in zip(tc, thumbs):
+            col.image(f.getvalue(), caption=lab, use_container_width=True)
+    st.markdown(f"- 📸 Photos: **{_vf_photo_status(d)}**" + (f" + {len(d.get('extra') or [])} other" if d.get("extra") else "") + "\n"
                 f"- 🧊 Fridge **{d.get('fridge', '-')}** · 🥟 FIFO **{d.get('fifo', '-')}** · old buns **{d.get('old_pcs', 0)}**\n"
                 f"- 🏷️ Sticker **{d.get('sticker', '-')}** · changed **{d.get('changed', 0)}**\n"
                 f"- 🛠️ Fixed: **{', '.join(fixes) or 'nothing'}**\n"
@@ -9311,10 +9347,21 @@ def _vf_summary(d, ctx):
                 f"- ⚠️ Problems: **{', '.join(p.split(' ', 1)[1] for p in d.get('problems', [])) or 'none'}**"
                 + (f" · follow-up {d.get('follow')}" if d.get("problems") else "") + "\n"
                 f"- 😊 Happiness **{d.get('sat', '-')}** · 📝 {d.get('notes') or 'no notes'}")
+    missing = [k for k in ("front", "before", "after") if d.get(k) is None and
+               (k == "front" or _vf_fixes(d) or d.get("before") is not None or d.get("after") is not None)]
+    for k in missing:
+        st.warning(f"{VF_PHOTO_LABEL[k]} photo is missing — add it here:")
+        if k == "front":
+            front = st.camera_input("📸 Shop front", key="vf_cam_sum", label_visibility="collapsed")
+            if front is not None:
+                d["front"] = _vf_keep(front)
+                st.rerun(scope="fragment") if _in_fragment() else st.rerun()
+        else:
+            _vf_photo_slot(d, k, f"{VF_PHOTO_LABEL[k]} photo", f"vf_{k}_sum")
     err = _vf_validate(d)
-    if err:
+    if err and not missing:
         st.error(err)
-    else:
+    elif not err:
         st.success("Everything is filled in. Press **✅ Save visit**.")
 
 
@@ -10456,4 +10503,3 @@ elif _label.startswith("🏪"):
     tab_shop_visits()
 else:
     tab_bot()
-    
