@@ -880,25 +880,46 @@ def _request_cookie(name):
         return None
 
 
+def _tokens_fresh(force=False):
+    """The saved-login list, fetched from Dropbox first (after an app restart the local copy is empty).
+    -> (tokens, ok) ; ok=False when the list could not be checked (then nothing is deleted)."""
+    if USE_DROPBOX:
+        try:
+            pull(REMEMBER_FILE, force=force, max_age=60.0)
+        except Exception as e:
+            bot_log("warn", "Remember login", f"could not refresh: {str(e)[:100]}", "kept the phone's login")
+            return _read_tokens(), False
+    return _read_tokens(), True
+
+
 def restore_from_cookie():
-    """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, a new day...)."""
+    """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, an app restart...).
+    The phone's token is only deleted when it is surely invalid — never because Dropbox was slow."""
     token = _request_cookie(COOKIE_TOKEN)
     if not token:
         return False
     h, now = _tok_hash(token), time.time()
-    rec = _read_tokens().get(h)
+    tokens, ok = _tokens_fresh()
+    rec = tokens.get(h)
+    if rec is None and ok:
+        tokens, ok = _tokens_fresh(force=True)          # maybe saved by another session a moment ago
+        rec = tokens.get(h)
+    if rec is None:
+        if ok:                                          # checked the newest list: this token really does not exist
+            st.session_state["cookie_cmd"] = ("clear",)
+        return False
     try:
         users = load_users()
     except Exception:
-        return False
-    u = users.get(rec["user"]) if rec else None
-    if not rec or rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
-        if rec:
-            _modify_tokens(lambda d: (d.pop(h, None), d)[1])
+        return False                                    # cannot check now: keep the token, try again next time
+    u = users.get(rec["user"])
+    if rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
+        _modify_tokens(lambda d: (d.pop(h, None), d)[1])
         st.session_state["cookie_cmd"] = ("clear",)
         return False
     st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
                              "must_change": bool(u.get("must_change"))})
+    st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # refresh the phone's cookie (iPhone/iPad Safari drops old ones)
     audit("login", f"{u['role']} (remembered)")
     if rec.get("exp", 0) - now < (REMEMBER_DAYS - 1) * 86400:     # renew once a day
         def _renew(d):
@@ -961,8 +982,12 @@ def session_ok():
     try:
         rec = load_users().get(user)
     except Exception:
+        if time.time() - st.session_state.get("_users_ok_at", 0) < 3600:   # checked fine less than 1 h ago: stay logged in
+            st.warning("Account storage is not reachable right now; you stay logged in. Saving may fail until it is back.")
+            return True
         st.error("Cannot verify account access. Please retry when account storage is available.")
         return False
+    st.session_state["_users_ok_at"] = time.time()
     if not rec or not rec.get("active", True) or rec.get("role") != role:
         logout("account removed or changed")
         return False
@@ -9314,6 +9339,7 @@ def _vf_save(a, ctx):
         st.error("The visit could not be saved: " + str(e)[:160] + ". Your answers are still here; press Save again.")
         return
     audit("shop visit" + (" (TEST)" if _visit_test_mode() else ""), f"{customer} | {label} | {row['Problems']}")
+    _vf_draft_delete()
     for k in [k for k in list(st.session_state) if str(k).startswith(("visit_gps", "visit_customer", "visit_cam", "visit_files",
                                                                      "visit_before", "visit_after", "vf_", "visit_draft", "visit_ctx"))]:
         st.session_state.pop(k, None)
@@ -9365,6 +9391,7 @@ def _vf_phone_wizard(ctx):
                 st.error(err_here)
             else:
                 d["_step"] = step + 1
+                _vf_draft_save()
                 _frag_rerun()
     elif st.button("✅ Save visit", key="vf_save", type="primary", use_container_width=True):
         err = _vf_validate(d)
@@ -9384,7 +9411,87 @@ def _vf_phone_wizard(ctx):
             st.session_state.get("visit_draft", {}).pop(ctx["key"], None)
             for k in ("visit_gps", "visit_customer", "visit_customer_box", "visit_ctx"):
                 st.session_state.pop(k, None)
+            _vf_draft_delete()
             _frag_rerun()
+    _vf_draft_save()
+
+
+VF_DRAFT_KEEP_H = 8          # an unfinished visit is kept this many hours
+
+
+def _vf_draft_path(user):
+    safe = re.sub(r"[^a-z0-9._-]", "_", str(user or "-").lower())[:40]
+    return os.path.join(CACHE_DIR, "visit_drafts", safe + ".pkl")
+
+
+def _vf_plain(v):
+    """Draft -> plain Python (no app classes), so it can be read back after the app restarts."""
+    if isinstance(v, _Shot):
+        return {"__shot__": True, "data": v.data, "name": v.name, "thumb": v.thumb, "taken": v.taken}
+    if isinstance(v, dict):
+        return {k: _vf_plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return type(v)(_vf_plain(x) for x in v)
+    return v
+
+
+def _vf_unplain(v):
+    if isinstance(v, dict) and v.get("__shot__"):
+        return _Shot(v["data"], v.get("name", "photo.jpg"), v.get("thumb"), v.get("taken"))
+    if isinstance(v, dict):
+        return {k: _vf_unplain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return type(v)(_vf_unplain(x) for x in v)
+    return v
+
+
+def _vf_draft_save():
+    """Keep the unfinished visit on the server, so a phone that slept or reconnected gets it back."""
+    user = current_user()
+    if not user or not st.session_state.get("visit_draft"):
+        return
+    try:
+        path = _vf_draft_path(user)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        blob = pickle.dumps({"saved": time.time(), "draft": _vf_plain(st.session_state.get("visit_draft")),
+                             "ctx": _vf_plain(st.session_state.get("visit_ctx")), "customer": st.session_state.get("visit_customer"),
+                             "gps": st.session_state.get("visit_gps"), "test": bool(st.session_state.get("visit_test_mode"))})
+        _write_atomic(path, blob)
+    except Exception:
+        pass
+
+
+def _vf_draft_restore():
+    """Bring back an unfinished visit after the phone reconnected. Returns True when something was restored."""
+    user = current_user()
+    if not user or st.session_state.get("visit_draft"):
+        return False
+    path = _vf_draft_path(user)
+    try:
+        if not os.path.exists(path) or time.time() - os.path.getmtime(path) > VF_DRAFT_KEEP_H * 3600:
+            return False
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        if data.get("test") and current_role() != "admin":
+            return False
+        st.session_state["visit_draft"] = _vf_unplain(data.get("draft") or {})
+        if data.get("ctx"):
+            st.session_state["visit_ctx"] = _vf_unplain(data["ctx"])
+        for k, sk in (("customer", "visit_customer"), ("gps", "visit_gps")):
+            if data.get(k):
+                st.session_state[sk] = data[k]
+        if data.get("test"):
+            st.session_state["visit_test_mode"] = True
+        return bool(st.session_state["visit_draft"])
+    except Exception:
+        return False
+
+
+def _vf_draft_delete():
+    try:
+        os.remove(_vf_draft_path(current_user()))
+    except Exception:
+        pass
 
 
 def _vf_summary(d, ctx):
@@ -10333,6 +10440,9 @@ def _shop_visits_live():
 
 
 def _shop_visits_body():
+    if _vf_draft_restore():                              # before any switch is drawn (it may turn Test mode on)
+        st.session_state["visit_view"] = "📝 New visit"
+        st.toast("Your unfinished visit was brought back. Carry on where you stopped.", icon="↩️")
     _flash = st.session_state.pop("flash", None)        # saves redraw only Shop Visits, so show their message here
     if _flash:
         st.toast(_flash, icon="✅")
@@ -10447,6 +10557,13 @@ def _shop_visits_body():
 
 ROLE = require_login()                     # nothing below runs until the person is logged in
 _visit_read_gps_params()                   # a shop check-in comes back in the address bar
+if "main_section" not in st.session_state:  # new session (phone woke up / reconnected) with an unfinished visit
+    try:
+        _dp = _vf_draft_path(current_user())
+        if os.path.exists(_dp) and time.time() - os.path.getmtime(_dp) < VF_DRAFT_KEEP_H * 3600:
+            st.session_state["main_section"] = "🏪 Shop Visits"
+    except Exception:
+        pass
 
 _flash = st.session_state.pop("flash", None)
 if _flash:
