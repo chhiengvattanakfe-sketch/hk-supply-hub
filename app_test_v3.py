@@ -8249,6 +8249,7 @@ KM = {
     "6 · South (Chamkarmon · Mean Chey · Dangkao)": "6 · ខាងត្បូង (ចំការមន · មានជ័យ · ដង្កោ)",
     "7 · East (Chbar Ampov · Boeng Snor · Prek Eng)": "7 · ខាងកើត (ច្បារអំពៅ · បឹងស្នោរ · ព្រែកឯង)",
     "8 · Takhmao edge": "8 · ជាយក្រុងតាខ្មៅ", "❓ Zone not set": "❓ មិនទាន់កំណត់តំបន់",
+    "🚫 Outside Phnom Penh": "🚫 នៅក្រៅភ្នំពេញ",
     # what was fixed, status, review
     "Sticker changed": "បានប្តូរស្ទីគ័រ", "FIFO fixed": "បានរៀប FIFO", "Fridge/display cleaned": "បានសម្អាត / រៀបទូ",
     "Open": "មិនទាន់ដោះស្រាយ", "No problem": "គ្មានបញ្ហា", "Fixed": "បានដោះស្រាយ",
@@ -8323,41 +8324,81 @@ VISIT_ZONE_NOT_SET = "❓ Zone not set"
 VISIT_ZONES = {
     "1 · Center (Daun Penh · 7 Makara · BKK)": [
         "ផ្សារថ្មី", "វិមានឯករាជ្យ", "ស៊ីសុវត្", "ក្រោយវាំង", "វត្តភ្នំ", "វត្ដភ្នំ", "បឹងកេងកង", "អូឬស្សី", "អូរឬស្សី",
-        "អូឡាំព", "អូរឡាំពិក", "ចតុមុខ", "យុគន្ធ", "វិមានភ្នំពេញ", "ផ្សារកណ្ដាល", "ផ្សារកណ្តាល", "កោះពេជ្រ",
-        "ក្រសួងសេដ្ឋកិច្ច", "ក្រសួងការងារ", "BKK", "OLYMPI", "OLYMAPIC", "DIAMOND", "RIVERSIDE"],
+        "អូឡាំព", "អូរឡាំពិក", "ចតុមុខ", "យុគន្ធ", "MART វិមានភ្នំពេញ", "ផ្សារកណ្ដាល", "ផ្សារកណ្តាល", "កោះពេជ្រ",
+        "DAUN PENH", "DOUN PENH", "PSAR THMEI", "ទួលស្វាយព្រៃ", "TOUL SVAY PREY", "TUOL SVAY PREY",
+        "CHAKTUMUK", "CHAKTOMUK", "KENG KANG", "BENG KANG", "TONLE BASSAC", "ទន្លេបាសាក់", "បុរីកីឡា", "កាល់ម៉ែត្រ", "CALMETTE", "CENTRAL MARKET", "7 MAKARA", "7MAKARA", "៧មករា", "7 មករា", "7មករា",
+        "ក្រសួងសេដ្ឋកិច្ច", "ក្រសួងការងារ", "BKK", "OLYMPI", "OLYMAPIC", "DIAMOND ISLAND", "RIVERSIDE"],
     "2 · Tuol Kouk": [
         "ទួលគោក", "ទូលគោក", "បឹងកក់", "ទឹកល្អក់", "ដីហ៊ុយ", "ដីហុយ", "ដេប៉ូ", "បឹងសាឡាង", "ពេទ្យរុស្សី",
-        "មន្ទីរពេទ្យកុមារជាតិ", "កម្ពុជាក្រោម", "កម្ពជាក្រោម", "TUOL KORK", "TOUL KORK", "TK STORE", "TK AVENUE"],
+        "មន្ទីរពេទ្យកុមារជាតិ", "TOUL KOK", "TUOLKORK", "BOENG KAK", "BOEUNG KAK", "BEONG KAK", "DEPO", "កម្ពុជាក្រោម", "កម្ពជាក្រោម", "TUOL KORK", "TOUL KORK", "TK STORE", "TK AVENUE"],
     "3 · North (Russey Keo · Chroy Changvar · Prek Pnov)": [
         "ឫស្សីកែវ", "ឬស្សីកែវ", "ជ្រោយចង្វា", "ព្រែកព្នៅ", "ព្រែកលាប", "ទួលសង្កែ", "ព្រែកតាទែន", "ព្រែកអញ្ចាញ",
-        "គីឡូ", "ផ្លូវលេខ6A", "6A", "OCIC", "RUSSEY KEO", "CHROY CHANGVAR"],
+        "គីឡូ", "ផ្លូវលេខ6A", "6A", "OCIC", "RUSSEY KEO", "CHROY CHANGVAR", "PREK PNOV", "PREK LEAP",
+        "TUOL SANGKAE", "TOUL SANGKE", "KILO", "REOUSSEY KEO", "CHROY CHONG VA", "CHROY CHANG VA",
+        "ព្រែកលាភ", "598"],
     "4 · West (Sen Sok · Phnom Penh Thmey)": [
         "សែនសុខ", "ភ្នំពេញថ្មី", "ទឹកថ្លា", "ក្រាំងធ្នង់", "ក្រាំងធ្នុង", "ឈូកមាស", "អ៊ីអន2", "អ៊ីអន ២", "ពិភពថ្មី",
-        "បៀលប្រាយ", "បុរីសុខសាន្ដ", "បុរីសុខសាន្ត", "SEN SOK", "SENSOK", "AEON 2", "AEON2"],
+        "បៀលប្រាយ", "បុរីវិមានភ្នំពេញថ្មី", "សំរោងអណ្ដែត", "សំរោងអណ្តែត",
+        "PHNOM PENH THMEY", "PP THMEY", "TEUK THLA", "TUEK THLA", "CHUK MEAS", "SEN SOK",
+        "GRAND PHNOM PENH", "ផ្លូវ 2004", "ផ្លូវ2004", "2004", "2002", "ផ្សារត្រពាំងឈួក", "SENSOK", "AEON 2", "AEON2"],
     "5 · South-west (Pou Senchey · Kamboul · Airport)": [
         "ពោធិ៍សែនជ័យ", "ពោធិសែនជ័យ", "ចោមចៅ", "កប់ស្រូវ", "កំបូល", "វេងស្រេង", "ពោធិចិនតុង", "ពោធិ៍ចិនតុង",
-        "ត្រពាំងថ្លឹង", "ព្រៃស", "ព្រៃទា", "កាំកូ", "ទួលពង្រ", "តាំងក្រសាំង", "ក្រសួងការពារជាតិ", "ចម្រើនផល",
-        "ព្រៃជីសាក់", "គួរស្រូវ", "ឈូកវ៉ា", "បែកចាន", "CAMCO", "POCHENTONG", "AIRPORT"],
+        "ត្រពាំងថ្លឹង", "ព្រៃទា", "កាំកូ", "ទួលពង្រ", "តាំងក្រសាំង", "ក្រសួងការពារជាតិ", "ចម្រើនផល",
+        "ព្រៃជីសាក់", "គួរស្រូវ", "ឈូកវ៉ា", "បែកចាន", "ជម្ពូវ័ន្ត", "ជម្ពូវន្ត", "ជម្ពូវ័ន", "អង្គតាមិញ", "CHOMPOU VORN", "បុរីសន្តិភាព", "បុរីសន្ដិភាព", "CAMCO", "POCHENTONG", "AIRPORT",
+        "POR SEN CHEY", "POU SENCHEY", "PORSENCHEY", "CHOM CHAO", "CHOMCHAO", "KAMBOUL", "KAKAB", "VENG SRENG", "KOB SROV",
+        "KORK KLEANG"],
     "6 · South (Chamkarmon · Mean Chey · Dangkao)": [
         "ចំការដូង", "ចំកាដូង", "ស្ទឹងមានជ័យ", "ចាក់អង្រែ", "បឹងទំពុន", "ទួលទំពូង", "ក្បាលថ្នល់", "ដង្កោ",
-        "ជម្ពូវ័ន្ត", "ជម្ពូវន្ត", "ផ្សាររុស្សី", "បឹងត្របែក", "ទួលស្វាយព្រៃ", "ផ្លូវសឡា", "វត្តអង្គតាមិញ",
-        "271", "CHIP MONG 271", "MEAN CHEY", "CHAMKARMON", "TOUL TOM POUNG"],
+        "ផ្សាររុស្សី", "បឹងត្របែក",  "ផ្លូវសឡា", 
+        "271", "CHIP MONG 271", "MEAN CHEY", "CHAMKARMON", "TOUL TOM POUNG", "CHAK ANGRE", "CHAKANGRE",
+        "STEUNG MEANCHEY", "STUNG MEANCHEY", "TUOL TOMPOUNG", "TOUL TUMPUNG", "RUSSIAN MARKET", "DANGKAO", "BOENG TUMPUN",
+        "CHAMKAR DOUNG", "CHAMKA DOUNG", "PHSAR DEUM THKOV", "DEUM THKOV", "ដើមថ្កូវ", "TOUL TOMPUNG",
+        "ព្រៃស", "PREY SAR", "CHERNG EK", "CHOEUNG EK", "ជើងឯក", "ត្នោតជ្រុំ", "អ៊ីអន 3", "អ៊ីអន3", "AEON 3", "AEON3", "AEON MEAN CHEY",
+        "បុរីសូនី", "បូរីសូនី", "ពោធិញាណ", "ពោធិ៍ញ្ញាណ", "ពោធិ៍ញាណ"],
     "7 · East (Chbar Ampov · Boeng Snor · Prek Eng)": [
         "ច្បារអំពៅ", "ច្បាអំពៅ", "បឹងស្នោរ", "ព្រែកឯក", "ជាសុផារ៉ា", "និរោធ", "ព្រែកប្រា", "កោះនរា", "វាលស្បូវ",
-        "CHBAR AMPOV", "CHBA AMPOV"],
+        "CHBAR AMPOV", "CHBA AMPOV", "PREK ENG", "NIROTH", "KOH NORA", "VEAL SBOV", "BOENG SNOR",
+        "ជាសុផារា", "កៀនស្វាយ", "KIEN SVAY"],
     "8 · Takhmao edge": ["តាខ្មៅ", "ព្រែកហូរ", "ព្រែកសំរោង", "ផ្សារសិត្បូ", "TAKHMAO", "TA KHMAO"],
 }
-VISIT_ZONE_NAMES = list(VISIT_ZONES) + [VISIT_ZONE_NOT_SET]
+VISIT_ZONE_NAMES = list(VISIT_ZONES) + [VISIT_ZONE_NOT_SET, "🚫 Outside Phnom Penh"]
 _VISIT_ZONE_WORDS = sorted(((w.upper().replace(" ", ""), z) for z, ws in VISIT_ZONES.items() for w in ws),
                            key=lambda x: -len(x[0]))          # longest words first ("CHIP MONG 271" before "271")
 
 
 def _visit_zone_auto(name):
-    t = unicodedata.normalize("NFC", str(name)).upper().replace("​", "").replace(" ", "")
+    return _visit_zone_auto_info(name)[0]
+
+
+VISIT_ZONE_OUTSIDE = "🚫 Outside Phnom Penh"
+VISIT_OUTSIDE_WORDS = ["ឧត្ដមានជ័យ", "ឧត្តរមានជ័យ", "ODDAR MEANCHEY"]
+
+
+def _visit_zone_auto_info(name):
+    """-> (zone, note). note = "" when clear, or why a person should check it (two zones / another province).
+    Number words (street 2004, 598…) must stand alone; other words may be part of the name."""
+    raw = unicodedata.normalize("NFC", str(name)).replace("\u200b", "")
+    t = raw.upper().replace(" ", "")
+    tokens = set(re.split(r"[\s(),.]+", raw.upper()))
+    try:
+        prov, how = detect_province(raw, allow_pp=False)
+        if how != "province name":          # town / market names repeat across provinces ("ផ្សារឈូក" is also in Kampot)
+            prov = None
+    except Exception:
+        prov = None
+    if (prov and prov != "Kandal") or any(w.upper().replace(" ", "") in t for w in VISIT_OUTSIDE_WORDS):
+        return VISIT_ZONE_OUTSIDE, f"name says {prov or 'Oddar Meanchey'}"
+    hits = []
     for w, z in _VISIT_ZONE_WORDS:
-        if w in t:
-            return z
-    return VISIT_ZONE_NOT_SET
+        if (w in tokens) if w.isdigit() else (w in t):
+            hits.append((len(w), z))
+    if not hits:
+        return VISIT_ZONE_NOT_SET, ""
+    zones = []
+    for _l, z in sorted(hits, reverse=True):
+        if z not in zones:
+            zones.append(z)
+    return zones[0], ("name has 2 zones: " + " / ".join(z.split(" (")[0] for z in zones[:2])) if len(zones) > 1 else ""
 
 
 def _visit_shop_settings():
@@ -8380,10 +8421,72 @@ def _visit_type_map(names):
     return {k: over.get(k) or _visit_type_auto(n) for k, n in names.items()}
 
 
-def _visit_zone_map(names):
-    """{key: zone} for every Phnom Penh customer: Admin's choice first, then the name guess."""
+# Phnom Penh khans: (Khmer name, lat, lon, visit zone). A shop with a real location gets the zone of its nearest khan.
+_Z = list(VISIT_ZONES)
+VISIT_KHANS = [
+    ("ដូនពេញ", 11.5710, 104.9210, _Z[0]), ("៧មករា", 11.5630, 104.9120, _Z[0]), ("បឹងកេងកង", 11.5530, 104.9230, _Z[0]),
+    ("កោះពេជ្រ", 11.5530, 104.9400, _Z[0]),
+    ("ទួលគោក", 11.5780, 104.8960, _Z[1]),
+    ("ឫស្សីកែវ", 11.6150, 104.9050, _Z[2]), ("ជ្រោយចង្វារ", 11.6100, 104.9400, _Z[2]), ("ព្រែកព្នៅ", 11.6650, 104.8500, _Z[2]),
+    ("សែនសុខ", 11.5900, 104.8650, _Z[3]),
+    ("ពោធិ៍សែនជ័យ", 11.5200, 104.8100, _Z[4]), ("កំបូល", 11.5400, 104.7400, _Z[4]), ("ពោធិ៍ចិនតុង", 11.5480, 104.8450, _Z[4]),
+    ("ចំការមន", 11.5400, 104.9180, _Z[5]), ("មានជ័យ", 11.5200, 104.9150, _Z[5]), ("ដង្កោ", 11.4700, 104.8700, _Z[5]),
+    ("ច្បារអំពៅ", 11.5300, 104.9550, _Z[6]),
+    ("តាខ្មៅ", 11.4830, 104.9450, _Z[7]),
+]
+VISIT_KHAN_MAX_M = 9000           # farther than this from every khan centre = outside Phnom Penh: the location is not used
+
+
+def _visit_zone_from_gps(lat, lon):
+    """-> (zone, khan name) from a real location, or (None, None) when it is outside Phnom Penh."""
+    d, khan, zone = min((_haversine_m(lat, lon, a, b), k, z) for k, a, b, z in VISIT_KHANS)
+    return (zone, khan) if d <= VISIT_KHAN_MAX_M else (None, None)
+
+
+def _visit_zone_info(names):
+    """{key: (zone, where it came from)} — Admin's choice, else the real location, else the name. Reused for 2 minutes."""
+    try:
+        sig = (len(names), hash(tuple(sorted(names))), os.path.getmtime(VISIT_PIN_FILE) if os.path.exists(VISIT_PIN_FILE) else 0,
+               os.path.getmtime(VISIT_ZONE_FILE) if os.path.exists(VISIT_ZONE_FILE) else 0, int(time.time() // 120),
+               len(st.session_state.get("_visit_new", {}) or {}))
+    except Exception:
+        sig = None
+    hit = st.session_state.get("_visit_zone_cache")
+    if sig is not None and hit and hit[0] == sig:
+        return hit[1]
     over = _visit_zone_overrides()
-    return {k: over.get(k) or _visit_zone_auto(n) for k, n in names.items()}
+    registry, store = _visit_registry(), _visit_pin_store()
+    try:
+        auto = _visit_candidates_for(names, registry)[1]
+    except Exception:
+        auto = {}
+    out = {}
+    for k, n in names.items():
+        if over.get(k):
+            out[k] = (over[k], "👤 Admin")
+            continue
+        pin = _visit_pin(n, registry, store, auto)
+        if pin:
+            z, khan = _visit_zone_from_gps(*pin)
+            if z:
+                out[k] = (z, f"📍 ខណ្ឌ{khan} (GPS)")
+                continue
+            out[k] = (VISIT_ZONE_OUTSIDE, "🚫 ទីតាំងនៅក្រៅភ្នំពេញ (GPS) — ពិនិត្យ Master List")
+            continue
+        z, note = _visit_zone_auto_info(n)
+        if z == VISIT_ZONE_OUTSIDE:
+            out[k] = (z, "🚫 ឈ្មោះមានខេត្តផ្សេង — ពិនិត្យ Master List")
+        elif note:
+            out[k] = (z, "🔤⚠️ ឈ្មោះមាន 2 តំបន់ — សូមពិនិត្យ")
+        else:
+            out[k] = (z, "🔤 តាមឈ្មោះ")
+    st.session_state["_visit_zone_cache"] = (sig, out)
+    return out
+
+
+def _visit_zone_map(names):
+    """{key: zone} for every Phnom Penh customer: Admin's choice, then the real location, then the name."""
+    return {k: v[0] for k, v in _visit_zone_info(names).items()}
 
 
 def _visit_today_count(visits, user):
@@ -8404,7 +8507,7 @@ def _visit_zone_picker(zone_map, key, due=None):
     """Zone selector, remembered for the day so staff pick it once. due = Counter(zone -> shops due now)."""
     counts = Counter(zone_map.values())
     due = due or Counter()
-    options = [z for z in VISIT_ZONE_NAMES if counts.get(z)]
+    options = [z for z in VISIT_ZONE_NAMES if counts.get(z) and not z.startswith("🚫")]
     if not options:
         return None
     mem = st.session_state.get("visit_zone_today")
@@ -8424,7 +8527,8 @@ def _visit_map_link(customer, registry, store=None, auto=None):
 
 def _visit_zones_admin(names, visits):
     st.markdown("#### 🗺️ Zones & shop types")
-    st.caption("The app guesses each shop's zone and type from its name. Change the **Zone** or **Type** cell for any shop "
+    st.caption("Zone comes from the shop's real location (📍 nearest khan) when it has one, otherwise from its name (🔤). "
+               "Change the **Zone** or **Type** cell for any shop "
                "that is wrong or ❓ not set, then press Save. Your choice always wins over the guess.")
     over = _visit_zone_overrides()
     last = {}
@@ -8432,7 +8536,9 @@ def _visit_zones_admin(names, visits):
         v = visits.assign(Key=visits["Customer"].map(norm_name))
         last = v.groupby("Key")["_dt"].max().to_dict()
     tmap = _visit_type_map(names)
-    rows = [{"Customer": n, "Guess": _visit_zone_auto(n), "Zone": over.get(k) or _visit_zone_auto(n),
+    info = _visit_zone_info(names)
+    rows = [{"Customer": n, "Guess": info.get(k, (None, ""))[1] + " → " + str(_km(info.get(k, (_visit_zone_auto(n), ""))[0])),
+             "Zone": over.get(k) or info.get(k, (_visit_zone_auto(n), ""))[0],
              "Type": tmap.get(k, VISIT_TYPE_OTHER), "Set by admin": k in over,
              "Last visit": f"{last[k]:%d %b}" if k in last else "never"} for k, n in names.items()]
     frame = pd.DataFrame(rows).sort_values(["Zone", "Customer"]).reset_index(drop=True)
@@ -8991,7 +9097,7 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
         v["Key"] = v["Customer"].map(norm_name)
         last_visit = v.groupby("Key")["_dt"].max().to_dict()
         open_prob = Counter(v.loc[v["Status"].eq("Open"), "Key"])
-    keys = set(names)
+    keys = {k for k in names if not str((zone_map or {}).get(k, "")).startswith("🚫")}     # shops outside Phnom Penh are not visited
     if zone:
         keys = {k for k in keys if (zone_map or {}).get(k) == zone}
     new = st.session_state.get("_visit_new", {}) or {}
@@ -10618,6 +10724,7 @@ def _shop_visits_body():
         _visit_progress(visits, user)
         _visit_redo_notice(visits, user)
         zone_map = _visit_zone_map(names)
+        zone_src = {k: v[1] for k, v in _visit_zone_info(names).items()}
         all_route = _visit_route(visits, stats, names, areas, zone_map)
         due_all = _visit_is_due(all_route)
         zone = _visit_zone_picker(zone_map, "visit_zone_plan", Counter(due_all["Area"]))
@@ -10644,7 +10751,8 @@ def _shop_visits_body():
             with st.container(border=True):
                 c1, c2, c3 = st.columns([4, 1, 1])
                 c1.markdown(f"**{'⭐ ' if n < VISIT_DAILY_TARGET and not q.strip() else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
-                            f"<span style='color:#6B7280'>{_km(row['Size'])} · ចុះហាងចុងក្រោយ {_km_days(row['Last visit'])} · {row['Pcs 28 days']:,} pcs ក្នុង ២៨ ថ្ងៃ</span>",
+                            f"<span style='color:#6B7280'>{_km(row['Size'])} · ចុះហាងចុងក្រោយ {_km_days(row['Last visit'])} · {row['Pcs 28 days']:,} pcs ក្នុង ២៨ ថ្ងៃ"
+                            f" · {zone_src.get(norm_name(row['Customer']), '')}</span>",
                             unsafe_allow_html=True)
                 c2.link_button("🧭 ទៅ" if exact else "⚠️ គ្មានទីតាំង", link, use_container_width=True,
                                help="ផ្លូវទៅទីតាំងហាងដែលបានរក្សាទុក" if exact
