@@ -8424,15 +8424,15 @@ def _visit_type_map(names):
 # Phnom Penh khans: (Khmer name, lat, lon, visit zone). A shop with a real location gets the zone of its nearest khan.
 _Z = list(VISIT_ZONES)
 VISIT_KHANS = [
-    ("ដូនពេញ", 11.5710, 104.9210, _Z[0]), ("៧មករា", 11.5630, 104.9120, _Z[0]), ("បឹងកេងកង", 11.5530, 104.9230, _Z[0]),
-    ("កោះពេជ្រ", 11.5530, 104.9400, _Z[0]),
-    ("ទួលគោក", 11.5780, 104.8960, _Z[1]),
-    ("ឫស្សីកែវ", 11.6150, 104.9050, _Z[2]), ("ជ្រោយចង្វារ", 11.6100, 104.9400, _Z[2]), ("ព្រែកព្នៅ", 11.6650, 104.8500, _Z[2]),
-    ("សែនសុខ", 11.5900, 104.8650, _Z[3]),
-    ("ពោធិ៍សែនជ័យ", 11.5200, 104.8100, _Z[4]), ("កំបូល", 11.5400, 104.7400, _Z[4]), ("ពោធិ៍ចិនតុង", 11.5480, 104.8450, _Z[4]),
-    ("ចំការមន", 11.5400, 104.9180, _Z[5]), ("មានជ័យ", 11.5200, 104.9150, _Z[5]), ("ដង្កោ", 11.4700, 104.8700, _Z[5]),
+    ("ដូនពេញ", 11.5750, 104.9200, _Z[0]), ("៧មករា", 11.5650, 104.9100, _Z[0]), ("បឹងកេងកង", 11.5520, 104.9220, _Z[0]),
+    ("កោះពេជ្រ", 11.5530, 104.9420, _Z[0]),
+    ("ទួលគោក", 11.5800, 104.8930, _Z[1]),
+    ("ឫស្សីកែវ", 11.6250, 104.9120, _Z[2]), ("ជ្រោយចង្វារ", 11.6100, 104.9450, _Z[2]), ("ព្រែកព្នៅ", 11.6800, 104.8400, _Z[2]),
+    ("សែនសុខ", 11.6050, 104.8620, _Z[3]),
+    ("ពោធិ៍សែនជ័យ", 11.5300, 104.8000, _Z[4]), ("កំបូល", 11.5450, 104.7350, _Z[4]), ("ពោធិ៍ចិនតុង", 11.5480, 104.8450, _Z[4]),
+    ("ចំការមន", 11.5380, 104.9250, _Z[5]), ("មានជ័យ", 11.5150, 104.9150, _Z[5]), ("ដង្កោ", 11.4700, 104.8650, _Z[5]),
     ("ច្បារអំពៅ", 11.5300, 104.9550, _Z[6]),
-    ("តាខ្មៅ", 11.4830, 104.9450, _Z[7]),
+    ("តាខ្មៅ", 11.4800, 104.9480, _Z[7]),
 ]
 VISIT_KHAN_MAX_M = 9000           # farther than this from every khan centre = outside Phnom Penh: the location is not used
 
@@ -8525,8 +8525,69 @@ def _visit_map_link(customer, registry, store=None, auto=None):
     return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(f"{customer} Phnom Penh"), False
 
 
+def _visit_zone_evidence(n, registry, store, auto):
+    """What the shop's location / name say, ignoring Admin: (zone, why)."""
+    pin = _visit_pin(n, registry, store, auto)
+    if pin:
+        z, khan = _visit_zone_from_gps(*pin)
+        return (z or VISIT_ZONE_OUTSIDE), (f"location: ខណ្ឌ{khan}" if z else "location outside Phnom Penh")
+    z, note = _visit_zone_auto_info(n)
+    return z, ("name" + (f" ({note})" if note else ""))
+
+
+def _visit_override_audit(names):
+    """Admin zones that disagree with the shop's own location or name (e.g. saved by mistake)."""
+    df = _visit_shop_settings()
+    if df.empty:
+        return pd.DataFrame()
+    registry, store = _visit_registry(), _visit_pin_store()
+    try:
+        auto = _visit_candidates_for(names, registry)[1]
+    except Exception:
+        auto = {}
+    latest = df.sort_values("_dt").groupby(df["Customer"].map(norm_name)).tail(1)
+    rows = []
+    for _, r in latest.iterrows():
+        k = norm_name(r["Customer"])
+        if k not in names or r["Zone"] not in VISIT_ZONE_NAMES:
+            continue
+        ez, why = _visit_zone_evidence(names[k], registry, store, auto)
+        if ez.startswith("❓") or ez == r["Zone"]:
+            continue
+        rows.append({"Remove": True, "Customer": names[k], "Admin zone": _km(r["Zone"]), "Shop says": _km(ez),
+                     "Because of": why, "Saved": str(r["Date"])[:16], "By": r["By"]})
+    return pd.DataFrame(rows)
+
+
+def _visit_override_cleanup(names):
+    bad = _visit_override_audit(names)
+    if bad.empty:
+        return
+    with st.expander(f"🧹 {len(bad)} Admin zones disagree with the shop's own location / name — check them", expanded=True):
+        st.caption("Admin's choice always wins, so a zone saved by mistake sends staff to the wrong area. Ticked rows are "
+                   "removed: the shop then uses its location or name again. Untick any Admin zone that is really correct.")
+        ver = st.session_state.get("_vz_ver", 0)
+        ed = st.data_editor(bad, hide_index=True, use_container_width=True, key=f"vz_clean_{ver}",
+                            disabled=[c for c in bad.columns if c != "Remove"],
+                            column_config={"Remove": st.column_config.CheckboxColumn("Remove")})
+        pick = set(ed.loc[ed["Remove"].fillna(False).astype(bool), "Customer"].map(norm_name))
+        if st.button(f"🧹 Remove {len(pick)} Admin zone(s)", type="primary", disabled=not pick, key="vz_clean_btn"):
+            def _drop(df, pick=pick):
+                return df[~df["Customer"].map(norm_name).isin(pick)].drop(columns=[c for c in ("_dt",) if c in df])
+            try:
+                modify_csv(VISIT_ZONE_FILE, VISIT_SET_COLS, _drop)
+                audit("visit zones cleaned", f"{len(pick)} removed")
+                st.session_state["flash"] = f"Removed {len(pick)} Admin zone(s)"
+                st.session_state["_vz_ver"] = ver + 1
+                st.session_state.pop("_visit_zone_cache", None)
+                _frag_rerun()
+            except Exception as e:
+                st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+
+
 def _visit_zones_admin(names, visits):
     st.markdown("#### 🗺️ Zones & shop types")
+    _visit_override_cleanup(names)
     st.caption("Zone comes from the shop's real location (📍 nearest khan) when it has one, otherwise from its name (🔤). "
                "Change the **Zone** or **Type** cell for any shop "
                "that is wrong or ❓ not set, then press Save. Your choice always wins over the guess.")
@@ -8554,12 +8615,23 @@ def _visit_zones_admin(names, visits):
         view = view[view["Zone"].eq(only)]
     if q.strip():
         view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
-    edited = st.data_editor(view, hide_index=True, use_container_width=True, key="vz_editor",
+    ver = st.session_state.get("_vz_ver", 0)               # new editor after each save / filter change: old edits never
+    ekey = f"vz_editor_{ver}_{abs(hash((only, q.strip()))) % 10**8}"   # move onto other rows
+    edited = st.data_editor(view, hide_index=True, use_container_width=True, key=ekey,
                             disabled=["Customer", "Guess", "Set by admin", "Last visit"],
                             column_config={"Zone": st.column_config.SelectboxColumn("Zone", options=VISIT_ZONE_NAMES, required=True),
                                            "Type": st.column_config.SelectboxColumn("Type", options=VISIT_TYPE_NAMES, required=True)},
                             height=min(520, 60 + 35 * max(1, len(view))))
-    changed = edited[(edited["Zone"] != view["Zone"]) | (edited["Type"] != view["Type"])]
+    before = view.set_index("Customer")
+    after = edited.set_index("Customer")
+    diff = [(c, before.at[c, "Zone"], after.at[c, "Zone"], before.at[c, "Type"], after.at[c, "Type"])
+            for c in after.index if c in before.index and
+            (after.at[c, "Zone"] != before.at[c, "Zone"] or after.at[c, "Type"] != before.at[c, "Type"])]
+    changed = pd.DataFrame([{"Customer": c, "Zone": z1, "Type": t1} for c, _z0, z1, _t0, t1 in diff])
+    if diff:
+        st.markdown("**You are about to save:**")
+        st.markdown("\n".join(f"- **{c}**: {_km(z0)} → **{_km(z1)}**" + (f" · {_km(t0)} → **{_km(t1)}**" if t0 != t1 else "")
+                               for c, z0, z1, t0, t1 in diff))
     if st.button(f"💾 Save {len(changed)} change(s)", type="primary", disabled=changed.empty, key="vz_save"):
         who, at = current_user() or "-", now_str()
 
@@ -8572,6 +8644,8 @@ def _visit_zones_admin(names, visits):
             modify_csv(VISIT_ZONE_FILE, VISIT_SET_COLS, _apply)
             audit("visit zones", f"{len(changed)} changed")
             st.session_state["flash"] = f"Saved {len(changed)} zone change(s)"
+            st.session_state["_vz_ver"] = ver + 1
+            st.session_state.pop("_visit_zone_cache", None)
             _frag_rerun()
         except Exception as e:
             st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
