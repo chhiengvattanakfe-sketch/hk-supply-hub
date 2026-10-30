@@ -7155,12 +7155,12 @@ def _si_contact_text(c):
     if not c:
         return "⏳ មិនទាន់ទាក់ទង"
     d = pd.to_datetime(c.get("Date"), errors="coerce")
-    bits = [f"✅ {d:%d %b}" if pd.notna(d) else "✅"]
-    for col in ("Platform", "Outcome", "Recorded by"):
+    bits = [f"✅ {d:%d %b}" if pd.notna(d) else "✅", _si_platform_of(c)]
+    for col in ("Notes", "Recorded by"):
         v = str(c.get(col, "") or "").strip()
         if v and v not in ("-", "nan"):
-            bits.append(v)
-    return " · ".join(bits)
+            bits.append(v[:60])
+    return " · ".join(b for b in bits if b)
 
 
 def _si_no_order_contact_table(frame, history, month_start, key, height=420):
@@ -7184,8 +7184,7 @@ def _si_no_order_contact_table(frame, history, month_start, key, height=420):
         st.caption("គ្មាន")
         return
     view.insert(0, "✅ ទាក់ទងហើយ", view["_k"].isin(contacted))
-    view["Platform"] = [(_si_platform_guess(history, c) if k not in contacted
-                         else (contacted[k].get("Platform") if contacted[k].get("Platform") in CALL_PLATFORMS else _si_platform_guess(history, c)))
+    view["Platform"] = [(_si_platform_of(contacted[k]) if k in contacted else "") or _si_platform_guess(history, c)
                         for k, c in zip(view["_k"], view["Customer"])]
     view["Outcome"] = [contacted[k].get("Outcome") if k in contacted and contacted[k].get("Outcome") in CALL_OUTCOMES
                        else "Reached customer" for k in view["_k"]]
@@ -7528,11 +7527,24 @@ def _si_platform_guess(history, customer, phone=""):
     except Exception:
         pass
     ph = str(phone or "").strip().lower()
-    if "t.me" in ph or ph.startswith("@") or "telegram" in ph:
+    if "t.me" in ph or ph.startswith("@") or ph.startswith("tel") or "telegram" in ph or "telrgram" in ph or "telegarm" in ph:
         return "✈️ Telegram"
-    if "facebook" in ph or "fb.com" in ph or "m.me" in ph:
+    if "facebook" in ph or "fb.com" in ph or "m.me" in ph or ph.startswith("page") or "messenger" in ph:
         return "💬 Messenger / Facebook"
+    if "whatsapp" in ph:
+        return "🟢 WhatsApp"
+    if "wechat" in ph:
+        return "💚 WeChat"
     return CALL_PLATFORMS[0]
+
+
+def _si_platform_of(call):
+    """Platform of one saved contact. Older notes have no Platform column: staff typed 'Telegram' / 'Page' in Phone."""
+    p = str(call.get("Platform", "") or "")
+    if p in CALL_PLATFORMS:
+        return p
+    ph = str(call.get("Phone", "") or "").strip()
+    return _si_platform_guess(None, "", ph) if ph and ph not in ("-", "nan") else ""
 CALL_OUTCOMES = ["Reached customer", "No answer", "Busy / call back", "Wrong number",
                  "Order requested", "Complaint / problem", "Not interested", "Customer update only"]
 CALL_STATUSES = ["Active", "Follow-up needed", "Temporarily closed", "Stopped buying", "Do not contact"]
@@ -7680,6 +7692,9 @@ def tab_followups():
     _si_call_panel(names)
 
 
+CALL_RECENT_DAYS = 7          # a customer contacted in the last N days is not put back in the urgent call list
+
+
 def _si_contact_context(frame, history, daily, today):
     """Join saved contact history and latest paid orders onto customer lists."""
     result = frame.copy()
@@ -7696,14 +7711,33 @@ def _si_contact_context(frame, history, daily, today):
         order = pd.to_datetime(last_orders.get(key), errors="coerce")
         called_today = pd.notna(called) and called.date() == today
         ordered_today = pd.notna(order) and order.date() == today
+        days_ago = (today - called.date()).days if pd.notna(called) else None
+        recent = days_ago is not None and 0 <= days_ago <= CALL_RECENT_DAYS
+        ordered_after = pd.notna(order) and pd.notna(called) and order.normalize() > called.normalize()
         due = pd.to_datetime(call.get("Follow-up date", ""), errors="coerce")
         scheduled = pd.notna(due) and due.date() > today and call.get("Follow-up state") in ("Open", "Awaiting order")
-        state = "Ordered today" if ordered_today else ("Call recorded today" if called_today else ("Follow-up scheduled" if scheduled else ("Previously contacted" if call else "Not contacted")))
+        plat = _si_platform_of(call) if call else ""
+        when = (f"{called:%d %b}" + (" (today)" if days_ago == 0 else f" ({days_ago} d ago)")) if pd.notna(called) else ""
+        if ordered_today:
+            state = "🛒 Ordered today"
+        elif call and ordered_after:
+            state = f"🛒 Ordered after contact on {when}"
+        elif called_today:
+            state = "✅ Contacted today" + (f" · {plat}" if plat else "")
+        elif scheduled:
+            state = f"📅 Follow-up {due:%d %b}"
+        elif recent:
+            state = f"✅ Contacted {when}" + (f" · {plat}" if plat else "") + " — waiting"
+        elif call:
+            state = f"☑️ Last contact {when}" + (f" · {plat}" if plat else "")
+        else:
+            state = "⏳ Not contacted"
         rows.append({"Contact status": state, "Last call": clean(call.get("Date", "")),
                      "Call outcome": clean(call.get("Outcome", "")), "Last call note": clean(call.get("Notes", "")),
                      "Next action": clean(call.get("Next action", "")), "Follow-up date": clean(call.get("Follow-up date", "")),
                      "Last order": order.strftime("%Y-%m-%d") if pd.notna(order) else "",
-                     "Call now": not (ordered_today or called_today or scheduled or call.get("Customer status") == "Do not contact")})
+                     "Call now": not (ordered_today or called_today or scheduled or (recent and not ordered_after)
+                                      or call.get("Customer status") in ("Do not contact", "Temporarily closed", "Stopped buying"))})
     if rows:
         for column in rows[0]: result[column] = [r[column] for r in rows]
     else:
