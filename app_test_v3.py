@@ -6269,8 +6269,32 @@ class _ResolvedMapPin(Exception):
         self.url = url
 
 
+_MAP_CONSENT_HOSTS = frozenset({"consent.google.com", "consent.youtube.com"})
+_MAP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0 Safari/537.36"),
+    "Accept-Language": "en-US,en;q=0.8",
+    "Cookie": "CONSENT=YES+cb; SOCS=CAI",          # skip Google's cookie page so the map page itself comes back
+}
+
+
+def _map_consent_target(url):
+    """Google sometimes sends links to its cookie page first; the real map address is in ?continue=."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.hostname in _MAP_CONSENT_HOSTS:
+            nxt = urllib.parse.parse_qs(parsed.query).get("continue", [""])[0]
+            return trusted_map_url(nxt)
+    except (ValueError, TypeError):
+        pass
+    return ""
+
+
 class _MapRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = _map_consent_target(newurl)
+        if target:
+            newurl = target
         if not trusted_map_url(newurl):
             if fp is not None:
                 fp.close()
@@ -6282,22 +6306,73 @@ class _MapRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _map_in_cambodia(lat, lon):
+    return math.isfinite(lat) and math.isfinite(lon) and 10 <= lat <= 15 and 102 <= lon <= 108
+
+
+def _map_coords_from_page(final_url, html):
+    """(lat, lon, how) of the shop on a Google Maps place page, or None.
+    New share links (maps.app.goo.gl → ?q=name&ftid=… or /maps/place/name/data=…) carry no numbers in the address,
+    but the page itself does. Marker positions are used first; the page centre only for a single-place page."""
+    text = urllib.parse.unquote(html.replace("\\u0026", "&").replace("\u0026", "&").replace("&amp;", "&"))
+    num = r"([-+]?\d{1,3}\.\d{3,})"
+    # 1) static map preview with a marker on the place
+    for la, lo in re.findall(r"staticmap\?[^\"'\s]*?markers=[^\"'\s]*?" + num + r"(?:,|%2C)" + num, text):
+        if _map_in_cambodia(float(la), float(lo)):
+            return float(la), float(lo), "marker on the Google place page"
+    # 2) the place's own pin (!3d lat !4d lon); several different pins = not safe to choose
+    pins = {(round(float(la), 5), round(float(lo), 5)) for la, lo in re.findall(r"!3d" + num + r"!4d" + num, text)}
+    pins = {p for p in pins if _map_in_cambodia(*p)}
+    if len(pins) == 1:
+        la, lo = next(iter(pins))
+        return la, lo, "pin on the Google place page"
+    path = urllib.parse.urlsplit(final_url)
+    single_place = "/maps/place/" in path.path or "ftid=" in path.query or "cid=" in path.query
+    if not single_place:
+        return None
+    # 3) static map preview centred on the place
+    for la, lo in re.findall(r"staticmap\?[^\"'\s]*?center=" + num + r"(?:,|%2C)" + num, text):
+        if _map_in_cambodia(float(la), float(lo)):
+            return float(la), float(lo), "centre of the Google place page"
+    # 4) the place address itself: /maps/place/<name>/@lat,lon,zoom
+    m = re.search(r"/@" + num + "," + num + ",", urllib.parse.unquote(final_url))
+    if m and _map_in_cambodia(float(m.group(1)), float(m.group(2))):
+        return float(m.group(1)), float(m.group(2)), "Google place address"
+    # 5) the first map view of the page (centred on the place)
+    m = re.search(r"APP_INITIALIZATION_STATE=\[\[\[[-+\d.e]+," + num + "," + num + r"\]", text)
+    if m and _map_in_cambodia(float(m.group(2)), float(m.group(1))):
+        return float(m.group(2)), float(m.group(1)), "centre of the Google place page"
+    return None
+
+
 def resolve_map_link(url):
-    """Network-only worker: no Streamlit/session access and no coordinates guessed from HTML."""
+    """Network-only worker: no Streamlit/session access. Returns a link that contains the shop's coordinates."""
     if not trusted_map_url(url):
         raise ValueError("Unsupported map link")
     if analyse_map_link(url)["Map status"] == "Ready pin":
         return url
     opener = urllib.request.build_opener(_MapRedirectHandler())
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; CustomerMap/1.0)"})
+    request = urllib.request.Request(url, headers=_MAP_HEADERS)
     try:
-        with opener.open(request, timeout=10) as response:
+        with opener.open(request, timeout=12) as response:
             final_url = response.geturl()
+            target = _map_consent_target(final_url)
+            if target:
+                final_url = target
             if not trusted_map_url(final_url):
                 raise ValueError("Unsupported map destination")
-            if analyse_map_link(final_url)["Map status"] != "Ready pin":
-                raise ValueError("Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead.")
-            return final_url
+            if analyse_map_link(final_url)["Map status"] == "Ready pin":
+                return final_url
+            html = response.read(3_000_000).decode("utf-8", "ignore") if not target else ""
+        if target:                                       # cookie page: open the real map page once
+            with opener.open(urllib.request.Request(final_url, headers=_MAP_HEADERS), timeout=12) as response:
+                html = response.read(3_000_000).decode("utf-8", "ignore")
+        found = _map_coords_from_page(final_url, html)
+        if found:
+            lat, lon, _how = found
+            return f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+        raise ValueError("Link opened but no usable destination coordinates were found. "
+                         "In Google Maps press and hold on the shop to drop a pin, then Share that pin.")
     except _ResolvedMapPin as found:
         return found.url
 
@@ -6414,10 +6489,14 @@ def _map_admin_panel(registry, locations):
                 except Exception as e:
                     st.error(f"Could not remove this match: {e}")
     with st.expander("Expand shortened map links"):
-        pending = locations[locations["Map status"] == "Needs link expansion"]
-        st.caption(f"{len(pending)} links need expansion. The app opens up to 20 links at a time. Your server needs access to Google / Apple Maps.")
+        retry = ("Needs link expansion", "Needs full pin link", "Link has no destination coordinates")
+        pending = locations[locations["Map status"].isin(retry)
+                            & ~locations["Resolution note"].astype(str).str.contains("press and hold", regex=False)]
+        st.caption(f"{len(pending)} links need expansion (links that failed before are tried again with the new reader). "
+                   "The app opens up to 20 links at a time. Your server needs access to Google / Apple Maps.")
         if st.button("Resolve next 20 map links", key="map_resolve", disabled=pending.empty):
-            selected = pending.sort_values("Resolution note", kind="stable").head(20)
+            order = pending["Map status"].map({"Needs link expansion": 0}).fillna(1)
+            selected = pending.assign(_o=order).sort_values(["_o", "Resolution note"], kind="stable").head(20)
             updates, failed = {}, []
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with st.spinner("Checking saved map links…"):
@@ -9611,7 +9690,11 @@ def _visit_new_form(visits, stats, names):
                     st.session_state["flash"] = "📍 បានរក្សាទុកទីតាំងហាងពី link"
                     _frag_rerun()
                 except Exception as e:
-                    st.error("មិនអាចប្រើ link នេះបានទេ: " + str(e)[:160])
+                    if "no usable destination" in str(e):
+                        st.error("link នេះមិនមានទីតាំងហាងទេ។ នៅក្នុង Google Maps ចុចឱ្យជាប់លើហាង (ដាក់ pin ក្រហម) → Share → Copy link "
+                                 "ហើយបិទភ្ជាប់ម្តងទៀត — ឬឈរនៅមុខហាង ហើយចុច 📍 ខ្ញុំនៅហាង។")
+                    else:
+                        st.error("មិនអាចប្រើ link នេះបានទេ: " + str(e)[:160])
         return
     if test:
         gps = st.session_state.get("visit_gps")
