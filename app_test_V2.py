@@ -12266,13 +12266,15 @@ def _media_priority(stats, names, zone_map, shoots, today):
     return out.sort_values(["Priority", "Pcs 28 days"], ascending=False).reset_index(drop=True)
 
 
-MEDIA_RESHOOT_TOP = 20            # top-selling Phnom Penh shops (pcs, last 28 days) worth filming again
+MEDIA_RESHOOT_TOP = 20            # top-selling Phnom Penh shops (pcs, last 28 days): highest re-shoot priority
+MEDIA_RESHOOT_TOP2 = 50           # next group
 MEDIA_RESHOOT_NEAR_KM = 1.5       # filmed shops this close to a new shop / new fridge are filmed again on the same trip
 MEDIA_RESHOOT_MIN_DAYS = 30       # never film the same shop again sooner than this
 
 
 def _media_reshoot_rows(rows, stats, names, zone_map, status, last, t):
-    """🔁 Shops already filmed that are worth filming again: top sellers, and shops near a new shop (same trip)."""
+    """🔁 Every customer already filmed can be filmed again (not sooner than 30 days after the last shoot).
+    Order: top sellers first, then shops near a new shop / new fridge (same trip), then the rest by sales."""
     on_list = {norm_name(r["Customer"]) for r in rows}
     pcs = {}
     for k in names:
@@ -12303,11 +12305,19 @@ def _media_reshoot_rows(rows, stats, names, zone_map, status, last, t):
             continue
         if shot is not None and (t - shot).days < MEDIA_RESHOOT_MIN_DAYS:
             continue
-        score, why = 0, []
+        score, why = 1, []                               # every filmed customer can be filmed again
         rk = rank.get(k)
         if rk and rk <= MEDIA_RESHOOT_TOP:
             score += 3
             why.append(f"⭐ Top sale #{rk}")
+        elif rk and rk <= MEDIA_RESHOOT_TOP2:
+            score += 2
+            why.append(f"⭐ Top {MEDIA_RESHOOT_TOP2} (#{rk})")
+        elif rk:
+            why.append(f"លក់ #{rk}")
+        else:
+            score -= 0.5
+            why.append("មិនបានបញ្ជាទិញ 28 ថ្ងៃ")
         if anchors:
             pin = _visit_pin(name, registry, store, auto)
             if pin:
@@ -12315,8 +12325,9 @@ def _media_reshoot_rows(rows, stats, names, zone_map, status, last, t):
                 if d <= MEDIA_RESHOOT_NEAR_KM * 1000:
                     score += 2
                     why.append(f"📍 ជិត {near[:28]} ({d / 1000:.1f} km)")
-        if not score:
-            continue
+        if shot is not None and (t - shot).days > MEDIA_REFRESH_DAYS:
+            score += 1
+            why.append(f"📷 រូបចាស់ {(t - shot).days} ថ្ងៃ")
         out.append({"Priority": score, "Customer": name, "Zone": zone_map.get(k, VISIT_ZONE_NOT_SET),
                     "Why": "🔁 ថតម្តងទៀត · " + " · ".join(why),
                     "Last photo": f"{shot:%d %b %Y}" if shot is not None else "✅ ថតរួច (មុន · Excel)",
@@ -12356,7 +12367,7 @@ def _media_plan_body(stats, names, zone_map, shoots, today):
               f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Videos', []))}")
     t1, t2 = st.columns(2)
     only_new = t1.toggle("🆕 បង្ហាញតែ ទូថ្មី និង អតិថិជនថ្មី", key="media_only_new")
-    with_re = t2.toggle(f"🔁 ថតម្តងទៀត: Top {MEDIA_RESHOOT_TOP} និងហាងជិតហាងថ្មី ({int(plan['_reshoot'].sum())})",
+    with_re = t2.toggle(f"🔁 ថតម្តងទៀត: ហាងថតរួចទាំងអស់ ({int(plan['_reshoot'].sum())}) — Top sale និងជិតហាងថ្មីមុន",
                         value=True, key="media_with_reshoot")
     view = plan[plan["_new"]] if only_new else plan
     if not with_re:
