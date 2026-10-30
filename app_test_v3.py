@@ -7852,6 +7852,111 @@ def _si_care_cached(sig, today, measure, _daily, _df, _codes, _habits, _names, _
     return _si_care(_daily, _df, _codes, _habits, _names, _areas, today, today.replace(day=1), _avgs, measure)
 
 
+# ---------- 🗺️ map of active customers (always the newest journal + shop pins) ----------
+AMAP_COLORS = {"top": [212, 160, 23], "active": [46, 125, 79], "quiet": [150, 150, 150]}
+
+
+def _si_active_table(daily, names, areas, days, top_n, today):
+    """One row per customer that ordered in the last `days` days: pcs, ៛, order days, last order, rank."""
+    start = pd.Timestamp(today) - pd.Timedelta(days=days - 1)
+    d = daily[(daily["D"] >= start) & (daily["D"] <= pd.Timestamp(today))]
+    if d.empty:
+        return pd.DataFrame()
+    g = d.groupby("Key").agg(Pcs=("Pcs", "sum"), Sales=("Sales", "sum"), Orders=("D", "nunique"), Last=("D", "max"))
+    g = g[g["Pcs"] > 0].sort_values("Sales", ascending=False)
+    g["Rank"] = range(1, len(g) + 1)
+    g["Group"] = ["top" if r <= top_n else "active" for r in g["Rank"]]
+    g["Customer"] = [names.get(k, k) for k in g.index]
+    g["Area"] = [areas.get(k, "") for k in g.index]
+    g["Days since"] = (pd.Timestamp(today) - g["Last"]).dt.days
+    return g.reset_index()
+
+
+def _si_active_map_section(daily, names, areas, today):
+    st.markdown("#### 🗺️ ផែនទីអតិថិជនសកម្ម")
+    st.caption("បង្ហាញអតិថិជនដែលបានបញ្ជាទិញក្នុងរយៈពេលដែលជ្រើស តាម Sale Journal ចុងក្រោយបំផុត។ "
+               "🟡 = Top sale · 🟢 = Active · ទំហំចំណុច = ចំនួននំ។ ចុច 🔄 Refresh ដើម្បីយកទិន្នន័យថ្មី។")
+    c1, c2, c3 = st.columns(3)
+    days = c1.radio("រយៈពេល", [30, 60, 90], index=1, horizontal=True, key="amap_days", format_func=lambda v: f"{v} ថ្ងៃ")
+    top_n = c2.select_slider("Top sale", [10, 20, 30, 50], value=20, key="amap_top")
+    where = c3.radio("តំបន់", ["ទាំងអស់", "ភ្នំពេញ", "ខេត្ត"], horizontal=True, key="amap_area")
+    t = _si_active_table(daily, names, areas, days, top_n, today)
+    if t.empty:
+        st.info("មិនទាន់មានការបញ្ជាទិញក្នុងរយៈពេលនេះទេ។")
+        return
+    registry, store = _visit_registry(), _visit_pin_store()
+    try:
+        auto = _visit_candidates_for({k: names.get(k, k) for k in t["Key"]}, registry)[1]
+    except Exception:
+        auto = {}
+    pins = [_visit_pin(n, registry, store, auto) for n in t["Customer"]]
+    t["Lat"] = [p[0] if p else None for p in pins]
+    t["Lon"] = [p[1] if p else None for p in pins]
+    if where != "ទាំងអស់":
+        want = AREA_LABEL[PP] if where == "ភ្នំពេញ" else AREA_LABEL["Province"]
+        t = t[t["Area"].eq(want)]
+    only_top = st.toggle("🟡 បង្ហាញតែ Top sale", key="amap_only_top")
+    show = t[t["Group"].eq("top")] if only_top else t
+    with_pin = show.dropna(subset=["Lat", "Lon"])
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("អតិថិជនសកម្ម", f"{len(t):,}", f"{days} ថ្ងៃចុងក្រោយ", delta_color="off")
+    k2.metric("🟡 Top sale", f"{int(t['Group'].eq('top').sum())}", f"{t.loc[t['Group'].eq('top'), 'Sales'].sum() / max(1, t['Sales'].sum()) * 100:.0f}% នៃការលក់", delta_color="off")
+    k3.metric("មានទីតាំងលើផែនទី", f"{len(t.dropna(subset=['Lat'])):,} / {len(t):,}")
+    k4.metric("នំសរុប (pcs)", f"{int(t['Pcs'].sum()):,}")
+    if with_pin.empty:
+        st.warning("អតិថិជនទាំងនេះមិនទាន់មានទីតាំងលើផែនទីទេ។")
+    else:
+        m = with_pin.copy()
+        m["color"] = m["Group"].map(AMAP_COLORS)
+        mx = max(1.0, float(m["Pcs"].max()))
+        m["radius"] = (60 + 340 * (m["Pcs"] / mx) ** 0.5).round(0)
+        m["label"] = [f"{'🟡 #' + str(r) + ' ' if g == 'top' else ''}{c}" for r, g, c in zip(m["Rank"], m["Group"], m["Customer"])]
+        m["info"] = [f"{int(p):,} pcs · ៛{int(s):,} · {o} ដង · ចុងក្រោយ {l:%d %b}"
+                     for p, s, o, l in zip(m["Pcs"], m["Sales"], m["Orders"], m["Last"])]
+        m["nav"] = [f"https://www.google.com/maps/dir/?api=1&destination={a},{b}" for a, b in zip(m["Lat"], m["Lon"])]
+        try:
+            import pydeck as pdk
+            data = m[["Lat", "Lon", "color", "radius", "label", "info"]].to_dict("records")
+            layer = pdk.Layer("ScatterplotLayer", data=data, get_position="[Lon, Lat]", get_radius="radius",
+                              radius_min_pixels=4, radius_max_pixels=22, get_fill_color="color", get_line_color=[255, 255, 255],
+                              stroked=True, line_width_min_pixels=1, pickable=True, opacity=0.85)
+            top_layer = pdk.Layer("TextLayer", data=[x for x in data if x["label"].startswith("🟡")] if len(m) > 40 else data,
+                                  get_position="[Lon, Lat]", get_text="label", get_size=11, get_color=[30, 35, 40],
+                                  get_pixel_offset=[0, -16], character_set="auto")
+            pp = m[(m["Lat"].between(11.4, 11.75)) & (m["Lon"].between(104.7, 105.05))]
+            base = pp if (where != "ខេត្ត" and len(pp) >= len(m) * 0.5) else m
+            view = pdk.ViewState(latitude=float(base["Lat"].median()), longitude=float(base["Lon"].median()),
+                                 zoom=11 if base is pp else 6.5, pitch=0)
+            deck = pdk.Deck(layers=[layer], map_provider="carto", map_style="light", initial_view_state=view,
+                            tooltip={"text": "{label}\n{info}"})
+            try:
+                st.pydeck_chart(deck, use_container_width=True, height=560)
+            except TypeError:
+                st.pydeck_chart(deck)
+        except Exception:
+            st.map(m.rename(columns={"Lat": "lat", "Lon": "lon"}), latitude="lat", longitude="lon", color="color", size="radius")
+        st.caption("🟡 Top sale  ·  🟢 Active  ·  ចុចលើចំណុចដើម្បីមើលព័ត៌មាន")
+    tbl = show.assign(**{"ក្រុម": show["Group"].map({"top": "🟡 Top sale", "active": "🟢 Active"}),
+                         "ចុងក្រោយ": show["Last"].dt.strftime("%d %b"),
+                         "ទីតាំង": show["Lat"].notna().map({True: "📍", False: "❌ គ្មាន"}),
+                         "ផ្លូវ": [f"https://www.google.com/maps/dir/?api=1&destination={a},{b}" if pd.notna(a) else ""
+                                   for a, b in zip(show["Lat"], show["Lon"])]})
+    tbl = tbl[["Rank", "ក្រុម", "Customer", "Area", "Pcs", "Sales", "Orders", "ចុងក្រោយ", "Days since", "ទីតាំង", "ផ្លូវ"]].rename(
+        columns={"Rank": "លេខ", "Customer": "អតិថិជន", "Area": "តំបន់", "Pcs": "នំ (pcs)", "Sales": "លក់ ៛", "Orders": "ចំនួនដង",
+                 "Days since": "ថ្ងៃមុន"})
+    try:
+        st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(520, 60 + 35 * len(tbl)),
+                     column_config={"លក់ ៛": st.column_config.NumberColumn(format="localized"),
+                                    "នំ (pcs)": st.column_config.NumberColumn(format="localized"),
+                                    "ផ្លូវ": st.column_config.LinkColumn("ផ្លូវ", display_text="🧭")})
+    except Exception:
+        st.dataframe(tbl, hide_index=True, use_container_width=True)
+    nopin = show[show["Lat"].isna()]
+    if len(nopin):
+        st.caption(f"❌ {len(nopin)} អតិថិជនសកម្មមិនទាន់មានទីតាំង (top sale: {int(nopin['Group'].eq('top').sum())})។ "
+                   "ដាក់ Label ក្នុង Google Maps ឬ Check-in នៅហាង ដើម្បីបន្ថែម។")
+
+
 def _sales_insights_body():
     h1, h2 = st.columns([5, 1])
     h1.markdown("### 🎯 Sales Insights")
@@ -7956,12 +8061,15 @@ def _sales_insights_body():
         st.warning("Call recommendations hidden because contact preferences could not be checked: " + str(call_error)[:120])
         care = care.iloc[0:0]
 
-    _si_tabs = ["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
+    _si_tabs = ["🗺️ ផែនទីអតិថិជន", "🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
                 "💝 Customer care", "📆 Monthly history", "🔎 Customer detail", "🧪 Data check"]
     if st.session_state.get("si_tab") not in _si_tabs:
         st.session_state["si_tab"] = _si_tabs[0]
     _si_tab = st.radio("Insights section", _si_tabs, horizontal=True, key="si_tab", label_visibility="collapsed")
-    t_top, t_miss, t_none, t_care, t_hist, t_det, t_dc = (_si_tab == name for name in _si_tabs)   # only the chosen one is built
+    t_top, t_miss, t_none, t_care, t_hist, t_det, t_dc = (_si_tab == name for name in _si_tabs[1:])   # only the chosen one is built
+    if _si_tab == "🗺️ ផែនទីអតិថិជន":
+        _si_active_map_section(daily, names, areas, today)
+        return
     if t_dc:
         _si_data_check_section(issues, totals, coverage)
 
