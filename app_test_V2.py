@@ -39,6 +39,7 @@ import json
 import html
 import unicodedata
 import hashlib
+import functools
 import math
 import logging
 import urllib.parse
@@ -285,6 +286,17 @@ def _try_parse(s, dayfirst):
 
 
 def parse_dt(v):
+    if isinstance(v, str):
+        return _parse_dt_text(v)
+    return _parse_dt_any(v)
+
+
+@functools.lru_cache(maxsize=65536)
+def _parse_dt_text(v):
+    return _parse_dt_any(v)
+
+
+def _parse_dt_any(v):
     """Parse consistently; ambiguous text follows DAYFIRST, never today's date.
     Offset-aware timestamps are converted to Cambodia local wall time for CSV filters.
     """
@@ -1375,6 +1387,23 @@ def pull(path, force=False, max_age=30.0):
     if not USE_DROPBOX:
         return
     S, name = _sync_state(), os.path.basename(path)
+    if not force:
+        if time.time() - S["last_pull"].get(path, 0) < max_age:
+            return
+        try:
+            entry = _remote_listing().get(name.lower())
+        except Exception:
+            entry = None
+        if entry is not None:
+            with S["lock"]:
+                if S["rev"].get(path) == entry["rev"] and os.path.exists(path):
+                    S["last_pull"][path] = time.time()
+                    return
+                downloaded, res = _dbx().files_download(_rpath(name))
+                _write_atomic(path, res.content)
+                S["rev"][path] = downloaded.rev
+                S["last_pull"][path] = time.time()
+            return
     with S["lock"]:
         if not force and time.time() - S["last_pull"].get(path, 0) < max_age:
             return
@@ -1415,6 +1444,14 @@ def push(path):
             raise
         S["rev"][path] = md.rev
         S["last_pull"][path] = time.time()
+    try:                                       # our own save: the folder list now knows the new version
+        state = _remote_list_state()
+        with state["lock"]:
+            e = state["entries"].get(name.lower())
+            state["entries"][name.lower()] = {**(e or {"name": name, "mtime": time.time()}), "rev": md.rev,
+                                              "hash": getattr(md, "content_hash", None) or md.rev}
+    except Exception:
+        pass
 
 
 def _log_pull_once(path):
@@ -1455,20 +1492,76 @@ def _schedule_log_push(path):
         t.start()
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _list_remote_folder(_token=0):
-    dbx, out = _dbx(), []
+REMOTE_LIST_EVERY_S = 12         # the Dropbox folder list is refreshed in the background this often
+REMOTE_LIST_MAX_AGE_S = 60       # an older list is never trusted: the page then asks Dropbox directly
+
+
+@st.cache_resource(show_spinner=False)
+def _remote_list_state():
+    return {"entries": {}, "t": 0.0, "lock": threading.Lock(), "thread": None, "used": 0.0}
+
+
+def _fetch_remote_folder(dbx):
+    out = {}
     res = dbx.files_list_folder(DROPBOX_FOLDER)
     while True:
         for e in res.entries:
             if hasattr(e, "rev"):
-                out.append({"name": e.name, "rev": e.rev,
-                            "hash": getattr(e, "content_hash", None) or e.rev,
-                            "mtime": e.server_modified.replace(tzinfo=timezone.utc).timestamp()})
+                out[e.name.lower()] = {"name": e.name, "rev": e.rev,
+                                       "hash": getattr(e, "content_hash", None) or e.rev,
+                                       "mtime": e.server_modified.replace(tzinfo=timezone.utc).timestamp()}
         if not res.has_more:
             break
         res = dbx.files_list_folder_continue(res.cursor)
     return out
+
+
+def _remote_list_worker(state, dbx):
+    """One background thread per server: keeps the folder list fresh so page clicks never wait for Dropbox."""
+    while time.time() - state["used"] < 900:            # stop after 15 min without visitors
+        time.sleep(REMOTE_LIST_EVERY_S)
+        try:
+            entries = _fetch_remote_folder(dbx)
+            with state["lock"]:
+                state["entries"], state["t"] = entries, time.time()
+        except Exception:
+            pass
+    with state["lock"]:
+        state["thread"] = None
+
+
+def _remote_listing():
+    """{lower-case file name: info} for the Dropbox folder. Instant after the first call."""
+    state = _remote_list_state()
+    state["used"] = time.time()
+    with state["lock"]:
+        fresh = time.time() - state["t"] < REMOTE_LIST_MAX_AGE_S
+        alive = state["thread"] is not None and state["thread"].is_alive()
+    if not fresh:
+        entries = _fetch_remote_folder(_dbx())
+        with state["lock"]:
+            state["entries"], state["t"] = entries, time.time()
+    if not alive:
+        with state["lock"]:
+            if state["thread"] is None or not state["thread"].is_alive():
+                th = threading.Thread(target=_remote_list_worker, args=(state, _dbx()), daemon=True, name="dropbox-list")
+                state["thread"] = th
+                th.start()
+    return state["entries"]
+
+
+def _remote_listing_forget():
+    state = _remote_list_state()
+    with state["lock"]:
+        state["t"] = 0.0
+
+
+def _remote_entry(name):
+    return _remote_listing().get(str(name).lower())
+
+
+def _list_remote_folder(_token=0):
+    return list(_remote_listing().values())
 
 
 def _remote_excel_names():
@@ -1520,6 +1613,7 @@ def resync_now():
     """Forget everything we know about Dropbox so the next read downloads fresh copies."""
     st.cache_data.clear()
     if USE_DROPBOX:
+        _remote_listing_forget()
         S = _sync_state()
         with S["lock"]:
             S["last_pull"].clear()
@@ -1574,14 +1668,15 @@ def latest_good_backup(path):
     return max(files, key=os.path.getmtime) if files else None
 
 
-def prune_backups():
+def prune_backups(dbx=None):
     removed = 0
     try:
         if USE_DROPBOX:
-            res = _dbx().files_list_folder(_remote_backup_dir())
+            dbx = dbx or _dbx()
+            res = dbx.files_list_folder(_remote_backup_dir())
             ents = list(res.entries)
             while res.has_more:
-                res = _dbx().files_list_folder_continue(res.cursor)
+                res = dbx.files_list_folder_continue(res.cursor)
                 ents += list(res.entries)
             now = datetime.now(timezone.utc).timestamp()
             for e in ents:
@@ -1590,7 +1685,7 @@ def prune_backups():
                 age_days = (now - e.server_modified.replace(tzinfo=timezone.utc).timestamp()) / 86400
                 extra = re.match(r"^\d{4}-\d{2}-\d{2}_\d{6}_", e.name)
                 if age_days > 30 or (extra and age_days > 7):
-                    _dbx().files_delete_v2(f"{_remote_backup_dir()}/{e.name}")
+                    dbx.files_delete_v2(f"{_remote_backup_dir()}/{e.name}")
                     removed += 1
             return removed
         now = time.time()
@@ -1605,51 +1700,104 @@ def prune_backups():
     return removed
 
 
+_BACKUP_FILES = lambda: (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE,
+                         MAP_REGISTRY_FILE, CALLS_FILE, SI_ALIAS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
+                         os.path.join(DATA_DIR, "visit_settings.json"))
+
+
 def daily_backup_once(day_str):
-    """Retry failed backups, cache only success, and protect accounts/locations too."""
+    """Retry failed backups, cache only success, and protect accounts/locations too.
+    Dropbox mode: runs in the background (about 30 Dropbox requests) so the first click of the day never waits."""
     state = _sync_state()
+    if not USE_DROPBOX:
+        return _daily_backup_local(state, day_str)
+    with state["lock"]:
+        if state.get("backup_day") != day_str:
+            state["backup_day"] = day_str
+            state["backup_done"] = set()
+            state["backup_failures"] = []
+            state["backup_try"] = 0.0
+        done_all = state.get("backup_ok_day") == day_str
+        running = state.get("backup_running", False)
+        recent = time.time() - state.get("backup_try", 0.0) < 600           # failed ones are retried every 10 min
+        if done_all or running or recent:
+            return list(state.get("backup_failures", []))
+        state["backup_running"], state["backup_try"] = True, time.time()
+    try:
+        dbx = _dbx()
+        names = {k: v for k, v in _remote_listing().items()}
+    except Exception as e:
+        with state["lock"]:
+            state["backup_running"] = False
+            state["backup_failures"] = [f"Cannot access backup folder: {str(e)[:120]}"]
+        return list(state["backup_failures"])
+    threading.Thread(target=_daily_backup_dropbox, args=(state, dbx, names, day_str), daemon=True,
+                     name="daily-backup").start()
+    return list(state.get("backup_failures", []))
+
+
+def _daily_backup_dropbox(state, dbx, remote_names, day_str):
+    failures = []
+    try:
+        try:
+            dbx.files_create_folder_v2(_remote_backup_dir())
+        except Exception as e:
+            if not _is_conflict(e):
+                raise
+        for path in _BACKUP_FILES():
+            base = os.path.basename(path)
+            with state["lock"]:
+                if path in state.setdefault("backup_done", set()):
+                    continue
+            if base.lower() not in remote_names:
+                continue
+            dest = f"{_remote_backup_dir()}/{day_str}_{base}"
+            try:
+                try:
+                    dbx.files_get_metadata(dest)
+                except Exception as e:
+                    if not _is_not_found(e):
+                        raise
+                    dbx.files_copy_v2(_rpath(base), dest)
+                with state["lock"]:
+                    state["backup_done"].add(path)
+            except Exception as e:
+                failures.append(f"{base}: {str(e)[:160]}")
+        if not failures and state.get("pruned_day") != day_str:
+            prune_backups(dbx)
+            state["pruned_day"] = day_str
+    except Exception as e:
+        failures.append(f"Cannot access backup folder: {str(e)[:120]}")
+    with state["lock"]:
+        state["backup_failures"] = failures
+        state["backup_running"] = False
+        if not failures:
+            state["backup_ok_day"] = day_str
+
+
+def _daily_backup_local(state, day_str):
     failures = []
     with state["lock"]:
         if state.get("backup_day") != day_str:
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, SI_ALIAS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
-                 os.path.join(DATA_DIR, "visit_settings.json"))
-        if USE_DROPBOX:
-            try:
-                _dbx().files_create_folder_v2(_remote_backup_dir())
-            except Exception as e:
-                if not _is_conflict(e):
-                    return [f"Cannot access backup folder: {str(e)[:120]}"]
-        else:
-            try:
-                os.makedirs(BACKUP_DIR, exist_ok=True)
-            except OSError as e:
-                return [f"Cannot access backup folder: {str(e)[:120]}"]
-        for path in files:
+        try:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+        except OSError as e:
+            return [f"Cannot access backup folder: {str(e)[:120]}"]
+        for path in _BACKUP_FILES():
             if path in done:
                 continue
             base = os.path.basename(path)
             try:
-                if USE_DROPBOX:
-                    if remote_meta(base) is None:
-                        continue
-                    dest = f"{_remote_backup_dir()}/{day_str}_{base}"
-                    try:
-                        _dbx().files_get_metadata(dest)
-                    except Exception as e:
-                        if not _is_not_found(e):
-                            raise
-                        _dbx().files_copy_v2(_rpath(base), dest)
-                else:
-                    if not os.path.exists(path):
-                        continue
-                    dest = os.path.join(BACKUP_DIR, f"{day_str}_{base}")
-                    if not os.path.exists(dest):
-                        with file_lock(path):
-                            with open(path, "rb") as f:
-                                _write_atomic(dest, f.read())
+                if not os.path.exists(path):
+                    continue
+                dest = os.path.join(BACKUP_DIR, f"{day_str}_{base}")
+                if not os.path.exists(dest):
+                    with file_lock(path):
+                        with open(path, "rb") as f:
+                            _write_atomic(dest, f.read())
                 done.add(path)
             except Exception as e:
                 failures.append(f"{base}: {str(e)[:160]}")
@@ -2111,7 +2259,7 @@ def _check_csv(add, key, master, auto_fix):
     suggestions = []
     if USE_DROPBOX:
         try:
-            pull(path, force=True)
+            pull(path)                       # uses the background folder list: no wait unless the file changed
         except Exception as e:
             add("error", label, f"Cannot refresh {base}: {str(e)[:100]}", "retry when storage is available; no repair attempted")
             return suggestions
@@ -2209,7 +2357,7 @@ def run_health_check(auto_fix=True):
     # --- storage ---
     if USE_DROPBOX:
         try:
-            _dbx().files_get_metadata(DROPBOX_FOLDER)
+            _remote_listing()
             add("info", "Dropbox", f"Connected - data folder {DROPBOX_FOLDER}", "-")
         except Exception as e:
             add("error", "Dropbox", f"Cannot open folder '{DROPBOX_FOLDER}': {str(e)[:120]}",
@@ -6203,8 +6351,13 @@ def modify_map_registry(fn):
             time.sleep(0.2 * (attempt + 1))
 
 
+@functools.lru_cache(maxsize=8192)
+def _analyse_map_link_cached(url):
+    return analyse_map_link(url)
+
+
 def map_record_analysis(record):
-    analysis = analyse_map_link(record.get("resolved_url") or record.get("url", ""))
+    analysis = dict(_analyse_map_link_cached(record.get("resolved_url") or record.get("url", "")))
     if (analysis["Map status"] == "Needs link expansion"
             and "no usable destination coordinates" in record.get("resolution_note", "")):
         analysis["Map status"] = "Needs full pin link"
@@ -6225,6 +6378,17 @@ def map_registry_frame(registry=None):
     return frame
 
 
+def _map_name_index(registry):
+    """{normalised name: [records]} — built once per loaded registry (kept on the registry dict itself)."""
+    idx = registry.get("_name_index")
+    if idx is None or registry.get("_name_index_n") != len(registry.get("records", {})):
+        idx = {}
+        for rec in registry.get("records", {}).values():
+            idx.setdefault(norm_name(rec["customer"]), []).append(rec)
+        registry["_name_index"], registry["_name_index_n"] = idx, len(registry.get("records", {}))
+    return idx
+
+
 def customer_map_match(customer, registry):
     """No fuzzy identity matching and no merging separate leads with the same name."""
     key = norm_name(customer)
@@ -6235,7 +6399,7 @@ def customer_map_match(customer, registry):
             return {"Map status": "Saved match needs review", "Map link": "", "Directions": "", "Location ID": ""}
         candidates = [rec]
     else:
-        candidates = [rec for rec in registry["records"].values() if norm_name(rec["customer"]) == key]
+        candidates = _map_name_index(registry).get(key, [])
     if not candidates:
         return {"Map status": "No location match", "Map link": "", "Directions": "", "Location ID": ""}
     # Any duplicate identity requires Admin's explicit choice, even when a pin is shared.
@@ -6795,13 +6959,52 @@ def _si_collect_journals(snap):
     return combined,codes
 
 
+@st.cache_resource(show_spinner=False)
+def _si_prepare_memo():
+    return {}
+
+
+_SI_PREP_STATE_KEYS = ("si_journal_coverage", "si_journal_warnings", "si_skipped", "si_combined")
+
+
+def _si_prepare_sig():
+    """Changes only when a journal, a history file or the site orders change (or the day changes)."""
+    files = (SI_JOURNAL_HISTORY_FILE, SI_HIST_DAILY_FILE, SI_HIST_MONTHLY_FILE, ORDERS_FILE)
+    if USE_DROPBOX:
+        for p in files:
+            try:
+                pull(p)
+            except Exception:
+                pass
+        journals = tuple(sorted((r["name"], r["rev"]) for r in _list_remote_folder() if _si_is_journal_name(r["name"])))
+    else:
+        journals = tuple(sorted((os.path.basename(p), _file_sig(p)) for p in glob.glob(os.path.join(CURRENT_DIR, "*.xlsx"))
+                                if _si_is_journal_name(os.path.basename(p))))
+    cur = find_excel_file()
+    return (str(cur), _file_sig(cur) if cur else (0, 0), journals, tuple(_file_sig(p) for p in files), str(today_kh()))
+
+
 def _si_prepare(snap):
-    """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows."""
+    """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows.
+    Reused by every page and every person until a journal / history / order file changes (was rebuilt on each click)."""
+    try:
+        sig = _si_prepare_sig()
+    except Exception:
+        sig = None
+    memo = _si_prepare_memo()
+    hit = memo.get("v")
+    if sig is not None and hit and hit[0] == sig:
+        for k, v in hit[2].items():
+            st.session_state[k] = v
+        return hit[1]
     j, codes = _si_collect_journals(snap)
     history_daily = _si_read_hist(SI_HIST_DAILY_FILE)
     history_monthly = _si_read_hist(SI_HIST_MONTHLY_FILE)
     sell = (snap.get("buns", {}) or {}).get("sell", {}) or {}
-    return _si_prepare_cached(j, codes, history_daily, history_monthly, sell, today_kh())
+    out = _si_prepare_cached(j, codes, history_daily, history_monthly, sell, today_kh())
+    if sig is not None:
+        memo["v"] = (sig, out, {k: st.session_state.get(k) for k in _SI_PREP_STATE_KEYS})
+    return out
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -6889,38 +7092,58 @@ def _si_top(daily, start, end, metric, names, areas, top_n=20, df=None, codes=()
 
 
 def _si_habits(daily, today, min_orders=4, lookback=180, factor=1.5, dormant_factor=4.0, names=None, areas=None):
-    """Usual ordering rhythm of each customer and whether they are late. Status: On track | Missing | Dormant."""
+    """Usual ordering rhythm of each customer and whether they are late. Status: On track | Missing | Dormant.
+    Works on plain number arrays per customer (about 10x faster than pandas per group)."""
+    import numpy as np
     names, areas = names or {}, areas or {}
     t = pd.Timestamp(today)
-    d = daily[daily["D"] >= t - pd.Timedelta(days=lookback)]
+    d = daily[daily["D"] >= t - pd.Timedelta(days=lookback)].sort_values(["Key", "D"], kind="mergesort")
     rows = []
-    for key, g in d.groupby("Key"):
-        dates = g["D"].sort_values().reset_index(drop=True)
-        if len(dates) < min_orders:
-            continue
-        gaps = dates.diff().dt.days.dropna()
-        gap = max(1.0, float(gaps.median()))
-        cv = float(gaps.std() / gaps.mean()) if len(gaps) > 1 and gaps.mean() > 0 else 0.0
-        last = dates.iloc[-1]
-        since = int((t - last).days)
-        late_at = max(gap * factor, gap + 1)
-        dormant_at = max(min(gap * dormant_factor, 90), late_at + 1)
-        status = "Dormant" if since > dormant_at else ("Missing" if since >= late_at else "On track")
-        wd = dates.dt.dayofweek.value_counts()
-        wd_name = ("Mon Tue Wed Thu Fri Sat Sun".split()[int(wd.index[0])]) if wd.iloc[0] / len(dates) >= 0.5 else "-"
-        avg_order = float(g["Sales"].mean())
-        avg_pcs = float(g["Pcs"].mean())
-        cycles = max(1, int(since // gap)) if status != "On track" else 0
-        rows.append({
-            "Key": key, "Customer": names.get(key, g["Customer"].iloc[0]), "Area": areas.get(key, AREA_LABEL["Unknown"]),
-            "Orders in period": len(dates), "Usual gap (days)": round(gap, 1), "Usual day": wd_name,
-            "Pattern": "🟢 Regular" if cv <= 0.6 else "🟡 Irregular",
-            "Last order": last.strftime("%Y-%m-%d"), "Days since": since,
-            "Expected by": (last + pd.Timedelta(days=gap)).strftime("%Y-%m-%d"),
-            "Days late": max(0, int(round(since - gap))), "Usual cases": round(float(g["Cases"].median()), 1),
-            "Usual pcs": int(round(float(g["Pcs"].median()))), "Avg order ៛": int(round(avg_order)),
-            "Missed orders (est.)": cycles, "Lost pcs (est.)": int(round(cycles * avg_pcs)),
-            "Lost sales ៛ (est.)": int(round(cycles * avg_order)), "Status": status})
+    if not d.empty:
+        keys = d["Key"].to_numpy()
+        days = d["D"].to_numpy().astype("datetime64[D]").astype("int64")
+        sales = d["Sales"].to_numpy(dtype="float64")
+        pcs = d["Pcs"].to_numpy(dtype="float64")
+        cases = pd.to_numeric(d["Cases"], errors="coerce").to_numpy(dtype="float64")
+        custs = d["Customer"].to_numpy()
+        t_day = int(np.datetime64(t.normalize(), "D").astype("int64"))
+        starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
+        ends = np.r_[starts[1:], len(keys)]
+        day_names = "Mon Tue Wed Thu Fri Sat Sun".split()
+        for s0, e0 in zip(starts, ends):
+            n = e0 - s0
+            if n < min_orders:
+                continue
+            key = keys[s0]
+            dts = days[s0:e0]
+            gaps = np.diff(dts).astype("float64")
+            gap = max(1.0, float(np.median(gaps))) if len(gaps) else 1.0
+            gm = gaps.mean() if len(gaps) else 0.0
+            cv = float(gaps.std(ddof=1) / gm) if len(gaps) > 1 and gm > 0 else 0.0
+            last_i = int(dts[-1])
+            last = pd.Timestamp(np.datetime64(last_i, "D"))
+            since = int(t_day - last_i)
+            late_at = max(gap * factor, gap + 1)
+            dormant_at = max(min(gap * dormant_factor, 90), late_at + 1)
+            status = "Dormant" if since > dormant_at else ("Missing" if since >= late_at else "On track")
+            wd = np.bincount(((dts + 3) % 7).astype("int64"), minlength=7)      # 1970-01-01 was a Thursday
+            wd_name = day_names[int(wd.argmax())] if wd.max() / n >= 0.5 else "-"
+            avg_order = float(sales[s0:e0].mean())
+            avg_pcs = float(pcs[s0:e0].mean())
+            cs = cases[s0:e0]
+            cs = cs[~np.isnan(cs)]
+            usual_cases = round(float(np.median(cs)), 1) if len(cs) else float("nan")
+            cycles = max(1, int(since // gap)) if status != "On track" else 0
+            rows.append({
+                "Key": key, "Customer": names.get(key, custs[s0]), "Area": areas.get(key, AREA_LABEL["Unknown"]),
+                "Orders in period": int(n), "Usual gap (days)": round(gap, 1), "Usual day": wd_name,
+                "Pattern": "🟢 Regular" if cv <= 0.6 else "🟡 Irregular",
+                "Last order": last.strftime("%Y-%m-%d"), "Days since": since,
+                "Expected by": (last + pd.Timedelta(days=gap)).strftime("%Y-%m-%d"),
+                "Days late": max(0, int(round(since - gap))), "Usual cases": usual_cases,
+                "Usual pcs": int(round(float(np.median(pcs[s0:e0])))), "Avg order ៛": int(round(avg_order)),
+                "Missed orders (est.)": cycles, "Lost pcs (est.)": int(round(cycles * avg_pcs)),
+                "Lost sales ៛ (est.)": int(round(cycles * avg_order)), "Status": status})
     cols = ["Key", "Customer", "Area", "Orders in period", "Usual gap (days)", "Usual day", "Pattern", "Last order",
             "Days since", "Expected by", "Days late", "Usual cases", "Usual pcs", "Avg order ៛",
             "Missed orders (est.)", "Lost pcs (est.)", "Lost sales ៛ (est.)", "Status"]
@@ -7050,11 +7273,13 @@ def _si_dup_scan(missing_items, ordered_items, all_names):
     for n in set(all_names):
         word_count.update(set(_si_name_tokens(n)))
     okeys = [(k, n, _visit_match_key(n)) for k, n in ordered_items]
+    gidx = _gram_index([o[2] for o in okeys])
     out = {}
     for k, n in missing_items:
         mk = _visit_match_key(n)
         best = None
-        for ok, on, omk in okeys:
+        for j in _gram_shortlist(mk, gidx, 0.3):
+            ok, on, omk = okeys[j]
             if ok == k or not mk or not omk:
                 continue
             if mk != omk:
@@ -7105,10 +7330,27 @@ def _si_alias_save(name, same_as, decision):
 
 
 def _si_no_order_split(table, daily, names, month_start, month_end):
-    """Remove customers who DID order under another spelling.
+    """Remove customers who DID order under another spelling (remembered until the data or a decision changes).
     -> (table without them, review table of look-alikes, number hidden because Admin confirmed / same spelling)."""
     if table is None or table.empty or daily.empty:
         return table, pd.DataFrame(), 0
+    try:
+        _si_alias_read()                                    # refresh the decisions file first
+        key = (_si_frame_sig(table), _si_frame_sig(daily), str(month_start), str(month_end), _file_sig(SI_ALIAS_FILE))
+    except Exception:
+        key = None
+    memo = st.session_state.setdefault("_si_split_memo", {})
+    if key is not None and key in memo:
+        return memo[key]
+    out = _si_no_order_split_calc(table, daily, names, month_start, month_end)
+    if key is not None:
+        if len(memo) > 6:
+            memo.clear()
+        memo[key] = out
+    return out
+
+
+def _si_no_order_split_calc(table, daily, names, month_start, month_end):
     s, e = pd.Timestamp(month_start), pd.Timestamp(month_end)
     month = daily[(daily["D"] >= s) & (daily["D"] <= e)]
     if month.empty:
@@ -7592,16 +7834,34 @@ CALL_PLATFORMS = ["📞 Phone call", "✈️ Telegram", "💬 Messenger / Facebo
                   "📱 SMS", "🚶 Visit shop", "🗨️ Other"]
 
 
+_PLAT_MEMO = {}
+
+
+def _si_platform_map(history):
+    """{customer key: (last platform used, last phone text)} — built once per loaded call history."""
+    hit = _PLAT_MEMO.get("v")
+    if hit is not None and hit[0] is history:
+        return hit[1]
+    out = {}
+    if history is not None and not history.empty:
+        plats = history["Platform"].astype(str) if "Platform" in history else pd.Series("", index=history.index)
+        phones = history["Phone"].astype(str) if "Phone" in history else pd.Series("", index=history.index)
+        for k, pl, ph in zip(history["Customer"].map(norm_name), plats, phones):
+            prev = out.get(k, ("", ""))
+            out[k] = (pl if pl in CALL_PLATFORMS else prev[0], ph)
+    _PLAT_MEMO["v"] = (history, out)
+    return out
+
+
 def _si_platform_guess(history, customer, phone=""):
     """Platform to pre-select: the one used last time with this customer, else a guess from the phone / Telegram field."""
     try:
-        if history is not None and not history.empty and "Platform" in history:
-            mine = history[history["Customer"].map(norm_name).eq(norm_name(customer))]
-            used = [p for p in mine["Platform"].astype(str) if p in CALL_PLATFORMS]
+        if history is not None and not history.empty:
+            used, last_phone = _si_platform_map(history).get(norm_name(customer), ("", ""))
             if used:
-                return used[-1]
-            if not phone and not mine.empty:
-                phone = str(mine.iloc[-1].get("Phone", ""))
+                return used
+            if not phone:
+                phone = last_phone
     except Exception:
         pass
     ph = str(phone or "").strip().lower()
@@ -7695,13 +7955,12 @@ def _followup_sales_context():
             return names,pd.DataFrame(),False
         # Confirm order storage is readable rather than silently assuming it is empty.
         if USE_DROPBOX:
-            metadata = remote_meta(os.path.basename(journal_path))
-            if metadata is None:
+            entry = _remote_entry(os.path.basename(journal_path))
+            if entry is None:
                 return names,pd.DataFrame(),False
-            expected_hash = getattr(metadata, 'content_hash', None) or metadata.rev
-            if _sync_state()["xl_hash"].get(os.path.basename(journal_path)) != expected_hash:
+            if _sync_state()["xl_hash"].get(os.path.basename(journal_path)) != entry["hash"]:
                 return names,pd.DataFrame(),False
-            pull(ORDERS_FILE, force=True)
+            pull(ORDERS_FILE)
         read_raw(ORDERS_FILE, ORDER_COLS)
         orders=journal_plus_orders(snap)
         if 'FOC' in orders:orders=orders[~orders['FOC'].fillna(False).astype(bool)]
@@ -7738,23 +7997,39 @@ def _followup_review_panel(history):
     if view.empty:st.info('No follow-ups match these filters. Clear the filters to see all records.')
     st.caption('Order received is detected only from an order dated after the latest call. A same-day order needs manual confirmation. Receipt of an order does not prove a complaint was resolved. Save Resolved with a result after checking.')
     if has_permission('reports'):
-        by_reason=report.groupby(['Reason','Alert'],dropna=False).size().reset_index(name='Customers')
-        by_owner=report.assign(**{'Assigned to':report['Assigned to'].replace('','Unassigned')}).groupby(['Assigned to','Alert']).size().reset_index(name='Customers')
-        buf=_report_excel_bytes(dict([('Current follow-ups',report),('Filtered review',view),('Reasons',by_reason),('Staff results',by_owner),('Call history',history[[c for c in CALL_COLS if c in history]])]))
-        st.download_button('Download follow-up review report',buf,file_name=f'Followup_Review_{today_kh()}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',key='fu_review_download')
+        def _fu_frames():
+            by_reason=report.groupby(['Reason','Alert'],dropna=False).size().reset_index(name='Customers')
+            by_owner=report.assign(**{'Assigned to':report['Assigned to'].replace('','Unassigned')}).groupby(['Assigned to','Alert']).size().reset_index(name='Customers')
+            return dict([('Current follow-ups',report),('Filtered review',view),('Reasons',by_reason),('Staff results',by_owner),('Call history',history[[c for c in CALL_COLS if c in history]])])
+        _lazy_excel_download('Download follow-up review report', _fu_frames, f'Followup_Review_{today_kh()}.xlsx', 'fu_review_download')
     return report
 
 
 @st.fragment(run_every=300)
+def _file_sig(path):
+    try:
+        stt = os.stat(path)
+        return (stt.st_mtime_ns, stt.st_size)
+    except OSError:
+        return (0, 0)
+
+
 def followup_alert_banner():
     if not (has_permission('view') or has_permission('reports')):return
     try:
-        history=read_raw(CALLS_FILE,CALL_COLS)
+        history=read_raw(CALLS_FILE,CALL_COLS,max_age=120)
         if history.empty:return
-        _,orders,available=_followup_sales_context()
-        report=_followup_review_data(history,orders,today_kh(),sales_available=available)
-        due=int(report['Alert'].isin(['Overdue','Due today']).sum())
-        setup=int(report['Alert'].eq('Needs setup').sum())
+        sig=(_file_sig(CALLS_FILE),_file_sig(ORDERS_FILE),str(find_excel_file() if not USE_DROPBOX else _sync_state()["xl_hash"]),
+             str(today_kh()),int(time.time()//300))
+        hit=st.session_state.get('_fu_banner')
+        if hit and hit[0]==sig:
+            due,setup,available=hit[1]
+        else:
+            _,orders,available=_followup_sales_context()
+            report=_followup_review_data(history,orders,today_kh(),sales_available=available)
+            due=int(report['Alert'].isin(['Overdue','Due today']).sum())
+            setup=int(report['Alert'].eq('Needs setup').sum())
+            st.session_state['_fu_banner']=(sig,(due,setup,available))
         if due or setup:
             st.warning(f'Customer follow-ups: {due} due/overdue · {setup} need a date, owner or next action. Open Customer Follow-ups to review.')
         if not available:st.caption('Follow-up alerts: order confirmation is unavailable until sales data is accessible.')
@@ -7785,14 +8060,15 @@ def _si_contact_context(frame, history, daily, today):
     for customer in result.get("Customer", pd.Series(dtype=str)):
         key = norm_name(customer)
         call = contacts.get(key, {})
-        called = pd.to_datetime(call.get("Date", ""), errors="coerce")
-        order = pd.to_datetime(last_orders.get(key), errors="coerce")
+        called = parse_dt(call.get("Date", ""))
+        order = last_orders.get(key)
+        order = pd.Timestamp(order) if order is not None and pd.notna(order) else pd.NaT
         called_today = pd.notna(called) and called.date() == today
         ordered_today = pd.notna(order) and order.date() == today
         days_ago = (today - called.date()).days if pd.notna(called) else None
         recent = days_ago is not None and 0 <= days_ago <= CALL_RECENT_DAYS
         ordered_after = pd.notna(order) and pd.notna(called) and order.normalize() > called.normalize()
-        due = pd.to_datetime(call.get("Follow-up date", ""), errors="coerce")
+        due = parse_dt(call.get("Follow-up date", ""))
         scheduled = pd.notna(due) and due.date() > today and call.get("Follow-up state") in ("Open", "Awaiting order")
         plat = _si_platform_of(call) if call else ""
         when = (f"{called:%d %b}" + (" (today)" if days_ago == 0 else f" ({days_ago} d ago)")) if pd.notna(called) else ""
@@ -8022,6 +8298,23 @@ def _followup_export_frame():
         return pd.DataFrame([{"Report unavailable": str(error)[:200]}])
 
 
+def _lazy_excel_download(label, frames_fn, file_name, key):
+    """Build the Excel file only when someone asks for it (building it on every click made pages slow)."""
+    if not st.session_state.get(f"{key}_ready"):
+        if st.button(f"📄 Prepare: {label}", key=f"{key}_prep"):
+            st.session_state[f"{key}_ready"] = True
+            st.rerun()
+        return
+    try:
+        st.download_button(label, _report_excel_bytes(frames_fn()), file_name=file_name, mime=XLSX_MIME, key=key,
+                           on_click=lambda: st.session_state.pop(f"{key}_ready", None))
+    except Exception as e:
+        st.warning(f"Could not build Excel file: {e}")
+
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
 def _report_excel_bytes(frames):
     """Export reports with the same Excel dependency used to read journals."""
     from openpyxl.utils import get_column_letter
@@ -8109,10 +8402,29 @@ SI_DC_SPECS = [
 SI_DC_SEV = {"fix": ("❗", "Needs fixing"), "review": ("⚠️", "Please review"), "info": ("ℹ️", "For your information")}
 
 
+_SI_SIG_MEMO = {}
+
+
 def _si_frame_sig(frame):
-    """Cheap fingerprint of a DataFrame, used to cache heavy calculations until the data really changes."""
+    """Cheap fingerprint of a DataFrame, used to cache heavy calculations until the data really changes.
+    The same (shared, unchanged) table object is fingerprinted only once."""
     if frame is None or len(frame) == 0:
         return "empty"
+    hit = _SI_SIG_MEMO.get(id(frame))
+    if hit is not None and hit[0] is frame:
+        return hit[1]
+    sig = _si_frame_sig_calc(frame)
+    if len(_SI_SIG_MEMO) > 32:
+        _SI_SIG_MEMO.clear()
+    _SI_SIG_MEMO[id(frame)] = (frame, sig)
+    return sig
+
+
+def _si_frame_sig_calc(frame):
+    try:
+        return f"{len(frame)}-{int(pd.util.hash_pandas_object(frame, index=False).sum())}"
+    except Exception:
+        pass
     try:
         return f"{len(frame)}-{int(pd.util.hash_pandas_object(frame.astype(str), index=False).sum())}"
     except Exception:
@@ -8278,9 +8590,7 @@ def _si_data_check_section(issues, totals, coverage):
             for k, t, sev, *_ in SI_DC_SPECS:
                 if len(issues.get(k, ())):
                     frames[t[:31]] = issues[k]
-            st.download_button("📥 Download data check (Excel)", data=_report_excel_bytes(frames),
-                               file_name=f"Data_Check_{today_kh()}.xlsx", key="si_dc_dl",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            _lazy_excel_download("📥 Download data check (Excel)", lambda: frames, f"Data_Check_{today_kh()}.xlsx", "si_dc_dl")
         except Exception as e:
             st.warning(f"Could not build the Excel file: {e}")
 
@@ -8411,7 +8721,7 @@ def _sales_insights_body():
                  help="Read the newest journal and orders from Dropbox"):
         try:
             if USE_DROPBOX:
-                _list_remote_folder.clear()
+                _remote_listing_forget()
                 pull(ORDERS_FILE, force=True)
                 pull(CALLS_FILE, force=True)
             get_snapshot.clear()
@@ -9624,19 +9934,48 @@ def _visit_registry_pins(registry):
     return out
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
+def _grams(key):
+    k = f"  {key} "
+    return {k[i:i + 3] for i in range(len(k) - 2)}
+
+
+def _gram_index(keys):
+    """3-letter piece -> set of positions. Lets fuzzy matching skip names that share almost nothing."""
+    idx = {}
+    for i, k in enumerate(keys):
+        for g in _grams(k):
+            idx.setdefault(g, set()).add(i)
+    return idx
+
+
+def _gram_shortlist(key, idx, min_share=0.3):
+    """Positions sharing at least min_share of key's 3-letter pieces (the only ones worth a full comparison)."""
+    gs = _grams(key)
+    if not gs:
+        return []
+    hits = Counter()
+    for g in gs:
+        for i in idx.get(g, ()):
+            hits[i] += 1
+    need = max(1, int(len(gs) * min_share))
+    return [i for i, c in hits.items() if c >= need]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
 def _visit_pin_candidates(name_items, pin_items):
     """{key: [(score, location id, map name, lat, lon), ...best 3]} and {key: candidate} for the safe automatic links.
     Safe = same name after cleaning, or ≥ 90% alike and clearly better than the next pin."""
     import difflib
     pins = [(pid, pname, lat, lon, _visit_match_key(pname)) for pid, pname, lat, lon, _p in pin_items]
+    gidx = _gram_index([p[4] for p in pins])
     cands, auto, claimed = {}, {}, Counter()
     for k, name in name_items:
         nk = _visit_match_key(name)
         if len(nk) < 3:
             continue
         scored = []
-        for pid, pname, lat, lon, pk in pins:
+        for j in _gram_shortlist(nk, gidx, 0.25):
+            pid, pname, lat, lon, pk = pins[j]
             sm = difflib.SequenceMatcher(None, nk, pk)
             if sm.real_quick_ratio() < 0.5 or sm.quick_ratio() < 0.5:
                 continue
@@ -9660,8 +9999,22 @@ def _visit_pin_candidates(name_items, pin_items):
 
 
 def _visit_candidates_for(names, registry):
-    pins = tuple(_visit_registry_pins(registry))
-    return _visit_pin_candidates(tuple(sorted(names.items())), pins)
+    """Fuzzy pin suggestions. Remembered on the registry object, so repeated clicks cost nothing."""
+    items = tuple(sorted(names.items()))
+    memo = registry.setdefault("_cand_memo", {}) if isinstance(registry, dict) else {}
+    key = (hash(items), len(registry.get("records", {})) if isinstance(registry, dict) else 0)
+    if key in memo:
+        return memo[key]
+    pins = registry.get("_pins_tuple") if isinstance(registry, dict) else None
+    if pins is None:
+        pins = tuple(_visit_registry_pins(registry))
+        if isinstance(registry, dict):
+            registry["_pins_tuple"] = pins
+    out = _visit_pin_candidates(items, pins)
+    if len(memo) > 16:
+        memo.clear()
+    memo[key] = out
+    return out
 
 
 def _visit_pin_info(customer, registry=None, store=None, auto=None):
@@ -10748,9 +11101,8 @@ def _visit_report_body(visits):
         _visit_show_photos(r["Photos"], "vr")
     if has_permission("reports"):
         try:
-            st.download_button("📥 Download visits (Excel)", data=_report_excel_bytes({"Visits": v.drop(columns=["_dt"]), "By staff": per}),
-                               file_name=f"Shop_Visits_{start}_{end}.xlsx", key="vr_dl",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            _lazy_excel_download("📥 Download visits (Excel)", lambda: {"Visits": v.drop(columns=["_dt"]), "By staff": per},
+                                 f"Shop_Visits_{start}_{end}.xlsx", "vr_dl")
         except Exception as e:
             st.warning(f"Could not build the Excel file: {e}")
 
