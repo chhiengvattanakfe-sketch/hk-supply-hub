@@ -12406,23 +12406,26 @@ def _media_plan_body(stats, names, zone_map, shoots, today):
     n_r = sum(stmap.get(k, ("",))[0] == "Refused" for k in active)
     st.caption(f"ហាងភ្នំពេញ {len(active)}: ✅ ថតរួច {n_f} · 🚫 មិនឱ្យថត {n_r} (មិនបង្ហាញក្នុងបញ្ជី) · "
                f"⏳ មិនទាន់ថត {len(active) - n_f - n_r}")
-    c1, c2, c3, c4 = st.columns(4)
+    if _media_phone():
+        r1, r2 = st.columns(2), st.columns(2)
+        c1, c2, c3, c4 = r1[0], r1[1], r2[0], r2[1]
+    else:
+        c1, c2, c3, c4 = st.columns(4)
     c1.metric("ហាងត្រូវថត", f"{len(plan)}")
     c2.metric("🆕 ទូថ្មី / អតិថិជនថ្មី", f"{int(plan['_new'].sum())}")
     c3.metric("ថតរួចសប្តាហ៍នេះ", f"{done_week['Customer'].map(norm_name).nunique() if not done_week.empty else 0}")
     c4.metric("រូប / វីដេអូ សប្តាហ៍នេះ",
               f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Photos', []))} / "
               f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Videos', []))}")
-    t1, t2 = st.columns(2)
+    t1, t2 = (st.container(), st.container()) if _media_phone() else st.columns(2)
     only_new = t1.toggle("🆕 បង្ហាញតែ ទូថ្មី និង អតិថិជនថ្មី", key="media_only_new")
     with_re = t2.toggle(f"🔁 ថតម្តងទៀត: ហាងថតរួចទាំងអស់ ({int(plan['_reshoot'].sum())}) — Top sale និងជិតហាងថ្មីមុន",
                         value=True, key="media_with_reshoot")
     view = plan[plan["_new"]] if only_new else plan
     if not with_re:
         view = view[~view["_reshoot"]]
-    pz = {k: zone_map.get(norm_name(c), VISIT_ZONE_NOT_SET) for k, c in zip(view["Customer"].map(norm_name), view["Customer"])}
-    zone = _visit_zone_picker(pz, "media_zone", due=Counter(view["Zone"]))
-    if zone:
+    zone = _media_zone_picker(view)
+    if zone != MEDIA_ALL_ZONES:
         view = view[view["Zone"] == zone]
     registry, store = _visit_registry(), _visit_pin_store()
     try:
@@ -12437,8 +12440,25 @@ def _media_plan_body(stats, names, zone_map, shoots, today):
         chosen["_o"] = chosen["Customer"].map(order)
         _media_cards(chosen.sort_values("_o"), registry, store, auto, "mp", removable=True)
         st.divider()
+    show_n = st.session_state.get("media_show_n", 40)
     st.caption(f"{len(view)} ហាង · ចុច ▶ ដើម្បីថត និងបញ្ចូលរូប។ ហាងបាត់ពីបញ្ជីវិញ ពេលថតរួច។")
-    _media_cards(view.head(40), registry, store, auto, "mg")
+    _media_cards(view.head(show_n), registry, store, auto, "mg")
+    if len(view) > show_n:
+        st.button(f"⬇️ បង្ហាញបន្ថែម ({len(view) - show_n} ទៀត)", key="media_more", use_container_width=True,
+                  on_click=lambda: st.session_state.update(media_show_n=show_n + 40))
+
+
+MEDIA_ALL_ZONES = "🗺️ គ្រប់តំបន់ (ទាំងអស់)"
+
+
+def _media_zone_picker(view):
+    """Zone filter with one more choice: all zones on one map."""
+    counts = Counter(view["Zone"])
+    options = [MEDIA_ALL_ZONES] + [z for z in VISIT_ZONE_NAMES if counts.get(z) and not z.startswith("🚫")]
+    if st.session_state.get("media_zone") not in options:
+        st.session_state["media_zone"] = MEDIA_ALL_ZONES
+    return st.selectbox("🗺️ តំបន់", options, key="media_zone",
+                        format_func=lambda z: f"{z}  ({len(view)} ហាង)" if z == MEDIA_ALL_ZONES else f"{_km(z)}  ({counts.get(z, 0)} ហាង)")
 
 
 MEDIA_PIN_COLORS = {"fridge": [220, 40, 40, 230], "new": [30, 110, 220, 230], "print": [240, 150, 0, 230],
@@ -12480,7 +12500,8 @@ def _media_map_pick(view, registry, store, auto):
                         tooltip={"text": "{label}\n{info}"})
         ver = st.session_state.get("media_map_ver", 0)
         try:
-            event = st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key=f"media_map_{ver}", height=430)
+            event = st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key=f"media_map_{ver}",
+                                    height=320 if _media_phone() else 430)
         except TypeError:                                    # older Streamlit: map without tapping
             st.pydeck_chart(deck)
             event = None
@@ -12512,9 +12533,14 @@ def _fragment_rerun_ok():
 
 
 def _media_cards(view, registry, store, auto, prefix, removable=False):
+    phone = _media_phone()
     for i, r in enumerate(view.to_dict("records")):
         with st.container(border=True):
-            a, b, c = st.columns([5, 1.2, 1.2])
+            if phone:                                   # text on top, two big buttons side by side under it
+                a = st.container()
+                b, c = st.columns(2)
+            else:
+                a, b, c = st.columns([5, 1.2, 1.2])
             a.markdown(f"**{r['Customer']}**  \n<small>{r['Why']}<br>📷 រូបចុងក្រោយ: {r['Last photo']} · {r['Pcs 28 days']:,} pcs/28 ថ្ងៃ</small>",
                        unsafe_allow_html=True)
             link, exact = _visit_map_link(r["Customer"], registry, store, auto)
@@ -12551,10 +12577,14 @@ def _media_form_body(names, zone_map, today):
         videos = st.file_uploader(f"3️⃣ វីដេអូ (mp4 / mov, ≤ {MEDIA_VIDEO_MAX_MB} MB នីមួយៗ)", type=["mp4", "mov", "m4v"],
                                   accept_multiple_files=True)
         st.markdown("**4️⃣ ស្ទីគ័រ · ម៉ឺនុយ · បដា**")
-        cols = st.columns(3)
-        states = {item: cols[n].selectbox(MEDIA_KM[item], MEDIA_STATES, index=None, format_func=_mkm,
-                                          placeholder="ជ្រើស…", key=f"media_{item}")
-                  for n, item in enumerate(MEDIA_ITEMS)}
+        if _media_phone():                               # big tap targets, one item under the other
+            states = {item: st.radio(f"{MEDIA_KM[item]}", MEDIA_STATES, index=None, format_func=_mkm,
+                                     key=f"media_{item}") for item in MEDIA_ITEMS}
+        else:
+            cols = st.columns(3)
+            states = {item: cols[n].selectbox(MEDIA_KM[item], MEDIA_STATES, index=None, format_func=_mkm,
+                                              placeholder="ជ្រើស…", key=f"media_{item}")
+                      for n, item in enumerate(MEDIA_ITEMS)}
         note = st.text_area("5️⃣ កំណត់ចំណាំ (ជម្រើស)", max_chars=1000, placeholder="ឧ. ទូដាក់ខាងក្នុង ពន្លឺតិច…")
         saved = st.form_submit_button("💾 រក្សាទុក", type="primary", use_container_width=True)
     if not saved:
@@ -12616,7 +12646,7 @@ def _media_show_shoot(r, key):
                + (f" · 📝 {r['Note']}" if str(r.get("Note", "-")) not in ("-", "") else ""))
     photos = [p for p in str(r.get("Photos", "")).split(";") if p and p != "-"]
     if photos:
-        cols = st.columns(min(3, len(photos)))
+        cols = st.columns(min(2 if _media_phone() else 3, len(photos)))
         for i, name in enumerate(photos):
             try:
                 cols[i % len(cols)].image(_media_load_photo(name), use_container_width=True)
@@ -12792,9 +12822,20 @@ def _media_status_body(names, zone_map, shoots):
 MEDIA_VIEWS = ["📋 ផែនការ ថ្ងៃសុក្រ-សៅរ៍", "📸 ថតហាង", "🎨 ស្ថានភាពថត", "🖼️ រូបភាពហាង", "📊 របាយការណ៍"]
 
 
+def _media_phone():
+    if "media_phone" not in st.session_state:
+        st.session_state["media_phone"] = is_mobile()
+    return bool(st.session_state.get("media_phone"))
+
+
 def _media_body():
     today = today_kh()
-    st.subheader("📸 Media Team — ថតរូប និងវីដេអូ ហាងភ្នំពេញ (ថ្ងៃសុក្រ · សៅរ៍)")
+    h1, h2 = st.columns([4, 1.3])
+    h1.subheader("📸 Media Team — ថតរូប និងវីដេអូ ហាងភ្នំពេញ (ថ្ងៃសុក្រ · សៅរ៍)")
+    _media_phone()
+    h2.toggle("📱 Phone mode", key="media_phone", help="ប៊ូតុងធំ ផែនទីតូច ទម្រង់ងាយស្រួលលើទូរស័ព្ទ។ បើកដោយស្វ័យប្រវត្តិលើទូរស័ព្ទ។")
+    if _media_phone():
+        st.markdown(VISIT_PHONE_CSS, unsafe_allow_html=True)
     if st.session_state.get("media_view") not in MEDIA_VIEWS:
         st.session_state["media_view"] = MEDIA_VIEWS[0]
     view = st.radio("Media", MEDIA_VIEWS, key="media_view", horizontal=True, label_visibility="collapsed")
