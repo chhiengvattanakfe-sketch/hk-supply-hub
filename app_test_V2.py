@@ -1702,6 +1702,7 @@ def prune_backups(dbx=None):
 
 _BACKUP_FILES = lambda: (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE,
                          MAP_REGISTRY_FILE, CALLS_FILE, SI_ALIAS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
+                         os.path.join(DATA_DIR, "media_shoots.csv"),
                          os.path.join(DATA_DIR, "visit_settings.json"))
 
 
@@ -12027,6 +12028,433 @@ def _shop_visits_body():
         _visit_problems_body(visits)
 
 
+# ==========================================
+# 📸 MEDIA TEAM — photos & videos of Phnom Penh shops every Friday and Saturday
+# ==========================================
+MEDIA_FILE = os.path.join(DATA_DIR, "media_shoots.csv")
+MEDIA_COLS = ["Date", "Customer", "ShootID", "Zone", "By", "Photos", "Videos", "Sticker", "Menu", "Banner",
+              "Why", "Note", "Shoot day"]
+MEDIA_DIR = "media"
+MEDIA_DAYS = (4, 5)                       # Friday, Saturday (Monday = 0)
+MEDIA_ITEMS = ["Sticker", "Menu", "Banner"]
+MEDIA_STATES = ["✅ Put up a new one today", "👍 Has one, still good", "⚠️ Old — needs a new one", "❌ None — needs one",
+                "➖ Not for this shop"]
+MEDIA_NEED = ("⚠️ Old — needs a new one", "❌ None — needs one")
+MEDIA_KM = {"Sticker": "ស្ទីគ័រ", "Menu": "ម៉ឺនុយ", "Banner": "បដា / Banner",
+            "✅ Put up a new one today": "✅ បានដាក់ថ្មីថ្ងៃនេះ", "👍 Has one, still good": "👍 មានហើយ នៅល្អ",
+            "⚠️ Old — needs a new one": "⚠️ ចាស់ — ត្រូវការថ្មី", "❌ None — needs one": "❌ មិនមាន — ត្រូវការ",
+            "➖ Not for this shop": "➖ មិនត្រូវការសម្រាប់ហាងនេះ"}
+MEDIA_PHOTO_MAX = 12
+MEDIA_VIDEO_MAX_MB = 200
+MEDIA_RECENT_DAYS = 45                    # journal events this recent put a shop on the media list
+MEDIA_REFRESH_DAYS = 90                   # photos older than this are "old"
+# journal remark words -> why the media team should go
+MEDIA_EVENT_RULES = [
+    ("fridge", 10, "🧊 ទូថ្មី", re.compile(r"ទូរ?\s*ថ្មី|NEW\s*FRIDGE", re.I)),
+    ("display", 5, "🪧 ឧបករណ៍តាំងថ្មី", re.compile(r"X[\s\-]*STAND|រ៉េស៊ីស្តង់|ឆ័ត្រ|ឆ៍ត្រ|UMBRELLA|STICKER|ស្ទីគ័រ|BANNER|ផ្ទាំង|MENU|ម៉ឺនុយ", re.I)),
+]
+
+
+def _mkm(v):
+    return MEDIA_KM.get(v, v)
+
+
+def _media_read():
+    try:
+        return read_raw(MEDIA_FILE, MEDIA_COLS, max_age=60)
+    except Exception:
+        return pd.DataFrame(columns=MEDIA_COLS + ["_dt"])
+
+
+def _media_next_shoot_day(today):
+    """Today when it is Friday / Saturday, else the coming Friday."""
+    if today.weekday() in MEDIA_DAYS:
+        return today
+    return today + timedelta(days=(4 - today.weekday()) % 7)
+
+
+def _media_rel(name):
+    month = name[1:7] if name[:1] == "M" and name[1:7].isdigit() else "misc"
+    return f"{MEDIA_DIR}/{month[:4]}-{month[4:6]}/{name}"
+
+
+def _media_save_file(name, data):
+    """Photos and videos go to <Dropbox folder>/media/YYYY-MM/. Big videos are sent in 8 MB pieces."""
+    rel = _media_rel(name)
+    if not USE_DROPBOX:
+        full = os.path.join(DATA_DIR, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        _write_atomic(full, data)
+        return
+    import dropbox
+    dbx, path, chunk = _dbx(), f"{DROPBOX_FOLDER}/{rel}", 8 * 1024 * 1024
+    if len(data) <= 4 * chunk:
+        dbx.files_upload(data, path, mode=dropbox.files.WriteMode.overwrite, mute=True)
+        return
+    start = dbx.files_upload_session_start(data[:chunk])
+    cursor = dropbox.files.UploadSessionCursor(session_id=start.session_id, offset=chunk)
+    while cursor.offset + chunk < len(data):
+        dbx.files_upload_session_append_v2(data[cursor.offset:cursor.offset + chunk], cursor)
+        cursor.offset += chunk
+    dbx.files_upload_session_finish(data[cursor.offset:], cursor,
+                                    dropbox.files.CommitInfo(path=path, mode=dropbox.files.WriteMode.overwrite, mute=True))
+
+
+@st.cache_data(show_spinner=False, max_entries=120, ttl=3600)
+def _media_load_photo(name):
+    return _media_load(name)
+
+
+def _media_load(name):
+    rel = _media_rel(name)
+    if USE_DROPBOX:
+        _md, res = _dbx().files_download(f"{DROPBOX_FOLDER}/{rel}")
+        return res.content
+    with open(os.path.join(DATA_DIR, rel), "rb") as f:
+        return f.read()
+
+
+def _media_last_shoot(shoots):
+    """{customer key: newest shoot row}."""
+    if shoots.empty:
+        return {}
+    s = shoots.sort_values("_dt")
+    return {norm_name(r["Customer"]): r for r in s.to_dict("records")}
+
+
+def _media_events(names, today):
+    """{key: [(date, kind, score, label, remark)]} from the journal remarks + first orders + new leads."""
+    out = {}
+    start = pd.Timestamp(today) - pd.Timedelta(days=MEDIA_RECENT_DAYS)
+    comb = st.session_state.get("si_combined", pd.DataFrame())
+    if comb is not None and not comb.empty and {"Date", "Customer", "Remark"} <= set(comb.columns):
+        c = comb[["Date", "Customer", "Remark"]].copy()
+        c["D"] = pd.to_datetime(c["Date"], errors="coerce")
+        c = c[(c["D"] >= start) & c["Remark"].astype(str).str.strip().ne("-")]
+        for d, cust, rem in zip(c["D"], c["Customer"], c["Remark"].astype(str)):
+            k = norm_name(cust)
+            if k not in names:
+                continue
+            for kind, score, label, rx in MEDIA_EVENT_RULES:
+                if rx.search(rem):
+                    out.setdefault(k, []).append((d.normalize(), kind, score, label, rem))
+                    break
+    daily = st.session_state.get("_visit_daily", pd.DataFrame())
+    if daily is not None and not daily.empty:
+        first = daily.groupby("Key")["D"].min()
+        older = set()                                       # bought in months before the daily journal starts = not new
+        try:
+            hm = _si_read_hist(SI_HIST_MONTHLY_FILE)
+            if not hm.empty and {"Customer", "Month"} <= set(hm.columns):
+                start_m = pd.Timestamp(daily["D"].min()).strftime("%Y-%m")
+                pcs = pd.to_numeric(hm["Pcs"], errors="coerce").fillna(0) if "Pcs" in hm.columns else 1
+                older = set(hm.loc[(hm["Month"].astype(str) < start_m) & (pcs > 0), "Customer"].map(norm_name))
+        except Exception:
+            older = set()
+        for k, d in first.items():
+            if k in names and k not in older and d >= pd.Timestamp(today) - pd.Timedelta(days=30):
+                out.setdefault(k, []).append((pd.Timestamp(d).normalize(), "new", 8, "🆕 អតិថិជនថ្មី", f"បញ្ជាទិញលើកដំបូង {d:%d %b}"))
+    for k, v in (st.session_state.get("_visit_new", {}) or {}).items():
+        if k in names and v.get("date") is not None and not any(e[1] == "new" for e in out.get(k, [])):
+            out.setdefault(k, []).append((pd.Timestamp(v["date"]).normalize(), "new", 8, "🆕 អតិថិជនថ្មី", "ពី Leads report"))
+    return out
+
+
+def _media_priority(stats, names, zone_map, shoots, today):
+    """Shops for the media team, most urgent first. A journal event counts until the shop is filmed after it."""
+    events = _media_events(names, today)
+    last = _media_last_shoot(shoots)
+    t = pd.Timestamp(today)
+    rows = []
+    for k, name in names.items():
+        zone = zone_map.get(k, VISIT_ZONE_NOT_SET)
+        if str(zone).startswith("🚫"):
+            continue
+        ls = last.get(k)
+        shot = pd.to_datetime(ls["_dt"]) if ls is not None else None
+        shot_day = shot.normalize() if shot is not None and pd.notna(shot) else None
+        score, why, open_events = 0, [], []
+        for d, kind, sc, label, rem in sorted(events.get(k, []), key=lambda e: -e[2]):
+            if shot_day is not None and shot_day >= d:
+                continue                                   # already filmed after this happened
+            if any(e[1] == kind for e in open_events):
+                continue
+            open_events.append((d, kind))
+            score += sc
+            why.append(f"{label} ({d:%d %b})")
+        s = stats.loc[k] if (not stats.empty and k in stats.index) else None
+        pcs28 = float(s["Pcs 28d"]) if s is not None and pd.notna(s["Pcs 28d"]) else 0.0
+        if shot_day is None:
+            if pcs28 > 0:
+                score += 3
+                why.append("📷 មិនទាន់មានរូប")
+        elif (t - shot_day).days > MEDIA_REFRESH_DAYS and pcs28 > 0:
+            score += 2
+            why.append(f"📷 រូបចាស់ ({(t - shot_day).days} ថ្ងៃ)")
+        if ls is not None and any(str(ls.get(i, "")) in MEDIA_NEED for i in MEDIA_ITEMS):
+            need = [MEDIA_KM[i] for i in MEDIA_ITEMS if str(ls.get(i, "")) in MEDIA_NEED]
+            score += 4
+            why.append("🖨️ ត្រូវការ " + ", ".join(need))
+        if score <= 0:
+            continue
+        if pcs28 >= 1000:
+            score += 1
+        rows.append({"Priority": score, "Customer": name, "Zone": zone, "Why": " · ".join(why),
+                     "Last photo": f"{shot_day:%d %b %Y}" if shot_day is not None else "មិនទាន់",
+                     "Pcs 28 days": int(pcs28), "_new": any(e[1] in ("fridge", "new") for e in open_events)})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Priority", "Pcs 28 days"], ascending=False).reset_index(drop=True)
+
+
+def _media_start(customer):
+    st.session_state["media_view"] = "📸 ថតហាង"
+    st.session_state["media_customer"] = customer
+
+
+def _media_plan_body(stats, names, zone_map, shoots, today):
+    day = _media_next_shoot_day(today)
+    is_day = today.weekday() in MEDIA_DAYS
+    st.markdown(f"#### 📅 ថ្ងៃថត: **{'ថ្ងៃនេះ' if is_day else 'ថ្ងៃសុក្រ'} {day:%d %b}** " +
+                ("· ថ្ងៃសៅរ៍បន្ទាប់" if day.weekday() == 4 and is_day else ""))
+    plan = _media_priority(stats, names, zone_map, shoots, today)
+    st.session_state["media_why"] = dict(zip(plan["Customer"].map(norm_name), plan["Why"])) if not plan.empty else {}
+    if plan.empty:
+        st.success("គ្មានហាងត្រូវថតទេ — ហាងទាំងអស់មានរូបថ្មីហើយ។ 🎉")
+        return
+    week_start = pd.Timestamp(today - timedelta(days=today.weekday()))
+    done_week = shoots[shoots["_dt"] >= week_start] if not shoots.empty else shoots
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ហាងត្រូវថត", f"{len(plan)}")
+    c2.metric("🆕 ទូថ្មី / អតិថិជនថ្មី", f"{int(plan['_new'].sum())}")
+    c3.metric("ថតរួចសប្តាហ៍នេះ", f"{done_week['Customer'].map(norm_name).nunique() if not done_week.empty else 0}")
+    c4.metric("រូប / វីដេអូ សប្តាហ៍នេះ",
+              f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Photos', []))} / "
+              f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Videos', []))}")
+    only_new = st.toggle("🆕 បង្ហាញតែ ទូថ្មី និង អតិថិជនថ្មី", key="media_only_new")
+    view = plan[plan["_new"]] if only_new else plan
+    pz = {k: zone_map.get(norm_name(c), VISIT_ZONE_NOT_SET) for k, c in zip(view["Customer"].map(norm_name), view["Customer"])}
+    zone = _visit_zone_picker(pz, "media_zone", due=Counter(view["Zone"]))
+    if zone:
+        view = view[view["Zone"] == zone]
+    st.caption(f"{len(view)} ហាង · ចុច ▶ ដើម្បីថត និងបញ្ចូលរូប។ ហាងបាត់ពីបញ្ជីវិញ ពេលថតរួច។")
+    registry, store = _visit_registry(), _visit_pin_store()
+    try:
+        auto = _visit_candidates_for({norm_name(c): c for c in view["Customer"]}, registry)[1]
+    except Exception:
+        auto = {}
+    for i, r in enumerate(view.head(40).to_dict("records")):
+        with st.container(border=True):
+            a, b, c = st.columns([5, 1.2, 1.2])
+            a.markdown(f"**{r['Customer']}**  \n<small>{r['Why']}<br>📷 រូបចុងក្រោយ: {r['Last photo']} · {r['Pcs 28 days']:,} pcs/28 ថ្ងៃ</small>",
+                       unsafe_allow_html=True)
+            link, exact = _visit_map_link(r["Customer"], registry, store, auto)
+            b.link_button("🧭 ទៅ" if exact else "🔎 រក", link, use_container_width=True)
+            c.button("ថត ▶", key=f"media_go_{i}", use_container_width=True, on_click=_media_start, args=(r["Customer"],))
+
+
+def _media_form_body(names, zone_map, today):
+    customers = sorted(set(names.values()), key=str.casefold)
+    pre = st.session_state.get("media_customer")
+    idx = customers.index(pre) if pre in customers else None
+    customer = st.selectbox("1️⃣ ហាង (ភ្នំពេញ)", customers, index=idx, key="media_customer_box", placeholder="វាយឈ្មោះហាង…")
+    if not customer:
+        st.info("ជ្រើសហាង ឬចុច ▶ ពីផែនការ។")
+        return
+    st.session_state["media_customer"] = customer
+    if today.weekday() not in MEDIA_DAYS:
+        st.caption("ℹ️ ថ្ងៃនេះមិនមែនថ្ងៃសុក្រ/សៅរ៍ទេ — នៅតែអាចបញ្ចូលបាន។")
+    with st.form("media_form", clear_on_submit=True):
+        photos = st.file_uploader(f"2️⃣ រូបថតហាង (រហូតដល់ {MEDIA_PHOTO_MAX})", type=["jpg", "jpeg", "png", "heic", "webp"],
+                                  accept_multiple_files=True)
+        videos = st.file_uploader(f"3️⃣ វីដេអូ (mp4 / mov, ≤ {MEDIA_VIDEO_MAX_MB} MB នីមួយៗ)", type=["mp4", "mov", "m4v"],
+                                  accept_multiple_files=True)
+        st.markdown("**4️⃣ ស្ទីគ័រ · ម៉ឺនុយ · បដា**")
+        cols = st.columns(3)
+        states = {item: cols[n].selectbox(MEDIA_KM[item], MEDIA_STATES, index=None, format_func=_mkm,
+                                          placeholder="ជ្រើស…", key=f"media_{item}")
+                  for n, item in enumerate(MEDIA_ITEMS)}
+        note = st.text_area("5️⃣ កំណត់ចំណាំ (ជម្រើស)", max_chars=1000, placeholder="ឧ. ទូដាក់ខាងក្នុង ពន្លឺតិច…")
+        saved = st.form_submit_button("💾 រក្សាទុក", type="primary", use_container_width=True)
+    if not saved:
+        return
+    errs = []
+    if not photos and not videos:
+        errs.append("សូមបញ្ចូលរូប ឬវីដេអូយ៉ាងហោចណាស់ 1")
+    if photos and len(photos) > MEDIA_PHOTO_MAX:
+        errs.append(f"រូបច្រើនពេក (អតិបរមា {MEDIA_PHOTO_MAX})")
+    if any(v.size > MEDIA_VIDEO_MAX_MB * 1024 * 1024 for v in (videos or [])):
+        errs.append(f"វីដេអូធំពេក (អតិបរមា {MEDIA_VIDEO_MAX_MB} MB)")
+    missing = [MEDIA_KM[i] for i, v in states.items() if not v]
+    if missing:
+        errs.append("សូមជ្រើស: " + ", ".join(missing))
+    if errs:
+        st.error(" · ".join(errs))
+        return
+    sid = f"M{now_kh():%Y%m%d-%H%M%S}-{pysecrets.token_hex(2)}"
+    who = current_user() or "-"
+    p_names, v_names = [], []
+    prog = st.progress(0.0, text="កំពុងបញ្ចូល…")
+    total = len(photos or []) + len(videos or [])
+    try:
+        for n, f in enumerate(photos or [], 1):
+            data = _visit_photo_prepare(f.getvalue(), [customer[:40], f"{now_kh():%d/%m/%Y %H:%M} · {who}"])
+            name = f"{sid}_p{n}.jpg"
+            _media_save_file(name, data)
+            p_names.append(name)
+            prog.progress(len(p_names) / total, text=f"រូប {n}/{len(photos)}")
+        for n, f in enumerate(videos or [], 1):
+            ext = os.path.splitext(f.name)[1].lower() or ".mp4"
+            name = f"{sid}_v{n}{ext if ext in ('.mp4', '.mov', '.m4v') else '.mp4'}"
+            _media_save_file(name, f.getvalue())
+            v_names.append(name)
+            prog.progress((len(p_names) + len(v_names)) / total, text=f"វីដេអូ {n}/{len(videos)}")
+        k = norm_name(customer)
+        append_row(MEDIA_FILE, {"Date": now_str(), "Customer": customer, "ShootID": sid,
+                                "Zone": zone_map.get(k, VISIT_ZONE_NOT_SET), "By": who,
+                                "Photos": ";".join(p_names) or "-", "Videos": ";".join(v_names) or "-",
+                                **{i: states[i] for i in MEDIA_ITEMS},
+                                "Why": st.session_state.get("media_why", {}).get(k, "-"), "Note": note.strip() or "-",
+                                "Shoot day": "Yes" if today.weekday() in MEDIA_DAYS else "No"})
+        audit("media shoot saved", f"{customer} | {len(p_names)} photos | {len(v_names)} videos")
+    except Exception as e:
+        prog.empty()
+        st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:200] + (" — រូបដែលបានបញ្ចូលរួច: " + str(len(p_names)) if p_names else ""))
+        return
+    prog.empty()
+    st.session_state.pop("media_customer", None)
+    st.session_state["flash"] = f"📸 បានរក្សាទុក {customer}: {len(p_names)} រូប · {len(v_names)} វីដេអូ"
+    st.session_state["media_view"] = "📋 ផែនការ ថ្ងៃសុក្រ-សៅរ៍"
+    st.rerun()
+
+
+def _media_show_shoot(r, key):
+    st.markdown(f"**{r['Customer']}** · {str(r['Date'])[:16]} · {r['By']}")
+    st.caption(" · ".join(f"{MEDIA_KM[i]}: {_mkm(str(r.get(i, '-')))}" for i in MEDIA_ITEMS)
+               + (f" · 📝 {r['Note']}" if str(r.get("Note", "-")) not in ("-", "") else ""))
+    photos = [p for p in str(r.get("Photos", "")).split(";") if p and p != "-"]
+    if photos:
+        cols = st.columns(min(3, len(photos)))
+        for i, name in enumerate(photos):
+            try:
+                cols[i % len(cols)].image(_media_load_photo(name), use_container_width=True)
+            except Exception as e:
+                cols[i % len(cols)].warning(f"{name}: {str(e)[:60]}")
+    videos = [v for v in str(r.get("Videos", "")).split(";") if v and v != "-"]
+    for i, name in enumerate(videos):
+        vk = f"{key}_v{i}"
+        if st.session_state.get(vk):
+            try:
+                st.video(_media_load(name))
+            except Exception as e:
+                st.warning(f"{name}: {str(e)[:80]}")
+        elif st.button(f"▶️ បើកវីដេអូ {i + 1}", key=vk + "_btn"):
+            st.session_state[vk] = True
+            st.rerun()
+
+
+def _media_gallery_body(shoots, names):
+    if shoots.empty:
+        st.info("មិនទាន់មានរូបថតទេ។")
+        return
+    options = sorted(set(shoots["Customer"]), key=str.casefold)
+    pick = st.selectbox("ហាង", options, index=None, key="media_gal_shop", placeholder="ជ្រើសហាង ដើម្បីមើលរូបទាំងអស់…")
+    if pick:
+        rows = shoots[shoots["Customer"].map(norm_name).eq(norm_name(pick))].sort_values("_dt", ascending=False)
+        for n, r in enumerate(rows.to_dict("records")):
+            with st.container(border=True):
+                _media_show_shoot(r, f"mg_{n}")
+        return
+    st.caption("ថតចុងក្រោយ (10 ចុងក្រោយ)")
+    for n, r in enumerate(shoots.sort_values("_dt", ascending=False).head(10).to_dict("records")):
+        with st.container(border=True):
+            _media_show_shoot(r, f"ml_{n}")
+
+
+def _media_report_body(shoots, today):
+    if shoots.empty:
+        st.info("មិនទាន់មានទិន្នន័យ។")
+        return
+    s = shoots.copy()
+    s["Week"] = (s["_dt"] - pd.to_timedelta(s["_dt"].dt.weekday, unit="D")).dt.strftime("%d %b")
+    s["n_photo"] = s["Photos"].map(lambda p: len([x for x in str(p).split(";") if x and x != "-"]))
+    s["n_video"] = s["Videos"].map(lambda p: len([x for x in str(p).split(";") if x and x != "-"]))
+    s["_wk"] = s["_dt"] - pd.to_timedelta(s["_dt"].dt.weekday, unit="D")
+    wk = (s.groupby(["_wk", "Week"]).agg(ហាង=("Customer", "nunique"), រូប=("n_photo", "sum"), វីដេអូ=("n_video", "sum"),
+                                       ថ្ងៃសុក្រសៅរ៍=("Shoot day", lambda x: int((x == "Yes").sum())))
+          .reset_index().sort_values("_wk", ascending=False).drop(columns="_wk").head(10))
+    st.markdown("**📊 តាមសប្តាហ៍**")
+    show_df(wk.rename(columns={"Week": "សប្តាហ៍ចាប់ពី"}))
+    st.markdown("**👤 តាមបុគ្គលិក (30 ថ្ងៃ)**")
+    recent = s[s["_dt"] >= pd.Timestamp(today) - pd.Timedelta(days=30)]
+    show_df(recent.groupby("By").agg(ហាង=("Customer", "nunique"), រូប=("n_photo", "sum"), វីដេអូ=("n_video", "sum")).reset_index())
+    last = pd.DataFrame(list(_media_last_shoot(s).values()))
+    need = last[last[MEDIA_ITEMS].isin(MEDIA_NEED).any(axis=1)] if not last.empty else last
+    st.markdown(f"**🖨️ ហាងត្រូវការ ស្ទីគ័រ / ម៉ឺនុយ / បដា ថ្មី ({len(need)})**")
+    if need.empty:
+        st.caption("គ្មាន")
+    else:
+        t = need[["Customer", "Date"] + MEDIA_ITEMS].copy()
+        for i in MEDIA_ITEMS:
+            t[i] = t[i].map(lambda v: "🖨️ ត្រូវការ" if v in MEDIA_NEED else _mkm(v))
+        show_df(t.rename(columns={"Date": "ថតចុងក្រោយ", **{i: MEDIA_KM[i] for i in MEDIA_ITEMS}}))
+    if has_permission("reports"):
+        _lazy_excel_download("📥 Download media report (Excel)",
+                             lambda: {"Shoots": s.drop(columns=["_dt", "_wk"], errors="ignore"), "By week": wk,
+                                      "Needs print": need.drop(columns=["_dt"], errors="ignore") if not need.empty else need},
+                             f"Media_{today}.xlsx", "media_dl")
+
+
+MEDIA_VIEWS = ["📋 ផែនការ ថ្ងៃសុក្រ-សៅរ៍", "📸 ថតហាង", "🖼️ រូបភាពហាង", "📊 របាយការណ៍"]
+
+
+def _media_body():
+    today = today_kh()
+    st.subheader("📸 Media Team — ថតរូប និងវីដេអូ ហាងភ្នំពេញ (ថ្ងៃសុក្រ · សៅរ៍)")
+    if st.session_state.get("media_view") not in MEDIA_VIEWS:
+        st.session_state["media_view"] = MEDIA_VIEWS[0]
+    view = st.radio("Media", MEDIA_VIEWS, key="media_view", horizontal=True, label_visibility="collapsed")
+    shoots = _media_read()
+    if view == "🖼️ រូបភាពហាង":
+        _media_gallery_body(shoots, {})
+        return
+    if view == "📊 របាយការណ៍":
+        _media_report_body(shoots, today)
+        return
+    snap, _src, _path, err = current_snapshot()
+    if snap:
+        try:
+            _si_prepare(snap)                       # journal remarks (ទូថ្មី, X STAND…) for the priority list
+        except Exception:
+            pass
+    stats, names, _areas = _visit_customer_stats()
+    if not names:
+        st.warning("រកមិនឃើញអតិថិជននៅភ្នំពេញទេ។ " + (err or ""))
+        return
+    zone_map = _visit_zone_map(names)
+    if view == "📸 ថតហាង":
+        _media_form_body(names, zone_map, today)
+    else:
+        _media_plan_body(stats, names, zone_map, shoots, today)
+
+
+@st.fragment
+def _media_fragment():
+    _media_body()
+
+
+def tab_media():
+    """Runs as a fragment: taps inside redraw only this section."""
+    try:
+        _media_fragment()
+    except Exception as e:
+        if "fragment" in str(e).lower():
+            _media_body()
+        else:
+            raise
+
+
 ROLE = require_login()                     # nothing below runs until the person is logged in
 _visit_read_gps_params()                   # a shop check-in comes back in the address bar
 if "main_section" not in st.session_state:  # new session (phone woke up / reconnected) with an unfinished visit
@@ -12113,6 +12541,7 @@ if _perms.get("view") or _perms.get("reports"):
     labels.append("📞 Customer Follow-ups")
 if ROLE in ("admin", "staff", "sales") and (_perms.get("edit") or _perms.get("reports")):
     labels.append("🏪 Shop Visits")
+    labels.append("📸 Media Team")
 if ROLE == "admin":
     labels.append("🤖 4. Admin: Bot, Users & Security")
 if not labels:
@@ -12144,5 +12573,7 @@ elif _label.startswith("📞"):
     tab_followups()
 elif _label.startswith("🏪"):
     tab_shop_visits()
+elif _label.startswith("📸"):
+    tab_media()
 else:
     tab_bot()
