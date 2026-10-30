@@ -7168,14 +7168,26 @@ def _si_no_order_contact_table(frame, history, month_start, key, height=420):
     if frame.empty:
         st.caption("គ្មាន")
         return
-    contacted = _si_contacted_map(history, month_start)
+    # Contacted = a contact saved AFTER the customer's last order (so it does not reset on the 1st of the month).
+    # Customers who never ordered: a contact in the last 60 days.
+    calls = _si_contacted_map(history, pd.Timestamp(month_start) - pd.Timedelta(days=400))
     view = frame.copy()
     view["_k"] = view["Customer"].map(norm_name)
+    contacted = {}
+    for k, last in zip(view["_k"], view.get("Last order", pd.Series("-", index=view.index))):
+        c = calls.get(k)
+        if not c:
+            continue
+        cd = pd.to_datetime(c.get("Date"), errors="coerce")
+        lo = pd.to_datetime(last, errors="coerce")
+        if pd.notna(cd) and ((pd.notna(lo) and cd.normalize() > lo.normalize())
+                             or (pd.isna(lo) and cd >= pd.Timestamp(today_kh()) - pd.Timedelta(days=60))):
+            contacted[k] = c
     view["Contact"] = view["_k"].map(lambda k: _si_contact_text(contacted.get(k)))
     n_done = int(view["_k"].isin(contacted).sum())
     f1, f2 = st.columns([3, 2])
     show = f1.radio("បង្ហាញ", ["ទាំងអស់", "⏳ មិនទាន់ទាក់ទង", "✅ ទាក់ទងហើយ"], horizontal=True, key=f"{key}_flt")
-    f2.caption(f"✅ ទាក់ទងហើយ {n_done} / {len(view)} នាក់ ក្នុងខែនេះ")
+    f2.caption(f"✅ ទាក់ទងហើយ {n_done} / {len(view)} នាក់ (ក្រោយការបញ្ជាទិញចុងក្រោយ)")
     if show.startswith("⏳"):
         view = view[~view["_k"].isin(contacted)]
     elif show.startswith("✅"):
@@ -11716,3 +11728,4 @@ elif _label.startswith("🏪"):
     tab_shop_visits()
 else:
     tab_bot()
+                
