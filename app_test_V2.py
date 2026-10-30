@@ -7759,6 +7759,43 @@ def _si_save_call(row):
 
 def _si_choose_call(customer):
     st.session_state["si_call_customer"] = customer
+    st.session_state["si_call_popup"] = customer          # open the form right here, not at the bottom of the page
+
+
+def _si_call_popup_body(customer):
+    try:
+        history = read_raw(CALLS_FILE, CALL_COLS)
+    except Exception as e:
+        st.error(f"Call history could not be opened: {e}")
+        return
+    st.caption("Platform is picked automatically (last one used with this customer). Save once; the window closes.")
+    _si_call_form(customer, history, "popup")
+
+
+_si_call_popup = None
+for _dlg_name in ("dialog", "experimental_dialog"):
+    try:
+        _dlg = getattr(st, _dlg_name, None)
+        if _dlg is not None:
+            _cand = _dlg("📝 Record call / update customer", width="large")(_si_call_popup_body)
+            if callable(_cand):
+                _si_call_popup = _cand
+                break
+    except Exception:
+        continue
+
+
+def _si_open_call_popup_if_asked():
+    """Show the form for the customer whose button was just pressed (once per click)."""
+    customer = st.session_state.pop("si_call_popup", None)
+    if not customer:
+        return
+    if _si_call_popup is not None:
+        _si_call_popup(customer)
+    else:                                                   # very old Streamlit: show it at the top of the list instead
+        with st.container(border=True):
+            st.markdown(f"#### 📝 {customer}")
+            _si_call_popup_body(customer)
 
 
 @st.fragment
@@ -7786,6 +7823,11 @@ def _si_call_panel(names):
     if st.session_state.get("si_call_customer") not in options:
         st.session_state["si_call_customer"] = options[0]
     customer = st.selectbox("Customer to call / update", options, key="si_call_customer")
+    _si_call_form(customer, history, "panel")
+
+
+def _si_call_form(customer, history, where="panel"):
+    """The call / customer-update form and this customer's history. Used at the bottom panel and in the pop-up."""
     mine = history[history["Customer"].map(norm_name).eq(norm_name(customer))]
     prev = mine.iloc[-1].to_dict() if not mine.empty else {}
     def value(col, default=""):
@@ -7798,7 +7840,7 @@ def _si_call_panel(names):
     if value("Customer status") == "Do not contact":
         st.warning("This customer is marked Do not contact. Record an internal update if needed.")
     if has_permission("edit"):
-        with st.form("call_form_" + token, clear_on_submit=False):
+        with st.form(f"call_form_{where}_" + token, clear_on_submit=False):
             a, p_col, b = st.columns(3)
             plat_default = _si_platform_guess(history, customer)
             platform = p_col.selectbox("Platform (how you contacted)", CALL_PLATFORMS, index=CALL_PLATFORMS.index(plat_default),
@@ -7840,6 +7882,7 @@ def _si_call_panel(names):
             else:
                 st.session_state.pop(token_key, None)
                 st.session_state["si_call_saved"] = customer
+                st.session_state["flash"] = f"✅ Call saved for {customer}"
                 st.rerun()
     else:
         st.info("Read-only access. An admin can enable Create, edit, and submit changes for your account.")
@@ -7853,7 +7896,7 @@ def _si_call_panel(names):
         st.dataframe(display, hide_index=True, use_container_width=True)
         if has_permission("reports"):
             st.download_button("Download this customer's call history", display.to_csv(index=False).encode("utf-8-sig"),
-                               file_name="customer_call_history.csv", mime="text/csv", key="si_call_export")
+                               file_name="customer_call_history.csv", mime="text/csv", key=f"si_call_export_{where}")
     else:
         st.caption("No calls recorded for this customer yet.")
 
@@ -8476,6 +8519,7 @@ def _sales_insights_body():
                 view = view[view["Area"].isin(area_pick)]
             if q.strip():
                 view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
+            _si_open_call_popup_if_asked()
             st.markdown("#### 📞 Call list (urgent first)")
             urgent = view[(view["Priority"] <= 2) & view["Call now"].eq(True)].head(10)
             st.caption("Calls recorded today, customers who ordered today, and future scheduled follow-ups stay in the table below but are excluded from this urgent sales-call queue. Due follow-ups remain in the follow-up review.")
