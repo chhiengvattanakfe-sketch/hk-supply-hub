@@ -7251,32 +7251,98 @@ def _si_no_order_contact_table(frame, history, month_start, key, height=420):
         st.rerun()
 
 
-def _si_dup_review(review, key="si_dup"):
-    """Look-alike names: one did not order, the other did. Admin decides once; the answer is remembered."""
-    if review.empty:
-        return
+def _si_dup_review(review, key="si_dup", all_names=()):
+    """Table of look-alike names (one did not order, the other did). Choose ✅ Same / ❌ Different per row, then Save."""
     st.markdown(f"**🔁 ប្រហែលជាអតិថិជនដដែល — បានបញ្ជាទិញក្រោមឈ្មោះផ្សេង ({len(review)})**")
-    st.caption("ឈ្មោះទាំងនេះមិនបង្ហាញក្នុងតារាង 'មិនបញ្ជាទិញ' ខាងក្រោមទេ រហូតដល់អ្នកសម្រេច។ "
-               "✅ ដូចគ្នា = លុបចេញពីបញ្ជីមិនបញ្ជាទិញជារៀងរហូត · ❌ ផ្សេងគ្នា = បង្ហាញវិញ ហើយមិនសួរទៀត។")
     can = has_permission("edit")
-    for i, r in enumerate(review.head(25).to_dict("records")):
-        c1, c2, c3 = st.columns([6, 1.3, 1.3])
-        c1.markdown(f"**{r['Customer']}** ↔ បានបញ្ជាទិញជា **{r['Ordered as']}**  \n"
-                    f"<small>{r['Pcs this month']:,} pcs ខែនេះ · ចុងក្រោយ {r['Last order (other name)']} · ស្រដៀង {r['Likeness %']}%</small>",
-                    unsafe_allow_html=True)
-        tag = hashlib.sha256(f"{r['Customer']}|{r['Ordered as']}".encode()).hexdigest()[:16]
-        for col, label, dec in ((c2, "✅ ដូចគ្នា", "Same"), (c3, "❌ ផ្សេងគ្នា", "Different")):
-            if col.button(label, key=f"{key}_{dec}_{tag}", disabled=not can, use_container_width=True):
+    if not review.empty:
+        st.caption("ឈ្មោះទាំងនេះមិនបង្ហាញក្នុងតារាង 'មិនបញ្ជាទិញ' ខាងក្រោមទេ រហូតដល់អ្នកសម្រេច។ ជ្រើស ✅ ដូចគ្នា ឬ ❌ ផ្សេងគ្នា "
+                   "ក្នុងជួរ 'សម្រេច' (ឬប្រើប៊ូតុងជ្រើសទាំងអស់) ហើយចុច 💾 រក្សាទុក។ "
+                   "✅ ដូចគ្នា = ចាត់ទុកជាអតិថិជនតែមួយ · ❌ ផ្សេងគ្នា = បង្ហាញវិញ ហើយមិនសួរទៀត។")
+        CHOICES = ["—", "✅ ដូចគ្នា", "❌ ផ្សេងគ្នា"]
+        ver = st.session_state.get(f"{key}_ver", 0)
+        preset = st.session_state.get(f"{key}_preset", "—")
+        b1, b2, b3, _sp = st.columns([1.4, 1.4, 1.6, 3])
+        if b1.button("✅ ជ្រើស ≥95% ជាដូចគ្នា", key=f"{key}_p95", disabled=not can, use_container_width=True):
+            st.session_state[f"{key}_preset"] = "95"
+            st.session_state[f"{key}_ver"] = ver + 1
+            st.rerun()
+        if b2.button("✅ ជ្រើសទាំងអស់ ដូចគ្នា", key=f"{key}_pall", disabled=not can, use_container_width=True):
+            st.session_state[f"{key}_preset"] = "all"
+            st.session_state[f"{key}_ver"] = ver + 1
+            st.rerun()
+        if b3.button("↩️ សម្អាតការជ្រើស", key=f"{key}_pclr", disabled=not can, use_container_width=True):
+            st.session_state[f"{key}_preset"] = "—"
+            st.session_state[f"{key}_ver"] = ver + 1
+            st.rerun()
+        view = review.copy()
+        view.insert(0, "សម្រេច", ["✅ ដូចគ្នា" if preset == "all" or (preset == "95" and p >= 95) else "—"
+                                  for p in view["Likeness %"]])
+        edited = st.data_editor(
+            view, hide_index=True, use_container_width=True, key=f"{key}_ed_{ver}",
+            height=min(520, 38 + 35 * (len(view) + 1)),
+            disabled=[c for c in view.columns if c != "សម្រេច"] if can else True,
+            column_config={
+                "សម្រេច": st.column_config.SelectboxColumn("សម្រេច", options=CHOICES, required=True, width="small"),
+                "Customer": st.column_config.TextColumn("ឈ្មោះមិនបញ្ជាទិញ"),
+                "Ordered as": st.column_config.TextColumn("បានបញ្ជាទិញជា"),
+                "Pcs this month": st.column_config.NumberColumn("Pcs ខែនេះ", format="%d"),
+                "Last order (other name)": st.column_config.TextColumn("បញ្ជាទិញចុងក្រោយ"),
+                "Likeness %": st.column_config.ProgressColumn("ស្រដៀង", min_value=0, max_value=100, format="%d%%"),
+            })
+        picked = edited[edited["សម្រេច"] != "—"] if can else edited.iloc[0:0]
+        n_same = int((picked["សម្រេច"] == "✅ ដូចគ្នា").sum())
+        n_diff = len(picked) - n_same
+        if st.button(f"💾 រក្សាទុក ({n_same} ដូចគ្នា · {n_diff} ផ្សេងគ្នា)", key=f"{key}_save", type="primary",
+                     disabled=picked.empty):
+            done, errs = 0, []
+            for r in picked.to_dict("records"):
                 try:
-                    _si_alias_save(r["Customer"], r["Ordered as"], dec)
-                    st.session_state["flash"] = f"បានរក្សាទុក: {r['Customer']} = {'ដូចគ្នា' if dec == 'Same' else 'ផ្សេងគ្នា'}"
+                    _si_alias_save(r["Customer"], r["Ordered as"], "Same" if r["សម្រេច"].startswith("✅") else "Different")
+                    done += 1
+                except Exception as e:
+                    errs.append(f"{r['Customer']}: {str(e)[:60]}")
+            st.session_state[f"{key}_preset"] = "—"
+            st.session_state[f"{key}_ver"] = ver + 1
+            if errs:
+                st.warning("មិនបានរក្សាទុក: " + "; ".join(errs[:5]))
+            st.session_state["flash"] = f"✅ បានរក្សាទុក {done} ការសម្រេច ({n_same} ដូចគ្នា · {n_diff} ផ្សេងគ្នា)"
+            st.rerun()
+    else:
+        st.caption("រកមិនឃើញឈ្មោះស្រដៀងគ្នាទេ។")
+    with st.expander("🔗 ភ្ជាប់ឈ្មោះ 2 ដោយខ្លួនឯង (ឈ្មោះដែលកម្មវិធីរកមិនឃើញ)"):
+        opts = sorted(set(all_names), key=str.casefold)
+        if not opts or not can:
+            st.caption("មិនមានឈ្មោះ ឬគណនីរបស់អ្នកមិនអាចកែបាន។")
+        else:
+            c1, c2 = st.columns(2)
+            n1 = c1.selectbox("ឈ្មោះទី 1", opts, index=None, key=f"{key}_m1", placeholder="វាយឈ្មោះ…")
+            n2 = c2.selectbox("ឈ្មោះទី 2 (អតិថិជនតែមួយ)", opts, index=None, key=f"{key}_m2", placeholder="វាយឈ្មោះ…")
+            ok = bool(n1 and n2 and n1 != n2)
+            if st.button("✅ ចាត់ទុកជាអតិថិជនតែមួយ", key=f"{key}_mset", disabled=not ok) and ok:
+                try:
+                    _si_alias_save(n1, n2, "Same")
+                    st.session_state["flash"] = f"✅ {n1} = {n2}"
                     st.rerun()
                 except Exception as e:
                     st.error(str(e)[:150])
-    if len(review) > 25:
-        with st.expander(f"មើលទាំងអស់ ({len(review)})"):
-            _si_show(review)
-
+        same, _diff = _si_alias_decisions()
+        saved = _si_alias_read()
+        if not saved.empty:
+            st.markdown("**ការសម្រេចដែលបានរក្សាទុក**")
+            last = saved.assign(_p=[frozenset((norm_name(a), norm_name(b))) for a, b in zip(saved["Customer"], saved["Same as"])])
+            last = last.drop_duplicates("_p", keep="last").drop(columns=["_p", "_dt"], errors="ignore").iloc[::-1]
+            st.dataframe(last, hide_index=True, use_container_width=True, height=min(300, 38 + 35 * (len(last) + 1)))
+            undo = st.selectbox("ដកការសម្រេចចេញ (សួរម្តងទៀត)", [f"{a} ↔ {b}" for a, b in zip(last["Customer"], last["Same as"])],
+                                index=None, key=f"{key}_undo", placeholder="ជ្រើសដើម្បីដកចេញ…")
+            if undo and st.button("↩️ ដកចេញ", key=f"{key}_undo_btn", disabled=not can):
+                a, b = undo.split(" ↔ ", 1)
+                try:
+                    _si_alias_save(a, b, "Undecided")
+                    st.session_state["flash"] = "↩️ បានដកការសម្រេចចេញ"
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e)[:150])
 
 def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=None, measure="Pcs"):
     """Rule-based customer-care list: who to contact, why, and what to say / offer."""
@@ -8517,7 +8583,7 @@ def _sales_insights_body():
             hist_calls = read_raw(CALLS_FILE, CALL_COLS)
         except Exception:
             hist_calls = pd.DataFrame(columns=CALL_COLS)
-        _si_dup_review(dup_review)
+        _si_dup_review(dup_review, all_names=list(names.values()))
         if table.empty:
             st.success("Every customer ordered in this month. 🎉")
         else:
@@ -11728,4 +11794,3 @@ elif _label.startswith("🏪"):
     tab_shop_visits()
 else:
     tab_bot()
-                
