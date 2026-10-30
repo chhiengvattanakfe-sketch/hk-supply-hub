@@ -93,6 +93,7 @@ ORDERS_FILE = os.path.join(DATA_DIR, "sale_orders.csv")              # orders ty
 HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers moved to tomorrow / cancelled
 MAP_REGISTRY_FILE = os.path.join(DATA_DIR, "customer_map_registry.json")
 CALLS_FILE = os.path.join(DATA_DIR, "customer_call_history.csv")
+SI_ALIAS_FILE = os.path.join(DATA_DIR, "customer_same_names.csv")   # Admin: two spellings = same customer (or not)
 VISITS_FILE = os.path.join(DATA_DIR, "shop_visits.csv")             # staff visits to customer shops
 VISITS_TEST_FILE = os.path.join(DATA_DIR, "shop_visits_TEST.csv")   # admin practice visits (never in real reports)
 VISIT_ZONE_FILE = os.path.join(DATA_DIR, "visit_zones.csv")         # Phnom Penh zone per shop, set by Admin
@@ -1613,7 +1614,7 @@ def daily_backup_once(day_str):
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, SI_ALIAS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
                  os.path.join(DATA_DIR, "visit_settings.json"))
         if USE_DROPBOX:
             try:
@@ -7004,6 +7005,279 @@ def _si_no_order(daily, names, areas, month_start, month_end, today, avgs=None):
     return out.reset_index(drop=True)
 
 
+# ---------- possible duplicate customer names (same shop written two ways) ----------
+SI_ALIAS_COLS = ["Date", "Customer", "Same as", "Decision", "By"]
+SI_DUP_MIN = 0.80                 # name likeness (0-1) from which two names are shown as "maybe the same customer"
+
+
+def _si_name_tokens(name):
+    t = unicodedata.normalize("NFC", str(name)).replace("​", "").replace("‌", "").replace("្ដ", "្ត")
+    t = re.sub(r"([A-Za-z])([^\sA-Za-z0-9])", r"\1 \2", t)          # "COFFEEចោមចៅ" -> "COFFEE ចោមចៅ"
+    return [w.upper() for w in re.split(r"[\s(),.\-_/:]+", t) if len(w) >= 2]
+
+
+def _si_name_score(a, b, word_count):
+    """0-1. Rare words (a person's name) count much more than common words (khan, province, 'MART', 'AEON'):
+    two shops in the same place with different owners are not the same customer."""
+    import difflib
+    ka, kb = _visit_match_key(a), _visit_match_key(b)
+    if not ka or not kb:
+        return 0.0
+    if ka == kb:
+        return 1.0
+    r = difflib.SequenceMatcher(None, ka, kb).ratio()
+    ta, tb = _si_name_tokens(a), _si_name_tokens(b)
+    if not ta or not tb:
+        return r * 0.8
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    def sim(x):
+        return max(1.0 if x == y else difflib.SequenceMatcher(None, x, y).ratio() for y in long_)
+    sims = {x: sim(x) for x in short}
+    weight = {x: 1.0 / max(1, word_count.get(x, 1)) for x in short}
+    total = sum(weight.values())
+    cover = sum(w for x, w in weight.items() if sims[x] >= 0.75) / total if total else 0.0
+    rare_match = any(word_count.get(x, 1) <= 3 and sims[x] >= 0.75 for x in short)
+    if not rare_match:
+        return r if r >= 0.9 else r * 0.6
+    return 0.6 * cover + 0.4 * r
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def _si_dup_scan(missing_items, ordered_items, all_names):
+    """{missing key: (ordered key, score)} best look-alike that DID order, for every customer without an order."""
+    import difflib
+    word_count = Counter()
+    for n in set(all_names):
+        word_count.update(set(_si_name_tokens(n)))
+    okeys = [(k, n, _visit_match_key(n)) for k, n in ordered_items]
+    out = {}
+    for k, n in missing_items:
+        mk = _visit_match_key(n)
+        best = None
+        for ok, on, omk in okeys:
+            if ok == k or not mk or not omk:
+                continue
+            if mk != omk:
+                sm = difflib.SequenceMatcher(None, mk, omk)
+                if sm.real_quick_ratio() < 0.45 or sm.quick_ratio() < 0.45:
+                    continue
+            sc = _si_name_score(n, on, word_count)
+            if sc >= SI_DUP_MIN and (best is None or sc > best[1]):
+                best = (ok, round(sc, 2))
+        if best:
+            out[k] = best
+    return out
+
+
+def _si_alias_read():
+    try:
+        return read_raw(SI_ALIAS_FILE, SI_ALIAS_COLS, max_age=60)
+    except Exception:
+        return pd.DataFrame(columns=SI_ALIAS_COLS)
+
+
+def _si_alias_decisions():
+    """-> (same: {key: set(keys)}, different: set(frozenset({key, key}))). The newest decision for a pair wins."""
+    df = _si_alias_read()
+    pairs = {}
+    for r in df.to_dict("records"):
+        a, b = norm_name(r.get("Customer", "")), norm_name(r.get("Same as", ""))
+        if a and b and a != b:
+            pairs[frozenset((a, b))] = str(r.get("Decision", ""))
+    same, diff = {}, set()
+    for pair, dec in pairs.items():
+        a, b = tuple(pair)
+        if dec == "Same":
+            same.setdefault(a, set()).add(b)
+            same.setdefault(b, set()).add(a)
+        elif dec == "Different":
+            diff.add(pair)
+    return same, diff
+
+
+def _si_alias_save(name, same_as, decision):
+    if not has_permission("edit"):
+        raise PermissionError("Your account needs Create, edit, and submit changes permission.")
+    row = {"Date": now_str(), "Customer": safe_text(name, maxlen=MAX_TEXT), "Same as": safe_text(same_as, maxlen=MAX_TEXT),
+           "Decision": decision, "By": current_user() or "-"}
+    modify_csv(SI_ALIAS_FILE, SI_ALIAS_COLS, lambda f: pd.concat([f, pd.DataFrame([row])], ignore_index=True))
+    audit("customer same-name decision", f"{name} | {same_as} | {decision}")
+
+
+def _si_no_order_split(table, daily, names, month_start, month_end):
+    """Remove customers who DID order under another spelling.
+    -> (table without them, review table of look-alikes, number hidden because Admin confirmed / same spelling)."""
+    if table is None or table.empty or daily.empty:
+        return table, pd.DataFrame(), 0
+    s, e = pd.Timestamp(month_start), pd.Timestamp(month_end)
+    month = daily[(daily["D"] >= s) & (daily["D"] <= e)]
+    if month.empty:
+        return table, pd.DataFrame(), 0
+    ordered = month.groupby("Key").agg(Customer=("Customer", "first"), Pcs=("Pcs", "sum"), Last=("D", "max"))
+    same, diff = _si_alias_decisions()
+    keys = table["Customer"].map(norm_name)
+    confirmed = keys.map(lambda k: bool(same.get(k, set()) & set(ordered.index)))
+    scan = _si_dup_scan(tuple(sorted(zip(keys[~confirmed], table.loc[~confirmed, "Customer"]))),
+                        tuple(sorted(zip(ordered.index, ordered["Customer"]))),
+                        tuple(sorted(set(names.values()) | set(ordered["Customer"]))))
+    auto_same, review = set(), []
+    for k, cust in zip(keys[~confirmed], table.loc[~confirmed, "Customer"]):
+        hit = scan.get(k)
+        if not hit or frozenset((k, hit[0])) in diff:
+            continue
+        o = ordered.loc[hit[0]]
+        if hit[1] >= 1.0:
+            auto_same.add(k)                  # identical apart from spaces / punctuation / spelling marks
+            continue
+        review.append({"Customer": cust, "Ordered as": o["Customer"], "Pcs this month": int(o["Pcs"]),
+                       "Last order (other name)": o["Last"].strftime("%Y-%m-%d"), "Likeness %": int(round(hit[1] * 100))})
+    review = pd.DataFrame(review)
+    hide = confirmed | keys.isin(auto_same) | (keys.isin(set(review["Customer"].map(norm_name))) if not review.empty else False)
+    if not review.empty:
+        review = review.sort_values("Likeness %", ascending=False).reset_index(drop=True)
+    return table[~hide].reset_index(drop=True), review, int(confirmed.sum() + len(auto_same))
+
+
+def _si_contacted_map(history, month_start):
+    """{customer key: latest contact (dict) recorded on or after month_start}."""
+    if history is None or history.empty:
+        return {}
+    h = history.copy()
+    h["_d"] = pd.to_datetime(h["Date"], errors="coerce")
+    h = h[h["_d"] >= pd.Timestamp(month_start)]
+    if h.empty:
+        return {}
+    h["_k"] = h["Customer"].map(norm_name)
+    return {r["_k"]: r for r in h.drop_duplicates("_k", keep="last").to_dict("records")}
+
+
+def _si_contact_text(c):
+    if not c:
+        return "⏳ មិនទាន់ទាក់ទង"
+    d = pd.to_datetime(c.get("Date"), errors="coerce")
+    bits = [f"✅ {d:%d %b}" if pd.notna(d) else "✅", _si_platform_of(c)]
+    for col in ("Notes", "Recorded by"):
+        v = str(c.get(col, "") or "").strip()
+        if v and v not in ("-", "nan"):
+            bits.append(v[:60])
+    return " · ".join(b for b in bits if b)
+
+
+def _si_no_order_contact_table(frame, history, month_start, key, height=420):
+    """No-order list with a ✅ contacted state per customer. Tick, choose platform, Save -> saved in call history."""
+    if frame.empty:
+        st.caption("គ្មាន")
+        return
+    # Contacted = a contact saved AFTER the customer's last order (so it does not reset on the 1st of the month).
+    # Customers who never ordered: a contact in the last 60 days.
+    calls = _si_contacted_map(history, pd.Timestamp(month_start) - pd.Timedelta(days=400))
+    view = frame.copy()
+    view["_k"] = view["Customer"].map(norm_name)
+    contacted = {}
+    for k, last in zip(view["_k"], view.get("Last order", pd.Series("-", index=view.index))):
+        c = calls.get(k)
+        if not c:
+            continue
+        cd = pd.to_datetime(c.get("Date"), errors="coerce")
+        lo = pd.to_datetime(last, errors="coerce")
+        if pd.notna(cd) and ((pd.notna(lo) and cd.normalize() > lo.normalize())
+                             or (pd.isna(lo) and cd >= pd.Timestamp(today_kh()) - pd.Timedelta(days=60))):
+            contacted[k] = c
+    view["Contact"] = view["_k"].map(lambda k: _si_contact_text(contacted.get(k)))
+    n_done = int(view["_k"].isin(contacted).sum())
+    f1, f2 = st.columns([3, 2])
+    show = f1.radio("បង្ហាញ", ["ទាំងអស់", "⏳ មិនទាន់ទាក់ទង", "✅ ទាក់ទងហើយ"], horizontal=True, key=f"{key}_flt")
+    f2.caption(f"✅ ទាក់ទងហើយ {n_done} / {len(view)} នាក់ (ក្រោយការបញ្ជាទិញចុងក្រោយ)")
+    if show.startswith("⏳"):
+        view = view[~view["_k"].isin(contacted)]
+    elif show.startswith("✅"):
+        view = view[view["_k"].isin(contacted)]
+    if view.empty:
+        st.caption("គ្មាន")
+        return
+    view.insert(0, "✅ ទាក់ទងហើយ", view["_k"].isin(contacted))
+    view["Platform"] = [(_si_platform_of(contacted[k]) if k in contacted else "") or _si_platform_guess(history, c)
+                        for k, c in zip(view["_k"], view["Customer"])]
+    view["Outcome"] = [contacted[k].get("Outcome") if k in contacted and contacted[k].get("Outcome") in CALL_OUTCOMES
+                       else "Reached customer" for k in view["_k"]]
+    view["Note"] = ""
+    show_cols = ["✅ ទាក់ទងហើយ", "Customer", "Area", "Last order", "Days since", "Avg pcs/month", "Contact", "Platform", "Outcome", "Note"]
+    show_cols = [c for c in show_cols if c in view.columns]
+    base = view[show_cols + ["_k"]].reset_index(drop=True)
+    ver = st.session_state.get(f"{key}_ver", 0)
+    can_edit = has_permission("edit")
+    edited = st.data_editor(
+        base[show_cols], hide_index=True, use_container_width=True, height=min(height, 38 + 35 * (len(base) + 1)),
+        key=f"{key}_ed_{ver}", disabled=[c for c in show_cols if c not in ("✅ ទាក់ទងហើយ", "Platform", "Outcome", "Note")] if can_edit else True,
+        column_config={
+            "✅ ទាក់ទងហើយ": st.column_config.CheckboxColumn("✅ ទាក់ទងហើយ", help="Tick when you have contacted this customer, then press Save."),
+            "Platform": st.column_config.SelectboxColumn("Platform", options=CALL_PLATFORMS, required=True,
+                                                         help="Picked automatically from the last contact. Change it if needed."),
+            "Outcome": st.column_config.SelectboxColumn("Outcome", options=CALL_OUTCOMES, required=True),
+            "Note": st.column_config.TextColumn("Note (optional)", max_chars=500),
+            "Contact": st.column_config.TextColumn("ស្ថានភាពទាក់ទង"),
+            "Avg pcs/month": st.column_config.NumberColumn("Avg pcs/month", format="%d"),
+        })
+    if not can_edit:
+        return
+    new = [(i, r) for i, r in edited.iterrows() if bool(r["✅ ទាក់ទងហើយ"]) and base.at[i, "_k"] not in contacted]
+    if st.button(f"💾 រក្សាទុក ({len(new)} នាក់ ទាក់ទងហើយ)", key=f"{key}_save", disabled=not new, type="primary"):
+        saved, errors = 0, []
+        latest = _si_call_latest(history) if history is not None and not history.empty else pd.DataFrame()
+        prev = latest.set_index("_key").to_dict("index") if not latest.empty else {}
+        for i, r in new:
+            k = base.at[i, "_k"]
+            p = prev.get(k, {})
+            status = p.get("Customer status") if p.get("Customer status") in CALL_STATUSES else "Active"
+            if status == "Do not contact":
+                errors.append(f"{r['Customer']}: marked Do not contact")
+                continue
+            row = {"Date": now_str(), "Customer": r["Customer"],
+                   "CallID": hashlib.sha256(f"{k}|{today_kh()}|{current_user()}|noorder".encode()).hexdigest()[:32],
+                   "Outcome": r["Outcome"], "Notes": str(r.get("Note") or "").strip() or "Contacted: no order this month",
+                   "Customer status": status, "Contact person": p.get("Contact person", ""), "Phone": p.get("Phone", ""),
+                   "Next action": "", "Follow-up date": "", "Assigned to": current_user() or "", "Recorded by": current_user() or "-",
+                   "Reason": "Not specified", "Follow-up state": "No follow-up", "Priority": "Normal", "Result": "",
+                   "Platform": r["Platform"]}
+            try:
+                _si_save_call(row)
+                saved += 1
+            except Exception as e:
+                errors.append(f"{r['Customer']}: {str(e)[:80]}")
+        st.session_state[f"{key}_ver"] = ver + 1
+        if errors:
+            st.warning("មិនបានរក្សាទុក: " + "; ".join(errors[:5]))
+        st.session_state["flash"] = f"✅ បានកត់ត្រា {saved} នាក់ ថាទាក់ទងហើយ"
+        st.rerun()
+
+
+def _si_dup_review(review, key="si_dup"):
+    """Look-alike names: one did not order, the other did. Admin decides once; the answer is remembered."""
+    if review.empty:
+        return
+    st.markdown(f"**🔁 ប្រហែលជាអតិថិជនដដែល — បានបញ្ជាទិញក្រោមឈ្មោះផ្សេង ({len(review)})**")
+    st.caption("ឈ្មោះទាំងនេះមិនបង្ហាញក្នុងតារាង 'មិនបញ្ជាទិញ' ខាងក្រោមទេ រហូតដល់អ្នកសម្រេច។ "
+               "✅ ដូចគ្នា = លុបចេញពីបញ្ជីមិនបញ្ជាទិញជារៀងរហូត · ❌ ផ្សេងគ្នា = បង្ហាញវិញ ហើយមិនសួរទៀត។")
+    can = has_permission("edit")
+    for i, r in enumerate(review.head(25).to_dict("records")):
+        c1, c2, c3 = st.columns([6, 1.3, 1.3])
+        c1.markdown(f"**{r['Customer']}** ↔ បានបញ្ជាទិញជា **{r['Ordered as']}**  \n"
+                    f"<small>{r['Pcs this month']:,} pcs ខែនេះ · ចុងក្រោយ {r['Last order (other name)']} · ស្រដៀង {r['Likeness %']}%</small>",
+                    unsafe_allow_html=True)
+        tag = hashlib.sha256(f"{r['Customer']}|{r['Ordered as']}".encode()).hexdigest()[:16]
+        for col, label, dec in ((c2, "✅ ដូចគ្នា", "Same"), (c3, "❌ ផ្សេងគ្នា", "Different")):
+            if col.button(label, key=f"{key}_{dec}_{tag}", disabled=not can, use_container_width=True):
+                try:
+                    _si_alias_save(r["Customer"], r["Ordered as"], dec)
+                    st.session_state["flash"] = f"បានរក្សាទុក: {r['Customer']} = {'ដូចគ្នា' if dec == 'Same' else 'ផ្សេងគ្នា'}"
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e)[:150])
+    if len(review) > 25:
+        with st.expander(f"មើលទាំងអស់ ({len(review)})"):
+            _si_show(review)
+
+
 def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=None, measure="Pcs"):
     """Rule-based customer-care list: who to contact, why, and what to say / offer."""
     t = pd.Timestamp(today)
@@ -7246,7 +7520,43 @@ def _si_show(df, money=(), pct=(), height=None):
 
 # Each call is an immutable customer snapshot; the newest call supplies current details.
 CALL_COLS = ["Date", "Customer", "CallID", "Outcome", "Notes", "Customer status",
-             "Contact person", "Phone", "Next action", "Follow-up date", "Assigned to", "Recorded by", "Reason", "Follow-up state", "Priority", "Result"]
+             "Contact person", "Phone", "Next action", "Follow-up date", "Assigned to", "Recorded by", "Reason", "Follow-up state", "Priority", "Result",
+             "Platform"]
+CALL_PLATFORMS = ["📞 Phone call", "✈️ Telegram", "💬 Messenger / Facebook", "🟢 WhatsApp", "💚 WeChat", "🟩 LINE",
+                  "📱 SMS", "🚶 Visit shop", "🗨️ Other"]
+
+
+def _si_platform_guess(history, customer, phone=""):
+    """Platform to pre-select: the one used last time with this customer, else a guess from the phone / Telegram field."""
+    try:
+        if history is not None and not history.empty and "Platform" in history:
+            mine = history[history["Customer"].map(norm_name).eq(norm_name(customer))]
+            used = [p for p in mine["Platform"].astype(str) if p in CALL_PLATFORMS]
+            if used:
+                return used[-1]
+            if not phone and not mine.empty:
+                phone = str(mine.iloc[-1].get("Phone", ""))
+    except Exception:
+        pass
+    ph = str(phone or "").strip().lower()
+    if "t.me" in ph or ph.startswith("@") or ph.startswith("tel") or "telegram" in ph or "telrgram" in ph or "telegarm" in ph:
+        return "✈️ Telegram"
+    if "facebook" in ph or "fb.com" in ph or "m.me" in ph or ph.startswith("page") or "messenger" in ph:
+        return "💬 Messenger / Facebook"
+    if "whatsapp" in ph:
+        return "🟢 WhatsApp"
+    if "wechat" in ph:
+        return "💚 WeChat"
+    return CALL_PLATFORMS[0]
+
+
+def _si_platform_of(call):
+    """Platform of one saved contact. Older notes have no Platform column: staff typed 'Telegram' / 'Page' in Phone."""
+    p = str(call.get("Platform", "") or "")
+    if p in CALL_PLATFORMS:
+        return p
+    ph = str(call.get("Phone", "") or "").strip()
+    return _si_platform_guess(None, "", ph) if ph and ph not in ("-", "nan") else ""
 CALL_OUTCOMES = ["Reached customer", "No answer", "Busy / call back", "Wrong number",
                  "Order requested", "Complaint / problem", "Not interested", "Customer update only"]
 CALL_STATUSES = ["Active", "Follow-up needed", "Temporarily closed", "Stopped buying", "Do not contact"]
@@ -7394,6 +7704,9 @@ def tab_followups():
     _si_call_panel(names)
 
 
+CALL_RECENT_DAYS = 7          # a customer contacted in the last N days is not put back in the urgent call list
+
+
 def _si_contact_context(frame, history, daily, today):
     """Join saved contact history and latest paid orders onto customer lists."""
     result = frame.copy()
@@ -7410,14 +7723,33 @@ def _si_contact_context(frame, history, daily, today):
         order = pd.to_datetime(last_orders.get(key), errors="coerce")
         called_today = pd.notna(called) and called.date() == today
         ordered_today = pd.notna(order) and order.date() == today
+        days_ago = (today - called.date()).days if pd.notna(called) else None
+        recent = days_ago is not None and 0 <= days_ago <= CALL_RECENT_DAYS
+        ordered_after = pd.notna(order) and pd.notna(called) and order.normalize() > called.normalize()
         due = pd.to_datetime(call.get("Follow-up date", ""), errors="coerce")
         scheduled = pd.notna(due) and due.date() > today and call.get("Follow-up state") in ("Open", "Awaiting order")
-        state = "Ordered today" if ordered_today else ("Call recorded today" if called_today else ("Follow-up scheduled" if scheduled else ("Previously contacted" if call else "Not contacted")))
+        plat = _si_platform_of(call) if call else ""
+        when = (f"{called:%d %b}" + (" (today)" if days_ago == 0 else f" ({days_ago} d ago)")) if pd.notna(called) else ""
+        if ordered_today:
+            state = "🛒 Ordered today"
+        elif call and ordered_after:
+            state = f"🛒 Ordered after contact on {when}"
+        elif called_today:
+            state = "✅ Contacted today" + (f" · {plat}" if plat else "")
+        elif scheduled:
+            state = f"📅 Follow-up {due:%d %b}"
+        elif recent:
+            state = f"✅ Contacted {when}" + (f" · {plat}" if plat else "") + " — waiting"
+        elif call:
+            state = f"☑️ Last contact {when}" + (f" · {plat}" if plat else "")
+        else:
+            state = "⏳ Not contacted"
         rows.append({"Contact status": state, "Last call": clean(call.get("Date", "")),
                      "Call outcome": clean(call.get("Outcome", "")), "Last call note": clean(call.get("Notes", "")),
                      "Next action": clean(call.get("Next action", "")), "Follow-up date": clean(call.get("Follow-up date", "")),
                      "Last order": order.strftime("%Y-%m-%d") if pd.notna(order) else "",
-                     "Call now": not (ordered_today or called_today or scheduled or call.get("Customer status") == "Do not contact")})
+                     "Call now": not (ordered_today or called_today or scheduled or (recent and not ordered_after)
+                                      or call.get("Customer status") in ("Do not contact", "Temporarily closed", "Stopped buying"))})
     if rows:
         for column in rows[0]: result[column] = [r[column] for r in rows]
     else:
@@ -7442,6 +7774,8 @@ def _si_save_call(row):
         raise ValueError("Choose a customer and enter a call note.")
     if row.get("Outcome") not in CALL_OUTCOMES or row.get("Customer status") not in CALL_STATUSES:
         raise ValueError("Choose a valid outcome and customer status.")
+    if row.get("Platform", "") and row["Platform"] not in CALL_PLATFORMS:
+        raise ValueError("Choose a valid platform.")
     follow = row.get("Follow-up date", "")
     if follow:
         date.fromisoformat(follow)
@@ -7471,11 +7805,49 @@ def _si_save_call(row):
 
 def _si_choose_call(customer):
     st.session_state["si_call_customer"] = customer
+    st.session_state["si_call_popup"] = customer          # open the form right here, not at the bottom of the page
+
+
+def _si_call_popup_body(customer):
+    try:
+        history = read_raw(CALLS_FILE, CALL_COLS)
+    except Exception as e:
+        st.error(f"Call history could not be opened: {e}")
+        return
+    st.caption("Platform is picked automatically (last one used with this customer). Save once; the window closes.")
+    _si_call_form(customer, history, "popup")
+
+
+_si_call_popup = None
+for _dlg_name in ("dialog", "experimental_dialog"):
+    try:
+        _dlg = getattr(st, _dlg_name, None)
+        if _dlg is not None:
+            _cand = _dlg("📝 Record call / update customer", width="large")(_si_call_popup_body)
+            if callable(_cand):
+                _si_call_popup = _cand
+                break
+    except Exception:
+        continue
+
+
+def _si_open_call_popup_if_asked():
+    """Show the form for the customer whose button was just pressed (once per click)."""
+    customer = st.session_state.pop("si_call_popup", None)
+    if not customer:
+        return
+    if _si_call_popup is not None:
+        _si_call_popup(customer)
+    else:                                                   # very old Streamlit: show it at the top of the list instead
+        with st.container(border=True):
+            st.markdown(f"#### 📝 {customer}")
+            _si_call_popup_body(customer)
 
 
 @st.fragment
 def _si_call_panel(names):
     st.markdown("#### 📝 Call notes & customer updates")
+    st.caption("Platform is picked automatically (last one used with this customer); change it when you used another app.")
     st.caption("Select a customer, record what happened, and save once. Previous calls stay in the history. "
                "Contact details here are customer-care details; requested orders must be entered in Sales Orders.")
     try:
@@ -7497,6 +7869,11 @@ def _si_call_panel(names):
     if st.session_state.get("si_call_customer") not in options:
         st.session_state["si_call_customer"] = options[0]
     customer = st.selectbox("Customer to call / update", options, key="si_call_customer")
+    _si_call_form(customer, history, "panel")
+
+
+def _si_call_form(customer, history, where="panel"):
+    """The call / customer-update form and this customer's history. Used at the bottom panel and in the pop-up."""
     mine = history[history["Customer"].map(norm_name).eq(norm_name(customer))]
     prev = mine.iloc[-1].to_dict() if not mine.empty else {}
     def value(col, default=""):
@@ -7509,8 +7886,11 @@ def _si_call_panel(names):
     if value("Customer status") == "Do not contact":
         st.warning("This customer is marked Do not contact. Record an internal update if needed.")
     if has_permission("edit"):
-        with st.form("call_form_" + token, clear_on_submit=False):
-            a, b = st.columns(2)
+        with st.form(f"call_form_{where}_" + token, clear_on_submit=False):
+            a, p_col, b = st.columns(3)
+            plat_default = _si_platform_guess(history, customer)
+            platform = p_col.selectbox("Platform (how you contacted)", CALL_PLATFORMS, index=CALL_PLATFORMS.index(plat_default),
+                                       help="Chosen automatically from the last contact with this customer. Change it if you used another app.")
             outcome = a.selectbox("Call outcome", CALL_OUTCOMES)
             status = b.selectbox("Customer status", CALL_STATUSES,
                                  index=CALL_STATUSES.index(value("Customer status", "Active"))
@@ -7539,7 +7919,8 @@ def _si_call_panel(names):
                    "Notes": notes, "Customer status": status, "Contact person": contact, "Phone": phone,
                    "Next action": action, "Follow-up date": follow.isoformat() if follow else "",
                    "Assigned to": owner, "Recorded by": current_user() or "-",
-                   "Reason": reason, "Follow-up state": follow_state, "Priority": priority, "Result": result}
+                   "Reason": reason, "Follow-up state": follow_state, "Priority": priority, "Result": result,
+                   "Platform": platform}
             try:
                 _si_save_call(row)
             except Exception as e:
@@ -7547,6 +7928,7 @@ def _si_call_panel(names):
             else:
                 st.session_state.pop(token_key, None)
                 st.session_state["si_call_saved"] = customer
+                st.session_state["flash"] = f"✅ Call saved for {customer}"
                 st.rerun()
     else:
         st.info("Read-only access. An admin can enable Create, edit, and submit changes for your account.")
@@ -7560,7 +7942,7 @@ def _si_call_panel(names):
         st.dataframe(display, hide_index=True, use_container_width=True)
         if has_permission("reports"):
             st.download_button("Download this customer's call history", display.to_csv(index=False).encode("utf-8-sig"),
-                               file_name="customer_call_history.csv", mime="text/csv", key="si_call_export")
+                               file_name="customer_call_history.csv", mime="text/csv", key=f"si_call_export_{where}")
     else:
         st.caption("No calls recorded for this customer yet.")
 
@@ -8024,6 +8406,10 @@ def _sales_insights_body():
     last_start = last_end.replace(day=1)
     same_end = min(last_start + timedelta(days=today.day - 1), last_end)
     d_prev = daily[(daily["D"] >= pd.Timestamp(last_start)) & (daily["D"] <= pd.Timestamp(same_end))]
+    try:
+        no_month, _dups_m, _n_same_m = _si_no_order_split(no_month, daily, names, today.replace(day=1), today)
+    except Exception:
+        pass
     lost_month = no_month[no_month["Group"] == "Ordered last month"] if not no_month.empty else no_month
     missing = habits[habits["Status"] == "Missing"] if not habits.empty else habits
 
@@ -8122,24 +8508,36 @@ def _sales_insights_body():
         else:
             m_start, m_end = last_start, last_end
         table = _si_no_order(daily, names, areas, m_start, m_end, today, avgs)
+        try:
+            table, dup_review, n_same = _si_no_order_split(table, daily, names, m_start, m_end)
+        except Exception as dup_error:
+            dup_review, n_same = pd.DataFrame(), 0
+            st.caption("Duplicate-name check skipped: " + str(dup_error)[:120])
+        try:
+            hist_calls = read_raw(CALLS_FILE, CALL_COLS)
+        except Exception:
+            hist_calls = pd.DataFrame(columns=CALL_COLS)
+        _si_dup_review(dup_review)
         if table.empty:
             st.success("Every customer ordered in this month. 🎉")
         else:
             counts = table["Group"].value_counts()
             st.caption(f"{m_start} → {m_end} · {len(table)} customers without an order "
                        f"({counts.get('Ordered last month', 0)} ordered the month before, "
-                       f"{counts.get('Ordered earlier', 0)} earlier, {counts.get('Never ordered', 0)} never).")
+                       f"{counts.get('Ordered earlier', 0)} earlier, {counts.get('Never ordered', 0)} never)."
+                       + (f" {n_same} hidden: they ordered under another spelling of the same name." if n_same else ""))
             if mode == "This month" and today.day <= 5:
                 st.info("It is the start of the month, so many customers have not ordered yet. Check 'Missing from habit' for who is really late.")
             g1 = table[table["Group"] == "Ordered last month"]
             g2 = table[table["Group"] == "Ordered earlier"]
             g3 = table[table["Group"] == "Never ordered"]
             st.markdown(f"**📞 Ordered the month before but not this month ({len(g1)})**")
-            _si_show(g1.drop(columns="Group"), money=("Avg pcs/month", "Avg ៛/month"), height=420)
+            st.caption("Tick ✅ when you have contacted the customer, check the Platform (picked automatically), then press 💾 Save.")
+            _si_no_order_contact_table(g1.drop(columns="Group"), hist_calls, m_start, "si_no1", height=460)
             with st.expander(f"Ordered earlier, silent for more than a month ({len(g2)})"):
-                _si_show(g2.drop(columns="Group"), money=("Avg pcs/month", "Avg ៛/month"), height=420)
+                _si_no_order_contact_table(g2.drop(columns="Group"), hist_calls, m_start, "si_no2")
             with st.expander(f"In the Master List but never ordered in the journal ({len(g3)})"):
-                _si_show(g3[["Customer", "Area"]], height=420)
+                _si_no_order_contact_table(g3.drop(columns="Group"), hist_calls, m_start, "si_no3")
 
     if t_care:
         if care.empty:
@@ -8167,6 +8565,7 @@ def _sales_insights_body():
                 view = view[view["Area"].isin(area_pick)]
             if q.strip():
                 view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
+            _si_open_call_popup_if_asked()
             st.markdown("#### 📞 Call list (urgent first)")
             urgent = view[(view["Priority"] <= 2) & view["Call now"].eq(True)].head(10)
             st.caption("Calls recorded today, customers who ordered today, and future scheduled follow-ups stay in the table below but are excluded from this urgent sales-call queue. Due follow-ups remain in the follow-up review.")
