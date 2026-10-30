@@ -93,6 +93,12 @@ ORDERS_FILE = os.path.join(DATA_DIR, "sale_orders.csv")              # orders ty
 HOLD_FILE = os.path.join(DATA_DIR, "customer_holds.csv")           # customers moved to tomorrow / cancelled
 MAP_REGISTRY_FILE = os.path.join(DATA_DIR, "customer_map_registry.json")
 CALLS_FILE = os.path.join(DATA_DIR, "customer_call_history.csv")
+SI_ALIAS_FILE = os.path.join(DATA_DIR, "customer_same_names.csv")   # Admin: two spellings = same customer (or not)
+VISITS_FILE = os.path.join(DATA_DIR, "shop_visits.csv")             # staff visits to customer shops
+VISITS_TEST_FILE = os.path.join(DATA_DIR, "shop_visits_TEST.csv")   # admin practice visits (never in real reports)
+VISIT_ZONE_FILE = os.path.join(DATA_DIR, "visit_zones.csv")         # Phnom Penh zone per shop, set by Admin
+VISIT_PIN_FILE = os.path.join(DATA_DIR, "shop_pins.csv")            # shop locations saved at the shop by staff
+LEADS_FILE = os.path.join(DATA_DIR, "new_customers_leads.csv")      # NPHK Leads Report rows imported in Shop Visits
 LOCATIONS_FILE = os.path.join(DATA_DIR, "customer_locations.csv")   # provinces that the admin set by hand
 LOG_PUSH_DELAY = 10                                                # seconds before logs are copied to Dropbox
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache_" + _APP_SCOPE)       # outside Dropbox = faster
@@ -875,25 +881,46 @@ def _request_cookie(name):
         return None
 
 
+def _tokens_fresh(force=False):
+    """The saved-login list, fetched from Dropbox first (after an app restart the local copy is empty).
+    -> (tokens, ok) ; ok=False when the list could not be checked (then nothing is deleted)."""
+    if USE_DROPBOX:
+        try:
+            pull(REMEMBER_FILE, force=force, max_age=60.0)
+        except Exception as e:
+            bot_log("warn", "Remember login", f"could not refresh: {str(e)[:100]}", "kept the phone's login")
+            return _read_tokens(), False
+    return _read_tokens(), True
+
+
 def restore_from_cookie():
-    """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, a new day...)."""
+    """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, an app restart...).
+    The phone's token is only deleted when it is surely invalid — never because Dropbox was slow."""
     token = _request_cookie(COOKIE_TOKEN)
     if not token:
         return False
     h, now = _tok_hash(token), time.time()
-    rec = _read_tokens().get(h)
+    tokens, ok = _tokens_fresh()
+    rec = tokens.get(h)
+    if rec is None and ok:
+        tokens, ok = _tokens_fresh(force=True)          # maybe saved by another session a moment ago
+        rec = tokens.get(h)
+    if rec is None:
+        if ok:                                          # checked the newest list: this token really does not exist
+            st.session_state["cookie_cmd"] = ("clear",)
+        return False
     try:
         users = load_users()
     except Exception:
-        return False
-    u = users.get(rec["user"]) if rec else None
-    if not rec or rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
-        if rec:
-            _modify_tokens(lambda d: (d.pop(h, None), d)[1])
+        return False                                    # cannot check now: keep the token, try again next time
+    u = users.get(rec["user"])
+    if rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
+        _modify_tokens(lambda d: (d.pop(h, None), d)[1])
         st.session_state["cookie_cmd"] = ("clear",)
         return False
     st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
                              "must_change": bool(u.get("must_change"))})
+    st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # refresh the phone's cookie (iPhone/iPad Safari drops old ones)
     audit("login", f"{u['role']} (remembered)")
     if rec.get("exp", 0) - now < (REMEMBER_DAYS - 1) * 86400:     # renew once a day
         def _renew(d):
@@ -956,8 +983,12 @@ def session_ok():
     try:
         rec = load_users().get(user)
     except Exception:
+        if time.time() - st.session_state.get("_users_ok_at", 0) < 3600:   # checked fine less than 1 h ago: stay logged in
+            st.warning("Account storage is not reachable right now; you stay logged in. Saving may fail until it is back.")
+            return True
         st.error("Cannot verify account access. Please retry when account storage is available.")
         return False
+    st.session_state["_users_ok_at"] = time.time()
     if not rec or not rec.get("active", True) or rec.get("role") != role:
         logout("account removed or changed")
         return False
@@ -1583,7 +1614,8 @@ def daily_backup_once(day_str):
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE)
+        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, SI_ALIAS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
+                 os.path.join(DATA_DIR, "visit_settings.json"))
         if USE_DROPBOX:
             try:
                 _dbx().files_create_folder_v2(_remote_backup_dir())
@@ -1696,11 +1728,12 @@ def _csv_cached(path, mtime_ns, size, cols):
     return _csv_read(path, list(cols))
 
 
-def read_raw(path, cols):
-    """Cleaned DataFrame of a CSV (with hidden `_dt` datetime column). Fast: cached until the file changes."""
+def read_raw(path, cols, max_age=30.0):
+    """Cleaned DataFrame of a CSV (with hidden `_dt` datetime column). Fast: cached until the file changes.
+    max_age: seconds before Dropbox is asked again whether the file changed."""
     if USE_DROPBOX:
         try:
-            pull(path)                                   # cheap check, downloads only if Dropbox changed
+            pull(path, max_age=max_age)                  # cheap check, downloads only if Dropbox changed
         except Exception as e:
             bot_log("warn", "Dropbox", f"Could not refresh {os.path.basename(path)}: {str(e)[:100]}", "using the saved copy")
     try:
@@ -5527,19 +5560,19 @@ def tab_bot():
 
 
 _MAP_SEED_JSON = r"""[
-{"id": "nphk-20261015-0001", "customer": "CHHIM SAYORN ទួលគោក", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 3, "lead_no": 1},
-{"id": "nphk-20261015-0002", "customer": "MO", "province": "", "url": "https://maps.google.com/maps?q=11.518901,104.876871&ll=11.518901,104.876871&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 4, "lead_no": 2},
+{"id": "nphk-20261015-0001", "customer": "CHHIM SAYORN ទួលគោក", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/kmeov5GDr5oW875dA", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 3, "lead_no": 1, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
+{"id": "nphk-20261015-0002", "customer": "MO ទួលពង្រ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.518901,104.876871&ll=11.518901,104.876871&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 4, "lead_no": 2},
 {"id": "nphk-20261015-0003", "customer": "ស្រីលីន ក្រចេះ", "province": "ក្រចេះ", "url": "https://maps.app.goo.gl/fmUAVum6c6joAkR36", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 5, "lead_no": 3, "resolved_url": "https://www.google.com/maps/place/12%C2%B029'29.9%22N+106%C2%B003'55.5%22E/@12.491629,106.065429,1302m/data=!3m1!1e3!4m4!3m3!8m2!3d12.491629!4d106.065429?entry=tts&g_ep=EgoyMDI2MTAxMS4wIPu8ASoASAFQAw%3D%3D&skid=1e0918d0-4a09-4bb6-8f0f-94836d11cbc9", "resolution_note": "Expanded from supplied map link"},
 {"id": "nphk-20261015-0004", "customer": "LY MEY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.528484,104.957959&ll=11.528484,104.957959&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 6, "lead_no": 4},
 {"id": "nphk-20261015-0005", "customer": "SEANG HAI ផ្សារព្រែកថ្មី កៀនស្វាយ", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/PDtGo2oRZGsm7acz7", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 7, "lead_no": 5, "resolved_url": "https://www.google.com/maps/place/11%C2%B017'10.1%22N+105%C2%B008'22.8%22E/@11.286135,105.139678,1336m/data=!3m1!1e3!4m4!3m3!8m2!3d11.286135!4d105.139678?entry=tts&g_ep=EgoyMDI2MTAwNS4wIPu8ASoASAFQAw%3D%3D&skid=471f9c7b-a880-4720-86ad-18b986c57d7e", "resolution_note": "Expanded from supplied map link"},
 {"id": "nphk-20261015-0006", "customer": "ម៉ៅ ចន្ធី ក្រុងស្វាយរៀង", "province": "ស្វាយរៀង", "url": "https://goo.gl/maps/qDgJr3DkWZx5Adxk8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 8, "lead_no": 6, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.045241,105.817289&entry=gps&g_ep=CAESBzI2LjM4LjEYACDXggMqvQEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksMTAwODA4NjU0LDk0Mjc1MTY4LDk0Mjc5NjE5LDEwMDgzNTcwNCwxMDA4MjUwMjUsMTAwODIwMjM3LDEwMDgyMjQ5NCwxMDA4Mjc5NzVCAktI&skid=f4dac2ed-dd5f-44b5-a5f6-2eed44ffbb83&shorturl=1"},
-{"id": "nphk-20261015-0007", "customer": "SREY TUCH", "province": "កំពង់ធំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 9, "lead_no": 7},
-{"id": "nphk-20261015-0008", "customer": "MAO SREYNICH វិទ្យាល័យជាតិ បាត់ដំបង", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 10, "lead_no": 8},
-{"id": "nphk-20261015-0009", "customer": "SAIFONG កប់ស្រូវ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 11, "lead_no": 9},
+{"id": "nphk-20261015-0007", "customer": "SREY TUCH", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/oKiq5Sba38YpU6CGA", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 9, "lead_no": 7, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
+{"id": "nphk-20261015-0008", "customer": "MAO SREYNICH វិទ្យាល័យជាតិ បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/4HG2iRYneSnRYfXj7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 10, "lead_no": 8, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
+{"id": "nphk-20261015-0009", "customer": "SAIFONG កប់ស្រូវ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/HHAhyhkvFP9EX4tG6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 11, "lead_no": 9, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0010", "customer": "UNG RAKSMEY ជិតព្តលានថ្មី", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/GmRUA4t1Ur12HmBL8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 12, "lead_no": 10, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0011", "customer": "SUO SORPHOIN បារាយណ៍ កំពង់ធំ", "province": "កំពង់ធំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 13, "lead_no": 11},
+{"id": "nphk-20261015-0011", "customer": "SUO SORPHOIN បារាយណ៍ កំពង់ធំ", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/vpAak8j9jLELdUXZ8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 13, "lead_no": 11, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0012", "customer": "SREYDIN KEO", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.503340,103.611797&ll=13.503340,103.611797&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 14, "lead_no": 12},
-{"id": "nphk-20261015-0013", "customer": "HAPPY DAILY MART គួរស្រូវ2", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 15, "lead_no": 13},
+{"id": "nphk-20261015-0013", "customer": "HAPPY DAILY MART គួរស្រូវ2", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/ABhHRyLa4u4HaFwY8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 15, "lead_no": 13, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0014", "customer": "KHEANG SIRONG ឡែម", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.084906,102.458952&ll=13.084906,102.458952&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 16, "lead_no": 14},
 {"id": "nphk-20261015-0015", "customer": "KANNITHA កំពង់ធំ", "province": "កំពង់ធំ", "url": "https://maps.google.com/maps?q=12.636423,104.984085&ll=12.636423,104.984085&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 17, "lead_no": 15},
 {"id": "nphk-20261015-0016", "customer": "UDOM ចោមចៅ 2", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.512740,104.832276&ll=11.512740,104.832276&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 18, "lead_no": 16},
@@ -5550,19 +5583,16 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0021", "customer": "NICH NICH តាខ្មៅ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.465950,104.957160&ll=11.465950,104.957160&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 23, "lead_no": 21},
 {"id": "nphk-20261015-0022", "customer": "MR ONEDAY បុរៅមហាសែនសុខ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.576133,104.836465&ll=11.576133,104.836465&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 24, "lead_no": 22},
 {"id": "nphk-20261015-0023", "customer": "YI MALUX កំពង៉ធំ", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/2nMtvtDqXFVukG4L7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 25, "lead_no": 23, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.7915973,104.8399923&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,100821555,47071704,94218641,94282134,100835699,94286869,100820247,100822504&g_ep=CAISEjI2LjM4LjEuOTgwODE1NDQ1MBgAINeCAypnLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDEwMDgyMTU1NSw0NzA3MTcwNCw5NDIxODY0MSw5NDI4MjEzNCwxMDA4MzU2OTksOTQyODY4NjksMTAwODIwMjQ3LDEwMDgyMjUwNEICS0g%3D&skid=8df3a248-85c2-4840-a679-81d16bec1236&g_st=it"},
-{"id": "nphk-20261015-0024", "customer": "ROMDOUL SAM ផ្សារឈូក", "province": "", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 26, "lead_no": 24},
+{"id": "nphk-20261015-0024", "customer": "ROMDOUL SAM ផ្សារឈូក", "province": "កំពត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 26, "lead_no": 24},
 {"id": "nphk-20261015-0025", "customer": "JEE LEANG ព្រះវិហារ", "province": "ព្រះវិហារ", "url": "https://maps.google.com/maps?q=14.238279,104.731919&ll=14.238279,104.731919&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 27, "lead_no": 25},
-{"id": "nphk-20261015-0026", "customer": "SOK NITA MACH ឈូកវ៉ា2", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 28, "lead_no": 26},
 {"id": "nphk-20261015-0027", "customer": "SOKAN THUCH កំរៀង បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.085018,102.484079&ll=13.085018,102.484079&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 29, "lead_no": 27},
-{"id": "nphk-20261015-0028", "customer": "Mey ព្រែកព្នៅ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 30, "lead_no": 28},
-{"id": "nphk-20261015-0029", "customer": "DALIN KE តាំងគោក កំពង់ធំ", "province": "", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 31, "lead_no": 29},
+{"id": "nphk-20261015-0028", "customer": "MEY ព្រែកព្នៅ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/yJsSRve1rhtzphyw9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 30, "lead_no": 28, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0030", "customer": "ទ្រី ផារី កំបូល3", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.476493,104.787410&ll=11.476493,104.787410&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 32, "lead_no": 30},
 {"id": "nphk-20261015-0031", "customer": "JEE LANG", "province": "ព្រះវិហារ", "url": "https://maps.google.com/maps?q=14.238279,104.731919&ll=14.238279,104.731919&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 33, "lead_no": 31},
 {"id": "nphk-20261015-0032", "customer": "KIT KHUNNY ផ្សារសៃវ៉ា តាកែវ", "province": "តាកែវ", "url": "https://goo.gl/maps/gbvYaR8rvmEdhRfZ7?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 34, "lead_no": 32, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.162750,104.875431&entry=gps&g_ep=CAESBzI2LjMxLjIYACCdtwgqlQEsOTQyNjc3MjcsOTQyOTIxOTUsOTQyOTk1MzIsMTAwNzk2NDk4LDEwMDc5Nzc2MSwxMDA3OTY1MzUsOTQyODA1NzYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksMTAwODE1NjQwLDEwMDgyMDIzN0ICS0g%3D&skid=d96271f7-d43f-4f33-9d71-07cf20c3a6db&shorturl=1"},
 {"id": "nphk-20261015-0033", "customer": "CHHIM SAYORN ឈូកមាស", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/WQ64GazKVkia1Exp7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 35, "lead_no": 33, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0034", "customer": "THING បុរីសុខសាន្ដ ព្រែកឯក", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.502566,105.007372&ll=11.502566,105.007372&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 36, "lead_no": 34},
-{"id": "nphk-20261015-0035", "customer": "SOTHEANY", "province": "ភ្នំពេញ", "url": "https://mapshttps://maps.google.com/maps?q=11.575709,104.878839&ll=11.575709,104.878839&z=16.google.com/maps?q=11.575709,104.878839&ll=11.575709,104.878839&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 37, "lead_no": 35},
-{"id": "nphk-20261015-0036", "customer": "SOTHEANY", "province": "", "url": "https://maps.google.com/maps?q=11.575709,104.878839&ll=11.575709,104.878839&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 38, "lead_no": 36},
+{"id": "nphk-20261015-0036", "customer": "SOTHEANY សែនសុខ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.575709,104.878839&ll=11.575709,104.878839&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 38, "lead_no": 36},
 {"id": "nphk-20261015-0037", "customer": "Neang leasmy ផ្សារកាបី ក្រចេះ", "province": "ក្រចេះ", "url": "https://maps.google.com/maps?q=12.136423,106.724029&ll=12.136423,106.724029&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 39, "lead_no": 37},
 {"id": "nphk-20261015-0038", "customer": "VIN CHHAY", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/TXhEBGjgrrLcCqBw9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 40, "lead_no": 38, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0039", "customer": "OAM RATHANA ពោធិចិនតុង", "province": "បន្ទាយមានជ័យ", "url": "https://maps.app.goo.gl/gzZoTR5wCD66J1dN7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 41, "lead_no": 39, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
@@ -5578,7 +5608,7 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0049", "customer": "HANG KY", "province": "ស្វាយរៀង", "url": "https://maps.google.com/maps?q=11.037891,106.010845&ll=11.037891,106.010845&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 51, "lead_no": 49},
 {"id": "nphk-20261015-0050", "customer": "CHHAY HENG ផ្លូវភ្លោះអូឬស្សី", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.558024,104.917652&ll=11.558024,104.917652&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 52, "lead_no": 50},
 {"id": "nphk-20261015-0051", "customer": "AU HANG ក្រាំងធ្នុងសែនសុខ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/mB9KagZxV7fV1R2Q9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 53, "lead_no": 51, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0052", "customer": "VANNAK", "province": "កែប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 54, "lead_no": 52},
+{"id": "nphk-20261015-0052", "customer": "VANNAK កែប", "province": "កែប", "url": "https://maps.app.goo.gl/bc75BzayehpJuabm9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 54, "lead_no": 52, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0053", "customer": "GRACE SOTHEA ស្រុកស្ទឹងហាវ", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.724686,103.619956&ll=10.724686,103.619956&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 55, "lead_no": 53},
 {"id": "nphk-20261015-0054", "customer": "PHIM PHIM ស្រុកអង្គរជ័យ", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.893829,104.557942&ll=10.893829,104.557942&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 56, "lead_no": 54},
 {"id": "nphk-20261015-0055", "customer": "RACHANA ROUS ព្រែកព្នៅ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.700776,104.840686&ll=11.700776,104.840686&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 57, "lead_no": 55},
@@ -5593,10 +5623,9 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0064", "customer": "MO NYMEAN ព្រះនេត្រព្រះ", "province": "បន្ទាយមានជ័យ", "url": "https://maps.google.com/maps?q=13.627369,103.184197&ll=13.627369,103.184197&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 66, "lead_no": 64},
 {"id": "nphk-20261015-0065", "customer": "SAVIMEX អង្គរជ័យ", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.769698,104.637231&ll=10.769698,104.637231&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 67, "lead_no": 65},
 {"id": "nphk-20261015-0066", "customer": "EII TY COFFEE កំពងចម្លងកំពង់គរ ឆ្លូង", "province": "ស្ទឹងត្រែង", "url": "https://maps.google.com/maps?q=12.274468,105.963532&ll=12.274468,105.963532&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 68, "lead_no": 66},
-{"id": "nphk-20261015-0067", "customer": "SO NITA ផ្សារស្វៃវ៉ា តាកែវ", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 69, "lead_no": 67},
+{"id": "nphk-20261015-0067", "customer": "SO NITA ផ្សារស្វៃវ៉ា តាកែវ", "province": "តាកែវ", "url": "https://maps.app.goo.gl/ZnmWBQH67GSGjMP6A?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 69, "lead_no": 67, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0068", "customer": "RACHANA ចល័ចរ កាហ្វេ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/sjag1gLzbBWAMx5M9?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 70, "lead_no": 68, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0069", "customer": "THEARA គូស្រូវ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/eEPLivNuFr8u1YJj7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 71, "lead_no": 69, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.4406193,104.8933391&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,100821559,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMzLjEuOTYxODkxNDMyMBgAINeCAypnLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDEwMDgyMTU1OSw0NzA3MTcwNCw5NDIxODY0MSw5NDI4MjEzNCwxMDA4MTM0NjQsOTQyODY4NjksMTAwODIwMjQ3LDEwMDgyMjUwNEICS0g%3D&skid=562076a0-e81b-4b3f-8dc7-4bb785a7780d&g_st=it"},
-{"id": "nphk-20261015-0070", "customer": "LONG KR", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 72, "lead_no": 70},
 {"id": "nphk-20261015-0071", "customer": "KHANN LINA ព្រែកក្ដាម កោះចិន", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.797184,104.824930&ll=11.797184,104.824930&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 73, "lead_no": 71},
 {"id": "nphk-20261015-0072", "customer": "កាហ្វេ ននោង គង់ពិសី កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/pxFHvDwi9G7Hs91R8?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 74, "lead_no": 72, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0073", "customer": "VA KHIM", "province": "កំពង់ស្ពឺ", "url": "https://maps.apple/p/HMUUc2MNszxsA9", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 75, "lead_no": 73, "resolved_url": "https://maps.apple.com/place?coordinate=11.808148,104.164605&name=My%20Location&map=h", "resolution_note": "Expanded from supplied map link"},
@@ -5611,11 +5640,9 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0082", "customer": "SREY POV", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/z9WqBm1a11XAh56B7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 84, "lead_no": 82, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0083", "customer": "J.T WO.S MART ( VISAL CHAN )", "province": "បាក់ទូក", "url": "https://maps.google.com/maps?q=11.566293,104.911586&ll=11.566293,104.911586&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 85, "lead_no": 83},
 {"id": "nphk-20261015-0084", "customer": "SUON SODALIN បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.080248,103.204883&ll=13.080248,103.204883&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 86, "lead_no": 84},
-{"id": "nphk-20261015-0085", "customer": "SO CHEATA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/ZgGDSsJoBTydd8Xy5?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 87, "lead_no": 85, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0086", "customer": "MEY", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 88, "lead_no": 86},
 {"id": "nphk-20261015-0087", "customer": "អាង ឈឹម ត្រែងត្រយឹង កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.278807,104.206944&ll=11.278807,104.206944&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 89, "lead_no": 87},
 {"id": "nphk-20261015-0088", "customer": "ពុំ ស្រីនិត អូរពី កំពង់សោម", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=12.401523,105.435468&ll=12.401523,105.435468&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 90, "lead_no": 88},
-{"id": "nphk-20261015-0089", "customer": "SOK KHEA ពន្ធធានាគា សៀមរាប", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 91, "lead_no": 89},
+{"id": "nphk-20261015-0089", "customer": "SOK KHEA ពន្ធធានាគា សៀមរាប", "province": "សៀមរាប", "url": "https://youtu.be/rAMq3cEQSVM?si=KFfX3n3wFbC_CU4o", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 91, "lead_no": 89, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0090", "customer": "HENG SINHUNSY វត្តភ្នំ", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.575317,104.924417&ll=11.575317,104.924417&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 92, "lead_no": 90},
 {"id": "nphk-20261015-0091", "customer": "ផារី", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/zefjMLN3XkciapeJ8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 93, "lead_no": 91, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.0959807,103.1974225&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822499&g_ep=CAISEjI2LjMyLjUuOTU4MDQ3MzAzMBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNDk5QgJLSA%3D%3D&skid=84634bb2-1ebd-49be-8866-2e37e993cb01&g_st=ic"},
 {"id": "nphk-20261015-0092", "customer": "HAK KANHA តាកែវ", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.162067,104.952845&ll=11.162067,104.952845&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 94, "lead_no": 92},
@@ -5626,11 +5653,11 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0097", "customer": "SERM SOPI វង្វង់មូលតាពញាក្រែក", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/NfppBsyFiy2z7DDf6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 99, "lead_no": 97, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0098", "customer": "ផារី បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/wWvEN5N3MQ7DxLJYA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 100, "lead_no": 98, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0099", "customer": "PHANNA PHATH ស្វាយរៀង", "province": "ស្វាយរៀង", "url": "https://maps.app.goo.gl/zmqevLisEfN52oweA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 101, "lead_no": 99, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0100", "customer": "CROIS CAFÉ 271", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 102, "lead_no": 100},
+{"id": "nphk-20261015-0100", "customer": "CROIS CAFÉ 271", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/4DfzCcsRwTf6VgwHA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 102, "lead_no": 100, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0101", "customer": "SREY PICH ទួលពង្រ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/TWdw6Ka1RmUhoRg66?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 103, "lead_no": 101, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0102", "customer": "ង៉ែត ញាណ ថ្មបាំង ក្រចេះ", "province": "ក្រចេះ", "url": "https://maps.app.goo.gl/SS9GfTdZNtVAFr9P6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 104, "lead_no": 102, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0103", "customer": "HENG SONY", "province": "កំពត", "url": "https://maps.app.goo.gl/Lj7axsZME21ZYRFF8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 105, "lead_no": 103, "resolution_note": "<urlopen error timed out>"},
-{"id": "nphk-20261015-0104", "customer": "MONITA TANN សាលាកំរើក សៀមរាប", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 106, "lead_no": 104},
+{"id": "nphk-20261015-0104", "customer": "MONITA TANN សាលាកំរើក សៀមរាប", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/atmJZK616MVppEoJ7?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 106, "lead_no": 104, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0105", "customer": "POV POV", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.833427,104.451803&ll=10.833427,104.451803&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 107, "lead_no": 105},
 {"id": "nphk-20261015-0106", "customer": "WAYU STEAM&SAUNA", "province": "កំពត", "url": "https://maps.google.com/maps?q=10.619675,104.174688&ll=10.619675,104.174688&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 108, "lead_no": 106},
 {"id": "nphk-20261015-0107", "customer": "សុជាតា​ អ៊ុយ ផ្សារក្រគរ", "province": "ពោធិ៍សាត់", "url": "https://maps.google.com/maps?q=42.553084,0.000008&ll=42.553084,0.000008&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 109, "lead_no": 107},
@@ -5638,18 +5665,17 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0109", "customer": "ម៉ីង ទៀង អូត្រេះ", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/Z6NP579sHZCEAh2T8?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 111, "lead_no": 109, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.5617710,103.5578800&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjUuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=bb1c7680-220a-4d5e-a17c-7cc7802a3b69&g_st=ifm"},
 {"id": "nphk-20261015-0110", "customer": "PHAN NA វត្តអង្គតាមិញ", "province": "ភ្នំពេញ", "url": "https://www.google.com/maps/place/11%C2%B032'45.3%22N+104%C2%B051'37.1%22E/@11.545903,104.860301,16z/data=!4m4!3m3!8m2!3d11.545903!4d104.860301?entry=ttu&g_ep=EgoyMDI2MDgwNS4xIKXMDSoASAFQAw%3D%3D", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 112, "lead_no": 110},
 {"id": "nphk-20261015-0111", "customer": "LY SOK", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.259908,105.274687&ll=11.259908,105.274687&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 113, "lead_no": 111},
-{"id": "nphk-20261015-0112", "customer": "ឌុល សុវណ្ណនិត ផ្សារស្ពឺ កំពង់ចាម", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 114, "lead_no": 112},
+{"id": "nphk-20261015-0112", "customer": "ឌុល សុវណ្ណនិត ផ្សារស្ពឺ កំពង់ចាម", "province": "កំពង់ចាម", "url": "https://maps.google.com/maps?q=12.329244,105.327782&ll=12.329244,105.327782&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 114, "lead_no": 112, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0113", "customer": "OUK PONLEU", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.455301,105.000743&ll=11.455301,105.000743&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 115, "lead_no": 113},
-{"id": "nphk-20261015-0114", "customer": "UTH SIEMHONG", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 116, "lead_no": 114},
+{"id": "nphk-20261015-0114", "customer": "UTH SIEMHONG ច្បារអំពៅ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/GUmLkozJ6H9Kiuz89", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 116, "lead_no": 114, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0115", "customer": "CHUNGMEI LY", "province": "កំពង់ឆ្នាំង", "url": "https://maps.app.goo.gl/ZmrGSK5sVVtmgTEk6?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 117, "lead_no": 115, "resolution_note": "<urlopen error timed out>"},
 {"id": "nphk-20261015-0116", "customer": "CHHING GERRA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/K87quDujsBvqACYNA?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 118, "lead_no": 116, "resolved_url": "https://www.google.com/maps/place/11.530821,104.923610/data=!4m6!3m5!1s0!7e2!8m2!3d11.5308207!4d104.9236105!17m2!4m1!1e3!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBjI2LjcuNRgAIPrsDSqLASw5NDI2NzcyNyw5NDI5MjE5NSw5NDI5OTUzMiwxMDA3OTY0OTgsMTAwNzk3NzU3LDEwMDc5NjUzNSw5NDI4MDU3Niw5NDIwNzM5NCw5NDIwNzUwNiw5NDIwODUwNiw5NDIxODY1Myw5NDIyOTgzOSw5NDI3NTE2OCw5NDI3OTYxOSwxMDA3OTE0ODNCAktI&skid=db4e1f9c-e742-41e7-9dc2-f2ccbfdd7d81&g_st=afm", "resolution_note": "Expanded from supplied map link"},
-{"id": "nphk-20261015-0117", "customer": "MAK NANA", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 119, "lead_no": 117},
+{"id": "nphk-20261015-0117", "customer": "MAK NANA ផ្សារទម្លាប់តាកែវ", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 119, "lead_no": 117},
 {"id": "nphk-20261015-0118", "customer": "ម៉ាក់ ម៉ីយ៉ីង", "province": "កំពង់ចាម", "url": "https://maps.google.com/maps?q=12.301544,105.568075&ll=12.301544,105.568075&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 120, "lead_no": 118},
-{"id": "nphk-20261015-0119", "customer": "NONG DAVY", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 121, "lead_no": 119},
+{"id": "nphk-20261015-0119", "customer": "NONG DAVY ត្រពាំងថ្លឹង", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/2ycX1P4jWtsfkGtg8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 121, "lead_no": 119, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0120", "customer": "VA KHIM", "province": "កំពង់ស្ពឺ", "url": "https://maps.apple/p/HMUUc2MNszxsA9", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 122, "lead_no": 120, "resolved_url": "https://maps.apple.com/place?coordinate=11.808148,104.164605&name=My%20Location&map=h", "resolution_note": "Expanded from supplied map link"},
 {"id": "nphk-20261015-0121", "customer": "KA ANGEL កៀនស្វាយ", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.511703,105.053247&ll=11.511703,105.053247&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 123, "lead_no": 121},
 {"id": "nphk-20261015-0122", "customer": "KET KIKO បឹងកេងកង", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/yJvqVu1YvTzH5C7V7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 124, "lead_no": 122, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0123", "customer": "SOU SARITH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 125, "lead_no": 123},
 {"id": "nphk-20261015-0124", "customer": "MTD ផ្សារថ្នល់បត់ផ្លូវលេខ 3", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/5QUa2mZBaYoGDYNN8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 126, "lead_no": 124, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0125", "customer": "នំបុ័ងភ្នំពេញ តាំងក្រសាំង", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 127, "lead_no": 125},
 {"id": "nphk-20261015-0126", "customer": "គីម លី បាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.083099,102.999665&ll=13.083099,102.999665&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 128, "lead_no": 126},
@@ -5690,7 +5716,7 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0161", "customer": "THE FRESS ទួលសង្កែ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/ThGiKiBBoPqxx1Ty5?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 163, "lead_no": 161, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5954700,104.9145390&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=cbc638e8-c340-46e0-8511-252b997b52ed&g_st=it"},
 {"id": "nphk-20261015-0162", "customer": "NK NK បឹងកង", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.582141,104.890701&ll=11.582141,104.890701&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 164, "lead_no": 162},
 {"id": "nphk-20261015-0163", "customer": "JAY UNG ស្ពានអាកាស 7មករា", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/d7ZWzt3xmSWDeRKZA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 165, "lead_no": 163, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5645881,104.8887910&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100799877,94286869&g_ep=CAISEjI2LjIxLjEuOTE3Mzg1NDY3MBgAINeCAypJLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDc5OTg3Nyw5NDI4Njg2OUICS0g%3D&skid=534d4e3e-ecbd-4e21-ab15-b7760b468a9a&g_st=ic"},
-{"id": "nphk-20261015-0164", "customer": "ជា ទិត្យ សូម៉ាតឿន(ABC ព្រៃស)", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 166, "lead_no": 164},
+{"id": "nphk-20261015-0164", "customer": "ផ្សារយូស្តា កំពង់សោម", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/LKfhzX1mvLRSAvGp8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 166, "lead_no": 164, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0165", "customer": "SENG WANDEAN ឬស្សីកែវ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/UPgiHG9jrx51SbVBA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 167, "lead_no": 165, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.6032710,104.9133091&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,100808659,94282134,94286869,100813014&g_ep=CAISEjI2LjIzLjQuOTI0MzY0MTg2MBgAINeCAypTLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDEwMDgwODY1OSw5NDI4MjEzNCw5NDI4Njg2OSwxMDA4MTMwMTRCAktI&skid=51c53ec1-1275-43e3-918a-5998ddf905de&g_st=it"},
 {"id": "nphk-20261015-0166", "customer": "LIM LONG កាន់ណាបាត់ដំបង", "province": "បាត់ដំបង", "url": "https://maps.app.goo.gl/4vUfyVs638ZBPAvH6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 168, "lead_no": 166, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.8777222,103.3779722&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,100809209,94218641,94282134,100799872,94286869&g_ep=CAISEjI2LjIwLjQuOTEzODcwMjQ0MBgAINeCAypTLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDEwMDgwOTIwOSw5NDIxODY0MSw5NDI4MjEzNCwxMDA3OTk4NzIsOTQyODY4NjlCAktI&skid=eecf08ac-384f-46e5-abeb-31c6acb4f409&g_st=it"},
 {"id": "nphk-20261015-0167", "customer": "MR.DAD COFFEE ច្បារអំពៅ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/tHQQMgeftfR1LewGA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 169, "lead_no": 167, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5312136,104.9475468&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,100808654,94282134,100813469,94286869&g_ep=CAISEjI2LjIxLjEuOTE3Mzg1NDY3MBgAIIgnKlMsOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsMTAwODA4NjU0LDk0MjgyMTM0LDEwMDgxMzQ2OSw5NDI4Njg2OUICS0g%3D&skid=7e77bd63-1c15-4a81-a567-a593895bfadc&g_st=it"},
@@ -5713,7 +5739,7 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0184", "customer": "LY Ly", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.570794,104.919895&ll=11.570794,104.919895&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 186, "lead_no": 184},
 {"id": "nphk-20261015-0185", "customer": "YOEURN SOKYENG", "province": "ស្វាយរៀង", "url": "https://maps.app.goo.gl/QtjJ4HhUkfJmTzgx6?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 187, "lead_no": 185, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0186", "customer": "KE SOKHA", "province": "ត្បូងឃ្មុំ", "url": "https://maps.google.com/maps?q=12.020603,105.883518&ll=12.020603,105.883518&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 188, "lead_no": 186},
-{"id": "nphk-20261015-0187", "customer": "CHANBO VIBOL", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 189, "lead_no": 187},
+{"id": "nphk-20261015-0187", "customer": "CHANBO VIBOL គួរស្រូវ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 189, "lead_no": 187},
 {"id": "nphk-20261015-0188", "customer": "LONG SOKHOM", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.235964,104.868356&ll=11.235964,104.868356&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 190, "lead_no": 188},
 {"id": "nphk-20261015-0189", "customer": "ងឿន វណ្ណរ៉េត", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.082886,103.206204&ll=13.082886,103.206204&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 191, "lead_no": 189},
 {"id": "nphk-20261015-0190", "customer": "ភឿន ចរិយា", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.565854,104.870867&ll=11.565854,104.870867&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 192, "lead_no": 190},
@@ -5739,12 +5765,11 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0210", "customer": "KAN NHA សិរីសោភ័ណ បន្ទាយមានជ័យ", "province": "បន្ទាយមានជ័យ", "url": "https://maps.app.goo.gl/SRr8AEFtLo1MYCyh8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 212, "lead_no": 210, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0211", "customer": "រ័ត្ន មនោរិទ្ធ", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/iqsdUiyvoDj391qT9", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 213, "lead_no": 211, "resolved_url": "https://www.google.com/maps/place/12.395248,105.082778/data=!4m6!3m5!1s0!7e2!8m2!3d12.3952484!4d105.0827781?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESCjExLjEyOS4xMDMYACDXggMqGyw5NDIwNzUwNiw5NDIwODUwNiw5NDIxODY1M0ICS0g%3D&skid=3fe9ce11-f8c4-45f0-9f86-0399ea45993b", "resolution_note": "Expanded from supplied map link"},
 {"id": "nphk-20261015-0212", "customer": "ប៊ុនធេង", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.582224,104.849146&ll=11.582224,104.849146&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 214, "lead_no": 212},
-{"id": "nphk-20261015-0213", "customer": "牡丹花", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 215, "lead_no": 213},
 {"id": "nphk-20261015-0214", "customer": "ម៉ី ក្បាលស្ពាន", "province": "ប៉ោយប៉ែត", "url": "https://maps.google.com/maps?q=13.660573,102.551352&ll=13.660573,102.551352&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 216, "lead_no": 214},
 {"id": "nphk-20261015-0215", "customer": "LEANG", "province": "ត្បូងឃ្មុំ", "url": "https://maps.google.com/maps?q=11.826201,105.783795&ll=11.826201,105.783795&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 217, "lead_no": 215},
 {"id": "nphk-20261015-0216", "customer": "CHOUN CHEASEYHA", "province": "កំពង់ឆ្នាំង", "url": "https://maps.google.com/maps?q=12.253794,104.670043&ll=12.253794,104.670043&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 218, "lead_no": 216},
 {"id": "nphk-20261015-0217", "customer": "ទេពនិមន្ដ", "province": "កណ្តាល", "url": "https://goo.gl/maps/zDfGmNn5UzMqfPhG8?g_st=ac", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 219, "lead_no": 217, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.582924,104.970368&entry=gps&g_ep=CAESBzI2LjE2LjUYACCIJyqLASw5NDI2NzcyNyw5NDI5MjE5NSw5NDI5OTUzMiwxMDA3OTY0OTgsMTAwNzk3NzYxLDEwMDc5NjUzNSw5NDI4MDU3Niw5NDIwNzM5NCw5NDIwNzUwNiw5NDIwODUwNiw5NDIxODY1Myw5NDIyOTgzOSw5NDI3NTE2OCw5NDI3OTYxOSwxMDA4MTA0NThCAktI&skid=49a92ffc-f193-488e-9473-134b2e240b7d&shorturl=1"},
-{"id": "nphk-20261015-0218", "customer": "Caltex", "province": "ព្រៃវែង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 220, "lead_no": 218},
+{"id": "nphk-20261015-0218", "customer": "Caltex ស្វាយអន្ទរ", "province": "ព្រៃវែង", "url": "https://maps.app.goo.gl/CCxpHExShQG87UUL8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 220, "lead_no": 218, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0219", "customer": "H LYHACH", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/cBTp18aLGUbMDFmB8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 221, "lead_no": 219, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0220", "customer": "SOMBO MANA", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.074360,104.496803&ll=11.074360,104.496803&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 222, "lead_no": 220},
 {"id": "nphk-20261015-0221", "customer": "MUY SOCHENDA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/2dLY1dJ6s2tJJbPDA?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 223, "lead_no": 221, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
@@ -5759,7 +5784,7 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0230", "customer": "SAK COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Xk49StYVdgK7m9cp9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 232, "lead_no": 230, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0231", "customer": "វណ្ណះ ចរិយា", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/m2HQMBsGgqoU3pSf6?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 233, "lead_no": 231, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0232", "customer": "HENG SAMNANG", "province": "ព្រៃវែង", "url": "https://maps.google.com/maps?q=11.257800,105.401289&ll=11.257800,105.401289&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 234, "lead_no": 232},
-{"id": "nphk-20261015-0233", "customer": "NY TANG CALTEX", "province": "កំពង់ឆ្នាំង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 235, "lead_no": 233},
+{"id": "nphk-20261015-0233", "customer": "NY TANG CALTEX កំពង់ឆ្នាំង", "province": "កំពង់ឆ្នាំង", "url": "https://maps.app.goo.gl/ZU885NiPvFDd1nkq5", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 235, "lead_no": 233, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0234", "customer": "OUNPOV", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.502077,104.809401&ll=11.502077,104.809401&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 236, "lead_no": 234},
 {"id": "nphk-20261015-0235", "customer": "CHENG DANET", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.367083,103.838365&ll=13.367083,103.838365&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 237, "lead_no": 235},
 {"id": "nphk-20261015-0236", "customer": "JEE DAEN", "province": "កំពង់ចាម", "url": "https://maps.google.com/maps?q=11.939365,105.167322&ll=11.939365,105.167322&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 238, "lead_no": 236},
@@ -5768,10 +5793,9 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0239", "customer": "LEANG LEANG", "province": "ប៉ៃលិន", "url": "https://maps.google.com/maps?q=12.927933,102.497464&ll=12.927933,102.497464&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 241, "lead_no": 239},
 {"id": "nphk-20261015-0240", "customer": "PHENG AN AN", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.333880,104.719774&ll=11.333880,104.719774&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 242, "lead_no": 240},
 {"id": "nphk-20261015-0241", "customer": "YU MI", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.488753,104.813017&ll=11.488753,104.813017&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 243, "lead_no": 241},
-{"id": "nphk-20261015-0242", "customer": "Central Beach Resort Long Set Beach", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 244, "lead_no": 242},
+{"id": "nphk-20261015-0242", "customer": "Central Beach Resort Long Set Beach កោះរ៉ុង", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 244, "lead_no": 242},
 {"id": "nphk-20261015-0243", "customer": "MOLII COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/2Q7f3eShrBa1mFsu5?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 245, "lead_no": 243, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0244", "customer": "NONG DAVY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.514568,104.854154&ll=11.514568,104.854154&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 246, "lead_no": 244},
-{"id": "nphk-20261015-0245", "customer": "SREY NICH", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 247, "lead_no": 245},
 {"id": "nphk-20261015-0246", "customer": "KOEM SREYRATH", "province": "តាកែវ", "url": "https://maps.app.goo.gl/49L6KmGJf6SXJZRg6?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 248, "lead_no": 246, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0247", "customer": "PHO MONICA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/iAC73XScurjxpswx7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 249, "lead_no": 247, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0248", "customer": "SOMALY", "province": "បន្ទាយមានជ័យ", "url": "https://maps.app.goo.gl/NUSnfMVEGJHArCsp6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 250, "lead_no": 248, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.4662464,103.0137777&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,94286869&g_ep=CAISEjI2LjEwLjIuODc3MzE3OTEwMBgAINeCAyo_LDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDk0Mjg2ODY5QgJLSA%3D%3D&skid=bef26b1e-a15c-48c5-84b1-b39a81a0b492&g_st=it"},
@@ -5818,7 +5842,7 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0289", "customer": "SENGHEEANG SEAN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/qboNuqdjp1Zf9Grd7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 291, "lead_no": 289, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5448858,104.8328784&entry=gps&shh=CAE&lucs=,94297699,94275415,94284466,94231188,94280568,47071704,94218641,94282134,94286869&g_ep=CAISEjI2LjA0LjEuODU4MjY5MDE5MBgAINeCAypRLDk0Mjk3Njk5LDk0Mjc1NDE1LDk0Mjg0NDY2LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDk0Mjg2ODY5QgJLSA%3D%3D&skid=8f83239a-9366-4fa6-b224-99527d06491d&g_st=ic"},
 {"id": "nphk-20261015-0290", "customer": "RAVY SEANG", "province": "កោះកុង", "url": "https://maps.app.goo.gl/DCdZUKs93Av5gLdu7?g_st=com.google.maps.preview.copy", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 292, "lead_no": 290, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0291", "customer": "ម៉ាក់ អូនយ៉ា", "province": "ឧត្តរមានជ័យ", "url": "https://maps.app.goo.gl/tjxyr5iLP2Ud8ksn7?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 293, "lead_no": 291, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0292", "customer": "សម្បត្ដិរក្សាតេលា", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 294, "lead_no": 292},
+{"id": "nphk-20261015-0292", "customer": "សម្បត្ដិរក្សាតេលា អង្គរតាសោម", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 294, "lead_no": 292},
 {"id": "nphk-20261015-0293", "customer": "BUN LEANG", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 295, "lead_no": 293},
 {"id": "nphk-20261015-0294", "customer": "KIMSOUR SENG", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.520112,104.878930&ll=11.520112,104.878930&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 296, "lead_no": 294},
 {"id": "nphk-20261015-0295", "customer": "J KEOV", "province": "កោះកុង", "url": "https://maps.google.com/maps?q=11.604918,102.979726&ll=11.604918,102.979726&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 297, "lead_no": 295},
@@ -5840,8 +5864,8 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0311", "customer": "EM LIMHEAR", "province": "ព្រៃវែង", "url": "https://maps.app.goo.gl/4C2JmkVAHYoXbf6R9?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 313, "lead_no": 311, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0312", "customer": "SREY NUCH", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.529477,104.944569&ll=11.529477,104.944569&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 314, "lead_no": 312},
 {"id": "nphk-20261015-0313", "customer": "អេតឌី", "province": "ប៉ៃលិន", "url": "https://goo.gl/maps/d35bwfyeiP95zzfP6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 315, "lead_no": 313, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.085273,102.452879&entry=gps&g_ep=CAESBzI1LjQ5LjYYACDXggMqbCw5NDI2NzcyNyw5NDI3NTQwNyw5NDI5MjE5NSw5NDI5OTUzMiw5NDI4MDU3Niw5NDIwNzM5NCw5NDIwNzUwNiw5NDIwODUwNiw5NDIxODY1Myw5NDIyOTgzOSw5NDI3NTE2OCw5NDI3OTYxOUICS0g%3D&skid=d16e8e94-d412-4016-a924-aba3f504b785&shorturl=1"},
-{"id": "nphk-20261015-0314", "customer": "សារិកា ​កាហ្វេ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 316, "lead_no": 314},
-{"id": "nphk-20261015-0315", "customer": "EANG BORA", "province": "ស្វាយរៀង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 317, "lead_no": 315},
+{"id": "nphk-20261015-0314", "customer": "សារិកា ​កាហ្វេ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/D213L6hWGpKkMgWz7", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 316, "lead_no": 314, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
+{"id": "nphk-20261015-0315", "customer": "EANG BORA បាវិត", "province": "ស្វាយរៀង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 317, "lead_no": 315},
 {"id": "nphk-20261015-0316", "customer": "BERRY", "province": "បាត់ដំបង", "url": "https://maps.google.com/maps?q=13.098559,103.203813&ll=13.098559,103.203813&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 318, "lead_no": 316},
 {"id": "nphk-20261015-0317", "customer": "CREAM COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/t7yLYEAgMUgC3fpb6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 319, "lead_no": 317, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0318", "customer": "KRIS", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.544433,104.916156&ll=11.544433,104.916156&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 320, "lead_no": 318},
@@ -5871,7 +5895,6 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0342", "customer": "SOVAN PANHA", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.497437,104.863061&ll=11.497437,104.863061&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 344, "lead_no": 342},
 {"id": "nphk-20261015-0343", "customer": "DANETTOUCH JINGJUNG", "province": "ក្រចេះ", "url": "https://maps.app.goo.gl/8DvaHEUaEJMBykuT8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 345, "lead_no": 343, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0344", "customer": "AH HOUY", "province": "កំពង់ឆ្នាំង", "url": "https://maps.app.goo.gl/QrBtFHaXnWSxH7HKA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 346, "lead_no": 344, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0345", "customer": "CHIN HOK", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 347, "lead_no": 345},
 {"id": "nphk-20261015-0346", "customer": "LEV SOKUN", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/SbfsM3LLsa6VYZmr8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 348, "lead_no": 346, "resolved_url": "https://www.google.com/maps/place/11.769701,104.782439/data=!4m6!3m5!1s0!7e2!8m2!3d11.7697007!4d104.78243909999999!17m2!4m1!1e3!18m1!1e1?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI1LjQ3LjgYACD67A0qqwEsOTQyNjc3MjcsOTQyNzU0MDcsOTQyOTIxOTUsOTQyODQ0OTksOTQyMjMyOTksOTQyMTY0MTMsOTQyODA1NzYsOTQyMTI0OTYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTc1MjMsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsOTQyNzk2MTksOTQyOTU1MDQsNDcwODQzOTMsOTQyMTMyMDBCAktI&skid=a9d890ed-23b3-49e8-8a2c-74f84e23fa6c&g_st=afm", "resolution_note": "Expanded from supplied map link"},
 {"id": "nphk-20261015-0347", "customer": "ខ្មែរម៉ាត ស្គន់ កំពង់ចាម", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/w9tdjbatw1kstuxd6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 349, "lead_no": 347, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.0544820,105.0642078&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=cd9bac3e-37ad-4220-8943-e5c3c221ff76&g_st=it"},
 {"id": "nphk-20261015-0348", "customer": "QM SERVICES", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/tZ9ke66oeRGnqjBW6?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 350, "lead_no": 348, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5393579,104.9251836&entry=gps&lucs=,94286590,94275415,94284505,94224825,94227247,94227248,94231188,94280568,47071704,47069508,94218641,94282134,94292074,94203019,47084304,94286869&g_ep=CAISEjI1LjQ2LjEuODMwNDc0Nzc1MBgAINeCAyqQASw5NDI4NjU5MCw5NDI3NTQxNSw5NDI4NDUwNSw5NDIyNDgyNSw5NDIyNzI0Nyw5NDIyNzI0OCw5NDIzMTE4OCw5NDI4MDU2OCw0NzA3MTcwNCw0NzA2OTUwOCw5NDIxODY0MSw5NDI4MjEzNCw5NDI5MjA3NCw5NDIwMzAxOSw0NzA4NDMwNCw5NDI4Njg2OUICS0g%3D&skid=6154530c-e97f-4076-b720-bda10f968843&g_st=ipc"},
@@ -5904,9 +5927,8 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0375", "customer": "NA RY", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/Br5PJpNPS9zyHESs6?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 377, "lead_no": 375, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0376", "customer": "ខ្មែរ ម៉ាត", "province": "រតនគិរី", "url": "https://maps.google.com/maps?q=13.739884,106.982289&ll=13.739884,106.982289&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 378, "lead_no": 376},
 {"id": "nphk-20261015-0377", "customer": "YOY COFFEE", "province": "ឧត្តរមានជ័យ", "url": "https://maps.app.goo.gl/AKTGmd1rft2Skg6s5?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 379, "lead_no": 377, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0378", "customer": "ម៉ៃ", "province": "ប៉ោយប៉ែត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 380, "lead_no": 378},
+{"id": "nphk-20261015-0378", "customer": "ម៉ៃ បោយប៉ែត", "province": "ប៉ោយប៉ែត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 380, "lead_no": 378},
 {"id": "nphk-20261015-0379", "customer": "VICHARA", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.458049,104.923536&ll=11.458049,104.923536&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 381, "lead_no": 379},
-{"id": "nphk-20261015-0380", "customer": "ចន្នី", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 382, "lead_no": 380},
 {"id": "nphk-20261015-0381", "customer": "LY THAIING", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.576684,104.925812&ll=11.576684,104.925812&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 383, "lead_no": 381},
 {"id": "nphk-20261015-0382", "customer": "JOHN MENGHAK", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.587049,104.938251&ll=11.587049,104.938251&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 384, "lead_no": 382},
 {"id": "nphk-20261015-0383", "customer": "NOK NOI CAFÉ", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/yQoqyywPPjpTckzU7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 385, "lead_no": 383, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.4640374,104.9582579&entry=gps&lucs=,94284508,94224825,94227247,94227248,94231188,94280568,47071704,47069508,94218641,94282134,94203019,47084304,94286869&g_ep=CAISEjI1LjM4LjAuODA3MzYwMDM5MBgAINeCAyp1LDk0Mjg0NTA4LDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjE4NjQxLDk0MjgyMTM0LDk0MjAzMDE5LDQ3MDg0MzA0LDk0Mjg2ODY5QgJLSA%3D%3D&skid=783090d8-0306-4150-bb67-a9e954e968ea&g_st=it"},
@@ -5940,7 +5962,7 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0411", "customer": "សោ ភា", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/74oa632xYXMNaPCJ9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 413, "lead_no": 411, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5748733,104.8897452&entry=gps&lucs=,94284463,94224825,94227247,94227248,94231188,94280568,47071704,47069508,94218641,94282134,94203019,47084304&g_ep=CAISEjI1LjM5LjIuODEwMTI3MDQ4MBgAINeCAypsLDk0Mjg0NDYzLDk0MjI0ODI1LDk0MjI3MjQ3LDk0MjI3MjQ4LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDQ3MDY5NTA4LDk0MjE4NjQxLDk0MjgyMTM0LDk0MjAzMDE5LDQ3MDg0MzA0QgJLSA%3D%3D&skid=1446eda7-1879-4560-84a5-c970123e8eaa&g_st=ifm"},
 {"id": "nphk-20261015-0412", "customer": "ឡឹង បញ្ញា", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.510606,104.746121&ll=11.510606,104.746121&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 414, "lead_no": 412},
 {"id": "nphk-20261015-0413", "customer": "ឈាង លីដា", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/JjSCJwtD5Q7CVVSS8?g_st=afm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 415, "lead_no": 413, "resolved_url": "https://www.google.com/maps/place/13.287168,103.820569/data=!4m6!3m5!1s0!7e2!8m2!3d13.287168399999999!4d103.82056879999999?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI1LjE5LjYYACD4wA0qhwEsOTQyNjc3MjcsOTQyODQ0OTAsOTQyMjMyOTksOTQyMTY0MTMsOTQyODA1NzYsOTQyMTI0OTYsOTQyMDczOTQsOTQyMDc1MDYsOTQyMDg1MDYsOTQyMTc1MjMsOTQyMTg2NTMsOTQyMjk4MzksOTQyNzUxNjgsNDcwODQzOTMsOTQyMTMyMDBCAktI&skid=83d207e7-267d-4564-8f1e-3a060c83d526&g_st=afm", "resolution_note": "Expanded from supplied map link"},
-{"id": "nphk-20261015-0414", "customer": "បាយស្រូប", "province": "កោះពេជ្រ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 416, "lead_no": 414},
+{"id": "nphk-20261015-0414", "customer": "ហាងបាយពូហេង_ ព្រះសីហនុ", "province": "កោះពេជ្រ", "url": "https://maps.app.goo.gl/gtxKrmoJ23f9JKWe7?g_st=com.google.maps.preview.copy", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 416, "lead_no": 414, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0415", "customer": "SAM MST", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.608234,103.537815&ll=10.608234,103.537815&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 417, "lead_no": 415},
 {"id": "nphk-20261015-0416", "customer": "PANHCHAKRITHD", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.564029,104.923772&ll=11.564029,104.923772&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 418, "lead_no": 416},
 {"id": "nphk-20261015-0417", "customer": "VOLEAK TAING", "province": "សៀមរាប", "url": "https://maps.app.goo.gl/NsG7MaRtvwoNKSUM9?g_st=ifm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 419, "lead_no": 417, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
@@ -5952,12 +5974,11 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0423", "customer": "ឈាន រស្មី", "province": "មណ្ឌលគិរី", "url": "https://maps.google.com/maps?q=12.441636,107.198472&ll=12.441636,107.198472&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 425, "lead_no": 423},
 {"id": "nphk-20261015-0424", "customer": "HENG THIDA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/YfAcFVppjHudWCqW8?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 426, "lead_no": 424, "resolution_note": "<urlopen error timed out>"},
 {"id": "nphk-20261015-0425", "customer": "SOPHAL FREEMAN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/ii7EG7PooU7u7h3YA?g_st=ipc", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 427, "lead_no": 425, "resolution_note": "<urlopen error timed out>"},
-{"id": "nphk-20261015-0426", "customer": "RA CHANBORMEY", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 428, "lead_no": 426},
 {"id": "nphk-20261015-0427", "customer": "CHENG HOUR", "province": "កំពង់ធំ", "url": "https://maps.google.com/maps?q=12.733231,104.896563&ll=12.733231,104.896563&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 429, "lead_no": 427},
 {"id": "nphk-20261015-0428", "customer": "LIDA JOLIE MART", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=11.462188,104.949840&ll=11.462188,104.949840&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 430, "lead_no": 428},
 {"id": "nphk-20261015-0429", "customer": "SROS SAING", "province": "កំពត", "url": "https://maps.app.goo.gl/n9crDHY5d9VG5CdR6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 431, "lead_no": 429, "resolution_note": "<urlopen error timed out>"},
 {"id": "nphk-20261015-0430", "customer": "LIM LONG", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Bva2ppmK7HjW1k7C7?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 432, "lead_no": 430, "resolution_note": "<urlopen error timed out>"},
-{"id": "nphk-20261015-0431", "customer": "ម៉ាក់ណា", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 433, "lead_no": 431},
+{"id": "nphk-20261015-0431", "customer": "ម៉ាក់ណា កាហ្វេ បែកគូស", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 433, "lead_no": 431},
 {"id": "nphk-20261015-0432", "customer": "HOUY NITA", "province": "តាកែវ", "url": "https://maps.app.goo.gl/Vo7WPXKe8BoBUJcg6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 434, "lead_no": 432, "resolution_note": "<urlopen error timed out>"},
 {"id": "nphk-20261015-0433", "customer": "HENG SO PHEAP", "province": "កំពត", "url": "https://maps.app.goo.gl/N7jDeTmWvZmVWBcg6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 435, "lead_no": 433, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0434", "customer": "TELA RITHY", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.591583,104.894529&ll=11.591583,104.894529&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 436, "lead_no": 434},
@@ -5968,61 +5989,38 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0439", "customer": "LEANG HUN", "province": "ស្វាយរៀង", "url": "https://maps.google.com/maps?q=11.081084,105.847270&ll=11.081084,105.847270&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 441, "lead_no": 439},
 {"id": "nphk-20261015-0440", "customer": "ចែ ណែត", "province": "ប៉ោយប៉ែត", "url": "https://maps.app.goo.gl/sW6et5CiYK854gqT6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 442, "lead_no": 440, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.6717180,102.5675520&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=2f9c0926-4030-4131-9505-b1a573f3d2d7&g_st=it"},
 {"id": "nphk-20261015-0441", "customer": "TIK TOK CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/JPhYwtCPFv6zQfpN6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 443, "lead_no": 441, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0442", "customer": "ចន្ថា ប៉ុណ្ណាការ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 444, "lead_no": 442},
-{"id": "nphk-20261015-0443", "customer": "SREY KHOUCH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 445, "lead_no": 443},
-{"id": "nphk-20261015-0444", "customer": "MORNIKA VAYOUK", "province": "ពោធិ៍សាត់", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 446, "lead_no": 444},
+{"id": "nphk-20261015-0443", "customer": "SREY KHOUCH ព្រែកព្នៅ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 445, "lead_no": 443},
 {"id": "nphk-20261015-0445", "customer": "OUNKHIM LOVE", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/Yg69EwJQAeJnNsqU7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 447, "lead_no": 445, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0446", "customer": "ម៉ុង បរមី", "province": "", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 448, "lead_no": 446},
 {"id": "nphk-20261015-0447", "customer": "TON CHANNY", "province": "កោះកុង", "url": "https://maps.app.goo.gl/3pyXDbYCkTiyZCyGA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 449, "lead_no": 447, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0448", "customer": "ROTH NARAK", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 450, "lead_no": 448},
-{"id": "nphk-20261015-0449", "customer": "NA NA", "province": "ស្វាយរៀង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 451, "lead_no": 449},
-{"id": "nphk-20261015-0450", "customer": "CHHEA PISEY", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 452, "lead_no": 450},
 {"id": "nphk-20261015-0451", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 453, "lead_no": 451},
 {"id": "nphk-20261015-0452", "customer": "ម៉ុង បរមី", "province": "", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 454, "lead_no": 452},
-{"id": "nphk-20261015-0453", "customer": "សួរ ឧស្សាហ៍", "province": "បន្ទាយមានជ័យ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 455, "lead_no": 453},
 {"id": "nphk-20261015-0454", "customer": "BARANG KTH", "province": "កំពត", "url": "https://maps.app.goo.gl/jZfSv5DgZDP97hTm9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 456, "lead_no": 454, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0455", "customer": "THIDA CHHOUN", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 457, "lead_no": 455},
 {"id": "nphk-20261015-0456", "customer": "LEONG KUNTHEA", "province": "តាកែវ", "url": "https://maps.google.com/maps?q=11.183393,104.780581&ll=11.183393,104.780581&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 458, "lead_no": 456},
 {"id": "nphk-20261015-0457", "customer": "RASY HR", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/16niAUFaiU2GdJYN7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 459, "lead_no": 457, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.4439860,104.8838930&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b9120834-9311-4f8c-8026-86d7a99b7e79&g_st=it"},
 {"id": "nphk-20261015-0458", "customer": "ROS SARADANY", "province": "ឧត្តរមានជ័យ", "url": "https://maps.app.goo.gl/3LeWNWXj2c6pMKmS7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 460, "lead_no": 458, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0459", "customer": "CALTEX", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 461, "lead_no": 459},
-{"id": "nphk-20261015-0460", "customer": "អ៊ុក កញ្ញា", "province": "កោះកុង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 462, "lead_no": 460},
-{"id": "nphk-20261015-0461", "customer": "MS NA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 463, "lead_no": 461},
+{"id": "nphk-20261015-0459", "customer": "NY TANG CALTEX កណ្ដាលស្ទឹង", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/ZbHvpqii8Sj7PzRu6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 461, "lead_no": 459, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
+{"id": "nphk-20261015-0460", "customer": "អ៊ុក កញ្ញា ថ្មបាំង", "province": "កោះកុង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 462, "lead_no": 460},
 {"id": "nphk-20261015-0462", "customer": "សៀក នី", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/u6qQkKy9wUf2FS1L9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 464, "lead_no": 462, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.2110680,104.5835330&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b8c863db-6d37-4ffb-a264-a75298a4b2ec&g_st=it"},
-{"id": "nphk-20261015-0463", "customer": "ROTHA សំបុកត្រចៀកកាំ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 465, "lead_no": 463},
 {"id": "nphk-20261015-0464", "customer": "DARA PICH", "province": "កណ្តាល", "url": "https://maps.google.com/maps?q=13.645170,102.590579&ll=13.645170,102.590579&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 466, "lead_no": 464},
-{"id": "nphk-20261015-0465", "customer": "អ៊ុក មឿន", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 467, "lead_no": 465},
-{"id": "nphk-20261015-0466", "customer": "BE STRONG", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 468, "lead_no": 466},
 {"id": "nphk-20261015-0467", "customer": "BELLA SMITT", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/SgaLfpMkbU5goa3KA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 469, "lead_no": 467, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0468", "customer": "អ៊ីង អ៊ីង", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 470, "lead_no": 468},
-{"id": "nphk-20261015-0469", "customer": "VOREAKTEY", "province": "ប៉ោយប៉ែត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 471, "lead_no": 469},
-{"id": "nphk-20261015-0470", "customer": "ចាន់ ថន", "province": "ព្រៃវែង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 472, "lead_no": 470},
 {"id": "nphk-20261015-0471", "customer": "ម៉ាក់អូន ឈីញ", "province": "ព្រះវិហារ", "url": "https://maps.app.goo.gl/LGwFe8YMrQisKQLC9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 473, "lead_no": 471, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0472", "customer": "PISEY CHHEA", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 474, "lead_no": 472},
 {"id": "nphk-20261015-0473", "customer": "អា នី", "province": "ត្បូងឃ្មុំ", "url": "https://maps.app.goo.gl/WVmaXBosd8HPrjut8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 475, "lead_no": 473, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7610000,106.3343890&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=d4ebf53f-e308-4cd3-9169-e6b6fcddf316&g_st=it"},
-{"id": "nphk-20261015-0474", "customer": "SN79 MART & TOYS", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 476, "lead_no": 474},
-{"id": "nphk-20261015-0475", "customer": "SREYPICH THAI", "province": "ត្បូងឃ្មុំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 477, "lead_no": 475},
-{"id": "nphk-20261015-0476", "customer": "ចិ ភា លក់គ្រឿងក្រអូប ក្នុងផ្សារកំពង់ត្រាច", "province": "កំពត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 478, "lead_no": 476},
+{"id": "nphk-20261015-0474", "customer": "SN79 MART & TOYS បឹងស្នោរ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/nkp5ur1dP5s34ecj9", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 476, "lead_no": 474, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
+{"id": "nphk-20261015-0475", "customer": "SREYPICH THAI ត្បូងឃ្មុំ", "province": "ត្បូងឃ្មុំ", "url": "https://maps.app.goo.gl/GbdG4wNgwusRYfSn8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 477, "lead_no": 475, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0477", "customer": "CHEA MOLIVANN", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/9xqAkdZRKyogKbQ57?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 479, "lead_no": 477, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0478", "customer": "កង់ទីនសាលា BRIGHT LINE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Hq9d89aF7kn1356CA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 480, "lead_no": 478, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0479", "customer": "JEE DA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/VRHK5ono4srsGgaC9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 481, "lead_no": 479, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5121940,104.9300002&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b2d141e1-bb9b-46eb-8b85-5e66cd816145&g_st=it"},
 {"id": "nphk-20261015-0480", "customer": "MALAY MALAY", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/AEgveS7ThaQzveEY9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 482, "lead_no": 480, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.8717070,105.0431690&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=78cf2575-4095-49d0-8d80-61fadb58adb0&g_st=it"},
-{"id": "nphk-20261015-0481", "customer": "PHAL LA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 483, "lead_no": 481},
+{"id": "nphk-20261015-0481", "customer": "PHAL LA មន្ទីរពេទ្យកុមារជាតិ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/z1KyybEDmHyr9CNBA", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 483, "lead_no": 481, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0482", "customer": "OUK CHENDA", "province": "ព្រះសីហនុ", "url": "https://maps.app.goo.gl/FYnAD4G6vc94jEAA8?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 484, "lead_no": 482, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0483", "customer": "AM SANG HOUY", "province": "ពោធិ៍សាត់", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 485, "lead_no": 483},
 {"id": "nphk-20261015-0484", "customer": "RAINBO", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/HizthsHTMDdR15N8A?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 486, "lead_no": 484, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0485", "customer": "MASY MASY", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 487, "lead_no": 485},
-{"id": "nphk-20261015-0486", "customer": "MITHONA PEN", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 488, "lead_no": 486},
-{"id": "nphk-20261015-0487", "customer": "AH TOCH KH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 489, "lead_no": 487},
-{"id": "nphk-20261015-0488", "customer": "MAK VISAL", "province": "ពោធិ៍សាត់", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 490, "lead_no": 488},
-{"id": "nphk-20261015-0489", "customer": "MO LIKA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 491, "lead_no": 489},
+{"id": "nphk-20261015-0489", "customer": "MOLIKA បុរីអ័រគីដេ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/Hn9Nf2KqBm4zHX7U8?g_st=ac", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 491, "lead_no": 489, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0490", "customer": "PHAI VITA", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/pHMXdVTRx5neeMkNA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 492, "lead_no": 490, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0491", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 493, "lead_no": 491},
 {"id": "nphk-20261015-0492", "customer": "CHANRA CHOUN", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 494, "lead_no": 492},
 {"id": "nphk-20261015-0493", "customer": "CHANRA CHOUN", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 495, "lead_no": 493},
-{"id": "nphk-20261015-0494", "customer": "LY HONG", "province": "បាត់ដំបង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 496, "lead_no": 494},
-{"id": "nphk-20261015-0495", "customer": "FAML NU", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 497, "lead_no": 495},
-{"id": "nphk-20261015-0496", "customer": "SREYDET KHOUN", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 498, "lead_no": 496},
+{"id": "nphk-20261015-0495", "customer": "FAML NU ផ្សារត្រពាំងផុង កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 497, "lead_no": 495},
 {"id": "nphk-20261015-0497", "customer": "SOULINH HEANG", "province": "ព្រះវិហារ", "url": "https://maps.app.goo.gl/Jks3wPbS1y16y6pw6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 499, "lead_no": 497, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=13.3046450,105.0021700&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=5860543d-97b8-4eb4-9798-b5c31595bc40&g_st=it"},
 {"id": "nphk-20261015-0498", "customer": "ING MUOYSIM", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/wY6HYxzDmgRSDMb96?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 500, "lead_no": 498, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0499", "customer": "X CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/e5YhmG8cefwxksZK9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 501, "lead_no": 499, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
@@ -6033,95 +6031,50 @@ _MAP_SEED_JSON = r"""[
 {"id": "nphk-20261015-0504", "customer": "LY SOK IM", "province": "ព្រះវិហារ", "url": "https://maps.google.com/maps?q=13.304640,105.002195&ll=13.304640,105.002195&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 506, "lead_no": 504},
 {"id": "nphk-20261015-0505", "customer": "TANGIM COSMETIC", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/KATyHNN34rXurtzA6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 507, "lead_no": 505, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.2116670,104.5766390&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=49e6635d-f657-4dc2-9ed9-edc792adf148&g_st=it"},
 {"id": "nphk-20261015-0506", "customer": "SOKHEA NEANG", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/F52hXU154g9nnRMb7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 508, "lead_no": 506, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5970670,104.8025270&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=c7e016c3-689b-4b2f-b81d-50cad96662f9&g_st=it"},
-{"id": "nphk-20261015-0507", "customer": "តេលា", "province": "កំពង់ឆ្នាំង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 509, "lead_no": 507},
-{"id": "nphk-20261015-0508", "customer": "ដើមកាហ្វេ អ៊ិចស្រ្ពេស", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 510, "lead_no": 508},
-{"id": "nphk-20261015-0509", "customer": "PICH COFFEE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/NS6rxYzRAHRPnS5D6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 511, "lead_no": 509, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5318309,104.9296739&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=9cca0c1c-bb8e-4c08-b09b-30d4daf2be8c&g_st=it"},
-{"id": "nphk-20261015-0510", "customer": "ស្រី ពៅ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 512, "lead_no": 510},
-{"id": "nphk-20261015-0511", "customer": "SREY PHEAK", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 513, "lead_no": 511},
-{"id": "nphk-20261015-0512", "customer": "ពៅ លីហុង", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 514, "lead_no": 512},
+{"id": "nphk-20261015-0507", "customer": "ដេប៉ូតេលាគីឡូម៉ែត្រ65 ផ្លូវជាតិលេខ5", "province": "កំពង់ឆ្នាំង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 509, "lead_no": 507},
+{"id": "nphk-20261015-0508", "customer": "ដើមកាហ្វេ​ ដេអិន", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/JLuobf423tnhfK6n7", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 510, "lead_no": 508, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
+{"id": "nphk-20261015-0509", "customer": "ដើមកាហ្វេ បឹងកក់", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/NS6rxYzRAHRPnS5D6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 511, "lead_no": 509, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5318309,104.9296739&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=9cca0c1c-bb8e-4c08-b09b-30d4daf2be8c&g_st=it"},
 {"id": "nphk-20261015-0513", "customer": "THEARY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/fCyvZSzrEx2Mc8u56?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 515, "lead_no": 513, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5141191,104.9024659&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=4d59d915-2af7-462b-9fc2-9a16214896ca&g_st=it"},
 {"id": "nphk-20261015-0514", "customer": "មុំ ចន្ទ័រតនា", "province": "តាកែវ", "url": "https://maps.app.goo.gl/m2wRWPwMwYbHedGB7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 516, "lead_no": 514, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=10.9794480,104.7747130&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=f4e2a8d6-a20f-4d99-a704-4187c4b5bedc&g_st=it"},
 {"id": "nphk-20261015-0515", "customer": "និនិកាហ្វេ- NINI CAFÉ", "province": "កំពង់ធំ", "url": "https://maps.google.com/maps?q=13.036699,104.513791&ll=13.036699,104.513791&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 517, "lead_no": 515},
 {"id": "nphk-20261015-0516", "customer": "SOEURNG SREY NEANG", "province": "កំពង់ធំ", "url": "https://maps.app.goo.gl/oaWKqDxFCaxQnCyJ7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 518, "lead_no": 516, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=12.6128550,105.0031460&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=8929b6f1-adde-4fdc-a46f-afa4d2004a74&g_st=it"},
 {"id": "nphk-20261015-0517", "customer": "SON CHANDY", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/38LexCPMCQExx1TM9?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 519, "lead_no": 517, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0518", "customer": "TEB CHOMNO", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 520, "lead_no": 518},
-{"id": "nphk-20261015-0519", "customer": "ROTH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 521, "lead_no": 519},
 {"id": "nphk-20261015-0520", "customer": "MALIKA YURI", "province": "កំពង់ចាម", "url": "https://maps.app.goo.gl/fkka935UGb9iAkLF7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 522, "lead_no": 520, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
 {"id": "nphk-20261015-0521", "customer": "SAMNEANG LUN", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.583637,104.841023&ll=11.583637,104.841023&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 523, "lead_no": 521},
-{"id": "nphk-20261015-0522", "customer": "DIAMOND BICYCLE", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 524, "lead_no": 522},
+{"id": "nphk-20261015-0522", "customer": "DIAMOND BICYCLE ឬស្សីកែវ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/MewdYicvXvikCkJv6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 524, "lead_no": 522, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0523", "customer": "ដេប៉ូតេលាគីឡូម៉ែត្រ65", "province": "កំពង់ឆ្នាំង", "url": "https://maps.app.goo.gl/MUMtHk5JzN65nqg88?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 525, "lead_no": 523, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0524", "customer": "SREYPICH THAI", "province": "ត្បូងឃ្មុំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 526, "lead_no": 524},
-{"id": "nphk-20261015-0525", "customer": "MONI VANN", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 527, "lead_no": 525},
-{"id": "nphk-20261015-0526", "customer": "SOPHEAROM MEN", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 528, "lead_no": 526},
-{"id": "nphk-20261015-0527", "customer": "MOUY YIM", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 529, "lead_no": 527},
-{"id": "nphk-20261015-0528", "customer": "LIKA MECH", "province": "កំពត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 530, "lead_no": 528},
 {"id": "nphk-20261015-0529", "customer": "BELLA SMITT", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.395932,104.801630&ll=11.395932,104.801630&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 531, "lead_no": 529},
-{"id": "nphk-20261015-0530", "customer": "HORN SIVNAI", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 532, "lead_no": 530},
 {"id": "nphk-20261015-0531", "customer": "POP CAFÉ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/YVHnyEySsoBitf4f7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 533, "lead_no": 531, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0532", "customer": "ទួនហ្វា", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 534, "lead_no": 532},
-{"id": "nphk-20261015-0533", "customer": "PTT", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 535, "lead_no": 533},
 {"id": "nphk-20261015-0534", "customer": "ចណ្ណា កាហ្វេ", "province": "តាកែវ", "url": "https://maps.app.goo.gl/wURSFi2aqQRxotLKA?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 536, "lead_no": 534, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0535", "customer": "PTT", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 537, "lead_no": 535},
-{"id": "nphk-20261015-0536", "customer": "PTT", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 538, "lead_no": 536},
-{"id": "nphk-20261015-0537", "customer": "PTT", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 539, "lead_no": 537},
 {"id": "nphk-20261015-0538", "customer": "ហួត លៀងទុយ", "province": "កោះកុង", "url": "https://maps.google.com/maps?q=11.139767,103.768197&ll=11.139767,103.768197&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 540, "lead_no": 538},
-{"id": "nphk-20261015-0539", "customer": "KATI YA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 541, "lead_no": 539},
-{"id": "nphk-20261015-0540", "customer": "LEEYA SUON", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 542, "lead_no": 540},
-{"id": "nphk-20261015-0541", "customer": "លាស់ គីមលាង", "province": "ប៉ោយប៉ែត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 543, "lead_no": 541},
-{"id": "nphk-20261015-0542", "customer": "NIMOL VOEUN", "province": "តាកែវ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 544, "lead_no": 542},
+{"id": "nphk-20261015-0542", "customer": "NIMOL VOEUN ផ្សារសំរោងយ៉ោង", "province": "តាកែវ", "url": "https://maps.app.goo.gl/zXPtWxg5vmygyQTo6", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 544, "lead_no": 542, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0543", "customer": "LAY KONG RETAIL", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/8tzE4c8pDT5kFAm7A?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 545, "lead_no": 543, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0544", "customer": "លីមដា កាហ្វេ", "province": "កោះកុង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 546, "lead_no": 544},
 {"id": "nphk-20261015-0545", "customer": "HENG CHHUNIM", "province": "ភ្នំពេញ", "url": "https://maps.google.com/maps?q=11.530185,104.864197&ll=11.530185,104.864197&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 547, "lead_no": 545},
-{"id": "nphk-20261015-0546", "customer": "តុប ណៃអេង", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 548, "lead_no": 546},
+{"id": "nphk-20261015-0546", "customer": "តុប ណៃអេង ផ្សារតាឡាត់", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 548, "lead_no": 546},
 {"id": "nphk-20261015-0547", "customer": "ប៉ុក វ៉ាត", "province": "រតនគិរី", "url": "https://maps.app.goo.gl/jr1FMhFTVrpzXqfdA?g_st=atm", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 549, "lead_no": 547, "resolved_url": "https://www.google.com/maps/place/13.685918,107.216926/data=!4m6!3m5!1s0!7e2!8m2!3d13.6859176!4d107.2169263?utm_source=mstt_1&entry=gps&coh=192189&g_ep=CAESBzI1LjEzLjYYACDj7Q0qYyw5NDIyMzI5OSw5NDIxNjQxMyw5NDIxMjQ5Niw5NDIwNzM5NCw5NDIwNzUwNiw5NDIwODUwNiw5NDIxNzUyMyw5NDIxODY1Myw5NDIyOTgzOSw0NzA4NDM5Myw5NDIxMzIwMEICS0g%3D&skid=648cd766-2ce9-4479-823b-f383d4f044c7&g_st=atm", "resolution_note": "Expanded from supplied map link"},
-{"id": "nphk-20261015-0548", "customer": "KONG SIMALA", "province": "ប៉ៃលិន", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 550, "lead_no": 548},
 {"id": "nphk-20261015-0549", "customer": "សឿន ប៊ុនឆៃ បុរីសូនី", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/k3penyvvMnXeUpSn6?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 551, "lead_no": 549, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5275120,104.8807430&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b525be45-d9cb-4ce9-9240-272f9257a9a0&g_st=it"},
-{"id": "nphk-20261015-0550", "customer": "MA DY", "province": "ព្រៃវែង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 552, "lead_no": 550},
-{"id": "nphk-20261015-0551", "customer": "ចាន​ ថន", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 553, "lead_no": 551},
-{"id": "nphk-20261015-0552", "customer": "ដើមកាហ្វេ អ៊ិចស្រ្ពេស", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 554, "lead_no": 552},
+{"id": "nphk-20261015-0552", "customer": "ដើមកាហ្វេ បឹងកក់", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/fFDF5LYAwGFKpn5m8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 554, "lead_no": 552, "resolution_note": "Link updated 2026-10-30 (Location update.xlsx)"},
 {"id": "nphk-20261015-0553", "customer": "SOMA LY", "province": "ព្រះសីហនុ", "url": "https://maps.google.com/maps?q=10.620510,103.542128&ll=10.620510,103.542128&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 555, "lead_no": 553},
 {"id": "nphk-20261015-0554", "customer": "BTA WATCH", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/SPjvFBGQkcD5o2nT7", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 556, "lead_no": 554, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0555", "customer": "DY KIMSA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 557, "lead_no": 555},
 {"id": "nphk-20261015-0556", "customer": "នំបុ័ងភ្នំពេញ", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 558, "lead_no": 556},
-{"id": "nphk-20261015-0557", "customer": "AH HEAK", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 559, "lead_no": 557},
-{"id": "nphk-20261015-0558", "customer": "ជាងពុម្ភ ជាងដែក", "province": "កោះកុង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 560, "lead_no": 558},
 {"id": "nphk-20261015-0559", "customer": "KIM SEU LY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/1aNgLMuepZNhrQXk7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 561, "lead_no": 559, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5237610,104.9075820&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=b35e3b10-1f9c-4374-b435-68abc3a3b458&g_st=it"},
 {"id": "nphk-20261015-0560", "customer": "ចេ ស្រស់", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.278135,104.210464&ll=11.278135,104.210464&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 562, "lead_no": 560},
 {"id": "nphk-20261015-0561", "customer": "EI SOK MENG", "province": "កំពង់ស្ពឺ", "url": "https://maps.google.com/maps?q=11.389148,104.378740&ll=11.389148,104.378740&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 563, "lead_no": 561},
-{"id": "nphk-20261015-0562", "customer": "SOU SARITH", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 564, "lead_no": 562},
+{"id": "nphk-20261015-0562", "customer": "SOU SARITH បឹងកេងកង3", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 564, "lead_no": 562},
 {"id": "nphk-20261015-0563", "customer": "THEARYNA SENG", "province": "មណ្ឌលគិរី", "url": "https://maps.google.com/maps?q=12.460194,107.185893&ll=12.460194,107.185893&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 565, "lead_no": 563},
 {"id": "nphk-20261015-0564", "customer": "ម៉ាក់ កូនវិ", "province": "កណ្តាល", "url": "https://maps.app.goo.gl/dwtmMviNLSTYdSNW7?g_st=it", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 566, "lead_no": 564, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5008200,104.7504870&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMwLjMuOTUwNDkyMTU1MBgAINeCAypdLDk0Mjk3Njk5LDk0MjMxMTg4LDk0MjgwNTY4LDQ3MDcxNzA0LDk0MjE4NjQxLDk0MjgyMTM0LDEwMDgxMzQ2NCw5NDI4Njg2OSwxMDA4MjAyNDcsMTAwODIyNTA0QgJLSA%3D%3D&skid=31fa9195-cfcd-4d90-b258-6ee98f2267b6&g_st=it"},
-{"id": "nphk-20261015-0565", "customer": "NIN NOCH", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 567, "lead_no": 565},
+{"id": "nphk-20261015-0565", "customer": "NIN NOCH កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 567, "lead_no": 565},
 {"id": "nphk-20261015-0566", "customer": "THY CHOURY", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/yYPf4eriKD3qvbF6A?g_st=com.google.maps.preview.copy", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 568, "lead_no": 566, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7587270,104.9232300&entry=gps&lucs=,94259550,94242520,94224825,94227247,94227248,94231188,47071704,94259573,47069508,94218641,94203019,47084304,94208458,94208447&g_ep=CAISEjI1LjA4LjAuNzI3OTM5NzI3MBgAIIgnKn4sOTQyNTk1NTAsOTQyNDI1MjAsOTQyMjQ4MjUsOTQyMjcyNDcsOTQyMjcyNDgsOTQyMzExODgsNDcwNzE3MDQsOTQyNTk1NzMsNDcwNjk1MDgsOTQyMTg2NDEsOTQyMDMwMTksNDcwODQzMDQsOTQyMDg0NTgsOTQyMDg0NDdCAktI&g_st=com.google.maps.preview.copy"},
-{"id": "nphk-20261015-0567", "customer": "SREY LIN", "province": "កំពត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 569, "lead_no": 567},
+{"id": "nphk-20261015-0567", "customer": "SREY LIN ព្រែកចាក", "province": "កំពត", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 569, "lead_no": 567},
 {"id": "nphk-20261015-0568", "customer": "MORIKO KREE", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/oVxQR1sv3GSBVCi78?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 570, "lead_no": 568, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7293560,104.5577810&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=af70c0b9-cab8-4b4c-aaa1-9d7b32839142&g_st=ic"},
-{"id": "nphk-20261015-0569", "customer": "ស្រី នាត", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 571, "lead_no": 569},
+{"id": "nphk-20261015-0569", "customer": "ស្រី នាត​ វត្តស្អាងស្រែ កណ្ដាល", "province": "កណ្តាល", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 571, "lead_no": 569},
 {"id": "nphk-20261015-0570", "customer": "កោះកាហ្វេ", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/18SoQZcfJb72jGqV8", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 572, "lead_no": 570, "resolution_note": "Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead."},
-{"id": "nphk-20261015-0571", "customer": "RADET JASPER", "province": "ភ្នំពេញ", "url": "https://nphk-pos.balancikaapps.com/login", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 573, "lead_no": 571},
-{"id": "nphk-20261015-0572", "customer": "DYSON KLEN COFFEE", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 574, "lead_no": 572},
+{"id": "nphk-20261015-0571", "customer": "RADET JASPER ឈូកវ៉ា 2", "province": "ភ្នំពេញ", "url": "https://nphk-pos.balancikaapps.com/login", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 573, "lead_no": 571},
 {"id": "nphk-20261015-0573", "customer": "VOUCH CHHENG", "province": "សៀមរាប", "url": "https://maps.google.com/maps?q=13.126683,104.336279&ll=13.126683,104.336279&z=16", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 575, "lead_no": 573},
-{"id": "nphk-20261015-0574", "customer": "SOK HENG", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 576, "lead_no": 574},
-{"id": "nphk-20261015-0575", "customer": "THIDA RITH", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 577, "lead_no": 575},
 {"id": "nphk-20261015-0576", "customer": "ជឹមជ័យសិរីមុន្និន", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/VTeN9fhx6P3hCadZ8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 578, "lead_no": 576, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5513240,104.9396820&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=aede89dd-bf1b-4c7e-8fff-fc5f7f543902&g_st=ic"},
 {"id": "nphk-20261015-0577", "customer": "ជា សុភ័ក្រ្ត", "province": "ភ្នំពេញ", "url": "https://maps.app.goo.gl/BPoYiJgLGyzeANsw8?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 579, "lead_no": 577, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.5389860,104.9028930&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=1baf7668-37c7-4c70-ad93-9e562cbd05c7&g_st=ic"},
-{"id": "nphk-20261015-0578", "customer": "PK CAFÉ & MINI MART", "province": "សៀមរាប", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 580, "lead_no": 578},
-{"id": "nphk-20261015-0579", "customer": "RA SREYNA", "province": "ព្រៃវែង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 581, "lead_no": 579},
-{"id": "nphk-20261015-0580", "customer": "LITA OUDOM", "province": "កំពង់ចាម", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 582, "lead_no": 580},
-{"id": "nphk-20261015-0581", "customer": "SEAV AY", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 583, "lead_no": 581},
-{"id": "nphk-20261015-0582", "customer": "FA NG", "province": "ស្វាយរៀង", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 584, "lead_no": 582},
-{"id": "nphk-20261015-0583", "customer": "AH LEAK", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 585, "lead_no": 583},
-{"id": "nphk-20261015-0584", "customer": "NITA KNP", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 586, "lead_no": 584},
-{"id": "nphk-20261015-0585", "customer": "ចែ ទៀង", "province": "ព្រះសីហនុ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 587, "lead_no": 585},
-{"id": "nphk-20261015-0586", "customer": "JEE NEATH", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 588, "lead_no": 586},
-{"id": "nphk-20261015-0587", "customer": "SPATA CAFÉ KOH NOREA", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 589, "lead_no": 587},
-{"id": "nphk-20261015-0588", "customer": "PREMIUM LAND COFFEE", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 590, "lead_no": 588},
-{"id": "nphk-20261015-0589", "customer": "KON LYHOR", "province": "កំពង់ធំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 591, "lead_no": 589},
-{"id": "nphk-20261015-0590", "customer": "LAY LYCHING SOK SOTHEAVORN", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/oVxQR1sv3GSBVCi78?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 592, "lead_no": 590, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7293560,104.5577810&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=af70c0b9-cab8-4b4c-aaa1-9d7b32839142&g_st=ic"},
-{"id": "nphk-20261015-0591", "customer": "ROTH KIMHONG", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 593, "lead_no": 591},
-{"id": "nphk-20261015-0592", "customer": "PIN SAVAT", "province": "ត្បូងឃ្មុំ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 594, "lead_no": 592},
-{"id": "nphk-20261015-0593", "customer": "SOK ENG PUY", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 595, "lead_no": 593},
-{"id": "nphk-20261015-0594", "customer": "AH GECH CORNER", "province": "ភ្នំពេញ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 596, "lead_no": 594},
-{"id": "nphk-20261015-0595", "customer": "LAK KHA", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 597, "lead_no": 595}
+{"id": "nphk-20261015-0581", "customer": "SEAV AY ផ្សារក្រាំងចេក កំពង់ស្ពឺ", "province": "កំពង់ស្ពឺ", "url": "", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 583, "lead_no": 581},
+{"id": "nphk-20261015-0590", "customer": "LAY LYCHING SOK SOTHEAVORN", "province": "កំពង់ស្ពឺ", "url": "https://maps.app.goo.gl/oVxQR1sv3GSBVCi78?g_st=ic", "source": "NPHK_Leads_Report_20261015_152318.xlsx", "source_row": 592, "lead_no": 590, "resolution_note": "Expanded from supplied map link", "resolved_url": "https://maps.google.com/?q=11.7293560,104.5577810&entry=gps&shh=CAE&lucs=,94297699,94231188,94280568,47071704,94218641,94282134,100813464,94286869,100820247,100822504&g_ep=CAISEjI2LjMxLjQuOTU0MzA2MDQzMBgAIIgnKl0sOTQyOTc2OTksOTQyMzExODgsOTQyODA1NjgsNDcwNzE3MDQsOTQyMTg2NDEsOTQyODIxMzQsMTAwODEzNDY0LDk0Mjg2ODY5LDEwMDgyMDI0NywxMDA4MjI1MDRCAktI&skid=af70c0b9-cab8-4b4c-aaa1-9d7b32839142&g_st=ic"}
 ]"""
 
 # ==========================================
@@ -6317,8 +6270,32 @@ class _ResolvedMapPin(Exception):
         self.url = url
 
 
+_MAP_CONSENT_HOSTS = frozenset({"consent.google.com", "consent.youtube.com"})
+_MAP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0 Safari/537.36"),
+    "Accept-Language": "en-US,en;q=0.8",
+    "Cookie": "CONSENT=YES+cb; SOCS=CAI",          # skip Google's cookie page so the map page itself comes back
+}
+
+
+def _map_consent_target(url):
+    """Google sometimes sends links to its cookie page first; the real map address is in ?continue=."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.hostname in _MAP_CONSENT_HOSTS:
+            nxt = urllib.parse.parse_qs(parsed.query).get("continue", [""])[0]
+            return trusted_map_url(nxt)
+    except (ValueError, TypeError):
+        pass
+    return ""
+
+
 class _MapRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = _map_consent_target(newurl)
+        if target:
+            newurl = target
         if not trusted_map_url(newurl):
             if fp is not None:
                 fp.close()
@@ -6330,22 +6307,73 @@ class _MapRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _map_in_cambodia(lat, lon):
+    return math.isfinite(lat) and math.isfinite(lon) and 10 <= lat <= 15 and 102 <= lon <= 108
+
+
+def _map_coords_from_page(final_url, html):
+    """(lat, lon, how) of the shop on a Google Maps place page, or None.
+    New share links (maps.app.goo.gl → ?q=name&ftid=… or /maps/place/name/data=…) carry no numbers in the address,
+    but the page itself does. Marker positions are used first; the page centre only for a single-place page."""
+    text = urllib.parse.unquote(html.replace("\\u0026", "&").replace("\u0026", "&").replace("&amp;", "&"))
+    num = r"([-+]?\d{1,3}\.\d{3,})"
+    # 1) static map preview with a marker on the place
+    for la, lo in re.findall(r"staticmap\?[^\"'\s]*?markers=[^\"'\s]*?" + num + r"(?:,|%2C)" + num, text):
+        if _map_in_cambodia(float(la), float(lo)):
+            return float(la), float(lo), "marker on the Google place page"
+    # 2) the place's own pin (!3d lat !4d lon); several different pins = not safe to choose
+    pins = {(round(float(la), 5), round(float(lo), 5)) for la, lo in re.findall(r"!3d" + num + r"!4d" + num, text)}
+    pins = {p for p in pins if _map_in_cambodia(*p)}
+    if len(pins) == 1:
+        la, lo = next(iter(pins))
+        return la, lo, "pin on the Google place page"
+    path = urllib.parse.urlsplit(final_url)
+    single_place = "/maps/place/" in path.path or "ftid=" in path.query or "cid=" in path.query
+    if not single_place:
+        return None
+    # 3) static map preview centred on the place
+    for la, lo in re.findall(r"staticmap\?[^\"'\s]*?center=" + num + r"(?:,|%2C)" + num, text):
+        if _map_in_cambodia(float(la), float(lo)):
+            return float(la), float(lo), "centre of the Google place page"
+    # 4) the place address itself: /maps/place/<name>/@lat,lon,zoom
+    m = re.search(r"/@" + num + "," + num + ",", urllib.parse.unquote(final_url))
+    if m and _map_in_cambodia(float(m.group(1)), float(m.group(2))):
+        return float(m.group(1)), float(m.group(2)), "Google place address"
+    # 5) the first map view of the page (centred on the place)
+    m = re.search(r"APP_INITIALIZATION_STATE=\[\[\[[-+\d.e]+," + num + "," + num + r"\]", text)
+    if m and _map_in_cambodia(float(m.group(2)), float(m.group(1))):
+        return float(m.group(2)), float(m.group(1)), "centre of the Google place page"
+    return None
+
+
 def resolve_map_link(url):
-    """Network-only worker: no Streamlit/session access and no coordinates guessed from HTML."""
+    """Network-only worker: no Streamlit/session access. Returns a link that contains the shop's coordinates."""
     if not trusted_map_url(url):
         raise ValueError("Unsupported map link")
     if analyse_map_link(url)["Map status"] == "Ready pin":
         return url
     opener = urllib.request.build_opener(_MapRedirectHandler())
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; CustomerMap/1.0)"})
+    request = urllib.request.Request(url, headers=_MAP_HEADERS)
     try:
-        with opener.open(request, timeout=10) as response:
+        with opener.open(request, timeout=12) as response:
             final_url = response.geturl()
+            target = _map_consent_target(final_url)
+            if target:
+                final_url = target
             if not trusted_map_url(final_url):
                 raise ValueError("Unsupported map destination")
-            if analyse_map_link(final_url)["Map status"] != "Ready pin":
-                raise ValueError("Link opened but no usable destination coordinates were found. Paste a full dropped-pin link instead.")
-            return final_url
+            if analyse_map_link(final_url)["Map status"] == "Ready pin":
+                return final_url
+            html = response.read(3_000_000).decode("utf-8", "ignore") if not target else ""
+        if target:                                       # cookie page: open the real map page once
+            with opener.open(urllib.request.Request(final_url, headers=_MAP_HEADERS), timeout=12) as response:
+                html = response.read(3_000_000).decode("utf-8", "ignore")
+        found = _map_coords_from_page(final_url, html)
+        if found:
+            lat, lon, _how = found
+            return f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+        raise ValueError("Link opened but no usable destination coordinates were found. "
+                         "In Google Maps press and hold on the shop to drop a pin, then Share that pin.")
     except _ResolvedMapPin as found:
         return found.url
 
@@ -6462,10 +6490,14 @@ def _map_admin_panel(registry, locations):
                 except Exception as e:
                     st.error(f"Could not remove this match: {e}")
     with st.expander("Expand shortened map links"):
-        pending = locations[locations["Map status"] == "Needs link expansion"]
-        st.caption(f"{len(pending)} links need expansion. The app opens up to 20 links at a time. Your server needs access to Google / Apple Maps.")
+        retry = ("Needs link expansion", "Needs full pin link", "Link has no destination coordinates")
+        pending = locations[locations["Map status"].isin(retry)
+                            & ~locations["Resolution note"].astype(str).str.contains("press and hold", regex=False)]
+        st.caption(f"{len(pending)} links need expansion (links that failed before are tried again with the new reader). "
+                   "The app opens up to 20 links at a time. Your server needs access to Google / Apple Maps.")
         if st.button("Resolve next 20 map links", key="map_resolve", disabled=pending.empty):
-            selected = pending.sort_values("Resolution note", kind="stable").head(20)
+            order = pending["Map status"].map({"Needs link expansion": 0}).fillna(1)
+            selected = pending.assign(_o=order).sort_values(["_o", "Resolution note"], kind="stable").head(20)
             updates, failed = {}, []
             from concurrent.futures import ThreadPoolExecutor, as_completed
             with st.spinner("Checking saved map links…"):
@@ -6973,6 +7005,268 @@ def _si_no_order(daily, names, areas, month_start, month_end, today, avgs=None):
     return out.reset_index(drop=True)
 
 
+# ---------- possible duplicate customer names (same shop written two ways) ----------
+SI_ALIAS_COLS = ["Date", "Customer", "Same as", "Decision", "By"]
+SI_DUP_MIN = 0.80                 # name likeness (0-1) from which two names are shown as "maybe the same customer"
+
+
+def _si_name_tokens(name):
+    t = unicodedata.normalize("NFC", str(name)).replace("​", "").replace("‌", "").replace("្ដ", "្ត")
+    t = re.sub(r"([A-Za-z])([^\sA-Za-z0-9])", r"\1 \2", t)          # "COFFEEចោមចៅ" -> "COFFEE ចោមចៅ"
+    return [w.upper() for w in re.split(r"[\s(),.\-_/:]+", t) if len(w) >= 2]
+
+
+def _si_name_score(a, b, word_count):
+    """0-1. Rare words (a person's name) count much more than common words (khan, province, 'MART', 'AEON'):
+    two shops in the same place with different owners are not the same customer."""
+    import difflib
+    ka, kb = _visit_match_key(a), _visit_match_key(b)
+    if not ka or not kb:
+        return 0.0
+    if ka == kb:
+        return 1.0
+    r = difflib.SequenceMatcher(None, ka, kb).ratio()
+    ta, tb = _si_name_tokens(a), _si_name_tokens(b)
+    if not ta or not tb:
+        return r * 0.8
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    def sim(x):
+        return max(1.0 if x == y else difflib.SequenceMatcher(None, x, y).ratio() for y in long_)
+    sims = {x: sim(x) for x in short}
+    weight = {x: 1.0 / max(1, word_count.get(x, 1)) for x in short}
+    total = sum(weight.values())
+    cover = sum(w for x, w in weight.items() if sims[x] >= 0.75) / total if total else 0.0
+    rare_match = any(word_count.get(x, 1) <= 3 and sims[x] >= 0.75 for x in short)
+    if not rare_match:
+        return r if r >= 0.9 else r * 0.6
+    return 0.6 * cover + 0.4 * r
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def _si_dup_scan(missing_items, ordered_items, all_names):
+    """{missing key: (ordered key, score)} best look-alike that DID order, for every customer without an order."""
+    import difflib
+    word_count = Counter()
+    for n in set(all_names):
+        word_count.update(set(_si_name_tokens(n)))
+    okeys = [(k, n, _visit_match_key(n)) for k, n in ordered_items]
+    out = {}
+    for k, n in missing_items:
+        mk = _visit_match_key(n)
+        best = None
+        for ok, on, omk in okeys:
+            if ok == k or not mk or not omk:
+                continue
+            if mk != omk:
+                sm = difflib.SequenceMatcher(None, mk, omk)
+                if sm.real_quick_ratio() < 0.45 or sm.quick_ratio() < 0.45:
+                    continue
+            sc = _si_name_score(n, on, word_count)
+            if sc >= SI_DUP_MIN and (best is None or sc > best[1]):
+                best = (ok, round(sc, 2))
+        if best:
+            out[k] = best
+    return out
+
+
+def _si_alias_read():
+    try:
+        return read_raw(SI_ALIAS_FILE, SI_ALIAS_COLS, max_age=60)
+    except Exception:
+        return pd.DataFrame(columns=SI_ALIAS_COLS)
+
+
+def _si_alias_decisions():
+    """-> (same: {key: set(keys)}, different: set(frozenset({key, key}))). The newest decision for a pair wins."""
+    df = _si_alias_read()
+    pairs = {}
+    for r in df.to_dict("records"):
+        a, b = norm_name(r.get("Customer", "")), norm_name(r.get("Same as", ""))
+        if a and b and a != b:
+            pairs[frozenset((a, b))] = str(r.get("Decision", ""))
+    same, diff = {}, set()
+    for pair, dec in pairs.items():
+        a, b = tuple(pair)
+        if dec == "Same":
+            same.setdefault(a, set()).add(b)
+            same.setdefault(b, set()).add(a)
+        elif dec == "Different":
+            diff.add(pair)
+    return same, diff
+
+
+def _si_alias_save(name, same_as, decision):
+    if not has_permission("edit"):
+        raise PermissionError("Your account needs Create, edit, and submit changes permission.")
+    row = {"Date": now_str(), "Customer": safe_text(name, maxlen=MAX_TEXT), "Same as": safe_text(same_as, maxlen=MAX_TEXT),
+           "Decision": decision, "By": current_user() or "-"}
+    modify_csv(SI_ALIAS_FILE, SI_ALIAS_COLS, lambda f: pd.concat([f, pd.DataFrame([row])], ignore_index=True))
+    audit("customer same-name decision", f"{name} | {same_as} | {decision}")
+
+
+def _si_no_order_split(table, daily, names, month_start, month_end):
+    """Remove customers who DID order under another spelling.
+    -> (table without them, review table of look-alikes, number hidden because Admin confirmed / same spelling)."""
+    if table is None or table.empty or daily.empty:
+        return table, pd.DataFrame(), 0
+    s, e = pd.Timestamp(month_start), pd.Timestamp(month_end)
+    month = daily[(daily["D"] >= s) & (daily["D"] <= e)]
+    if month.empty:
+        return table, pd.DataFrame(), 0
+    ordered = month.groupby("Key").agg(Customer=("Customer", "first"), Pcs=("Pcs", "sum"), Last=("D", "max"))
+    same, diff = _si_alias_decisions()
+    keys = table["Customer"].map(norm_name)
+    confirmed = keys.map(lambda k: bool(same.get(k, set()) & set(ordered.index)))
+    scan = _si_dup_scan(tuple(sorted(zip(keys[~confirmed], table.loc[~confirmed, "Customer"]))),
+                        tuple(sorted(zip(ordered.index, ordered["Customer"]))),
+                        tuple(sorted(set(names.values()) | set(ordered["Customer"]))))
+    auto_same, review = set(), []
+    for k, cust in zip(keys[~confirmed], table.loc[~confirmed, "Customer"]):
+        hit = scan.get(k)
+        if not hit or frozenset((k, hit[0])) in diff:
+            continue
+        o = ordered.loc[hit[0]]
+        if hit[1] >= 1.0:
+            auto_same.add(k)                  # identical apart from spaces / punctuation / spelling marks
+            continue
+        review.append({"Customer": cust, "Ordered as": o["Customer"], "Pcs this month": int(o["Pcs"]),
+                       "Last order (other name)": o["Last"].strftime("%Y-%m-%d"), "Likeness %": int(round(hit[1] * 100))})
+    review = pd.DataFrame(review)
+    hide = confirmed | keys.isin(auto_same) | (keys.isin(set(review["Customer"].map(norm_name))) if not review.empty else False)
+    if not review.empty:
+        review = review.sort_values("Likeness %", ascending=False).reset_index(drop=True)
+    return table[~hide].reset_index(drop=True), review, int(confirmed.sum() + len(auto_same))
+
+
+def _si_contacted_map(history, month_start):
+    """{customer key: latest contact (dict) recorded on or after month_start}."""
+    if history is None or history.empty:
+        return {}
+    h = history.copy()
+    h["_d"] = pd.to_datetime(h["Date"], errors="coerce")
+    h = h[h["_d"] >= pd.Timestamp(month_start)]
+    if h.empty:
+        return {}
+    h["_k"] = h["Customer"].map(norm_name)
+    return {r["_k"]: r for r in h.drop_duplicates("_k", keep="last").to_dict("records")}
+
+
+def _si_contact_text(c):
+    if not c:
+        return "⏳ មិនទាន់ទាក់ទង"
+    d = pd.to_datetime(c.get("Date"), errors="coerce")
+    bits = [f"✅ {d:%d %b}" if pd.notna(d) else "✅"]
+    for col in ("Platform", "Outcome", "Recorded by"):
+        v = str(c.get(col, "") or "").strip()
+        if v and v not in ("-", "nan"):
+            bits.append(v)
+    return " · ".join(bits)
+
+
+def _si_no_order_contact_table(frame, history, month_start, key, height=420):
+    """No-order list with a ✅ contacted state per customer. Tick, choose platform, Save -> saved in call history."""
+    if frame.empty:
+        st.caption("គ្មាន")
+        return
+    contacted = _si_contacted_map(history, month_start)
+    view = frame.copy()
+    view["_k"] = view["Customer"].map(norm_name)
+    view["Contact"] = view["_k"].map(lambda k: _si_contact_text(contacted.get(k)))
+    n_done = int(view["_k"].isin(contacted).sum())
+    f1, f2 = st.columns([3, 2])
+    show = f1.radio("បង្ហាញ", ["ទាំងអស់", "⏳ មិនទាន់ទាក់ទង", "✅ ទាក់ទងហើយ"], horizontal=True, key=f"{key}_flt")
+    f2.caption(f"✅ ទាក់ទងហើយ {n_done} / {len(view)} នាក់ ក្នុងខែនេះ")
+    if show.startswith("⏳"):
+        view = view[~view["_k"].isin(contacted)]
+    elif show.startswith("✅"):
+        view = view[view["_k"].isin(contacted)]
+    if view.empty:
+        st.caption("គ្មាន")
+        return
+    view.insert(0, "✅ ទាក់ទងហើយ", view["_k"].isin(contacted))
+    view["Platform"] = [(_si_platform_guess(history, c) if k not in contacted
+                         else (contacted[k].get("Platform") if contacted[k].get("Platform") in CALL_PLATFORMS else _si_platform_guess(history, c)))
+                        for k, c in zip(view["_k"], view["Customer"])]
+    view["Outcome"] = [contacted[k].get("Outcome") if k in contacted and contacted[k].get("Outcome") in CALL_OUTCOMES
+                       else "Reached customer" for k in view["_k"]]
+    view["Note"] = ""
+    show_cols = ["✅ ទាក់ទងហើយ", "Customer", "Area", "Last order", "Days since", "Avg pcs/month", "Contact", "Platform", "Outcome", "Note"]
+    show_cols = [c for c in show_cols if c in view.columns]
+    base = view[show_cols + ["_k"]].reset_index(drop=True)
+    ver = st.session_state.get(f"{key}_ver", 0)
+    can_edit = has_permission("edit")
+    edited = st.data_editor(
+        base[show_cols], hide_index=True, use_container_width=True, height=min(height, 38 + 35 * (len(base) + 1)),
+        key=f"{key}_ed_{ver}", disabled=[c for c in show_cols if c not in ("✅ ទាក់ទងហើយ", "Platform", "Outcome", "Note")] if can_edit else True,
+        column_config={
+            "✅ ទាក់ទងហើយ": st.column_config.CheckboxColumn("✅ ទាក់ទងហើយ", help="Tick when you have contacted this customer, then press Save."),
+            "Platform": st.column_config.SelectboxColumn("Platform", options=CALL_PLATFORMS, required=True,
+                                                         help="Picked automatically from the last contact. Change it if needed."),
+            "Outcome": st.column_config.SelectboxColumn("Outcome", options=CALL_OUTCOMES, required=True),
+            "Note": st.column_config.TextColumn("Note (optional)", max_chars=500),
+            "Contact": st.column_config.TextColumn("ស្ថានភាពទាក់ទង"),
+            "Avg pcs/month": st.column_config.NumberColumn("Avg pcs/month", format="%d"),
+        })
+    if not can_edit:
+        return
+    new = [(i, r) for i, r in edited.iterrows() if bool(r["✅ ទាក់ទងហើយ"]) and base.at[i, "_k"] not in contacted]
+    if st.button(f"💾 រក្សាទុក ({len(new)} នាក់ ទាក់ទងហើយ)", key=f"{key}_save", disabled=not new, type="primary"):
+        saved, errors = 0, []
+        latest = _si_call_latest(history) if history is not None and not history.empty else pd.DataFrame()
+        prev = latest.set_index("_key").to_dict("index") if not latest.empty else {}
+        for i, r in new:
+            k = base.at[i, "_k"]
+            p = prev.get(k, {})
+            status = p.get("Customer status") if p.get("Customer status") in CALL_STATUSES else "Active"
+            if status == "Do not contact":
+                errors.append(f"{r['Customer']}: marked Do not contact")
+                continue
+            row = {"Date": now_str(), "Customer": r["Customer"],
+                   "CallID": hashlib.sha256(f"{k}|{today_kh()}|{current_user()}|noorder".encode()).hexdigest()[:32],
+                   "Outcome": r["Outcome"], "Notes": str(r.get("Note") or "").strip() or "Contacted: no order this month",
+                   "Customer status": status, "Contact person": p.get("Contact person", ""), "Phone": p.get("Phone", ""),
+                   "Next action": "", "Follow-up date": "", "Assigned to": current_user() or "", "Recorded by": current_user() or "-",
+                   "Reason": "Not specified", "Follow-up state": "No follow-up", "Priority": "Normal", "Result": "",
+                   "Platform": r["Platform"]}
+            try:
+                _si_save_call(row)
+                saved += 1
+            except Exception as e:
+                errors.append(f"{r['Customer']}: {str(e)[:80]}")
+        st.session_state[f"{key}_ver"] = ver + 1
+        if errors:
+            st.warning("មិនបានរក្សាទុក: " + "; ".join(errors[:5]))
+        st.session_state["flash"] = f"✅ បានកត់ត្រា {saved} នាក់ ថាទាក់ទងហើយ"
+        st.rerun()
+
+
+def _si_dup_review(review, key="si_dup"):
+    """Look-alike names: one did not order, the other did. Admin decides once; the answer is remembered."""
+    if review.empty:
+        return
+    st.markdown(f"**🔁 ប្រហែលជាអតិថិជនដដែល — បានបញ្ជាទិញក្រោមឈ្មោះផ្សេង ({len(review)})**")
+    st.caption("ឈ្មោះទាំងនេះមិនបង្ហាញក្នុងតារាង 'មិនបញ្ជាទិញ' ខាងក្រោមទេ រហូតដល់អ្នកសម្រេច។ "
+               "✅ ដូចគ្នា = លុបចេញពីបញ្ជីមិនបញ្ជាទិញជារៀងរហូត · ❌ ផ្សេងគ្នា = បង្ហាញវិញ ហើយមិនសួរទៀត។")
+    can = has_permission("edit")
+    for i, r in enumerate(review.head(25).to_dict("records")):
+        c1, c2, c3 = st.columns([6, 1.3, 1.3])
+        c1.markdown(f"**{r['Customer']}** ↔ បានបញ្ជាទិញជា **{r['Ordered as']}**  \n"
+                    f"<small>{r['Pcs this month']:,} pcs ខែនេះ · ចុងក្រោយ {r['Last order (other name)']} · ស្រដៀង {r['Likeness %']}%</small>",
+                    unsafe_allow_html=True)
+        tag = hashlib.sha256(f"{r['Customer']}|{r['Ordered as']}".encode()).hexdigest()[:16]
+        for col, label, dec in ((c2, "✅ ដូចគ្នា", "Same"), (c3, "❌ ផ្សេងគ្នា", "Different")):
+            if col.button(label, key=f"{key}_{dec}_{tag}", disabled=not can, use_container_width=True):
+                try:
+                    _si_alias_save(r["Customer"], r["Ordered as"], dec)
+                    st.session_state["flash"] = f"បានរក្សាទុក: {r['Customer']} = {'ដូចគ្នា' if dec == 'Same' else 'ផ្សេងគ្នា'}"
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e)[:150])
+    if len(review) > 25:
+        with st.expander(f"មើលទាំងអស់ ({len(review)})"):
+            _si_show(review)
+
+
 def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=None, measure="Pcs"):
     """Rule-based customer-care list: who to contact, why, and what to say / offer."""
     t = pd.Timestamp(today)
@@ -7215,7 +7509,30 @@ def _si_show(df, money=(), pct=(), height=None):
 
 # Each call is an immutable customer snapshot; the newest call supplies current details.
 CALL_COLS = ["Date", "Customer", "CallID", "Outcome", "Notes", "Customer status",
-             "Contact person", "Phone", "Next action", "Follow-up date", "Assigned to", "Recorded by", "Reason", "Follow-up state", "Priority", "Result"]
+             "Contact person", "Phone", "Next action", "Follow-up date", "Assigned to", "Recorded by", "Reason", "Follow-up state", "Priority", "Result",
+             "Platform"]
+CALL_PLATFORMS = ["📞 Phone call", "✈️ Telegram", "💬 Messenger / Facebook", "🟢 WhatsApp", "💚 WeChat", "🟩 LINE",
+                  "📱 SMS", "🚶 Visit shop", "🗨️ Other"]
+
+
+def _si_platform_guess(history, customer, phone=""):
+    """Platform to pre-select: the one used last time with this customer, else a guess from the phone / Telegram field."""
+    try:
+        if history is not None and not history.empty and "Platform" in history:
+            mine = history[history["Customer"].map(norm_name).eq(norm_name(customer))]
+            used = [p for p in mine["Platform"].astype(str) if p in CALL_PLATFORMS]
+            if used:
+                return used[-1]
+            if not phone and not mine.empty:
+                phone = str(mine.iloc[-1].get("Phone", ""))
+    except Exception:
+        pass
+    ph = str(phone or "").strip().lower()
+    if "t.me" in ph or ph.startswith("@") or "telegram" in ph:
+        return "✈️ Telegram"
+    if "facebook" in ph or "fb.com" in ph or "m.me" in ph:
+        return "💬 Messenger / Facebook"
+    return CALL_PLATFORMS[0]
 CALL_OUTCOMES = ["Reached customer", "No answer", "Busy / call back", "Wrong number",
                  "Order requested", "Complaint / problem", "Not interested", "Customer update only"]
 CALL_STATUSES = ["Active", "Follow-up needed", "Temporarily closed", "Stopped buying", "Do not contact"]
@@ -7411,6 +7728,8 @@ def _si_save_call(row):
         raise ValueError("Choose a customer and enter a call note.")
     if row.get("Outcome") not in CALL_OUTCOMES or row.get("Customer status") not in CALL_STATUSES:
         raise ValueError("Choose a valid outcome and customer status.")
+    if row.get("Platform", "") and row["Platform"] not in CALL_PLATFORMS:
+        raise ValueError("Choose a valid platform.")
     follow = row.get("Follow-up date", "")
     if follow:
         date.fromisoformat(follow)
@@ -7445,6 +7764,7 @@ def _si_choose_call(customer):
 @st.fragment
 def _si_call_panel(names):
     st.markdown("#### 📝 Call notes & customer updates")
+    st.caption("Platform is picked automatically (last one used with this customer); change it when you used another app.")
     st.caption("Select a customer, record what happened, and save once. Previous calls stay in the history. "
                "Contact details here are customer-care details; requested orders must be entered in Sales Orders.")
     try:
@@ -7479,7 +7799,10 @@ def _si_call_panel(names):
         st.warning("This customer is marked Do not contact. Record an internal update if needed.")
     if has_permission("edit"):
         with st.form("call_form_" + token, clear_on_submit=False):
-            a, b = st.columns(2)
+            a, p_col, b = st.columns(3)
+            plat_default = _si_platform_guess(history, customer)
+            platform = p_col.selectbox("Platform (how you contacted)", CALL_PLATFORMS, index=CALL_PLATFORMS.index(plat_default),
+                                       help="Chosen automatically from the last contact with this customer. Change it if you used another app.")
             outcome = a.selectbox("Call outcome", CALL_OUTCOMES)
             status = b.selectbox("Customer status", CALL_STATUSES,
                                  index=CALL_STATUSES.index(value("Customer status", "Active"))
@@ -7508,7 +7831,8 @@ def _si_call_panel(names):
                    "Notes": notes, "Customer status": status, "Contact person": contact, "Phone": phone,
                    "Next action": action, "Follow-up date": follow.isoformat() if follow else "",
                    "Assigned to": owner, "Recorded by": current_user() or "-",
-                   "Reason": reason, "Follow-up state": follow_state, "Priority": priority, "Result": result}
+                   "Reason": reason, "Follow-up state": follow_state, "Priority": priority, "Result": result,
+                   "Platform": platform}
             try:
                 _si_save_call(row)
             except Exception as e:
@@ -7820,6 +8144,111 @@ def _si_care_cached(sig, today, measure, _daily, _df, _codes, _habits, _names, _
     return _si_care(_daily, _df, _codes, _habits, _names, _areas, today, today.replace(day=1), _avgs, measure)
 
 
+# ---------- 🗺️ map of active customers (always the newest journal + shop pins) ----------
+AMAP_COLORS = {"top": [212, 160, 23], "active": [46, 125, 79], "quiet": [150, 150, 150]}
+
+
+def _si_active_table(daily, names, areas, days, top_n, today):
+    """One row per customer that ordered in the last `days` days: pcs, ៛, order days, last order, rank."""
+    start = pd.Timestamp(today) - pd.Timedelta(days=days - 1)
+    d = daily[(daily["D"] >= start) & (daily["D"] <= pd.Timestamp(today))]
+    if d.empty:
+        return pd.DataFrame()
+    g = d.groupby("Key").agg(Pcs=("Pcs", "sum"), Sales=("Sales", "sum"), Orders=("D", "nunique"), Last=("D", "max"))
+    g = g[g["Pcs"] > 0].sort_values("Sales", ascending=False)
+    g["Rank"] = range(1, len(g) + 1)
+    g["Group"] = ["top" if r <= top_n else "active" for r in g["Rank"]]
+    g["Customer"] = [names.get(k, k) for k in g.index]
+    g["Area"] = [areas.get(k, "") for k in g.index]
+    g["Days since"] = (pd.Timestamp(today) - g["Last"]).dt.days
+    return g.reset_index()
+
+
+def _si_active_map_section(daily, names, areas, today):
+    st.markdown("#### 🗺️ ផែនទីអតិថិជនសកម្ម")
+    st.caption("បង្ហាញអតិថិជនដែលបានបញ្ជាទិញក្នុងរយៈពេលដែលជ្រើស តាម Sale Journal ចុងក្រោយបំផុត។ "
+               "🟡 = Top sale · 🟢 = Active · ទំហំចំណុច = ចំនួននំ។ ចុច 🔄 Refresh ដើម្បីយកទិន្នន័យថ្មី។")
+    c1, c2, c3 = st.columns(3)
+    days = c1.radio("រយៈពេល", [30, 60, 90], index=1, horizontal=True, key="amap_days", format_func=lambda v: f"{v} ថ្ងៃ")
+    top_n = c2.select_slider("Top sale", [10, 20, 30, 50], value=20, key="amap_top")
+    where = c3.radio("តំបន់", ["ទាំងអស់", "ភ្នំពេញ", "ខេត្ត"], horizontal=True, key="amap_area")
+    t = _si_active_table(daily, names, areas, days, top_n, today)
+    if t.empty:
+        st.info("មិនទាន់មានការបញ្ជាទិញក្នុងរយៈពេលនេះទេ។")
+        return
+    registry, store = _visit_registry(), _visit_pin_store()
+    try:
+        auto = _visit_candidates_for({k: names.get(k, k) for k in t["Key"]}, registry)[1]
+    except Exception:
+        auto = {}
+    pins = [_visit_pin(n, registry, store, auto) for n in t["Customer"]]
+    t["Lat"] = [p[0] if p else None for p in pins]
+    t["Lon"] = [p[1] if p else None for p in pins]
+    if where != "ទាំងអស់":
+        want = AREA_LABEL[PP] if where == "ភ្នំពេញ" else AREA_LABEL["Province"]
+        t = t[t["Area"].eq(want)]
+    only_top = st.toggle("🟡 បង្ហាញតែ Top sale", key="amap_only_top")
+    show = t[t["Group"].eq("top")] if only_top else t
+    with_pin = show.dropna(subset=["Lat", "Lon"])
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("អតិថិជនសកម្ម", f"{len(t):,}", f"{days} ថ្ងៃចុងក្រោយ", delta_color="off")
+    k2.metric("🟡 Top sale", f"{int(t['Group'].eq('top').sum())}", f"{t.loc[t['Group'].eq('top'), 'Sales'].sum() / max(1, t['Sales'].sum()) * 100:.0f}% នៃការលក់", delta_color="off")
+    k3.metric("មានទីតាំងលើផែនទី", f"{len(t.dropna(subset=['Lat'])):,} / {len(t):,}")
+    k4.metric("នំសរុប (pcs)", f"{int(t['Pcs'].sum()):,}")
+    if with_pin.empty:
+        st.warning("អតិថិជនទាំងនេះមិនទាន់មានទីតាំងលើផែនទីទេ។")
+    else:
+        m = with_pin.copy()
+        m["color"] = m["Group"].map(AMAP_COLORS)
+        mx = max(1.0, float(m["Pcs"].max()))
+        m["radius"] = (60 + 340 * (m["Pcs"] / mx) ** 0.5).round(0)
+        m["label"] = [f"{'🟡 #' + str(r) + ' ' if g == 'top' else ''}{c}" for r, g, c in zip(m["Rank"], m["Group"], m["Customer"])]
+        m["info"] = [f"{int(p):,} pcs · ៛{int(s):,} · {o} ដង · ចុងក្រោយ {l:%d %b}"
+                     for p, s, o, l in zip(m["Pcs"], m["Sales"], m["Orders"], m["Last"])]
+        m["nav"] = [f"https://www.google.com/maps/dir/?api=1&destination={a},{b}" for a, b in zip(m["Lat"], m["Lon"])]
+        try:
+            import pydeck as pdk
+            data = m[["Lat", "Lon", "color", "radius", "label", "info"]].to_dict("records")
+            layer = pdk.Layer("ScatterplotLayer", data=data, get_position="[Lon, Lat]", get_radius="radius",
+                              radius_min_pixels=4, radius_max_pixels=22, get_fill_color="color", get_line_color=[255, 255, 255],
+                              stroked=True, line_width_min_pixels=1, pickable=True, opacity=0.85)
+            top_layer = pdk.Layer("TextLayer", data=[x for x in data if x["label"].startswith("🟡")] if len(m) > 40 else data,
+                                  get_position="[Lon, Lat]", get_text="label", get_size=11, get_color=[30, 35, 40],
+                                  get_pixel_offset=[0, -16], character_set="auto")
+            pp = m[(m["Lat"].between(11.4, 11.75)) & (m["Lon"].between(104.7, 105.05))]
+            base = pp if (where != "ខេត្ត" and len(pp) >= len(m) * 0.5) else m
+            view = pdk.ViewState(latitude=float(base["Lat"].median()), longitude=float(base["Lon"].median()),
+                                 zoom=11 if base is pp else 6.5, pitch=0)
+            deck = pdk.Deck(layers=[layer], map_provider="carto", map_style="light", initial_view_state=view,
+                            tooltip={"text": "{label}\n{info}"})
+            try:
+                st.pydeck_chart(deck, use_container_width=True, height=560)
+            except TypeError:
+                st.pydeck_chart(deck)
+        except Exception:
+            st.map(m.rename(columns={"Lat": "lat", "Lon": "lon"}), latitude="lat", longitude="lon", color="color", size="radius")
+        st.caption("🟡 Top sale  ·  🟢 Active  ·  ចុចលើចំណុចដើម្បីមើលព័ត៌មាន")
+    tbl = show.assign(**{"ក្រុម": show["Group"].map({"top": "🟡 Top sale", "active": "🟢 Active"}),
+                         "ចុងក្រោយ": show["Last"].dt.strftime("%d %b"),
+                         "ទីតាំង": show["Lat"].notna().map({True: "📍", False: "❌ គ្មាន"}),
+                         "ផ្លូវ": [f"https://www.google.com/maps/dir/?api=1&destination={a},{b}" if pd.notna(a) else ""
+                                   for a, b in zip(show["Lat"], show["Lon"])]})
+    tbl = tbl[["Rank", "ក្រុម", "Customer", "Area", "Pcs", "Sales", "Orders", "ចុងក្រោយ", "Days since", "ទីតាំង", "ផ្លូវ"]].rename(
+        columns={"Rank": "លេខ", "Customer": "អតិថិជន", "Area": "តំបន់", "Pcs": "នំ (pcs)", "Sales": "លក់ ៛", "Orders": "ចំនួនដង",
+                 "Days since": "ថ្ងៃមុន"})
+    try:
+        st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(520, 60 + 35 * len(tbl)),
+                     column_config={"លក់ ៛": st.column_config.NumberColumn(format="localized"),
+                                    "នំ (pcs)": st.column_config.NumberColumn(format="localized"),
+                                    "ផ្លូវ": st.column_config.LinkColumn("ផ្លូវ", display_text="🧭")})
+    except Exception:
+        st.dataframe(tbl, hide_index=True, use_container_width=True)
+    nopin = show[show["Lat"].isna()]
+    if len(nopin):
+        st.caption(f"❌ {len(nopin)} អតិថិជនសកម្មមិនទាន់មានទីតាំង (top sale: {int(nopin['Group'].eq('top').sum())})។ "
+                   "ដាក់ Label ក្នុង Google Maps ឬ Check-in នៅហាង ដើម្បីបន្ថែម។")
+
+
 def _sales_insights_body():
     h1, h2 = st.columns([5, 1])
     h1.markdown("### 🎯 Sales Insights")
@@ -7888,6 +8317,10 @@ def _sales_insights_body():
     last_start = last_end.replace(day=1)
     same_end = min(last_start + timedelta(days=today.day - 1), last_end)
     d_prev = daily[(daily["D"] >= pd.Timestamp(last_start)) & (daily["D"] <= pd.Timestamp(same_end))]
+    try:
+        no_month, _dups_m, _n_same_m = _si_no_order_split(no_month, daily, names, today.replace(day=1), today)
+    except Exception:
+        pass
     lost_month = no_month[no_month["Group"] == "Ordered last month"] if not no_month.empty else no_month
     missing = habits[habits["Status"] == "Missing"] if not habits.empty else habits
 
@@ -7924,12 +8357,15 @@ def _sales_insights_body():
         st.warning("Call recommendations hidden because contact preferences could not be checked: " + str(call_error)[:120])
         care = care.iloc[0:0]
 
-    _si_tabs = ["🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
+    _si_tabs = ["🗺️ ផែនទីអតិថិជន", "🏆 Top 20", "⏰ Missing from habit", "📭 No order this month",
                 "💝 Customer care", "📆 Monthly history", "🔎 Customer detail", "🧪 Data check"]
     if st.session_state.get("si_tab") not in _si_tabs:
         st.session_state["si_tab"] = _si_tabs[0]
     _si_tab = st.radio("Insights section", _si_tabs, horizontal=True, key="si_tab", label_visibility="collapsed")
-    t_top, t_miss, t_none, t_care, t_hist, t_det, t_dc = (_si_tab == name for name in _si_tabs)   # only the chosen one is built
+    t_top, t_miss, t_none, t_care, t_hist, t_det, t_dc = (_si_tab == name for name in _si_tabs[1:])   # only the chosen one is built
+    if _si_tab == "🗺️ ផែនទីអតិថិជន":
+        _si_active_map_section(daily, names, areas, today)
+        return
     if t_dc:
         _si_data_check_section(issues, totals, coverage)
 
@@ -7983,24 +8419,36 @@ def _sales_insights_body():
         else:
             m_start, m_end = last_start, last_end
         table = _si_no_order(daily, names, areas, m_start, m_end, today, avgs)
+        try:
+            table, dup_review, n_same = _si_no_order_split(table, daily, names, m_start, m_end)
+        except Exception as dup_error:
+            dup_review, n_same = pd.DataFrame(), 0
+            st.caption("Duplicate-name check skipped: " + str(dup_error)[:120])
+        try:
+            hist_calls = read_raw(CALLS_FILE, CALL_COLS)
+        except Exception:
+            hist_calls = pd.DataFrame(columns=CALL_COLS)
+        _si_dup_review(dup_review)
         if table.empty:
             st.success("Every customer ordered in this month. 🎉")
         else:
             counts = table["Group"].value_counts()
             st.caption(f"{m_start} → {m_end} · {len(table)} customers without an order "
                        f"({counts.get('Ordered last month', 0)} ordered the month before, "
-                       f"{counts.get('Ordered earlier', 0)} earlier, {counts.get('Never ordered', 0)} never).")
+                       f"{counts.get('Ordered earlier', 0)} earlier, {counts.get('Never ordered', 0)} never)."
+                       + (f" {n_same} hidden: they ordered under another spelling of the same name." if n_same else ""))
             if mode == "This month" and today.day <= 5:
                 st.info("It is the start of the month, so many customers have not ordered yet. Check 'Missing from habit' for who is really late.")
             g1 = table[table["Group"] == "Ordered last month"]
             g2 = table[table["Group"] == "Ordered earlier"]
             g3 = table[table["Group"] == "Never ordered"]
             st.markdown(f"**📞 Ordered the month before but not this month ({len(g1)})**")
-            _si_show(g1.drop(columns="Group"), money=("Avg pcs/month", "Avg ៛/month"), height=420)
+            st.caption("Tick ✅ when you have contacted the customer, check the Platform (picked automatically), then press 💾 Save.")
+            _si_no_order_contact_table(g1.drop(columns="Group"), hist_calls, m_start, "si_no1", height=460)
             with st.expander(f"Ordered earlier, silent for more than a month ({len(g2)})"):
-                _si_show(g2.drop(columns="Group"), money=("Avg pcs/month", "Avg ៛/month"), height=420)
+                _si_no_order_contact_table(g2.drop(columns="Group"), hist_calls, m_start, "si_no2")
             with st.expander(f"In the Master List but never ordered in the journal ({len(g3)})"):
-                _si_show(g3[["Customer", "Area"]], height=420)
+                _si_no_order_contact_table(g3.drop(columns="Group"), hist_calls, m_start, "si_no3")
 
     if t_care:
         if care.empty:
@@ -8171,7 +8619,2915 @@ if _reset_prefix:
         if str(_key).startswith(_reset_prefix):
             st.session_state.pop(_key, None)
 
+# ==========================================
+# ---------- Khmer on screen (saved values stay English so reports and history keep working) ----------
+KM = {
+    # fridge / FIFO / sticker / sales / priority
+    "Clean & cold": "ស្អាត និងត្រជាក់", "Dirty": "កខ្វក់", "Not cold": "មិនត្រជាក់", "Broken": "ខូច", "No fridge": "គ្មានទូទឹកកក",
+    "Good": "ល្អ", "Needs fixing": "ត្រូវរៀបចំ", "Fixed today": "បានរៀបចំថ្ងៃនេះ",
+    "Old / faded": "ចាស់ / ស្រអាប់", "Missing": "គ្មាន",
+    "⬆️ Up": "⬆️ កើនឡើង", "➡️ Same": "➡️ ដដែល", "⬇️ Down": "⬇️ ធ្លាក់ចុះ",
+    "Low": "ទាប", "Normal": "ធម្មតា", "Urgent": "បន្ទាន់",
+    # reasons
+    "Season / weather": "រដូវ / អាកាសធាតុ", "Competitor": "គូប្រជែង", "Price": "តម្លៃ", "Bun quality": "គុណភាពនំ",
+    "Delivery late / missing": "ដឹកយឺត / ខ្វះ", "Fewer customers at the area": "ភ្ញៀវក្នុងតំបន់តិច",
+    "Shop moved / renovating": "ហាងប្តូរទីតាំង / កំពុងជួសជុល", "New promotion worked": "ប្រូម៉ូសិនថ្មីមានប្រសិទ្ធភាព",
+    "Good display / new fridge": "តាំងល្អ / ទូទឹកកកថ្មី", "Other": "ផ្សេងៗ",
+    # who follows up
+    "Admin": "Admin", "Sales": "ផ្នែកលក់ (Sales)", "Delivery": "ផ្នែកដឹកជញ្ជូន", "Production": "ផ្នែកផលិត",
+    # problems (with and without emoji)
+    "🧊 Fridge broken / not cold": "🧊 ទូទឹកកកខូច / មិនត្រជាក់", "🏷️ Sticker old / missing": "🏷️ ស្ទីគ័រចាស់ / គ្មាន",
+    "🚚 Delivery late": "🚚 ដឹកយឺត", "🥟 Bun quality / taste": "🥟 គុណភាព / រសជាតិនំ", "📦 Wrong or short order": "📦 ដឹកខុស ឬខ្វះ",
+    "💵 Price / payment": "💵 តម្លៃ / ការទូទាត់", "🆚 Competitor pushing": "🆚 គូប្រជែងប្រជែងខ្លាំង",
+    "🗓️ Old buns not rotated (FIFO)": "🗓️ នំចាស់មិនបានរៀបមុន (FIFO)", "➕ Wants a new item": "➕ ចង់បានមុខទំនិញថ្មី", "❓ Other": "❓ ផ្សេងៗ",
+    # checklist items
+    "Buns visible at the counter": "នំដាក់មើលឃើញនៅបញ្ជរ", "Steamer / microwave working": "ឆ្នាំងចំហុយ / មីក្រូវ៉េវដំណើរការ",
+    "Menu or poster shows our buns": "មានម៉ឺនុយ ឬផ្ទាំងរូបភាពនំយើង", "Shop staff know how to heat buns": "បុគ្គលិកហាងចេះកំដៅនំ",
+    "Fridge at the front, easy to see": "ទូទឹកកកនៅខាងមុខ ងាយមើលឃើញ", "Price tag shown": "មានស្លាកតម្លៃ",
+    "Our buns not hidden by competitors": "នំយើងមិនត្រូវគូប្រជែងបាំង", "Poster / sign outside": "មានផ្ទាំងរូបភាព / ស្លាកខាងក្រៅ",
+    "Fridge / shelf full enough": "ទូ / ធ្នើមាននំគ្រប់គ្រាន់", "Fridge near the canteen": "ទូទឹកកកនៅជិតអាហារដ្ឋាន",
+    "Enough stock for break time": "ស្តុកគ្រប់សម្រាប់ម៉ោងសម្រាក", "Price fits students": "តម្លៃសមរម្យសម្រាប់សិស្ស",
+    "Buns kept away from sun / dust": "នំការពារពីកម្តៅថ្ងៃ / ធូលី", "Delivery time fits break time": "ម៉ោងដឹកត្រូវនឹងម៉ោងសម្រាក",
+    "Display clean": "កន្លែងតាំងស្អាត", "Our buns placed well": "នំយើងតាំងបានល្អ",
+    "Covered from sun / dust": "មានគម្របការពារកម្តៅថ្ងៃ / ធូលី", "Steamer working": "ឆ្នាំងចំហុយដំណើរការ", "Price sign shown": "មានស្លាកតម្លៃ",
+    "Fridge installed & plugged in": "ទូទឹកកកបានដំឡើង និងដោតភ្លើង", "Stickers / poster put up": "បានបិទស្ទីគ័រ / ផ្ទាំងរូបភាព",
+    "Owner knows prices & how to heat buns": "ម្ចាស់ហាងដឹងតម្លៃ និងរបៀបកំដៅនំ", "Owner has our phone / Telegram": "ម្ចាស់ហាងមានលេខទូរស័ព្ទ / Telegram យើង",
+    # shop types and sizes
+    "☕ Coffee shop": "☕ ហាងកាហ្វេ", "⛽ Gas station": "⛽ ស្ថានីយប្រេង", "🛒 Mart / shop": "🛒 ម៉ាត / ហាង",
+    "🏫 School / canteen": "🏫 សាលា / អាហារដ្ឋាន", "🏛️ Office / ministry / hospital": "🏛️ ការិយាល័យ / ក្រសួង / មន្ទីរពេទ្យ",
+    "🥖 Bakery / food shop": "🥖 ហាងនំបុ័ង / អាហារ", "🏪 Market stall": "🏪 តូបផ្សារ", "📦 Other": "📦 ផ្សេងៗ",
+    "🟢 Big": "🟢 ធំ", "🟡 Medium": "🟡 មធ្យម", "⚪ Small": "⚪ តូច", "💤 No orders (28 d)": "💤 គ្មានការបញ្ជាទិញ (២៨ ថ្ងៃ)",
+    # zones
+    "1 · Center (Daun Penh · 7 Makara · BKK)": "1 · កណ្ដាលក្រុង (ដូនពេញ · ៧មករា · BKK)", "2 · Tuol Kouk": "2 · ទួលគោក",
+    "3 · North (Russey Keo · Chroy Changvar · Prek Pnov)": "3 · ខាងជើង (ឫស្សីកែវ · ជ្រោយចង្វារ · ព្រែកព្នៅ)",
+    "4 · West (Sen Sok · Phnom Penh Thmey)": "4 · ខាងលិច (សែនសុខ · ភ្នំពេញថ្មី)",
+    "5 · South-west (Pou Senchey · Kamboul · Airport)": "5 · និរតី (ពោធិ៍សែនជ័យ · កំបូល · អាកាសយានដ្ឋាន)",
+    "6 · South (Chamkarmon · Mean Chey · Dangkao)": "6 · ខាងត្បូង (ចំការមន · មានជ័យ · ដង្កោ)",
+    "7 · East (Chbar Ampov · Boeng Snor · Prek Eng)": "7 · ខាងកើត (ច្បារអំពៅ · បឹងស្នោរ · ព្រែកឯង)",
+    "8 · Takhmao edge": "8 · ជាយក្រុងតាខ្មៅ", "❓ Zone not set": "❓ មិនទាន់កំណត់តំបន់",
+    "🚫 Outside Phnom Penh": "🚫 នៅក្រៅភ្នំពេញ",
+    # what was fixed, status, review
+    "Sticker changed": "បានប្តូរស្ទីគ័រ", "FIFO fixed": "បានរៀប FIFO", "Fridge/display cleaned": "បានសម្អាត / រៀបទូ",
+    "Open": "មិនទាន់ដោះស្រាយ", "No problem": "គ្មានបញ្ហា", "Fixed": "បានដោះស្រាយ",
+    "To review": "រង់ចាំពិនិត្យ", "Redo": "ត្រូវធ្វើឡើងវិញ", "Approved": "បានអនុម័ត", "All": "ទាំងអស់",
+    # sections
+    "📋 Today's plan": "📋 ផែនការថ្ងៃនេះ", "📝 New visit": "📝 ចុះហាងថ្មី", "🆕 New customers": "🆕 អតិថិជនថ្មី",
+    "✅ Review visits": "✅ ពិនិត្យរបាយការណ៍", "📊 Visit report": "📊 របាយការណ៍ចុះហាង", "🔴 Open problems": "🔴 បញ្ហាមិនទាន់ដោះស្រាយ",
+    "📈 Did it help?": "📈 មានប្រសិទ្ធភាពទេ?", "🏅 Scorecard": "🏅 តារាងពិន្ទុ", "⚙️ Shops & zones": "⚙️ ហាង និងតំបន់",
+}
+KM_PLAIN_PROBLEM = {p.split(" ", 1)[1]: KM[p].split(" ", 1)[1] for p in [
+    "🧊 Fridge broken / not cold", "🏷️ Sticker old / missing", "🚚 Delivery late", "🥟 Bun quality / taste", "📦 Wrong or short order",
+    "💵 Price / payment", "🆚 Competitor pushing", "🗓️ Old buns not rotated (FIFO)", "➕ Wants a new item", "❓ Other"]}
+
+
+def _km(v):
+    """Khmer text for a saved English value (unknown values are shown as they are)."""
+    return KM.get(v, v) if isinstance(v, str) else v
+
+
+def _km_list(text, sep="; "):
+    """'Sticker old / missing; Delivery late' -> Khmer, part by part."""
+    if str(text) in ("-", "", "nan"):
+        return "-"
+    return ", ".join(KM_PLAIN_PROBLEM.get(p, KM.get(p, p)) for p in str(text).split(sep))
+
+
+def _km_loc(label):
+    """Location check label in Khmer."""
+    t = str(label)
+    if t.startswith("✅"):
+        return "✅ នៅហាង"
+    if t.startswith("❓"):
+        return "❓ គ្មាន GPS"
+    if t.startswith("📍 GPS saved"):
+        return "📍 រក្សាទុក GPS (ហាងមិនទាន់មានទីតាំងលើផែនទី)"
+    m = re.match(r"⚠️ (.+) from shop", t)
+    return f"⚠️ ឆ្ងាយពីហាង {m.group(1)}" if m else t
+
+
+def _km_days(text):
+    t = str(text)
+    if t == "never":
+        return "មិនធ្លាប់"
+    return re.sub(r"(\d+) d ago", r"\1 ថ្ងៃមុន", t)
+
+
+# 🏪 SHOP VISITS: staff visit customer shops (check-in GPS, photos, checklist, problems, report)
+# ==========================================
+VISIT_COLS = ["Date", "VisitID", "Staff", "Customer", "Check-in", "Minutes", "Lat", "Lon", "GPS accuracy m",
+              "Distance m", "Location check", "Fridge", "Display FIFO", "Old/damaged pcs", "Sticker",
+              "Stickers changed", "Customer says sales", "Sales reason", "Competitor", "App trend %",
+              "Problems", "Priority", "Follow-up by", "Notes", "Customer request", "Satisfaction",
+              "Photos", "Status", "Fixed by", "Fixed at", "Fix note", "Zone",
+              "Shop type", "Checks", "Check score %", "Size", "Fix done",
+              "Review", "Reviewed by", "Reviewed at", "Review note"]
+VISIT_AREA = AREA_LABEL[PP]       # only Phnom Penh customers are visited
+VISIT_AT_SHOP_M = 200            # check-in within this distance of the map pin = "At shop"
+VISIT_GPS_MAX_AGE_S = 900        # a check-in older than 15 minutes must be done again
+VISIT_PHOTO_DIR = "visit_photos"
+VISIT_PROBLEMS = ["🧊 Fridge broken / not cold", "🏷️ Sticker old / missing", "🚚 Delivery late", "🥟 Bun quality / taste",
+                  "📦 Wrong or short order", "💵 Price / payment", "🆚 Competitor pushing", "🗓️ Old buns not rotated (FIFO)",
+                  "➕ Wants a new item", "❓ Other"]
+VISIT_REASONS = ["-", "Season / weather", "Competitor", "Price", "Bun quality", "Delivery late / missing",
+                 "Fewer customers at the area", "Shop moved / renovating", "New promotion worked", "Good display / new fridge", "Other"]
+VISIT_FOLLOWUP = ["-", "Admin", "Sales", "Delivery", "Production"]
+
+
+# ---------- Phnom Penh visit zones ----------
+VISIT_DAILY_TARGET = 3            # visits each staff should do per day
+VISIT_ZONE_NOT_SET = "❓ Zone not set"
+# zone -> words found in the customer name (Khmer + English). First guess only: Admin corrects in 🗺️ Zones.
+VISIT_ZONES = {
+    "1 · Center (Daun Penh · 7 Makara · BKK)": [
+        "ផ្សារថ្មី", "វិមានឯករាជ្យ", "ស៊ីសុវត្", "ក្រោយវាំង", "វត្តភ្នំ", "វត្ដភ្នំ", "បឹងកេងកង", "អូឬស្សី", "អូរឬស្សី",
+        "អូឡាំព", "អូរឡាំពិក", "ចតុមុខ", "យុគន្ធ", "MART វិមានភ្នំពេញ", "ផ្សារកណ្ដាល", "ផ្សារកណ្តាល", "កោះពេជ្រ",
+        "DAUN PENH", "DOUN PENH", "PSAR THMEI", "ទួលស្វាយព្រៃ", "TOUL SVAY PREY", "TUOL SVAY PREY",
+        "CHAKTUMUK", "CHAKTOMUK", "KENG KANG", "BENG KANG", "TONLE BASSAC", "ទន្លេបាសាក់", "បុរីកីឡា", "កាល់ម៉ែត្រ", "CALMETTE", "CENTRAL MARKET", "7 MAKARA", "7MAKARA", "៧មករា", "7 មករា", "7មករា",
+        "ក្រសួងសេដ្ឋកិច្ច", "ក្រសួងការងារ", "BKK", "OLYMPI", "OLYMAPIC", "DIAMOND ISLAND", "RIVERSIDE"],
+    "2 · Tuol Kouk": [
+        "ទួលគោក", "ទូលគោក", "បឹងកក់", "ទឹកល្អក់", "ដីហ៊ុយ", "ដីហុយ", "ដេប៉ូ", "បឹងសាឡាង", "ពេទ្យរុស្សី",
+        "មន្ទីរពេទ្យកុមារជាតិ", "TOUL KOK", "TUOLKORK", "BOENG KAK", "BOEUNG KAK", "BEONG KAK", "DEPO", "កម្ពុជាក្រោម", "កម្ពជាក្រោម", "TUOL KORK", "TOUL KORK", "TK STORE", "TK AVENUE"],
+    "3 · North (Russey Keo · Chroy Changvar · Prek Pnov)": [
+        "ឫស្សីកែវ", "ឬស្សីកែវ", "ជ្រោយចង្វា", "ព្រែកព្នៅ", "ព្រែកលាប", "ទួលសង្កែ", "ព្រែកតាទែន", "ព្រែកអញ្ចាញ",
+        "គីឡូ", "ផ្លូវលេខ6A", "6A", "OCIC", "RUSSEY KEO", "CHROY CHANGVAR", "PREK PNOV", "PREK LEAP",
+        "TUOL SANGKAE", "TOUL SANGKE", "KILO", "REOUSSEY KEO", "CHROY CHONG VA", "CHROY CHANG VA",
+        "ព្រែកលាភ", "598"],
+    "4 · West (Sen Sok · Phnom Penh Thmey)": [
+        "សែនសុខ", "ភ្នំពេញថ្មី", "ទឹកថ្លា", "ក្រាំងធ្នង់", "ក្រាំងធ្នុង", "ឈូកមាស", "អ៊ីអន2", "អ៊ីអន ២", "ពិភពថ្មី",
+        "បៀលប្រាយ", "បុរីវិមានភ្នំពេញថ្មី", "សំរោងអណ្ដែត", "សំរោងអណ្តែត",
+        "PHNOM PENH THMEY", "PP THMEY", "TEUK THLA", "TUEK THLA", "CHUK MEAS", "SEN SOK",
+        "GRAND PHNOM PENH", "ផ្លូវ 2004", "ផ្លូវ2004", "2004", "2002", "ផ្សារត្រពាំងឈួក", "SENSOK", "AEON 2", "AEON2"],
+    "5 · South-west (Pou Senchey · Kamboul · Airport)": [
+        "ពោធិ៍សែនជ័យ", "ពោធិសែនជ័យ", "ចោមចៅ", "កប់ស្រូវ", "កំបូល", "វេងស្រេង", "ពោធិចិនតុង", "ពោធិ៍ចិនតុង",
+        "ត្រពាំងថ្លឹង", "ព្រៃទា", "កាំកូ", "ទួលពង្រ", "តាំងក្រសាំង", "ក្រសួងការពារជាតិ", "ចម្រើនផល",
+        "ព្រៃជីសាក់", "គួរស្រូវ", "ឈូកវ៉ា", "បែកចាន", "ជម្ពូវ័ន្ត", "ជម្ពូវន្ត", "ជម្ពូវ័ន", "អង្គតាមិញ", "CHOMPOU VORN", "បុរីសន្តិភាព", "បុរីសន្ដិភាព", "CAMCO", "POCHENTONG", "AIRPORT",
+        "POR SEN CHEY", "POU SENCHEY", "PORSENCHEY", "CHOM CHAO", "CHOMCHAO", "KAMBOUL", "KAKAB", "VENG SRENG", "KOB SROV",
+        "KORK KLEANG"],
+    "6 · South (Chamkarmon · Mean Chey · Dangkao)": [
+        "ចំការដូង", "ចំកាដូង", "ស្ទឹងមានជ័យ", "ចាក់អង្រែ", "បឹងទំពុន", "ទួលទំពូង", "ក្បាលថ្នល់", "ដង្កោ",
+        "ផ្សាររុស្សី", "បឹងត្របែក",  "ផ្លូវសឡា", 
+        "271", "CHIP MONG 271", "MEAN CHEY", "CHAMKARMON", "TOUL TOM POUNG", "CHAK ANGRE", "CHAKANGRE",
+        "STEUNG MEANCHEY", "STUNG MEANCHEY", "TUOL TOMPOUNG", "TOUL TUMPUNG", "RUSSIAN MARKET", "DANGKAO", "BOENG TUMPUN",
+        "CHAMKAR DOUNG", "CHAMKA DOUNG", "PHSAR DEUM THKOV", "DEUM THKOV", "ដើមថ្កូវ", "TOUL TOMPUNG",
+        "ព្រៃស", "PREY SAR", "CHERNG EK", "CHOEUNG EK", "ជើងឯក", "ត្នោតជ្រុំ", "អ៊ីអន 3", "អ៊ីអន3", "AEON 3", "AEON3", "AEON MEAN CHEY",
+        "បុរីសូនី", "បូរីសូនី", "ពោធិញាណ", "ពោធិ៍ញ្ញាណ", "ពោធិ៍ញាណ"],
+    "7 · East (Chbar Ampov · Boeng Snor · Prek Eng)": [
+        "ច្បារអំពៅ", "ច្បាអំពៅ", "បឹងស្នោរ", "ព្រែកឯក", "ជាសុផារ៉ា", "និរោធ", "ព្រែកប្រា", "កោះនរា", "វាលស្បូវ",
+        "CHBAR AMPOV", "CHBA AMPOV", "PREK ENG", "NIROTH", "KOH NORA", "VEAL SBOV", "BOENG SNOR",
+        "ជាសុផារា", "កៀនស្វាយ", "KIEN SVAY"],
+    "8 · Takhmao edge": ["តាខ្មៅ", "ព្រែកហូរ", "ព្រែកសំរោង", "ផ្សារសិត្បូ", "TAKHMAO", "TA KHMAO"],
+}
+VISIT_ZONE_NAMES = list(VISIT_ZONES) + [VISIT_ZONE_NOT_SET, "🚫 Outside Phnom Penh"]
+_VISIT_ZONE_WORDS = sorted(((w.upper().replace(" ", ""), z) for z, ws in VISIT_ZONES.items() for w in ws),
+                           key=lambda x: -len(x[0]))          # longest words first ("CHIP MONG 271" before "271")
+
+
+def _visit_zone_auto(name):
+    return _visit_zone_auto_info(name)[0]
+
+
+VISIT_ZONE_OUTSIDE = "🚫 Outside Phnom Penh"
+VISIT_OUTSIDE_WORDS = ["ឧត្ដមានជ័យ", "ឧត្តរមានជ័យ", "ODDAR MEANCHEY"]
+
+
+def _visit_zone_auto_info(name):
+    """-> (zone, note). note = "" when clear, or why a person should check it (two zones / another province).
+    Number words (street 2004, 598…) must stand alone; other words may be part of the name."""
+    raw = unicodedata.normalize("NFC", str(name)).replace("\u200b", "")
+    t = raw.upper().replace(" ", "")
+    tokens = set(re.split(r"[\s(),.]+", raw.upper()))
+    try:
+        prov, how = detect_province(raw, allow_pp=False)
+        if how != "province name":          # town / market names repeat across provinces ("ផ្សារឈូក" is also in Kampot)
+            prov = None
+    except Exception:
+        prov = None
+    if (prov and prov != "Kandal") or any(w.upper().replace(" ", "") in t for w in VISIT_OUTSIDE_WORDS):
+        return VISIT_ZONE_OUTSIDE, f"name says {prov or 'Oddar Meanchey'}"
+    hits = []
+    for w, z in _VISIT_ZONE_WORDS:
+        if (w in tokens) if w.isdigit() else (w in t):
+            hits.append((len(w), z))
+    if not hits:
+        return VISIT_ZONE_NOT_SET, ""
+    zones = []
+    for _l, z in sorted(hits, reverse=True):
+        if z not in zones:
+            zones.append(z)
+    return zones[0], ("name has 2 zones: " + " / ".join(z.split(" (")[0] for z in zones[:2])) if len(zones) > 1 else ""
+
+
+def _visit_shop_settings():
+    try:
+        return read_raw(VISIT_ZONE_FILE, VISIT_SET_COLS, max_age=300)
+    except Exception:
+        return pd.DataFrame(columns=VISIT_SET_COLS)
+
+
+def _visit_zone_overrides():
+    """{normalised customer: zone} set by Admin."""
+    df = _visit_shop_settings()
+    return {norm_name(c): z for c, z in zip(df["Customer"], df["Zone"]) if z in VISIT_ZONE_NAMES}
+
+
+def _visit_type_map(names):
+    """{key: shop type}: Admin's choice first, then the guess from the name."""
+    df = _visit_shop_settings()
+    over = {norm_name(c): t for c, t in zip(df["Customer"], df["Type"]) if t in VISIT_TYPE_NAMES}
+    return {k: over.get(k) or _visit_type_auto(n) for k, n in names.items()}
+
+
+# Khan centres (Khmer name, lat, lon, zone): only a rough middle point per khan. Zones come from the real borders below.
+_Z = list(VISIT_ZONES)
+VISIT_KHANS = [
+    ("ដូនពេញ", 11.5750, 104.9200, _Z[0]), ("៧មករា", 11.5650, 104.9100, _Z[0]), ("បឹងកេងកង", 11.5520, 104.9220, _Z[0]),
+    ("កោះពេជ្រ", 11.5530, 104.9420, _Z[0]),
+    ("ទួលគោក", 11.5800, 104.8930, _Z[1]),
+    ("ឫស្សីកែវ", 11.6250, 104.9120, _Z[2]), ("ជ្រោយចង្វារ", 11.6100, 104.9450, _Z[2]), ("ព្រែកព្នៅ", 11.6800, 104.8400, _Z[2]),
+    ("សែនសុខ", 11.6050, 104.8620, _Z[3]),
+    ("ពោធិ៍សែនជ័យ", 11.5300, 104.8000, _Z[4]), ("កំបូល", 11.5450, 104.7350, _Z[4]), ("ពោធិ៍ចិនតុង", 11.5480, 104.8450, _Z[4]),
+    ("ចំការមន", 11.5380, 104.9250, _Z[5]), ("មានជ័យ", 11.5150, 104.9150, _Z[5]), ("ដង្កោ", 11.4700, 104.8650, _Z[5]),
+    ("ច្បារអំពៅ", 11.5300, 104.9550, _Z[6]),
+    ("តាខ្មៅ", 11.4800, 104.9480, _Z[7]),
+]
+VISIT_KHAN_EDGE_M = 1500         # a pin just outside the border (river bank, map drift) still gets the nearest khan
+# Real khan borders (lat,lon), simplified to ~25 m. Source: Open Development Cambodia, administrative boundaries 2014,
+# via geoBoundaries (CC BY 4.0). 2014 borders: Boeng Keng Kang is still inside Chamkar Mon and Kamboul inside Pou Senchey,
+# so those two are split below by Mao Tse Tung Blvd and by longitude.
+_VISIT_KHAN_SHAPES_RAW = {
+    "Doun Penh": (
+        "11.56197,104.94662;11.56201,104.94174;11.56622,104.93542;11.56813,104.93370;11.57305,104.93131;"
+        "11.57530,104.92941;11.58774,104.92140;11.58889,104.92119;11.58783,104.91441;11.58506,104.91443;"
+        "11.58334,104.90783;11.57920,104.90527;11.57500,104.90442;11.57430,104.90386;11.57026,104.90496;"
+        "11.57158,104.91843;11.56727,104.91850;11.55590,104.92046;11.55605,104.92457;11.55701,104.93078;"
+        "11.55673,104.93401;11.55771,104.95251;11.56003,104.94861;11.56197,104.94662"),
+    "Prampir Meakkakra": (
+        "11.55590,104.92046;11.56727,104.91850;11.57158,104.91843;11.57054,104.90629;11.55775,104.90813;"
+        "11.55590,104.91042;11.55569,104.91127;11.55590,104.92046"),
+    "Chamkar Mon": (
+        "11.55590,104.92046;11.55569,104.91127;11.55590,104.91042;11.55775,104.90813;11.54835,104.89842;"
+        "11.54597,104.89921;11.54460,104.90084;11.54311,104.90648;11.54221,104.90782;11.52824,104.91579;"
+        "11.52670,104.91861;11.52670,104.92180;11.53132,104.93282;11.53618,104.93144;11.53824,104.93184;"
+        "11.53991,104.93327;11.54121,104.93523;11.54229,104.93833;11.54382,104.94098;11.54626,104.94397;"
+        "11.55771,104.95251;11.55673,104.93401;11.55701,104.93078;11.55605,104.92457;11.55590,104.92046"),
+    "Tuol Kouk": (
+        "11.55775,104.90813;11.57054,104.90629;11.57026,104.90496;11.57430,104.90386;11.57500,104.90442;"
+        "11.57920,104.90527;11.58334,104.90783;11.58577,104.90071;11.59093,104.89749;11.58492,104.88840;"
+        "11.58365,104.88741;11.56571,104.88856;11.56151,104.89055;11.55831,104.88749;11.55638,104.88676;"
+        "11.55332,104.88720;11.55099,104.88868;11.54974,104.89071;11.54968,104.89561;11.54811,104.89707;"
+        "11.54865,104.89763;11.54835,104.89842;11.55775,104.90813"),
+    "Dangkao": (
+        "11.42880,104.92259;11.45162,104.92276;11.46658,104.91822;11.48450,104.92138;11.48236,104.91362;"
+        "11.50217,104.91351;11.50502,104.91378;11.51899,104.91332;11.52011,104.90739;11.52302,104.89670;"
+        "11.52179,104.89394;11.52254,104.88851;11.52198,104.88374;11.52188,104.87548;11.51795,104.87810;"
+        "11.51636,104.87818;11.51460,104.87705;11.51142,104.87256;11.51010,104.86558;11.50666,104.86069;"
+        "11.50563,104.85716;11.50637,104.84484;11.50601,104.84009;11.50501,104.83865;11.50373,104.83785;"
+        "11.50134,104.83844;11.49964,104.83843;11.50034,104.83587;11.50056,104.82917;11.50015,104.82088;"
+        "11.50079,104.81851;11.49541,104.81771;11.49248,104.81993;11.49109,104.82011;11.48999,104.81759;"
+        "11.48146,104.81521;11.48075,104.80327;11.47876,104.79899;11.47673,104.79069;11.47623,104.78629;"
+        "11.45600,104.78098;11.45609,104.78354;11.45545,104.78451;11.45429,104.78514;11.45297,104.78458;"
+        "11.45028,104.78227;11.44925,104.78231;11.44758,104.78361;11.44687,104.78576;11.44532,104.78845;"
+        "11.44535,104.78919;11.44722,104.79146;11.44718,104.79323;11.44634,104.79371;11.44430,104.79301;"
+        "11.44349,104.79316;11.44350,104.79491;11.44491,104.79712;11.44514,104.79859;11.44483,104.79935;"
+        "11.44305,104.79912;11.44190,104.79769;11.44029,104.79758;11.43632,104.80099;11.43400,104.80146;"
+        "11.43159,104.80484;11.43000,104.81062;11.43081,104.81602;11.43128,104.81672;11.43240,104.81799;"
+        "11.43333,104.81842;11.43587,104.81935;11.43678,104.81925;11.43739,104.81889;11.43800,104.81553;"
+        "11.43883,104.81512;11.43937,104.81542;11.44076,104.81802;11.44356,104.82039;11.44407,104.82214;"
+        "11.44277,104.82365;11.43971,104.82557;11.43908,104.82679;11.43764,104.82680;11.43606,104.82748;"
+        "11.43091,104.83080;11.43035,104.85217;11.42866,104.85298;11.42817,104.85453;11.42533,104.85542;"
+        "11.42438,104.85623;11.42382,104.85756;11.42368,104.85852;11.42451,104.86222;11.42625,104.86442;"
+        "11.42249,104.87344;11.43621,104.88066;11.43589,104.88277;11.43426,104.88517;11.43263,104.88638;"
+        "11.43050,104.88725;11.43020,104.88861;11.43549,104.89658;11.43499,104.90145;11.43573,104.90569;"
+        "11.43535,104.90792;11.43310,104.91208;11.43239,104.91309;11.43109,104.91256;11.43026,104.91352;"
+        "11.43003,104.91670;11.42889,104.91758;11.42880,104.92259"),
+    "Mean Chey": (
+        "11.49386,104.94677;11.49951,104.94373;11.50415,104.94262;11.52583,104.93510;11.53132,104.93282;"
+        "11.52670,104.92180;11.52670,104.91861;11.52718,104.91733;11.52923,104.91497;11.54221,104.90782;"
+        "11.54311,104.90648;11.54460,104.90084;11.54597,104.89921;11.54835,104.89842;11.54865,104.89763;"
+        "11.54811,104.89707;11.54968,104.89561;11.54974,104.89071;11.54908,104.88932;11.54861,104.88671;"
+        "11.54720,104.87221;11.54514,104.86151;11.52186,104.86292;11.52198,104.88374;11.52254,104.88851;"
+        "11.52179,104.89394;11.52302,104.89670;11.52011,104.90739;11.51899,104.91332;11.50502,104.91378;"
+        "11.50217,104.91351;11.48236,104.91362;11.48450,104.92138;11.49386,104.94677"),
+    "Russey Keo": (
+        "11.58889,104.92119;11.60243,104.92113;11.60941,104.92055;11.61557,104.91935;11.62134,104.91652;"
+        "11.62636,104.91235;11.63187,104.90658;11.63299,104.90530;11.63541,104.90077;11.64067,104.88733;"
+        "11.64276,104.88255;11.64488,104.87898;11.65146,104.87317;11.65857,104.86843;11.64976,104.85613;"
+        "11.64838,104.85776;11.64850,104.86109;11.64347,104.86333;11.64320,104.86765;11.64245,104.86981;"
+        "11.64075,104.87161;11.63660,104.87385;11.63479,104.87432;11.63271,104.87387;11.62979,104.87183;"
+        "11.62753,104.87159;11.62440,104.87205;11.62369,104.87295;11.62459,104.87496;11.62453,104.87729;"
+        "11.62106,104.87805;11.62052,104.87889;11.61480,104.88219;11.61263,104.88496;11.61113,104.88556;"
+        "11.60756,104.88556;11.59039,104.89626;11.59093,104.89749;11.58577,104.90071;11.58334,104.90783;"
+        "11.58506,104.91443;11.58783,104.91441;11.58889,104.92119"),
+    "Saensokh": (
+        "11.59039,104.89626;11.60756,104.88556;11.61113,104.88556;11.61263,104.88496;11.61480,104.88219;"
+        "11.62052,104.87889;11.62106,104.87805;11.62453,104.87729;11.62459,104.87496;11.62369,104.87295;"
+        "11.62440,104.87205;11.62753,104.87159;11.62979,104.87183;11.63271,104.87387;11.63479,104.87432;"
+        "11.63660,104.87385;11.64075,104.87161;11.64245,104.86981;11.64320,104.86765;11.64347,104.86333;"
+        "11.64850,104.86109;11.64838,104.85776;11.64976,104.85613;11.63481,104.83614;11.62054,104.83875;"
+        "11.61949,104.83763;11.61881,104.83592;11.61211,104.83283;11.60568,104.83289;11.60241,104.83241;"
+        "11.59594,104.83301;11.59091,104.83214;11.58867,104.83151;11.58614,104.83000;11.57945,104.82337;"
+        "11.56861,104.82364;11.56916,104.82493;11.56828,104.83340;11.56800,104.83478;11.56655,104.83478;"
+        "11.56642,104.85332;11.56765,104.86429;11.56065,104.86291;11.55481,104.86276;11.54514,104.86151;"
+        "11.54720,104.87221;11.54781,104.88028;11.54908,104.88932;11.54974,104.89071;11.55178,104.88799;"
+        "11.55523,104.88679;11.55638,104.88676;11.55831,104.88749;11.56151,104.89055;11.56571,104.88856;"
+        "11.58365,104.88741;11.58492,104.88840;11.59039,104.89626"),
+    "Pur SenChey": (
+        "11.45600,104.78098;11.47623,104.78629;11.47673,104.79069;11.47876,104.79899;11.48075,104.80327;"
+        "11.48146,104.81521;11.48999,104.81759;11.49109,104.82011;11.49248,104.81993;11.49541,104.81771;"
+        "11.50079,104.81851;11.50015,104.82088;11.50056,104.82917;11.50034,104.83587;11.49964,104.83843;"
+        "11.50134,104.83844;11.50373,104.83785;11.50501,104.83865;11.50601,104.84009;11.50637,104.84484;"
+        "11.50563,104.85716;11.50666,104.86069;11.51010,104.86558;11.51142,104.87256;11.51460,104.87705;"
+        "11.51693,104.87826;11.51930,104.87747;11.52188,104.87548;11.52186,104.86292;11.54455,104.86140;"
+        "11.55481,104.86276;11.56065,104.86291;11.56765,104.86429;11.56642,104.85332;11.56655,104.83478;"
+        "11.56800,104.83478;11.56828,104.83340;11.56916,104.82493;11.56861,104.82364;11.57945,104.82337;"
+        "11.57993,104.80913;11.58194,104.80709;11.58325,104.80479;11.58457,104.80412;11.58552,104.80207;"
+        "11.58655,104.80094;11.59128,104.79981;11.60149,104.79827;11.60396,104.79701;11.60838,104.78986;"
+        "11.61035,104.78611;11.61052,104.78499;11.61000,104.78435;11.60887,104.78419;11.60585,104.78220;"
+        "11.60527,104.78166;11.60519,104.77971;11.60401,104.77898;11.60267,104.77824;11.59927,104.77829;"
+        "11.59850,104.77759;11.59849,104.77597;11.59394,104.77182;11.59288,104.76811;11.59186,104.76043;"
+        "11.59084,104.75908;11.59091,104.75567;11.59186,104.75475;11.59095,104.75419;11.59145,104.75324;"
+        "11.59029,104.75176;11.59128,104.75060;11.59041,104.74706;11.59063,104.74599;11.58977,104.74528;"
+        "11.58954,104.74214;11.58748,104.74094;11.58338,104.73994;11.58306,104.73635;11.58190,104.73545;"
+        "11.58119,104.73299;11.57843,104.73187;11.57448,104.72842;11.57595,104.72505;11.57497,104.72415;"
+        "11.57459,104.72264;11.57500,104.72056;11.57581,104.71924;11.57594,104.71427;11.57545,104.71296;"
+        "11.57403,104.71266;11.57289,104.71320;11.57222,104.71415;11.57216,104.72142;11.56845,104.72131;"
+        "11.56731,104.72304;11.56662,104.72341;11.56486,104.72299;11.56386,104.72215;11.56239,104.71936;"
+        "11.56081,104.72062;11.55937,104.72314;11.55795,104.72456;11.55633,104.72541;11.55050,104.72736;"
+        "11.54406,104.72791;11.54427,104.73048;11.54367,104.73539;11.54585,104.73855;11.54577,104.73976;"
+        "11.54294,104.74258;11.54106,104.74345;11.53825,104.74365;11.53629,104.74269;11.53378,104.74379;"
+        "11.52981,104.74436;11.52912,104.74501;11.52760,104.74873;11.53074,104.75475;11.53091,104.75599;"
+        "11.52730,104.75773;11.52347,104.76111;11.52055,104.76465;11.51861,104.76818;11.51013,104.76861;"
+        "11.50211,104.76810;11.50042,104.76596;11.49608,104.76308;11.49173,104.76269;11.49147,104.75889;"
+        "11.48899,104.75845;11.48915,104.74983;11.48643,104.74973;11.48632,104.74854;11.48454,104.74837;"
+        "11.48375,104.74630;11.47897,104.74627;11.47803,104.74490;11.45957,104.74474;11.45459,104.74430;"
+        "11.45489,104.74556;11.45467,104.74798;11.45659,104.75163;11.45645,104.75283;11.45575,104.75408;"
+        "11.45277,104.75390;11.45117,104.75516;11.45046,104.75784;11.45055,104.75938;11.45139,104.76025;"
+        "11.45262,104.76024;11.45379,104.75936;11.45651,104.75574;11.45785,104.75564;11.45891,104.75688;"
+        "11.45895,104.75833;11.45727,104.76031;11.45714,104.76293;11.45753,104.76410;11.45961,104.76551;"
+        "11.46273,104.76362;11.46354,104.76435;11.46385,104.76572;11.46355,104.76687;11.46196,104.76919;"
+        "11.46187,104.77138;11.46296,104.77320;11.46467,104.77412;11.46673,104.77639;11.46695,104.77733;"
+        "11.46633,104.77845;11.46539,104.77899;11.46452,104.77883;11.46348,104.77578;11.46215,104.77468;"
+        "11.45893,104.77393;11.45774,104.77425;11.45734,104.77504;11.45780,104.77781;11.45620,104.77869;"
+        "11.45580,104.77967;11.45600,104.78098"),
+    "Chraoy Chongvar": (
+        "11.71099,104.96837;11.71134,104.96003;11.71506,104.95901;11.72210,104.95214;11.72593,104.94922;"
+        "11.73195,104.94773;11.73320,104.94712;11.73447,104.94548;11.73579,104.93983;11.73632,104.91745;"
+        "11.72573,104.91760;11.71779,104.91655;11.71559,104.91528;11.71227,104.91256;11.71000,104.91146;"
+        "11.69934,104.90885;11.69689,104.90682;11.69145,104.90044;11.68840,104.89984;11.68699,104.89853;"
+        "11.68528,104.89783;11.68386,104.89972;11.67242,104.89965;11.67264,104.86267;11.66923,104.86063;"
+        "11.65146,104.87317;11.64488,104.87898;11.64276,104.88255;11.63671,104.89777;11.63299,104.90530;"
+        "11.62636,104.91235;11.62134,104.91652;11.61557,104.91935;11.60941,104.92055;11.60243,104.92113;"
+        "11.58774,104.92140;11.57530,104.92941;11.57305,104.93131;11.56813,104.93370;11.56482,104.93710;"
+        "11.56201,104.94174;11.56197,104.94662;11.56336,104.94593;11.58070,104.94471;11.58539,104.94402;"
+        "11.59230,104.94257;11.60592,104.93748;11.62235,104.93228;11.62417,104.93327;11.62754,104.93341;"
+        "11.63392,104.93459;11.63907,104.93613;11.64235,104.93756;11.65434,104.94594;11.65516,104.94725;"
+        "11.66588,104.95069;11.67499,104.95449;11.67852,104.95716;11.67865,104.95878;11.68986,104.96216;"
+        "11.69517,104.96317;11.70342,104.96547;11.71099,104.96837"),
+    "Praek Pnov": (
+        "11.67659,104.85519;11.68137,104.85224;11.68362,104.85147;11.69245,104.84644;11.71309,104.84035;"
+        "11.71561,104.84004;11.71575,104.82684;11.71541,104.82292;11.71359,104.82120;11.71228,104.82300;"
+        "11.70873,104.82414;11.70799,104.82313;11.70883,104.82210;11.70819,104.82018;11.70876,104.81928;"
+        "11.70844,104.81821;11.70690,104.81766;11.70566,104.81624;11.70380,104.81528;11.69962,104.81588;"
+        "11.69796,104.81526;11.69139,104.81455;11.68932,104.81709;11.68830,104.81696;11.68150,104.81120;"
+        "11.67855,104.80994;11.67713,104.81016;11.67564,104.81122;11.67395,104.81373;11.67322,104.81199;"
+        "11.67261,104.80053;11.67182,104.79893;11.67151,104.79705;11.67240,104.79424;11.67138,104.78096;"
+        "11.66999,104.77973;11.66794,104.76957;11.66658,104.76677;11.66605,104.75312;11.66495,104.74989;"
+        "11.66394,104.74852;11.65989,104.74733;11.65679,104.74814;11.65532,104.74779;11.65330,104.74696;"
+        "11.65318,104.74618;11.64801,104.74249;11.63934,104.74388;11.62118,104.74019;11.60680,104.73443;"
+        "11.60464,104.73450;11.60084,104.73609;11.59930,104.73601;11.59642,104.73466;11.59190,104.73159;"
+        "11.58951,104.73172;11.58340,104.73434;11.58151,104.73468;11.58306,104.73635;11.58338,104.73994;"
+        "11.58748,104.74094;11.58954,104.74214;11.58977,104.74528;11.59063,104.74599;11.59041,104.74706;"
+        "11.59128,104.75060;11.59029,104.75176;11.59145,104.75324;11.59095,104.75419;11.59186,104.75475;"
+        "11.59091,104.75567;11.59084,104.75908;11.59186,104.76043;11.59288,104.76811;11.59394,104.77182;"
+        "11.59849,104.77597;11.59850,104.77759;11.59927,104.77829;11.60267,104.77824;11.60401,104.77898;"
+        "11.60519,104.77971;11.60527,104.78166;11.60585,104.78220;11.60887,104.78419;11.61000,104.78435;"
+        "11.61052,104.78499;11.61035,104.78611;11.60838,104.78986;11.60396,104.79701;11.60149,104.79827;"
+        "11.59128,104.79981;11.58655,104.80094;11.58552,104.80207;11.58457,104.80412;11.58325,104.80479;"
+        "11.58194,104.80709;11.57993,104.80913;11.57935,104.82230;11.58001,104.82425;11.58614,104.83000;"
+        "11.58867,104.83151;11.59594,104.83301;11.60241,104.83241;11.60568,104.83289;11.61211,104.83283;"
+        "11.61881,104.83592;11.61949,104.83763;11.62054,104.83875;11.63481,104.83614;11.64885,104.85464;"
+        "11.65857,104.86843;11.67134,104.85907;11.67230,104.85775;11.67659,104.85519"),
+    "Chbar Ampov": (
+        "11.53904,105.04178;11.54154,105.03268;11.54352,105.01952;11.54389,105.01483;11.54369,105.00209;"
+        "11.54301,104.99429;11.54609,104.97602;11.54922,104.96739;11.55148,104.96456;11.55375,104.95945;"
+        "11.55771,104.95251;11.54626,104.94397;11.54382,104.94098;11.54229,104.93833;11.54121,104.93523;"
+        "11.53991,104.93327;11.53824,104.93184;11.53618,104.93144;11.53230,104.93241;11.52583,104.93510;"
+        "11.50415,104.94262;11.49951,104.94373;11.47770,104.95524;11.46708,104.96199;11.46410,104.96693;"
+        "11.46316,104.96997;11.46239,104.97563;11.46299,104.98752;11.46465,104.99415;11.46587,105.00362;"
+        "11.46613,105.01368;11.46542,105.02882;11.46621,105.02836;11.46920,105.02881;11.47214,105.03107;"
+        "11.47511,105.03440;11.47768,105.03830;11.47961,105.04228;11.48090,105.04743;11.48240,105.05038;"
+        "11.48304,105.04952;11.48353,105.02931;11.49123,105.02903;11.49440,105.02815;11.50356,105.02817;"
+        "11.51567,105.02628;11.51874,105.02710;11.52213,105.02896;11.52794,105.03504;11.53120,105.03723;"
+        "11.53805,105.04067;11.53904,105.04178"),
+    "Ta Khmau": (
+        "11.41932,104.94942;11.42118,104.95176;11.42231,104.95229;11.42492,104.95157;11.42450,104.95289;"
+        "11.42322,104.95299;11.42310,104.95353;11.42475,104.95418;11.42423,104.95577;11.42502,104.95913;"
+        "11.43257,104.95950;11.43239,104.97252;11.45529,104.96003;11.46268,104.97358;11.46316,104.96997;"
+        "11.46410,104.96693;11.46708,104.96199;11.46879,104.96062;11.47083,104.95981;11.48109,104.95323;"
+        "11.49386,104.94677;11.48450,104.92138;11.46658,104.91822;11.45162,104.92276;11.42880,104.92259;"
+        "11.42830,104.92289;11.42848,104.94104;11.41924,104.94115;11.41932,104.94942"),
+}
+_VISIT_KHAN_INFO = {      # border name -> (Khmer khan name, zone)
+    "Doun Penh": ("ដូនពេញ", _Z[0]), "Prampir Meakkakra": ("៧មករា", _Z[0]), "Chamkar Mon": ("ចំការមន", _Z[5]),
+    "Tuol Kouk": ("ទួលគោក", _Z[1]), "Russey Keo": ("ឫស្សីកែវ", _Z[2]), "Chraoy Chongvar": ("ជ្រោយចង្វារ", _Z[2]),
+    "Praek Pnov": ("ព្រែកព្នៅ", _Z[2]), "Saensokh": ("សែនសុខ", _Z[3]), "Pur SenChey": ("ពោធិ៍សែនជ័យ", _Z[4]),
+    "Mean Chey": ("មានជ័យ", _Z[5]), "Dangkao": ("ដង្កោ", _Z[5]), "Chbar Ampov": ("ច្បារអំពៅ", _Z[6]),
+    "Ta Khmau": ("តាខ្មៅ", _Z[7]),
+}
+VISIT_BKK_SOUTH_LAT = 11.5460     # Mao Tse Tung Blvd: north of it Chamkar Mon (2014) = BKK / Tonle Bassac / Koh Pich = Center
+VISIT_KAMBOUL_LON = 104.755       # west of this, Pou Senchey (2014) = today's Kamboul
+_VISIT_KHAN_SHAPES = {n: [tuple(float(x) for x in pt.split(",")) for pt in "".join(v).split(";") if pt]
+                      for n, v in _VISIT_KHAN_SHAPES_RAW.items()}
+
+
+def _visit_in_ring(lat, lon, ring):
+    inside = False
+    for i in range(len(ring)):
+        y1, x1 = ring[i]
+        y2, x2 = ring[i - 1]
+        if (y1 > lat) != (y2 > lat) and lon < (x2 - x1) * (lat - y1) / (y2 - y1) + x1:
+            inside = not inside
+    return inside
+
+
+def _visit_ring_dist_m(lat, lon, ring):
+    """Shortest distance (m) from a point to a border line."""
+    kx, ky = 111320.0 * math.cos(math.radians(lat)), 110540.0
+    px, py = lon * kx, lat * ky
+    best = float("inf")
+    for i in range(len(ring)):
+        y1, x1 = ring[i - 1]
+        y2, x2 = ring[i]
+        ax, ay, bx, by = x1 * kx, y1 * ky, x2 * kx, y2 * ky
+        dx, dy = bx - ax, by - ay
+        t = 0.0 if dx == dy == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+        best = min(best, math.hypot(px - ax - t * dx, py - ay - t * dy))
+    return best
+
+
+def _visit_khan_of(lat, lon):
+    """-> (border name, metres outside it: 0 when inside) or (None, None) when far from Phnom Penh."""
+    if not (11.3 <= lat <= 11.85 and 104.6 <= lon <= 105.15):
+        return None, None
+    for n, ring in _VISIT_KHAN_SHAPES.items():
+        if _visit_in_ring(lat, lon, ring):
+            return n, 0.0
+    d, n = min((_visit_ring_dist_m(lat, lon, ring), n) for n, ring in _VISIT_KHAN_SHAPES.items())
+    return (n, d) if d <= VISIT_KHAN_EDGE_M else (None, None)
+
+
+def _visit_zone_from_gps(lat, lon):
+    """-> (zone, khan name) from a real location using the real khan borders, or (None, None) outside Phnom Penh."""
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None, None
+    n, _d = _visit_khan_of(lat, lon)
+    if not n:
+        return None, None
+    khan, zone = _VISIT_KHAN_INFO[n]
+    if n == "Chamkar Mon" and lat >= VISIT_BKK_SOUTH_LAT:
+        khan, zone = ("កោះពេជ្រ" if lon >= 104.935 and lat <= 11.556 else "បឹងកេងកង"), _Z[0]
+    elif n == "Pur SenChey" and lon < VISIT_KAMBOUL_LON:
+        khan = "កំបូល"
+    return zone, khan
+
+
+def _visit_zone_info(names):
+    """{key: (zone, where it came from)} — Admin's choice, else the real location, else the name. Reused for 2 minutes."""
+    try:
+        sig = (len(names), hash(tuple(sorted(names))), os.path.getmtime(VISIT_PIN_FILE) if os.path.exists(VISIT_PIN_FILE) else 0,
+               os.path.getmtime(VISIT_ZONE_FILE) if os.path.exists(VISIT_ZONE_FILE) else 0, int(time.time() // 120),
+               len(st.session_state.get("_visit_new", {}) or {}))
+    except Exception:
+        sig = None
+    hit = st.session_state.get("_visit_zone_cache")
+    if sig is not None and hit and hit[0] == sig:
+        return hit[1]
+    over = _visit_zone_overrides()
+    registry, store = _visit_registry(), _visit_pin_store()
+    try:
+        auto = _visit_candidates_for(names, registry)[1]
+    except Exception:
+        auto = {}
+    out = {}
+    for k, n in names.items():
+        if over.get(k):
+            out[k] = (over[k], "👤 Admin")
+            continue
+        pin = _visit_pin(n, registry, store, auto)
+        if pin:
+            z, khan = _visit_zone_from_gps(*pin)
+            if z:
+                out[k] = (z, f"📍 ខណ្ឌ{khan} (GPS)")
+                continue
+            out[k] = (VISIT_ZONE_OUTSIDE, "🚫 ទីតាំងនៅក្រៅភ្នំពេញ (GPS) — ពិនិត្យ Master List")
+            continue
+        z, note = _visit_zone_auto_info(n)
+        if z == VISIT_ZONE_OUTSIDE:
+            out[k] = (z, "🚫 ឈ្មោះមានខេត្តផ្សេង — ពិនិត្យ Master List")
+        elif note:
+            out[k] = (z, "🔤⚠️ ឈ្មោះមាន 2 តំបន់ — សូមពិនិត្យ")
+        else:
+            out[k] = (z, "🔤 តាមឈ្មោះ")
+    st.session_state["_visit_zone_cache"] = (sig, out)
+    return out
+
+
+def _visit_zone_map(names):
+    """{key: zone} for every Phnom Penh customer: Admin's choice, then the real location, then the name."""
+    return {k: v[0] for k, v in _visit_zone_info(names).items()}
+
+
+def _visit_today_count(visits, user):
+    if visits.empty:
+        return 0
+    v = visits[(visits["_dt"].dt.date == today_kh()) & (visits["Staff"] == user)]
+    return int(v["Customer"].map(norm_name).nunique())
+
+
+def _visit_progress(visits, user):
+    done = _visit_today_count(visits, user)
+    left = max(0, VISIT_DAILY_TARGET - done)
+    st.progress(min(1.0, done / VISIT_DAILY_TARGET),
+                text=f"ថ្ងៃនេះ: បានចុះ {done} / {VISIT_DAILY_TARGET} ហាង" + (" 🎉 ដល់គោលដៅហើយ" if not left else f" · នៅសល់ {left}"))
+
+
+def _visit_zone_picker(zone_map, key, due=None):
+    """Zone selector, remembered for the day so staff pick it once. due = Counter(zone -> shops due now)."""
+    counts = Counter(zone_map.values())
+    due = due or Counter()
+    options = [z for z in VISIT_ZONE_NAMES if counts.get(z) and not z.startswith("🚫")]
+    if not options:
+        return None
+    mem = st.session_state.get("visit_zone_today")
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = mem if mem in options else options[0]
+    zone = st.selectbox("🗺️ តំបន់របស់ខ្ញុំថ្ងៃនេះ", options, key=key, format_func=lambda z: f"{_km(z)}  ({counts.get(z, 0)} ហាង" + (f" · ត្រូវចុះ {due[z]}" if due.get(z) else "") + ")")
+    st.session_state["visit_zone_today"] = zone
+    return zone
+
+
+def _visit_map_link(customer, registry, store=None, auto=None):
+    pin = _visit_pin(customer, registry, store, auto if auto is not None else {})
+    if pin:
+        return f"https://www.google.com/maps/dir/?api=1&destination={pin[0]},{pin[1]}&travelmode=driving", True
+    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(f"{customer} Phnom Penh"), False
+
+
+def _visit_zone_evidence(n, registry, store, auto):
+    """What the shop's location / name say, ignoring Admin: (zone, why)."""
+    pin = _visit_pin(n, registry, store, auto)
+    if pin:
+        z, khan = _visit_zone_from_gps(*pin)
+        return (z or VISIT_ZONE_OUTSIDE), (f"location: ខណ្ឌ{khan}" if z else "location outside Phnom Penh")
+    z, note = _visit_zone_auto_info(n)
+    return z, ("name" + (f" ({note})" if note else ""))
+
+
+def _visit_override_audit(names):
+    """Admin zones that disagree with the shop's own location or name (e.g. saved by mistake)."""
+    df = _visit_shop_settings()
+    if df.empty:
+        return pd.DataFrame()
+    registry, store = _visit_registry(), _visit_pin_store()
+    try:
+        auto = _visit_candidates_for(names, registry)[1]
+    except Exception:
+        auto = {}
+    latest = df.sort_values("_dt").groupby(df["Customer"].map(norm_name)).tail(1)
+    rows = []
+    for _, r in latest.iterrows():
+        k = norm_name(r["Customer"])
+        if k not in names or r["Zone"] not in VISIT_ZONE_NAMES:
+            continue
+        ez, why = _visit_zone_evidence(names[k], registry, store, auto)
+        if ez.startswith("❓") or ez == r["Zone"]:
+            continue
+        rows.append({"Remove": True, "Customer": names[k], "Admin zone": _km(r["Zone"]), "Shop says": _km(ez),
+                     "Because of": why, "Saved": str(r["Date"])[:16], "By": r["By"]})
+    return pd.DataFrame(rows)
+
+
+def _visit_override_cleanup(names):
+    bad = _visit_override_audit(names)
+    if bad.empty:
+        return
+    with st.expander(f"🧹 {len(bad)} Admin zones disagree with the shop's own location / name — check them", expanded=True):
+        st.caption("Admin's choice always wins, so a zone saved by mistake sends staff to the wrong area. Ticked rows are "
+                   "removed: the shop then uses its location or name again. Untick any Admin zone that is really correct.")
+        ver = st.session_state.get("_vz_ver", 0)
+        ed = st.data_editor(bad, hide_index=True, use_container_width=True, key=f"vz_clean_{ver}",
+                            disabled=[c for c in bad.columns if c != "Remove"],
+                            column_config={"Remove": st.column_config.CheckboxColumn("Remove")})
+        pick = set(ed.loc[ed["Remove"].fillna(False).astype(bool), "Customer"].map(norm_name))
+        if st.button(f"🧹 Remove {len(pick)} Admin zone(s)", type="primary", disabled=not pick, key="vz_clean_btn"):
+            def _drop(df, pick=pick):
+                return df[~df["Customer"].map(norm_name).isin(pick)].drop(columns=[c for c in ("_dt",) if c in df])
+            try:
+                modify_csv(VISIT_ZONE_FILE, VISIT_SET_COLS, _drop)
+                audit("visit zones cleaned", f"{len(pick)} removed")
+                st.session_state["flash"] = f"Removed {len(pick)} Admin zone(s)"
+                st.session_state["_vz_ver"] = ver + 1
+                st.session_state.pop("_visit_zone_cache", None)
+                _frag_rerun()
+            except Exception as e:
+                st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+
+
+def _visit_zones_admin(names, visits):
+    st.markdown("#### 🗺️ Zones & shop types")
+    _visit_override_cleanup(names)
+    st.caption("Zone comes from the shop's real location (📍 nearest khan) when it has one, otherwise from its name (🔤). "
+               "Change the **Zone** or **Type** cell for any shop "
+               "that is wrong or ❓ not set, then press Save. Your choice always wins over the guess.")
+    over = _visit_zone_overrides()
+    last = {}
+    if not visits.empty:
+        v = visits.assign(Key=visits["Customer"].map(norm_name))
+        last = v.groupby("Key")["_dt"].max().to_dict()
+    tmap = _visit_type_map(names)
+    info = _visit_zone_info(names)
+    rows = [{"Customer": n, "Guess": info.get(k, (None, ""))[1] + " → " + str(_km(info.get(k, (_visit_zone_auto(n), ""))[0])),
+             "Zone": over.get(k) or info.get(k, (_visit_zone_auto(n), ""))[0],
+             "Type": tmap.get(k, VISIT_TYPE_OTHER), "Set by admin": k in over,
+             "Last visit": f"{last[k]:%d %b}" if k in last else "never"} for k, n in names.items()]
+    frame = pd.DataFrame(rows).sort_values(["Zone", "Customer"]).reset_index(drop=True)
+    summary = frame.groupby("Zone").agg(Shops=("Customer", "size"),
+                                         **{"Visited ever": ("Last visit", lambda s: int((s != "never").sum()))}).reset_index()
+    summary["Days to visit all (3/day)"] = (summary["Shops"] / VISIT_DAILY_TARGET).apply(math.ceil)
+    _si_show(summary)
+    f1, f2 = st.columns([2, 1])
+    q = f1.text_input("🔎 Find shop", key="vz_q", max_chars=60)
+    only = f2.selectbox("Show", ["All zones"] + VISIT_ZONE_NAMES, key="vz_only")
+    view = frame
+    if only != "All zones":
+        view = view[view["Zone"].eq(only)]
+    if q.strip():
+        view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
+    ver = st.session_state.get("_vz_ver", 0)               # new editor after each save / filter change: old edits never
+    ekey = f"vz_editor_{ver}_{abs(hash((only, q.strip()))) % 10**8}"   # move onto other rows
+    edited = st.data_editor(view, hide_index=True, use_container_width=True, key=ekey,
+                            disabled=["Customer", "Guess", "Set by admin", "Last visit"],
+                            column_config={"Zone": st.column_config.SelectboxColumn("Zone", options=VISIT_ZONE_NAMES, required=True),
+                                           "Type": st.column_config.SelectboxColumn("Type", options=VISIT_TYPE_NAMES, required=True)},
+                            height=min(520, 60 + 35 * max(1, len(view))))
+    before = view.set_index("Customer")
+    after = edited.set_index("Customer")
+    diff = [(c, before.at[c, "Zone"], after.at[c, "Zone"], before.at[c, "Type"], after.at[c, "Type"])
+            for c in after.index if c in before.index and
+            (after.at[c, "Zone"] != before.at[c, "Zone"] or after.at[c, "Type"] != before.at[c, "Type"])]
+    changed = pd.DataFrame([{"Customer": c, "Zone": z1, "Type": t1} for c, _z0, z1, _t0, t1 in diff])
+    if diff:
+        st.markdown("**You are about to save:**")
+        st.markdown("\n".join(f"- **{c}**: {_km(z0)} → **{_km(z1)}**" + (f" · {_km(t0)} → **{_km(t1)}**" if t0 != t1 else "")
+                               for c, z0, z1, t0, t1 in diff))
+    if st.button(f"💾 Save {len(changed)} change(s)", type="primary", disabled=changed.empty, key="vz_save"):
+        who, at = current_user() or "-", now_str()
+
+        def _apply(df):
+            df = df[df["Customer"].map(norm_name).isin(set(changed["Customer"].map(norm_name))) == False].copy()
+            add = pd.DataFrame({"Date": at, "Customer": changed["Customer"], "Zone": changed["Zone"], "By": who,
+                                "Type": changed["Type"]})
+            return pd.concat([df.drop(columns=[c for c in ("_dt",) if c in df]), add], ignore_index=True)
+        try:
+            modify_csv(VISIT_ZONE_FILE, VISIT_SET_COLS, _apply)
+            audit("visit zones", f"{len(changed)} changed")
+            st.session_state["flash"] = f"Saved {len(changed)} zone change(s)"
+            st.session_state["_vz_ver"] = ver + 1
+            st.session_state.pop("_visit_zone_cache", None)
+            _frag_rerun()
+        except Exception as e:
+            st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+
+
+# ---------- shop types, size & visit frequency ----------
+VISIT_SETTINGS_FILE = os.path.join(DATA_DIR, "visit_settings.json")
+VISIT_WORK_DAYS = 26                      # working days per month, for the capacity check
+VISIT_SETTINGS_DEFAULT = {"big_pcs": 1000, "medium_pcs": 400, "big_days": 30, "medium_days": 90, "small_days": 180,
+                          "staff": 1}
+VISIT_TYPES = {     # type -> (words in the name, extra checks for that type)
+    "☕ Coffee shop": (["COFFEE", "CAFE", "CAFÉ", "COFF", "កាហ្វេ", "TEA", "តែ"],
+                      ["Buns visible at the counter", "Steamer / microwave working", "Menu or poster shows our buns",
+                       "Shop staff know how to heat buns"]),
+    "⛽ Gas station": (["TOTAL", "CALTEX", "PTT", "TELA", "តេលា", "SOKIMEX", "STATION"],
+                      ["Fridge at the front, easy to see", "Price tag shown", "Our buns not hidden by competitors",
+                       "Poster / sign outside"]),
+    "🛒 Mart / shop": (["MART", "ម៉ាត", "STORE", "SHOP", "MALL", "MINI", "ផ្សារទំនើប", "TOYS", "AEON", "MAXVALU",
+                      "SUPERMARKET", "LUCKY", "CHIP MONG", "RETAIL", "7-ELEVEN", "7 ELEVEN", "CIRCLE K", "STAR MART"],
+                     ["Fridge at the front, easy to see", "Price tag shown", "Our buns not hidden by competitors",
+                      "Fridge / shelf full enough"]),
+    "🏫 School / canteen": (["សាលា", "វិទ្យាល័យ", "SCHOOL", "កង់ទីន", "CANTEEN", "សាកលវិទ្យាល័យ", "UNIVERSITY"],
+                          ["Fridge near the canteen", "Enough stock for break time", "Price fits students",
+                           "Buns kept away from sun / dust"]),
+    "🏛️ Office / ministry / hospital": (["ក្រសួង", "មន្ទីរ", "អគ្គ", "ពេទ្យ", "HOSPITAL", "OFFICE"],
+                                       ["Delivery time fits break time", "Steamer / microwave working",
+                                        "Display clean"]),
+    "🥖 Bakery / food shop": (["នំបុ័ង", "BAKERY", "RESTAURANT", "ភោជនីយ", "នំបញ្ចុក", "នំបញ្ខុក", "អាហារ", "ចុងភៅ"],
+                             ["Display clean", "Price tag shown", "Our buns placed well"]),
+    "🏪 Market stall": (["ផ្សារ", "MARKET"],
+                       ["Covered from sun / dust", "Steamer working", "Price sign shown"]),
+}
+VISIT_TYPE_OTHER = "📦 Other"
+VISIT_TYPE_NAMES = list(VISIT_TYPES) + [VISIT_TYPE_OTHER]
+VISIT_TYPE_CHECKS = {**{t: c for t, (_w, c) in VISIT_TYPES.items()}, VISIT_TYPE_OTHER: ["Display clean", "Price tag shown"]}
+VISIT_SET_COLS = ["Date", "Customer", "Zone", "By", "Type"]
+VISIT_PHOTO_MAX_AGE_H = 0                 # 0 = no limit: photos may come from the gallery (check-in is the proof)
+
+
+def _visit_settings():
+    out = dict(VISIT_SETTINGS_DEFAULT)
+    try:
+        if USE_DROPBOX:
+            pull(VISIT_SETTINGS_FILE, max_age=300)
+        if os.path.exists(VISIT_SETTINGS_FILE):
+            with open(VISIT_SETTINGS_FILE, encoding="utf-8") as f:
+                saved = json.load(f)
+            out.update({k: int(v) for k, v in saved.items() if k in out})
+    except Exception:
+        pass
+    return out
+
+
+def _visit_settings_save(values):
+    with _sync_state()["lock"], file_lock(VISIT_SETTINGS_FILE):
+        if USE_DROPBOX:
+            try:
+                pull(VISIT_SETTINGS_FILE, force=True)
+            except Exception:
+                pass
+        _write_atomic(VISIT_SETTINGS_FILE, json.dumps(values, indent=2).encode("utf-8"))
+        if USE_DROPBOX:
+            push(VISIT_SETTINGS_FILE)
+
+
+def _visit_type_auto(name):
+    t = unicodedata.normalize("NFC", str(name)).upper().replace("​", "")
+    for typ, (words, _c) in VISIT_TYPES.items():
+        if any(w.upper() in t for w in words):
+            return typ
+    return VISIT_TYPE_OTHER
+
+
+def _visit_size(pcs28, cfg):
+    """-> (size label, visit every N days)."""
+    if pcs28 is None or pd.isna(pcs28) or pcs28 <= 0:
+        return "💤 No orders (28 d)", None
+    if pcs28 >= cfg["big_pcs"]:
+        return "🟢 Big", cfg["big_days"]
+    if pcs28 >= cfg["medium_pcs"]:
+        return "🟡 Medium", cfg["medium_days"]
+    return "⚪ Small", cfg["small_days"]
+
+
+def _visit_photo_taken_at(data):
+    """When the phone camera took the photo (EXIF), or None when the photo carries no date."""
+    try:
+        from PIL import Image
+        exif = Image.open(io.BytesIO(data)).getexif()
+        raw = exif.get_ifd(0x8769).get(36867) or exif.get(306)
+        return datetime.strptime(str(raw).strip()[:19], "%Y:%m:%d %H:%M:%S") if raw else None
+    except Exception:
+        return None
+
+
+def _visit_test_mode():
+    return current_role() == "admin" and bool(st.session_state.get("visit_test_mode"))
+
+
+def _visits_path():
+    """Real visit log, or the practice log while Admin has 🧪 Test mode on."""
+    return VISITS_TEST_FILE if _visit_test_mode() else VISITS_FILE
+
+
+def _visit_read():
+    try:
+        return read_raw(_visits_path(), VISIT_COLS, max_age=60)
+    except Exception as e:
+        st.warning("Visit log could not be read: " + str(e)[:150])
+        return pd.DataFrame(columns=VISIT_COLS + ["_dt"])
+
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+# ---------- shop map pins saved by staff (used when Customer Map has no pin, or the pin was wrong) ----------
+VISIT_PIN_COLS = ["Date", "Customer", "Lat", "Lon", "Accuracy m", "Source", "By", "Status", "Note"]
+VISIT_PIN_MAX_ACC = 80            # metres: a GPS fix worse than this is not good enough to save as a shop location
+
+
+def _visit_registry():
+    """Customer Map registry, reused for 5 minutes inside Shop Visits (it is big and rarely changes)."""
+    hit = st.session_state.get("_visit_registry_cache")
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    try:
+        reg = load_map_registry()
+    except Exception:
+        reg = {"records": {}, "bindings": {}}
+    st.session_state["_visit_registry_cache"] = (time.time(), reg)
+    return reg
+
+
+def _visit_pin_store():
+    """{key: {...}} newest active pin saved by staff per shop."""
+    try:
+        df = read_raw(VISIT_PIN_FILE, VISIT_PIN_COLS, max_age=120)
+    except Exception:
+        return {}
+    out = {}
+    for _, r in df[df["Status"].eq("Active")].sort_values("_dt").iterrows():
+        k = norm_name(r["Customer"])
+        try:
+            out[k] = {"lat": float(r["Lat"]), "lon": float(r["Lon"]), "acc": r["Accuracy m"], "source": r["Source"],
+                      "by": r["By"], "date": r["Date"]}
+        except Exception:
+            continue
+    return out
+
+
+def _visit_match_key(s):
+    """Name key that ignores spacing, punctuation, zero-width marks and the ្ដ / ្ត spelling difference."""
+    t = unicodedata.normalize("NFC", str(s)).lower()
+    t = re.sub(r"[​‌‍﻿]", "", t).replace("្ដ", "្ត")
+    return re.sub(r"[\s.,()\-_/'\"]+", "", t)
+
+
+def _visit_registry_pins(registry):
+    """Every usable Customer Map pin: list of (location id, map name, lat, lon, province)."""
+    out = []
+    for rec in registry.get("records", {}).values():
+        a = map_record_analysis(rec)
+        if a.get("Map status") == "Ready pin":
+            out.append((rec["id"], rec["customer"], float(a["Latitude"]), float(a["Longitude"]), rec.get("province", "")))
+    return out
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _visit_pin_candidates(name_items, pin_items):
+    """{key: [(score, location id, map name, lat, lon), ...best 3]} and {key: candidate} for the safe automatic links.
+    Safe = same name after cleaning, or ≥ 90% alike and clearly better than the next pin."""
+    import difflib
+    pins = [(pid, pname, lat, lon, _visit_match_key(pname)) for pid, pname, lat, lon, _p in pin_items]
+    cands, auto, claimed = {}, {}, Counter()
+    for k, name in name_items:
+        nk = _visit_match_key(name)
+        if len(nk) < 3:
+            continue
+        scored = []
+        for pid, pname, lat, lon, pk in pins:
+            sm = difflib.SequenceMatcher(None, nk, pk)
+            if sm.real_quick_ratio() < 0.5 or sm.quick_ratio() < 0.5:
+                continue
+            r = sm.ratio()
+            if len(pk) >= 4 and (nk.startswith(pk) or pk.startswith(nk)):
+                r = max(r, 0.86)                      # "LY MEY" vs "LY MEY បឹងស្នោរ"
+            if pk == nk:
+                r = 1.0
+            if r >= 0.6:
+                scored.append((round(r, 3), pid, pname, lat, lon))
+        scored.sort(reverse=True)
+        if scored:
+            cands[k] = scored[:3]
+            best = scored[0][0]
+            second = scored[1][0] if len(scored) > 1 else 0
+            if best == 1.0 or (best >= 0.9 and best - second >= 0.08):
+                auto[k] = scored[0]
+                claimed[scored[0][1]] += 1
+    auto = {k: c for k, c in auto.items() if claimed[c[1]] == 1}      # one pin can't belong to two shops
+    return cands, auto
+
+
+def _visit_candidates_for(names, registry):
+    pins = tuple(_visit_registry_pins(registry))
+    return _visit_pin_candidates(tuple(sorted(names.items())), pins)
+
+
+def _visit_pin_info(customer, registry=None, store=None, auto=None):
+    """(lat, lon, where it came from) or None. A pin saved at the shop by staff is newer than the Customer Map, so it wins."""
+    store = _visit_pin_store() if store is None else store
+    k = norm_name(customer)
+    if k in store:
+        p = store[k]
+        src = str(p["source"])
+        where = ("saved at the shop" if src.startswith("GPS") else
+                 "from 📍 Customer Map, confirmed" if src.startswith("Customer Map") else "saved from a Google Maps link")
+        return p["lat"], p["lon"], f"{where} by {p['by']} on {str(p['date'])[:10]}" + (" (pin moved)" if "moved" in str(p["source"]) else "")
+    try:
+        registry = registry if registry is not None else _visit_registry()
+        m = customer_map_match(customer, registry)
+        lat, lon = m.get("Latitude"), m.get("Longitude")
+        if lat is not None and lon is not None and math.isfinite(float(lat)) and math.isfinite(float(lon)):
+            return float(lat), float(lon), "from 📍 Customer Map"
+        nv = (st.session_state.get("_visit_new", {}) or {}).get(k)
+        if nv and nv.get("lat") is not None:
+            return nv["lat"], nv["lon"], f"from the leads report map link (sold {nv['date']:%d %b})"
+        if auto is None:
+            auto = _visit_candidates_for({k: customer}, registry)[1]
+        if k in auto:
+            c = auto[k]
+            return c[3], c[4], f"from 📍 Customer Map (spelled “{c[2]}” there)"
+    except Exception:
+        pass
+    return None
+
+
+def _visit_pin_save(customer, lat, lon, acc, source, note="-"):
+    if not (10 <= lat <= 15 and 102 <= lon <= 108):
+        raise ValueError("this location is outside Cambodia")
+    append_row(VISIT_PIN_FILE, {"Date": now_str(), "Customer": customer, "Lat": f"{lat:.6f}", "Lon": f"{lon:.6f}",
+                                "Accuracy m": "-" if acc in (None, "") else f"{float(acc):.0f}", "Source": source,
+                                "By": current_user() or "-", "Status": "Active", "Note": note or "-"})
+    audit("shop pin saved", f"{customer} | {lat:.5f},{lon:.5f} | {source}")
+
+
+def _visit_pin(customer, registry=None, store=None, auto=None):
+    """(lat, lon) of the shop, or None."""
+    info = _visit_pin_info(customer, registry, store, auto)
+    return (info[0], info[1]) if info else None
+
+
+def _visit_location_check(gps, pin):
+    """-> (label, distance m or None)."""
+    if not gps:
+        return "❓ No GPS", None
+    if not pin:
+        return "📍 GPS saved (shop has no map pin)", None
+    d = _haversine_m(gps["lat"], gps["lon"], pin[0], pin[1])
+    slack = min(float(gps.get("acc") or 0), 300.0)
+    if d <= VISIT_AT_SHOP_M + slack:
+        return "✅ At shop", d
+    return f"⚠️ {d / 1000:.1f} km from shop" if d >= 1000 else f"⚠️ {d:.0f} m from shop", d
+
+
+def _visit_apply_gps(lat, lon, acc, ms, mode, cust, navigate=True):
+    """Use one phone location: check in, or save / move the shop pin. navigate=True only before any widget is drawn."""
+    age = time.time() - ms / 1000.0
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError("bad coordinates")
+    if age > VISIT_GPS_MAX_AGE_S or age < -120:
+        st.session_state["visit_gps_error"] = "Check-in ចាស់ពេក។ សូមចុច 📍 Check-in ម្តងទៀតនៅហាង។"
+    elif mode in ("pin", "move") and acc > VISIT_PIN_MAX_ACC:
+        st.session_state["visit_gps_error"] = (f"GPS មិនទាន់ច្បាស់គ្រប់គ្រាន់ (±{acc:.0f} m ត្រូវការ ±{VISIT_PIN_MAX_ACC} m ឬតិចជាងនេះ)។ "
+                                               "សូមឈរនៅមុខទ្វារហាង រង់ចាំ 20 វិនាទី ហើយចុចម្តងទៀត។")
+    else:
+        if mode in ("pin", "move") and cust:
+            note = "first location of this shop" if mode == "pin" else "staff moved the pin: old pin was wrong"
+            _visit_pin_save(cust, lat, lon, acc, "GPS at shop" if mode == "pin" else "GPS at shop (moved)", note)
+            st.session_state["flash"] = "📍 បានរក្សាទុកទីតាំងហាង"
+            st.session_state.pop("_visit_registry_cache", None)
+        st.session_state["visit_gps"] = {"lat": lat, "lon": lon, "acc": acc, "at": now_str(), "customer": cust}
+    if navigate:
+        st.session_state["main_section"] = "🏪 Shop Visits"
+        st.session_state["visit_view"] = "📝 New visit"
+        if cust:
+            st.session_state["visit_customer"] = cust
+            st.session_state["visit_zone_force"] = True
+
+
+def _visit_read_gps_params():
+    """Backup path: the check-in button reloads the page with ?vgps=lat,lon,acc,ms&vcust=...; keep it, then clean the URL."""
+    try:
+        qp = st.query_params
+        raw = qp.get("vgps")
+        if not raw:
+            return
+        lat, lon, acc, ms = (float(x) for x in str(raw).split(","))
+        _visit_apply_gps(lat, lon, acc, ms, str(qp.get("vmode") or "checkin"), str(qp.get("vcust") or ""), navigate=True)
+    except Exception:
+        st.session_state["visit_gps_error"] = "មិនអាចអានទីតាំងបានទេ។ សូមចុច 📍 Check-in ម្តងទៀត។"
+    finally:
+        for k in ("vgps", "vcust", "vgpserr", "vmode"):
+            try:
+                if k in st.query_params:
+                    del st.query_params[k]
+            except Exception:
+                pass
+
+
+VISIT_GPS_BRIDGE = "vgps_bridge"
+
+
+def _visit_gps_bridge():
+    """Hidden box the check-in button writes the phone location into: Shop Visits redraws, no page reload."""
+    n = st.session_state.get("_vgps_n", 0)
+    st.markdown(f"""<style>div[data-testid="stTextInput"]:has(input[aria-label="{VISIT_GPS_BRIDGE}"])
+        {{position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0}}</style>""", unsafe_allow_html=True)
+    raw = st.text_input(VISIT_GPS_BRIDGE, key=f"vgps_bridge_{n}", label_visibility="collapsed")
+    if not raw:
+        return
+    st.session_state["_vgps_n"] = n + 1                    # next time a fresh, empty box
+    try:
+        v = json.loads(raw)
+        _visit_apply_gps(float(v["lat"]), float(v["lon"]), float(v["acc"]), float(v["ms"]), str(v.get("mode", "checkin")),
+                         str(v.get("cust", "")), navigate=False)
+        if v.get("cust"):
+            st.session_state["visit_customer"] = str(v["cust"])
+    except Exception:
+        st.session_state["visit_gps_error"] = "មិនអាចអានទីតាំងបានទេ។ សូមចុច 📍 Check-in ម្តងទៀត។"
+    _frag_rerun()
+
+
+def _visit_checkin_button(customer, mode="checkin", text="📍 Check-in នៅហាងនេះ", color="#B3261E"):
+    """Asks the phone for its location, takes the first one that is good enough (or the best within 8 s),
+    then hands it to the app without reloading the page. mode: checkin | pin | move."""
+    cust = json.dumps(customer)
+    text = html.escape(text)
+    good = 60 if mode == "checkin" else VISIT_PIN_MAX_ACC
+    st.components.v1.html(f"""
+<style>
+button{{width:100%;padding:13px 14px;border-radius:12px;border:0;background:{color};color:#fff;font:600 16px Inter,system-ui,sans-serif;cursor:pointer}}
+button:disabled{{opacity:.7}} #m{{font:13px system-ui,sans-serif;color:#6B7280;margin-top:6px}}
+</style>
+<button id="b">{text}</button><div id="m">សូមអនុញ្ញាតទីតាំង (Location) ពេលទូរស័ព្ទសួរ។</div>
+<script>
+const b=document.getElementById('b'), m=document.getElementById('m');
+const GOOD={good}, MAXWAIT=8000, CUST={cust}, MODE='{mode}';
+function deliver(p){{
+  const v={{lat:+p.coords.latitude.toFixed(6), lon:+p.coords.longitude.toFixed(6), acc:Math.round(p.coords.accuracy),
+           ms:Date.now(), mode:MODE, cust:CUST}};
+  m.textContent='✅ រកឃើញទីតាំង (±'+v.acc+' m)។ កំពុងរក្សាទុក…';
+  try {{
+    const doc=window.parent.document;
+    const el=doc.querySelector('input[aria-label="{VISIT_GPS_BRIDGE}"]');
+    if(!el) throw 'no box';
+    const set=Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype,'value').set;
+    set.call(el, JSON.stringify(v));
+    el.dispatchEvent(new Event('input',{{bubbles:true}}));
+    ['keydown','keypress','keyup'].forEach(t=>el.dispatchEvent(new KeyboardEvent(t,{{key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true}})));
+    el.dispatchEvent(new Event('blur',{{bubbles:true}})); el.dispatchEvent(new FocusEvent('focusout',{{bubbles:true}}));
+  }} catch(e) {{                                   // backup: reload the page with the location in the address
+    const u=new URL(window.parent.location.href);
+    u.searchParams.set('vgps',[v.lat,v.lon,v.acc,v.ms].join(','));
+    u.searchParams.set('vcust',CUST); u.searchParams.set('vmode',MODE);
+    window.parent.location.href=u.toString();
+  }}
+}}
+b.onclick=function(){{
+  const nav=(window.parent&&window.parent.navigator&&window.parent.navigator.geolocation)?window.parent.navigator.geolocation:navigator.geolocation;
+  if(!nav){{m.textContent='ទូរស័ព្ទ / browser នេះគ្មាន GPS។';return;}}
+  b.disabled=true; m.textContent='កំពុងរកទីតាំង…';
+  let best=null, done=false, id=null;
+  const finish=function(){{ if(done) return; done=true; if(id!==null) nav.clearWatch(id);
+      if(best) deliver(best); else {{ b.disabled=false; m.textContent='មិនទាន់មានសញ្ញា GPS។ សូមចេញមកខាងក្រៅ ហើយចុចម្តងទៀត។'; }} }};
+  id=nav.watchPosition(function(p){{
+      if(!best || p.coords.accuracy < best.coords.accuracy) best=p;
+      m.textContent='កំពុងរកទីតាំង… ±'+Math.round(best.coords.accuracy)+' m';
+      if(best.coords.accuracy <= GOOD) finish();
+  }}, function(e){{ if(e.code===1){{ done=true; b.disabled=false; m.textContent='ទីតាំងត្រូវបានបិទ។ សូមបើក Location សម្រាប់គេហទំព័រនេះក្នុង Settings របស់ browser។'; }} }},
+  {{enableHighAccuracy:true, maximumAge:20000, timeout:MAXWAIT}});
+  setTimeout(finish, MAXWAIT);
+}};
+</script>""", height=86)
+
+
+def _visit_photo_prepare(data, stamp_lines):
+    """Smaller JPEG (max 1280 px) with a time/staff/GPS stamp, so photos are light on mobile data and hard to reuse."""
+    from PIL import Image, ImageDraw, ImageOps
+    img = Image.open(io.BytesIO(data))
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    img.thumbnail((1280, 1280))
+    draw = ImageDraw.Draw(img)
+    text = "\n".join(stamp_lines)
+    try:
+        from PIL import ImageFont
+        font = ImageFont.load_default(size=max(14, img.width // 45))
+    except Exception:
+        font = None
+    box = draw.multiline_textbbox((0, 0), text, font=font)
+    w, h = box[2] - box[0], box[3] - box[1]
+    draw.rectangle([0, img.height - h - 16, w + 20, img.height], fill=(0, 0, 0))
+    draw.multiline_text((10, img.height - h - 9), text, fill=(255, 255, 255), font=font)
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=72, optimize=True)
+    return out.getvalue()
+
+
+def _visit_photo_path(name):
+    if name.startswith("T"):                                 # practice photos from 🧪 Test mode
+        return f"{VISIT_PHOTO_DIR}/TEST/{name}"
+    month = name[1:7] if name.startswith("V") else "misc"     # V202610…
+    return f"{VISIT_PHOTO_DIR}/{month[:4]}-{month[4:6]}/{name}"
+
+
+def _visit_photo_save(name, data):
+    rel = _visit_photo_path(name)
+    if USE_DROPBOX:
+        import dropbox
+        _dbx().files_upload(data, f"{DROPBOX_FOLDER}/{rel}", mode=dropbox.files.WriteMode.overwrite, mute=True)
+    else:
+        full = os.path.join(DATA_DIR, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        _write_atomic(full, data)
+
+
+@st.cache_data(show_spinner=False, max_entries=80, ttl=3600)
+def _visit_photo_load(name):
+    rel = _visit_photo_path(name)
+    if USE_DROPBOX:
+        _md, res = _dbx().files_download(f"{DROPBOX_FOLDER}/{rel}")
+        return res.content
+    with open(os.path.join(DATA_DIR, rel), "rb") as f:
+        return f.read()
+
+
+def _visit_customer_stats():
+    """Cached wrapper: the sales calculation is heavy, so it is reused for 3 minutes or until a file changes."""
+    def _mt(path):
+        try:
+            return os.stat(path).st_mtime_ns
+        except Exception:
+            return 0
+    try:
+        _snap, _src, path, _err = current_snapshot()
+    except Exception:
+        path = None
+    sig = (str(path), _mt(path) if path else 0, _mt(LEADS_FILE), str(today_kh()), int(time.time() // 180))
+    hit = st.session_state.get("_visit_stats_cache")
+    if hit and hit[0] == sig:
+        st.session_state["_visit_daily"], st.session_state["_visit_new"] = hit[2], hit[3]
+        return hit[1]
+    out = _visit_customer_stats_compute()
+    st.session_state["_visit_stats_cache"] = (sig, out, st.session_state.get("_visit_daily", pd.DataFrame()),
+                                              st.session_state.get("_visit_new", {}))
+    return out
+
+
+def _visit_customer_stats_compute():
+    """Per customer: last order, pcs last 28 days vs the 28 before, usual gap. Uses the same data as Sales Insights."""
+    try:
+        snap, _src, _path, _err = current_snapshot()
+        if not snap:
+            return pd.DataFrame(), {}, {}
+        daily, _df, _codes = _si_prepare(snap)
+        if daily.empty:
+            names = {norm_name(n): n for n in snap.get("customers", [])}
+            amap = areas_lookup(snap)
+            areas = {k: AREA_LABEL.get(amap.get(k, "Unknown"), AREA_LABEL["Unknown"]) for k in names}
+        else:
+            names, areas = _si_names_areas(snap, daily)
+    except Exception:
+        return pd.DataFrame(), {}, {}
+    # Shop visits are for Phnom Penh shops only.
+    names = {k: n for k, n in names.items()
+             if areas.get(k) == VISIT_AREA and str(n).strip().upper() not in SI_IGNORE_NAMES}
+    areas = {k: a for k, a in areas.items() if k in names}
+    try:                                   # new customers from the leads report (even before they are in the Master List)
+        new = {k: v for k, v in _lead_active(_lead_read(), _lead_master_index(snap)).items() if v["pp"]}
+    except Exception:
+        new = {}
+    st.session_state["_visit_new"] = new
+    for k, v in new.items():
+        if k not in names:
+            names[k], areas[k] = v["name"], VISIT_AREA
+    if daily.empty:
+        st.session_state["_visit_daily"] = pd.DataFrame()
+        return pd.DataFrame(), names, areas
+    daily = daily[daily["Key"].isin(names)]
+    st.session_state["_visit_daily"] = daily[["Key", "D", "Pcs", "Sales"]]
+    today = pd.Timestamp(today_kh())
+    d = daily[daily["D"] <= today]
+    last28 = d[d["D"] > today - pd.Timedelta(days=28)].groupby("Key")["Pcs"].sum()
+    prev28 = d[(d["D"] <= today - pd.Timedelta(days=28)) & (d["D"] > today - pd.Timedelta(days=56))].groupby("Key")["Pcs"].sum()
+    g = d.sort_values("D").groupby("Key")
+    stats = pd.DataFrame({"Last order": g["D"].max(), "Order days": g["D"].nunique(),
+                          "Usual gap": g["D"].apply(lambda s: s.diff().dt.days.median())})
+    stats["Pcs 28d"] = last28.reindex(stats.index).fillna(0)
+    stats["Pcs prev 28d"] = prev28.reindex(stats.index).fillna(0)
+    stats["Trend %"] = ((stats["Pcs 28d"] - stats["Pcs prev 28d"]) / stats["Pcs prev 28d"].where(stats["Pcs prev 28d"] > 0) * 100).round(0)
+    stats["Days since order"] = (today - stats["Last order"]).dt.days
+    return stats, names, areas
+
+
+def _visit_trend_text(pct):
+    if pct is None or pd.isna(pct):
+        return "ថ្មី / ទិន្នន័យមិនទាន់គ្រប់"
+    return f"{'⬆️' if pct >= 10 else ('⬇️' if pct <= -10 else '➡️')} {pct:+.0f}% (២៨ ថ្ងៃចុងក្រោយ ធៀបនឹង ២៨ ថ្ងៃមុន)"
+
+
+def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None):
+    """Shops of the zone, most important first. Each shop is due again after N days, N set by its size."""
+    cfg = cfg or _visit_settings()
+    today = pd.Timestamp(today_kh())
+    last_visit = {}
+    open_prob = Counter()
+    if not visits.empty:
+        v = visits.copy()
+        v["Key"] = v["Customer"].map(norm_name)
+        last_visit = v.groupby("Key")["_dt"].max().to_dict()
+        open_prob = Counter(v.loc[v["Status"].eq("Open"), "Key"])
+    keys = {k for k in names if not str((zone_map or {}).get(k, "")).startswith("🚫")}     # shops outside Phnom Penh are not visited
+    if zone:
+        keys = {k for k in keys if (zone_map or {}).get(k) == zone}
+    new = st.session_state.get("_visit_new", {}) or {}
+    rows = []
+    for k in keys:
+        s = stats.loc[k] if (not stats.empty and k in stats.index) else None
+        pcs28 = float(s["Pcs 28d"]) if s is not None and pd.notna(s["Pcs 28d"]) else 0.0
+        size, every = _visit_size(pcs28, cfg)
+        score, why = 0, []
+        lv = last_visit.get(k)
+        days_v = (today - pd.Timestamp(lv).normalize()).days if lv is not None and pd.notna(lv) else None
+        if open_prob.get(k):
+            score += 6; why.append(f"🔴 បញ្ហាមិនទាន់ដោះស្រាយ {open_prob[k]}")
+        nv = new.get(k)
+        first_visit = bool(nv) and not (lv is not None and pd.notna(lv) and pd.Timestamp(lv) >= nv["date"])
+        if first_visit:
+            age = (today - nv["date"]).days
+            score += 8 + (3 if age > LEAD_FIRST_VISIT_DAYS else 0) + min(age // 7, 3)
+            why.append(f"🆕 អតិថិជនថ្មី លក់ថ្ងៃ {nv['date']:%d %b} — ចុះលើកដំបូង" + (f" ({age} ថ្ងៃ យឺត)" if age > LEAD_FIRST_VISIT_DAYS else ""))
+        if every is None:
+            due_in = 0 if first_visit else None
+            if not open_prob.get(k) and not first_visit:
+                continue                                   # no orders and no problem: not on the visit plan
+        elif days_v is None:
+            due_in = 0
+            score += 3; why.append("🆕 មិនធ្លាប់ចុះ")
+        else:
+            due_in = every - days_v
+            if due_in <= 0:
+                score += 3 + min(-due_in // 7, 3)
+                why.append(f"📅 ដល់ពេលចុះ (រៀងរាល់ {every} ថ្ងៃ)" + (f" · យឺត {-due_in} ថ្ងៃ" if due_in < 0 else ""))
+            else:
+                score -= 6
+        if s is not None:
+            if pd.notna(s["Trend %"]) and s["Trend %"] <= -20:
+                score += 3; why.append(f"⬇️ ការលក់ {s['Trend %']:+.0f}%")
+            gap = s["Usual gap"]
+            if pd.notna(gap) and gap > 0 and s["Days since order"] > 2 * gap and s["Order days"] >= 3:
+                score += 2; why.append(f"⏰ មិនបញ្ជាទិញ {int(s['Days since order'])} ថ្ងៃ (ធម្មតា {gap:.0f})")
+        if size.startswith("🟢"):
+            score += 1
+        if due_in is not None and due_in > 0 and not why:
+            why.append(f"ចុះលើកក្រោយក្នុង {due_in} ថ្ងៃ")
+        rows.append({"Priority": score, "Customer": names.get(k, k), "Area": (zone_map or {}).get(k, areas.get(k, "")),
+                     "Size": size, "Every (days)": every, "Due in (days)": due_in,
+                     "Why visit": " · ".join(why),
+                     "Last visit": "never" if days_v is None else f"{days_v} d ago",
+                     "Pcs 28 days": int(pcs28), "Trend %": s["Trend %"] if s is not None else None})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Priority", "Pcs 28 days"], ascending=False).reset_index(drop=True)
+
+
+def _visit_is_due(route):
+    """Rows that need a visit now: due/late, never visited, or with an open problem."""
+    if route.empty:
+        return route.iloc[0:0]
+    return route[route["Due in (days)"].fillna(0).le(0) | route["Why visit"].str.contains("🔴")]
+
+
+def _visit_new_form(visits, stats, names):
+    user = current_user() or "-"
+    _visit_gps_bridge()
+    fast = st.session_state.get("visit_ctx")
+    if (_visit_phone_mode() and fast and fast.get("customer") == st.session_state.get("visit_customer")
+            and fast["key"] in st.session_state.get("visit_draft", {}) and st.session_state.get("visit_gps")
+            and int(st.session_state["visit_draft"][fast["key"]].get("_step", 0)) > 0):
+        _vf_phone_wizard(fast)        # only the current step is drawn: no shop list, map or Dropbox checks
+        return
+    _visit_progress(visits, user)
+    zone_map = _visit_zone_map(names)
+    pre = st.session_state.get("visit_customer")
+    if st.session_state.pop("visit_zone_force", False) and pre and norm_name(pre) in zone_map:
+        st.session_state["visit_zone_form"] = zone_map[norm_name(pre)]       # "Start ▶" opens the shop's own zone (once)
+    zone = _visit_zone_picker(zone_map, "visit_zone_form")
+    pool = {k: n for k, n in names.items() if zone is None or zone_map.get(k) == zone}
+    customers = sorted(set(pool.values()), key=lambda x: str(x).upper())
+    if not customers:
+        st.info("រកមិនឃើញអតិថិជននៅភ្នំពេញទេ។ សូមពិនិត្យតំបន់ក្នុង Master List ឬកំណត់ខេត្តក្នុង 📍 Customer Map។")
+        return
+    err = st.session_state.pop("visit_gps_error", None)
+    if err:
+        st.error(err)
+    pre = st.session_state.get("visit_customer")
+    idx = customers.index(pre) if pre in customers else None
+    customer = st.selectbox("1️⃣ តើអ្នកកំពុងចុះហាងណា? (ភ្នំពេញ)", customers, index=idx, key="visit_customer_box",
+                            placeholder="វាយឈ្មោះហាង…")
+    if not customer:
+        st.caption("គន្លឹះ: បើក **📋 ផែនការថ្ងៃនេះ** ដើម្បីមើលហាងសំខាន់ៗ 3 ក្នុងតំបន់របស់អ្នក។")
+        return
+    st.session_state["visit_customer"] = customer
+    key = norm_name(customer)
+    registry = _visit_registry()
+    try:
+        cands, auto = _visit_candidates_for(names, registry or {"records": {}, "bindings": {}})
+    except Exception:
+        cands, auto = {}, {}
+    pin_info = _visit_pin_info(customer, registry, None, auto)
+    pin = (pin_info[0], pin_info[1]) if pin_info else None
+
+    # ---- shop card
+    s = stats.loc[key] if (not stats.empty and key in stats.index) else None
+    past = visits[visits["Customer"].map(norm_name) == key].sort_values("_dt", ascending=False) if not visits.empty else visits
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("បញ្ជាទិញចុងក្រោយ", f"{s['Last order']:%d %b}" if s is not None else "—",
+                  f"{int(s['Days since order'])} ថ្ងៃមុន" if s is not None else None, delta_color="off")
+        c2.metric("ចំនួននំ ២៨ ថ្ងៃចុងក្រោយ", f"{int(s['Pcs 28d']):,}" if s is not None else "—",
+                  f"{s['Trend %']:+.0f}%" if s is not None and pd.notna(s["Trend %"]) else None)
+        c3.metric("ចុះហាងចុងក្រោយ", f"{past.iloc[0]['_dt']:%d %b}" if len(past) else "មិនធ្លាប់",
+                  past.iloc[0]["Staff"] if len(past) else None, delta_color="off")
+        open_p = past[past["Status"].eq("Open")] if len(past) else past
+        for _, r in open_p.head(3).iterrows():
+            st.warning(f"បញ្ហាមិនទាន់ដោះស្រាយ ថ្ងៃ {r['_dt']:%d %b} ({r['Staff']}): {_km_list(r['Problems'])} — {r['Notes']}")
+        if len(past) and str(past.iloc[0]["Notes"]) not in ("-", ""):
+            st.caption(f"កំណត់ចំណាំពេលចុះហាងចុងក្រោយ: {past.iloc[0]['Notes']}")
+
+    # ---- 2. shop location (must be real) + check-in
+    gps = st.session_state.get("visit_gps")
+    if gps and norm_name(gps.get("customer", "")) != key:
+        gps = None
+    test = _visit_test_mode()
+    if test:
+        st.markdown("**2️⃣ Check-in** · 🧪 Test mode")
+        if not pin:
+            st.caption("បុគ្គលិកពិតត្រូវរក្សាទុកទីតាំងហាងនេះជាមុនសិន។ ក្នុង Test mode ប្រើទីតាំងសាកល្បង។")
+            pin = (11.5564, 104.9282)
+            pin_info = (pin[0], pin[1], "🧪 ទីតាំងសាកល្បង (Test mode)")
+        if not gps:
+            t1, t2 = st.columns(2)
+            if t1.button("🧪 សាកល្បង៖ ខ្ញុំនៅហាង", key="visit_test_here", use_container_width=True, type="primary"):
+                st.session_state["visit_gps"] = {"lat": pin[0] + 0.0002, "lon": pin[1] + 0.0002, "acc": 12,
+                                                 "at": (now_kh() - timedelta(minutes=12)).strftime("%Y-%m-%d %H:%M:%S"), "customer": customer}
+                _frag_rerun()
+            if t2.button("🧪 សាកល្បង៖ ខ្ញុំនៅឆ្ងាយ 3 km", key="visit_test_far", use_container_width=True):
+                st.session_state["visit_gps"] = {"lat": pin[0] + 0.027, "lon": pin[1], "acc": 15,
+                                                 "at": (now_kh() - timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M:%S"), "customer": customer}
+                _frag_rerun()
+            st.caption("ឬប្រើប៊ូតុង Check-in ពិតខាងក្រោម ដើម្បីសាកល្បង GPS ទូរស័ព្ទ។")
+            _visit_checkin_button(customer)
+            return
+    if not test and not pin:
+        st.markdown("**2️⃣ រក្សាទុកទីតាំងហាងនេះជាមុនសិន**")
+        st.error("📍 ហាងនេះមិនទាន់មានទីតាំងលើផែនទី។ ត្រូវរក្សាទុកទីតាំងជាមុនសិន ទើបអាចចាប់ផ្តើមចុះហាងបាន។")
+        options = cands.get(key, [])
+        if options:
+            st.markdown("**តើហាងនេះជាទីតាំងមួយក្នុងចំណោមទីតាំងទាំងនេះពី 📍 Customer Map ឬទេ?** (ឈ្មោះនៅទីនោះសរសេរខុសគ្នាបន្តិច)")
+            for i, (score, pid, pname, lat, lon) in enumerate(options):
+                with st.container(border=True):
+                    o1, o2, o3 = st.columns([3, 1, 1])
+                    o1.markdown(f"**{pname}**  \n<span style='color:#6B7280'>{score * 100:.0f}% ឈ្មោះដូចគ្នា</span>", unsafe_allow_html=True)
+                    o2.link_button("🗺️ មើល", f"https://www.google.com/maps?q={lat},{lon}", use_container_width=True)
+                    if o3.button("✅ គឺហាងនេះ", key=f"visit_cand_{i}", use_container_width=True):
+                        try:
+                            _visit_pin_save(customer, lat, lon, None, "Customer Map pin (confirmed)", f"map name: {pname}"[:150])
+                            st.session_state["flash"] = "📍 បានភ្ជាប់ទីតាំងផែនទីទៅហាងនេះ"
+                            _frag_rerun()
+                        except Exception as e:
+                            st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+            st.markdown("**មិនមែនទាំងអស់នេះទេ? រក្សាទុកទីតាំងពិត:**")
+        _visit_checkin_button(customer, "pin", "📍 ខ្ញុំនៅហាង — រក្សាទុក GPS ជាទីតាំងហាង", "#2E7D4F")
+        st.caption(f"សូមឈរនៅមុខទ្វារហាង។ GPS ទូរស័ព្ទត្រូវច្បាស់ក្នុង ±{VISIT_PIN_MAX_ACC} m។ វានឹង Check-in ឱ្យអ្នកផងដែរ។")
+        with st.expander("…ឬបិទភ្ជាប់ Google Maps link របស់ហាង"):
+            link = st.text_input("Google Maps link (បើកហាងក្នុង Google Maps → Share → Copy link)", key="visit_pin_link",
+                                 max_chars=600, placeholder="https://maps.app.goo.gl/…")
+            if st.button("💾 រក្សាទុកទីតាំងពី link", key="visit_pin_link_save", disabled=not link.strip()):
+                try:
+                    with st.spinner("កំពុងបើក link…"):
+                        final = resolve_map_link(link.strip())
+                    info = analyse_map_link(final)
+                    if info.get("Map status") != "Ready pin":
+                        raise ValueError("link នេះគ្មានទីតាំងច្បាស់ទេ។ សូមដាក់ pin លើហាង ហើយ Share វា")
+                    _visit_pin_save(customer, float(info["Latitude"]), float(info["Longitude"]), None, "Google Maps link", link.strip()[:150])
+                    st.session_state["flash"] = "📍 បានរក្សាទុកទីតាំងហាងពី link"
+                    _frag_rerun()
+                except Exception as e:
+                    if "no usable destination" in str(e):
+                        st.error("link នេះមិនមានទីតាំងហាងទេ។ នៅក្នុង Google Maps ចុចឱ្យជាប់លើហាង (ដាក់ pin ក្រហម) → Share → Copy link "
+                                 "ហើយបិទភ្ជាប់ម្តងទៀត — ឬឈរនៅមុខហាង ហើយចុច 📍 ខ្ញុំនៅហាង។")
+                    else:
+                        st.error("មិនអាចប្រើ link នេះបានទេ: " + str(e)[:160])
+        return
+    if test:
+        gps = st.session_state.get("visit_gps")
+    directions = f"https://www.google.com/maps/dir/?api=1&destination={pin[0]},{pin[1]}&travelmode=driving"
+    m1, m2 = st.columns([3, 1])
+    m1.caption(f"📍 ទីតាំងហាង {pin_info[2]}")
+    m2.link_button("🧭 ផ្លូវទៅហាង", directions, use_container_width=True)
+    if not test:
+        st.markdown("**2️⃣ Check-in ពេលមកដល់ហាង**")
+    if not gps:
+        _visit_checkin_button(customer)
+        st.caption("ទម្រង់ចុះហាងនឹងបើកបន្ទាប់ពី Check-in។")
+        return
+    label, dist = _visit_location_check(gps, pin)
+    (st.success if label.startswith("✅") else st.warning)(
+        f"{_km_loc(label)} · Check-in ម៉ោង {gps['at'][11:16]} · GPS ±{gps['acc']:.0f} m")
+    b1, b2 = st.columns(2)
+    if b1.button("↻ Check-in ម្តងទៀត", key="visit_recheck", use_container_width=True):
+        st.session_state.pop("visit_gps", None)
+        _frag_rerun()
+    if not label.startswith("✅") and not test:
+        with b2:
+            with st.popover("📌 ទីតាំងលើផែនទីខុស", use_container_width=True):
+                st.caption("ប្រើតែពេលអ្នកកំពុងឈរនៅហាងពិត ហើយទីតាំងដែលបានរក្សាទុកចង្អុលទៅកន្លែងផ្សេង។ "
+                           "Admin នឹងឃើញថាអ្នកបានផ្លាស់ទីតាំង។")
+                _visit_checkin_button(customer, "move", "📌 ផ្លាស់ទីតាំងហាងមកកន្លែងខ្ញុំឈរ", "#B3261E")
+
+    # ---- 3. the visit form (desktop: one page · phone: step by step)
+    shop_type = _visit_type_map({key: customer}).get(key, VISIT_TYPE_OTHER)
+    nv = (st.session_state.get("_visit_new", {}) or {}).get(key)
+    is_first_visit = bool(nv) and not (len(past) and past.iloc[0]["_dt"] >= nv["date"])
+    _visit_redo_notice(visits, user, customer)
+    if is_first_visit:
+        st.info(f"🆕 **ចុះហាងលើកដំបូងក្រោយលក់ថ្ងៃ {nv['date']:%d %b}។** ពិនិត្យថាទូទឹកកកបានដំឡើង បិទស្ទីគ័ររួច "
+                "ហើយម្ចាស់ហាងដឹងពីរបៀបលក់ និងកំដៅនំ។" + ("" if nv["in_master"] else
+                " ⚠️ ហាងនេះមិនទាន់មានក្នុង Master List — សូមប្រាប់ Admin ឱ្យបន្ថែម។"))
+    cfg = _visit_settings()
+    size, _every = _visit_size(float(s["Pcs 28d"]) if s is not None else 0, cfg)
+    type_checks = list(VISIT_TYPE_CHECKS.get(shop_type, VISIT_TYPE_CHECKS[VISIT_TYPE_OTHER]))
+    if is_first_visit:
+        type_checks = LEAD_FIRST_VISIT_CHECKS + type_checks
+    app_pct = s["Trend %"] if s is not None else None
+    ctx = {"customer": customer, "key": key, "pin": pin, "user": user, "zone": zone_map.get(key, VISIT_ZONE_NOT_SET),
+           "shop_type": shop_type, "size": size, "app_pct": app_pct, "type_checks": type_checks}
+    st.session_state["visit_ctx"] = ctx
+    if not _visit_phone_mode():
+        st.caption(f"ប្រភេទហាង: **{_km(shop_type)}** · ទំហំ: **{_km(size)}**" + (" — Admin អាចប្តូរប្រភេទក្នុង ⚙️ ហាង និងតំបន់។" if current_role() == "admin" else ""))
+        with st.form("visit_form", clear_on_submit=False):
+            a = {}
+            st.markdown("**3️⃣ រូបថត** — ត្រូវមានរូបមុខហាង")
+            a.update(_vf_photos_arrive({}, False))
+            a.update(_vf_photos_after({}, False))
+            st.markdown(f"**4️⃣ ពិនិត្យហាង** · {_km(shop_type)}")
+            a.update(_vf_check({}, ctx, False))
+            st.markdown("**5️⃣ ការលក់**")
+            a.update(_vf_sales({}, ctx, False))
+            st.markdown("**6️⃣ បញ្ហា និងសំណើ**")
+            a.update(_vf_problems({}, False))
+            submitted = st.form_submit_button("✅ រក្សាទុករបាយការណ៍", type="primary", use_container_width=True)
+        if submitted:
+            err = _vf_validate(a)
+            if err:
+                st.error(err)
+            else:
+                _vf_save(a, ctx)
+        return
+    _vf_phone_wizard(ctx)
+
+
+# ---------- visit form sections (shared by desktop and phone) ----------
+class _Shot:
+    """A photo kept in memory between phone steps: shrunk once (≈1280 px), with a small thumbnail for the screen
+    and the time the camera took it (shown in reports)."""
+    def __init__(self, data, name="photo.jpg", thumb=None, taken=None):
+        self.data, self.name, self.thumb, self.taken = data, name, thumb, taken
+
+    def getvalue(self):
+        return self.data
+
+
+def _vf_keep(f):
+    if f is None:
+        return None
+    raw = f.getvalue()
+    taken = _visit_photo_taken_at(raw)
+    try:
+        from PIL import Image, ImageOps
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+        img.thumbnail((1280, 1280))
+        big = io.BytesIO()
+        img.save(big, "JPEG", quality=80, optimize=True)
+        img.thumbnail((240, 240))
+        small = io.BytesIO()
+        img.save(small, "JPEG", quality=70)
+        return _Shot(big.getvalue(), getattr(f, "name", "photo.jpg"), small.getvalue(), taken)
+    except Exception:
+        return _Shot(raw, getattr(f, "name", "photo.jpg"), None, taken)
+
+
+def _vf_thumb(shot):
+    return shot.thumb if getattr(shot, "thumb", None) else shot.getvalue()
+
+
+def _vf_thumb_row(items):
+    """Small thumbnails side by side (stays in one row on a phone)."""
+    import base64
+    cells = "".join(
+        f"<figure style='margin:0;text-align:center'><img src='data:image/jpeg;base64,{base64.b64encode(_vf_thumb(f)).decode()}' "
+        f"style='height:84px;border-radius:10px;border:1px solid #E6E0D6'><figcaption style='font-size:12px;color:#6B7280'>{_e(lab)}</figcaption></figure>"
+        for lab, f in items)
+    st.markdown(f"<div style='display:flex;gap:8px;flex-wrap:wrap;margin:4px 0 8px'>{cells}</div>", unsafe_allow_html=True)
+
+
+def _frag_rerun():
+    """Redraw only Shop Visits when possible (much faster than the whole app)."""
+    if _in_fragment():
+        st.rerun(scope="fragment")
+    st.rerun()  # keep
+
+
+def _vf_idx(options, value, default=0):
+    return options.index(value) if value in options else default
+
+
+VF_FRIDGE = ["Clean & cold", "Dirty", "Not cold", "Broken", "No fridge"]
+VF_FIFO = ["Good", "Needs fixing", "Fixed today"]
+VF_STICKER = ["Good", "Old / faded", "Missing"]
+VF_SAYS = ["⬆️ Up", "➡️ Same", "⬇️ Down"]
+VF_PRIORITY = ["Low", "Normal", "Urgent"]
+VF_SAT = ["😠 1", "🙁 2", "😐 3", "🙂 4", "😍 5"]
+VF_IMG = ["jpg", "jpeg", "png", "webp"]
+
+
+VF_PHOTO_LABEL = {"front": "📸 មុខហាង", "before": "🅱️ BEFORE", "after": "🅰️ AFTER"}
+
+
+def _vf_photo_slot(d, k, label, wkey, help_=None):
+    """Phone: show the photo already taken, or a big upload box for it. Updates the draft directly."""
+    if d.get(k) is not None:
+        _vf_thumb_row([(f"{VF_PHOTO_LABEL.get(k, label)} ✅", d[k])])
+        st.button("↻ ថតម្តងទៀត", key=f"{wkey}_redo", on_click=lambda: d.__setitem__(k, None))
+        return
+    f = st.file_uploader(label, type=VF_IMG, key=wkey, help=help_ or "ចុច → ថតរូប ឬជ្រើសពី Gallery")
+    if f is not None:
+        d[k] = _vf_keep(f)
+        st.caption(f"✅ បានរក្សាទុក {VF_PHOTO_LABEL.get(k, label)}")
+
+
+def _vf_photo_status(d):
+    need = ["front"] + (["before", "after"] if (_vf_fixes(d) or d.get("before") is not None or d.get("after") is not None) else [])
+    return " · ".join(f"{VF_PHOTO_LABEL[k]} {'✅' if d.get(k) is not None else '❌'}" for k in need)
+
+
+def _vf_photos_arrive(d, phone):
+    if phone:
+        st.caption("បន្ថែមរូប 2: ថតដោយកាមេរ៉ា ឬជ្រើសពី Gallery។")
+        st.markdown("**1 · 📸 រូបមុខហាង** (ចាំបាច់)")
+        _vf_photo_slot(d, "front", "📸 រូបមុខហាង", "vf_front_up", "ចុច → ថតរូប ឬជ្រើសពី Gallery")
+        st.markdown("**2 · 🅱️ BEFORE: ទូទឹកកក / កន្លែងតាំង ពេលមកដល់** (ត្រូវការ បើអ្នកនឹងជួសជុលអ្វីមួយ)")
+        _vf_photo_slot(d, "before", "🅱️ រូប BEFORE", "vf_before")
+        return {}
+    front = st.file_uploader("📸 រូបមុខហាង (ចាំបាច់)", type=VF_IMG, key="visit_cam",
+                             help="ថតដោយកាមេរ៉ា ឬជ្រើសពី Gallery។")
+    before = st.file_uploader("🅱️ BEFORE: ទូទឹកកក / កន្លែងតាំង ពេលមកដល់", type=VF_IMG, key="visit_before",
+                              help="ត្រូវការ ពេលអ្នកជួសជុលអ្វីមួយ។")
+    return {"front": front, "before": before}
+
+
+def _vf_photos_after(d, phone):
+    if phone:
+        if d.get("before") is None and (_vf_fixes(d) or d.get("after") is not None):
+            st.markdown("**🅱️ ខ្វះរូប BEFORE** — បន្ថែមនៅទីនេះ")
+            _vf_photo_slot(d, "before", "🅱️ រូប BEFORE", "vf_before2")
+        st.markdown("**🅰️ AFTER: កន្លែងដដែលក្រោយជួសជុល** (មុំដូច BEFORE)")
+        _vf_photo_slot(d, "after", "🅰️ រូប AFTER", "vf_after")
+        extra = st.file_uploader("រូបផ្សេងទៀត (មិនចាំបាច់ អតិបរមា 2)", type=VF_IMG, accept_multiple_files=True, key="vf_extra")
+        if extra:
+            ids = tuple(getattr(f, "file_id", f.name) for f in extra)
+            if ids != d.get("_extra_ids"):
+                d["extra"], d["_extra_ids"] = [_vf_keep(f) for f in extra], ids
+        elif d.get("extra"):
+            _vf_thumb_row([("ផ្សេងៗ", f) for f in d["extra"]])
+        return {}
+    after = st.file_uploader("🅰️ AFTER: កន្លែងដដែលក្រោយជួសជុល", type=VF_IMG, key="visit_after",
+                             help="មុំដូច BEFORE ដើម្បីងាយមើលការផ្លាស់ប្តូរ។")
+    extra = st.file_uploader("រូបផ្សេងទៀត (អតិបរមា 2)", type=VF_IMG, accept_multiple_files=True, key="visit_files")
+    return {"after": after, "extra": extra or []}
+
+
+def _vf_check(d, ctx, phone):
+    cols = (st, st, st, st, st) if phone else (*st.columns(2), *st.columns(3))
+    fridge = cols[0].radio("🧊 ទូទឹកកក", VF_FRIDGE, format_func=_km, index=_vf_idx(VF_FRIDGE, d.get("fridge")), horizontal=True, key="vf_fridge")
+    fifo = cols[1].radio("🥟 ការតាំង / នំចាស់នៅខាងមុខ (FIFO)", VF_FIFO, format_func=_km, index=_vf_idx(VF_FIFO, d.get("fifo")), horizontal=True, key="vf_fifo")
+    old_pcs = cols[2].number_input("នំចាស់ / ខូច ដែលរកឃើញ (pcs)", 0, 5000, int(d.get("old_pcs", 0)), 1, key="vf_old")
+    sticker = cols[3].radio("🏷️ ស្ទីគ័រ", VF_STICKER, format_func=_km, index=_vf_idx(VF_STICKER, d.get("sticker")), horizontal=True, key="vf_sticker")
+    changed = cols[4].number_input("ស្ទីគ័របានប្តូរថ្ងៃនេះ", 0, 100, int(d.get("changed", 0)), 1, key="vf_changed")
+    fridge_fixed = st.checkbox("🧽 ខ្ញុំបានសម្អាត / រៀបទូទឹកកក ឬកន្លែងតាំងថ្ងៃនេះ", value=bool(d.get("fridge_fixed")), key="vf_ffix")
+    st.caption(f"គូសធីកអ្វីដែលល្អនៅ {_km(ctx['shop_type'])}:")
+    prev = d.get("checks", {})
+    grid = [st] if phone else st.columns(2)
+    checks = {c: grid[i % len(grid)].checkbox(_km(c), value=bool(prev.get(c)), key=f"vf_chk_{i}") for i, c in enumerate(ctx["type_checks"])}
+    return {"fridge": fridge, "fifo": fifo, "old_pcs": old_pcs, "sticker": sticker, "changed": changed,
+            "fridge_fixed": fridge_fixed, "checks": checks}
+
+
+def _vf_sales(d, ctx, phone):
+    st.caption("តាម Sale Journal: " + _visit_trend_text(ctx["app_pct"]))
+    cols = (st, st, st) if phone else st.columns(3)
+    says = cols[0].radio("ម្ចាស់ហាងថាការលក់", VF_SAYS, format_func=_km, index=_vf_idx(VF_SAYS, d.get("says"), 1), horizontal=True, key="vf_says")
+    reason = cols[1].selectbox("មូលហេតុចម្បង", VISIT_REASONS, format_func=_km, index=_vf_idx(VISIT_REASONS, d.get("reason")), key="vf_reason")
+    competitor = cols[2].text_input("ម៉ាកគូប្រជែងដែលឃើញ (បើមាន)", value=d.get("competitor", ""), max_chars=60, key="vf_comp")
+    return {"says": says, "reason": reason, "competitor": competitor}
+
+
+def _vf_problems(d, phone):
+    problems = st.multiselect("បញ្ហាដែលរកឃើញ", VISIT_PROBLEMS, format_func=_km, default=[p for p in d.get("problems", []) if p in VISIT_PROBLEMS],
+                              placeholder="គ្មាន — ទុកទទេ បើគ្រប់យ៉ាងល្អ", key="vf_probs")
+    cols = (st, st, st) if phone else st.columns(3)
+    priority = cols[0].radio("អាទិភាព", VF_PRIORITY, format_func=_km, index=_vf_idx(VF_PRIORITY, d.get("priority"), 1), horizontal=True, key="vf_prio")
+    follow = cols[1].selectbox("អ្នកទទួលបន្ត", VISIT_FOLLOWUP, format_func=_km, index=_vf_idx(VISIT_FOLLOWUP, d.get("follow")), key="vf_follow")
+    sat = cols[2].select_slider("ការពេញចិត្តរបស់ហាង", VF_SAT, value=d.get("sat", "🙂 4"), key="vf_sat")
+    notes = st.text_area("កំណត់ចំណាំ (អ្វីដែលឃើញ អ្វីដែលបានធ្វើ)", value=d.get("notes", ""), max_chars=200, height=80, key="vf_notes")
+    request = st.text_input("សំណើរបស់អតិថិជន (ចង់បាននំប្រភេទណាបន្ថែម ការបញ្ជាទិញបន្ទាប់ ប្រូម៉ូសិន…)", value=d.get("request", ""),
+                            max_chars=150, key="vf_req")
+    return {"problems": problems, "priority": priority, "follow": follow, "sat": sat, "notes": notes, "request": request}
+
+
+def _vf_fixes(a):
+    return [x for x, on in (("Sticker changed", (a.get("changed") or 0) > 0), ("FIFO fixed", a.get("fifo") == "Fixed today"),
+                            ("Fridge/display cleaned", bool(a.get("fridge_fixed")))) if on]
+
+
+def _vf_validate(a):
+    """Error text, or None when the visit can be saved."""
+    skipped = [n for n, k in (("🔍 ពិនិត្យ", "fridge"), ("📈 ការលក់", "says"), ("⚠️ បញ្ហា", "priority")) if k not in a]
+    if skipped:
+        return "សូមបើក និងបំពេញជំហានទាំងនេះជាមុនសិន: " + ", ".join(skipped) + "។"
+    if a.get("front") is None:
+        return "សូមបន្ថែមរូបមុខហាងជាមុនសិន។"
+    if len(a.get("extra") or []) > 2:
+        return "ជ្រើសរូបផ្សេងទៀតបានច្រើនបំផុត 2។"
+    fixes = _vf_fixes(a)
+    if fixes and (a.get("before") is None or a.get("after") is None):
+        return "អ្នកបានជួសជុល (" + ", ".join(_km(x) for x in fixes) + ")។ សូមបន្ថែមទាំងរូប 🅱️ BEFORE និង 🅰️ AFTER។"
+    if (a.get("before") is None) != (a.get("after") is None):
+        return "សូមបន្ថែមទាំងរូប BEFORE និង AFTER ឬកុំបន្ថែមទាំងពីរ។"
+    if a.get("problems") and a.get("follow") in ("-", None):
+        return "អ្នកបានរាយការណ៍បញ្ហា: សូមជ្រើសអ្នកទទួលបន្ត។"
+    return None                       # photos may come from the gallery: the GPS check-in proves the visit
+
+
+def _vf_save(a, ctx):
+    customer, key, pin, user = ctx["customer"], ctx["key"], ctx["pin"], ctx["user"]
+    gps = st.session_state.get("visit_gps")
+    if gps and norm_name(gps.get("customer", "")) != key:
+        gps = None
+    label, dist = _visit_location_check(gps, pin)
+    now = now_kh()
+    vid = f"{'T' if _visit_test_mode() else 'V'}{now:%Y%m%d-%H%M%S}-{pysecrets.token_hex(2)}"
+    stamp = [f"{now:%Y-%m-%d %H:%M}  {user}", (f"GPS {gps['lat']:.5f},{gps['lon']:.5f} ±{gps['acc']:.0f}m" if gps else "No GPS"),
+             f"{vid}  {label.encode('ascii', 'ignore').decode().strip()}"]
+    names_saved = []
+    with st.spinner("កំពុងរក្សាទុករូបថត…"):
+        try:
+            shots = [("front", a["front"])] + ([("before", a["before"]), ("after", a["after"])] if a.get("before") is not None else []) \
+                + [(f"x{i}", f) for i, f in enumerate(a.get("extra") or [], start=1)]
+            for role, f in shots:
+                data = _visit_photo_prepare(f.getvalue(), stamp + [role.upper()])
+                name = f"{vid}_{role}.jpg"
+                _visit_photo_save(name, data)
+                names_saved.append(name)
+        except Exception as e:
+            st.error("មិនអាចរក្សាទុករូបថតបានទេ: " + str(e)[:150] + "។ មិនទាន់កត់ត្រាអ្វីទេ សូមព្យាយាមម្តងទៀត។")
+            return
+    minutes = ""
+    if gps:
+        try:
+            minutes = max(0, round((now.replace(tzinfo=None) - datetime.strptime(gps["at"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 60))
+        except Exception:
+            minutes = ""
+    fixes, checks, app_pct = _vf_fixes(a), a.get("checks", {}), ctx["app_pct"]
+    problems = a.get("problems") or []
+    row = {"Date": now_str(), "VisitID": vid, "Staff": user, "Customer": customer,
+           "Check-in": gps["at"] if gps else "-", "Minutes": minutes,
+           "Lat": f"{gps['lat']:.6f}" if gps else "-", "Lon": f"{gps['lon']:.6f}" if gps else "-",
+           "GPS accuracy m": f"{gps['acc']:.0f}" if gps else "-", "Distance m": f"{dist:.0f}" if dist is not None else "-",
+           "Location check": label, "Fridge": a["fridge"], "Display FIFO": a["fifo"], "Old/damaged pcs": int(a["old_pcs"]),
+           "Sticker": a["sticker"], "Stickers changed": int(a["changed"]), "Customer says sales": a["says"], "Sales reason": a["reason"],
+           "Competitor": a.get("competitor") or "-", "App trend %": "-" if app_pct is None or pd.isna(app_pct) else f"{app_pct:.0f}",
+           "Problems": "; ".join(p.split(" ", 1)[1] for p in problems) or "-", "Priority": a["priority"],
+           "Follow-up by": a["follow"], "Notes": a.get("notes") or "-", "Customer request": a.get("request") or "-",
+           "Satisfaction": a["sat"].split()[-1], "Photos": ";".join(names_saved), "Status": "Open" if problems else "No problem",
+           "Fixed by": "-", "Fixed at": "-", "Fix note": "-", "Zone": ctx["zone"],
+           "Shop type": ctx["shop_type"], "Checks": "; ".join(f"{c}: {'OK' if ok else 'NO'}" for c, ok in checks.items()),
+           "Check score %": round(100 * sum(checks.values()) / max(1, len(checks))), "Size": ctx["size"],
+           "Fix done": "; ".join(fixes) or "-", "Review": "-", "Reviewed by": "-", "Reviewed at": "-", "Review note": "-"}
+    try:
+        append_row(_visits_path(), row)
+    except Exception as e:
+        st.error("មិនអាចរក្សាទុករបាយការណ៍បានទេ: " + str(e)[:160] + "។ ចម្លើយរបស់អ្នកនៅដដែល សូមចុចរក្សាទុកម្តងទៀត។")
+        return
+    audit("shop visit" + (" (TEST)" if _visit_test_mode() else ""), f"{customer} | {label} | {row['Problems']}")
+    _vf_draft_delete()
+    for k in [k for k in list(st.session_state) if str(k).startswith(("visit_gps", "visit_customer", "visit_cam", "visit_files",
+                                                                     "visit_before", "visit_after", "vf_", "visit_draft", "visit_ctx"))]:
+        st.session_state.pop(k, None)
+    st.session_state["flash"] = f"បានរក្សាទុករបាយការណ៍: {customer}"
+    _frag_rerun()
+
+
+VF_STEPS = ["📸 មកដល់", "🔍 ពិនិត្យ", "🛠️ ក្រោយជួសជុល", "📈 ការលក់", "⚠️ បញ្ហា", "✅ រក្សាទុក"]
+
+
+def _vf_phone_wizard(ctx):
+    """One block of questions per screen, big buttons, answers kept when going back."""
+    drafts = st.session_state.setdefault("visit_draft", {})
+    d = drafts.setdefault(ctx["key"], {"_step": 0})
+    step = int(d.get("_step", 0))
+    st.progress((step + 1) / len(VF_STEPS), text=f"ជំហាន {step + 1} នៃ {len(VF_STEPS)} · {VF_STEPS[step]} · {ctx['customer']}")
+    with st.container(border=True):
+        if step == 0:
+            ans = _vf_photos_arrive(d, True)
+        elif step == 1:
+            st.caption(f"{_km(ctx['shop_type'])} · {_km(ctx['size'])}")
+            ans = _vf_check(d, ctx, True)
+        elif step == 2:
+            fixes = _vf_fixes(d)
+            if fixes:
+                st.info("អ្នកបានជួសជុល: **" + ", ".join(_km(x) for x in fixes) + "** → ថតរូប 🅰️ AFTER មុំដូច BEFORE។")
+            else:
+                st.caption("មិនបានជួសជុលអ្វីទេ? អាចរំលងរូប AFTER បាន (ត្រូវការតែពេលមានរូប BEFORE)។")
+            ans = _vf_photos_after(d, True)
+        elif step == 3:
+            ans = _vf_sales(d, ctx, True)
+        elif step == 4:
+            ans = _vf_problems(d, True)
+        else:
+            ans = {}
+            _vf_summary(d, ctx)
+    d.update(ans)
+    err_here = None
+    if step == 0 and d.get("front") is None:
+        err_here = "សូមបន្ថែមរូបមុខហាងដើម្បីបន្ត។"
+    if step == 2 and _vf_fixes(d) and (d.get("before") is None or d.get("after") is None):
+        err_here = "ដោយសារអ្នកបានជួសជុល សូមបន្ថែមរូប BEFORE (ជំហាន 1) និង AFTER។"
+    if step == 4 and d.get("problems") and d.get("follow") in ("-", None):
+        err_here = "សូមជ្រើសអ្នកទទួលបន្តបញ្ហានេះ។"
+    last = step == len(VF_STEPS) - 1
+    if not last:
+        if st.button(f"បន្ទាប់: {VF_STEPS[step + 1]} ➡️", key=f"vf_next_{step}", type="primary", use_container_width=True):
+            if err_here:
+                st.error(err_here)
+            else:
+                d["_step"] = step + 1
+                _vf_draft_save()
+                _frag_rerun()
+    elif st.button("✅ រក្សាទុករបាយការណ៍", key="vf_save", type="primary", use_container_width=True):
+        err = _vf_validate(d)
+        if err:
+            st.error(err)
+        else:
+            _vf_save(d, ctx)
+    if step > 0 and st.button(f"⬅️ ថយក្រោយ: {VF_STEPS[step - 1]}", key=f"vf_back_{step}", use_container_width=True):
+        d["_step"] = step - 1
+        _frag_rerun()
+    with st.expander("លោតទៅជំហាន / បោះបង់ការចុះហាងនេះ"):
+        go = st.radio("Step", VF_STEPS, index=step, horizontal=True, key=f"vf_jump_{step}", label_visibility="collapsed")
+        if go != VF_STEPS[step]:
+            d["_step"] = VF_STEPS.index(go)
+            _frag_rerun()
+        if st.button("✖ បោះបង់ការចុះហាងនេះ (ចម្លើយនឹងត្រូវលុប)", key=f"vf_cancel_{step}"):
+            st.session_state.get("visit_draft", {}).pop(ctx["key"], None)
+            for k in ("visit_gps", "visit_customer", "visit_customer_box", "visit_ctx"):
+                st.session_state.pop(k, None)
+            _vf_draft_delete()
+            _frag_rerun()
+    _vf_draft_save()
+
+
+VF_DRAFT_KEEP_H = 8          # an unfinished visit is kept this many hours
+
+
+def _vf_draft_path(user):
+    safe = re.sub(r"[^a-z0-9._-]", "_", str(user or "-").lower())[:40]
+    return os.path.join(CACHE_DIR, "visit_drafts", safe + ".pkl")
+
+
+def _vf_plain(v):
+    """Draft -> plain Python (no app classes), so it can be read back after the app restarts."""
+    if isinstance(v, _Shot):
+        return {"__shot__": True, "data": v.data, "name": v.name, "thumb": v.thumb, "taken": v.taken}
+    if isinstance(v, dict):
+        return {k: _vf_plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return type(v)(_vf_plain(x) for x in v)
+    return v
+
+
+def _vf_unplain(v):
+    if isinstance(v, dict) and v.get("__shot__"):
+        return _Shot(v["data"], v.get("name", "photo.jpg"), v.get("thumb"), v.get("taken"))
+    if isinstance(v, dict):
+        return {k: _vf_unplain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return type(v)(_vf_unplain(x) for x in v)
+    return v
+
+
+def _vf_draft_save():
+    """Keep the unfinished visit on the server, so a phone that slept or reconnected gets it back."""
+    user = current_user()
+    if not user or not st.session_state.get("visit_draft"):
+        return
+    try:
+        path = _vf_draft_path(user)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        blob = pickle.dumps({"saved": time.time(), "draft": _vf_plain(st.session_state.get("visit_draft")),
+                             "ctx": _vf_plain(st.session_state.get("visit_ctx")), "customer": st.session_state.get("visit_customer"),
+                             "gps": st.session_state.get("visit_gps"), "test": bool(st.session_state.get("visit_test_mode"))})
+        _write_atomic(path, blob)
+    except Exception:
+        pass
+
+
+def _vf_draft_restore():
+    """Bring back an unfinished visit after the phone reconnected. Returns True when something was restored."""
+    user = current_user()
+    if not user or st.session_state.get("visit_draft"):
+        return False
+    path = _vf_draft_path(user)
+    try:
+        if not os.path.exists(path) or time.time() - os.path.getmtime(path) > VF_DRAFT_KEEP_H * 3600:
+            return False
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        if data.get("test") and current_role() != "admin":
+            return False
+        st.session_state["visit_draft"] = _vf_unplain(data.get("draft") or {})
+        if data.get("ctx"):
+            st.session_state["visit_ctx"] = _vf_unplain(data["ctx"])
+        for k, sk in (("customer", "visit_customer"), ("gps", "visit_gps")):
+            if data.get(k):
+                st.session_state[sk] = data[k]
+        if data.get("test"):
+            st.session_state["visit_test_mode"] = True
+        return bool(st.session_state["visit_draft"])
+    except Exception:
+        return False
+
+
+def _vf_draft_delete():
+    try:
+        os.remove(_vf_draft_path(current_user()))
+    except Exception:
+        pass
+
+
+def _vf_summary(d, ctx):
+    fixes = _vf_fixes(d)
+    checks = d.get("checks", {})
+    photos = [n for n, k in (("front", "front"), ("before", "before"), ("after", "after")) if d.get(k) is not None]
+    st.markdown(f"**{ctx['customer']}**")
+    thumbs = [(VF_PHOTO_LABEL[k], d[k]) for k in ("front", "before", "after") if d.get(k) is not None] + \
+             [("ផ្សេងៗ", f) for f in (d.get("extra") or [])]
+    if thumbs:
+        _vf_thumb_row(thumbs)
+    st.markdown(f"- 📸 រូបថត: **{_vf_photo_status(d)}**" + (f" + ផ្សេងទៀត {len(d.get('extra') or [])}" if d.get("extra") else "") + "\n"
+                f"- 🧊 ទូទឹកកក **{_km(d.get('fridge', '-'))}** · 🥟 FIFO **{_km(d.get('fifo', '-'))}** · នំចាស់ **{d.get('old_pcs', 0)}**\n"
+                f"- 🏷️ ស្ទីគ័រ **{_km(d.get('sticker', '-'))}** · បានប្តូរ **{d.get('changed', 0)}**\n"
+                f"- 🛠️ បានជួសជុល: **{', '.join(_km(x) for x in fixes) or 'គ្មាន'}**\n"
+                f"- 📋 បញ្ជីពិនិត្យ: **ល្អ {sum(checks.values())} / {len(checks)}**\n"
+                f"- 📈 ម្ចាស់ហាងថា **{_km(d.get('says', '-'))}** · {_km(d.get('reason', '-'))}\n"
+                f"- ⚠️ បញ្ហា: **{', '.join(_km(p) for p in d.get('problems', [])) or 'គ្មាន'}**"
+                + (f" · អ្នកទទួលបន្ត {_km(d.get('follow'))}" if d.get("problems") else "") + "\n"
+                f"- 😊 ការពេញចិត្ត **{d.get('sat', '-')}** · 📝 {d.get('notes') or 'គ្មានកំណត់ចំណាំ'}")
+    missing = [k for k in ("front", "before", "after") if d.get(k) is None and
+               (k == "front" or _vf_fixes(d) or d.get("before") is not None or d.get("after") is not None)]
+    for k in missing:
+        st.warning(f"ខ្វះ {VF_PHOTO_LABEL[k]} — បន្ថែមនៅទីនេះ:")
+        _vf_photo_slot(d, k, f"{VF_PHOTO_LABEL[k]}", f"vf_{k}_sum")
+    err = _vf_validate(d)
+    if err and not missing:
+        st.error(err)
+    elif not err:
+        st.success("បំពេញគ្រប់ហើយ។ សូមចុច **✅ រក្សាទុករបាយការណ៍**។")
+
+
+def _in_fragment():
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        return bool(ctx and getattr(ctx, "current_fragment_id", None))
+    except Exception:
+        return False
+
+
+def _visit_phone_mode():
+    if "visit_phone" not in st.session_state:
+        st.session_state["visit_phone"] = is_mobile()
+    return bool(st.session_state.get("visit_phone"))
+
+
+VISIT_PHONE_CSS = """<style>
+.stButton > button, .stDownloadButton > button, .stLinkButton > a {min-height: 50px; font-size: 1.02rem; border-radius: 12px;}
+div[data-testid="stCameraInput"] button {min-height: 50px;}
+[data-baseweb="input"], [data-baseweb="select"] > div, [data-baseweb="textarea"] {min-height: 46px; font-size: 1rem;}
+label[data-baseweb="radio"] {padding: 9px 14px; margin: 4px 6px 4px 0;}
+label[data-baseweb="checkbox"] {padding: 6px 0;}
+[data-testid="stProgress"] p {font-weight: 700;}
+</style>"""
+
+
+def _visit_report_frame(visits, start, end, staff):
+    v = visits[(visits["_dt"].dt.date >= start) & (visits["_dt"].dt.date <= end)].copy()
+    if staff:
+        v = v[v["Staff"].isin(staff)]
+    for c in ("Minutes", "Distance m", "Old/damaged pcs", "Stickers changed", "Satisfaction", "Lat", "Lon"):
+        v[c] = pd.to_numeric(v[c], errors="coerce")
+    return v.sort_values("_dt", ascending=False)
+
+
+def _visit_report_body(visits):
+    today = today_kh()
+    c1, c2, c3 = st.columns([1, 1, 2])
+    start = c1.date_input("ពីថ្ងៃ", today, key="vr_from")
+    end = c2.date_input("ដល់ថ្ងៃ", today, key="vr_to")
+    staff_all = sorted(visits["Staff"].unique()) if not visits.empty else []
+    staff = c3.multiselect("Staff", staff_all, key="vr_staff", placeholder="All staff")
+    v = _visit_report_frame(visits, start, end, staff)
+    if v.empty:
+        st.info("No visits in this period yet.")
+        return
+    at_shop = v["Location check"].str.startswith("✅")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Visits", f"{len(v):,}", f"{v['Customer'].nunique()} shops", delta_color="off")
+    k2.metric("Confirmed at shop", f"{at_shop.mean() * 100:.0f}%", f"{int((~at_shop).sum())} not confirmed", delta_color="off")
+    k3.metric("Stickers changed", f"{int(v['Stickers changed'].fillna(0).sum()):,}")
+    k4.metric("Problems still open", f"{int(v['Status'].eq('Open').sum()):,}")
+
+    st.markdown("**👥 Staff today / in this period**")
+    per = v.groupby("Staff").agg(**{"Visits": ("VisitID", "size"), "Shops": ("Customer", "nunique"),
+                                   "At shop %": ("Location check", lambda s: round(s.str.startswith("✅").mean() * 100)),
+                                   "Avg minutes": ("Minutes", "mean"), "First visit": ("_dt", "min"), "Last visit": ("_dt", "max"),
+                                   "Stickers": ("Stickers changed", "sum"), "Problems": ("Status", lambda s: int(s.eq("Open").sum()))}).reset_index()
+    per["Avg minutes"] = per["Avg minutes"].round(0)
+    days = v.assign(Day=v["_dt"].dt.date, Key=v["Customer"].map(norm_name)).groupby(["Staff", "Day"])["Key"].nunique()
+    per[f"Days with {VISIT_DAILY_TARGET}+ shops"] = per["Staff"].map(lambda u: f"{int((days.get(u, pd.Series(dtype=int)) >= VISIT_DAILY_TARGET).sum())} / {len(days.get(u, []))}")
+    per["Zones"] = per["Staff"].map(v.groupby("Staff")["Zone"].agg(lambda s: ", ".join(sorted({str(z).split(' (')[0] for z in s if str(z) not in ('-', '')}))))
+    per["First visit"] = per["First visit"].dt.strftime("%d %b %H:%M")
+    per["Last visit"] = per["Last visit"].dt.strftime("%d %b %H:%M")
+    _si_show(per.sort_values("Visits", ascending=False))
+
+    pts = v.dropna(subset=["Lat", "Lon"])
+    if len(pts):
+        st.markdown("**🗺️ Where the check-ins were** (red = not at shop)")
+        pts = pts.assign(color=pts["Location check"].map(lambda x: "#2E7D4F" if str(x).startswith("✅") else "#B3261E"))
+        try:
+            st.map(pts, latitude="Lat", longitude="Lon", color="color", size=60)
+        except Exception:
+            st.map(pts.rename(columns={"Lat": "lat", "Lon": "lon"})[["lat", "lon"]])
+
+    st.markdown("**📈 What shops say about sales**")
+    t1, t2 = st.columns(2)
+    trend = v["Customer says sales"].value_counts().reindex(["⬆️ Up", "➡️ Same", "⬇️ Down"]).fillna(0).astype(int)
+    t1.dataframe(trend.rename("Shops").to_frame(), use_container_width=True)
+    down = v[v["Customer says sales"].eq("⬇️ Down")][["Customer", "Sales reason", "Competitor", "App trend %", "Staff"]]
+    with t2:
+        if len(down):
+            st.caption("Shops saying ⬇️ Down")
+            _si_show(down.reset_index(drop=True))
+        else:
+            st.caption("No shop said sales are down. 🎉")
+
+    st.markdown("**📋 All visits**")
+    show = v.assign(Time=v["_dt"].dt.strftime("%d %b %H:%M"))[
+        ["Time", "Staff", "Zone", "Customer", "Location check", "Fridge", "Sticker", "Stickers changed", "Customer says sales",
+         "Problems", "Status", "Notes", "Customer request", "Satisfaction"]]
+    _si_show(show.reset_index(drop=True), height=min(460, 60 + 36 * len(show)))
+
+    st.markdown("**🖼️ Photos**")
+    pick = st.selectbox("Open the photos of a visit", ["-"] + [f"{r['_dt']:%d %b %H:%M} · {r['Customer']} · {r['Staff']}" for _, r in v.head(60).iterrows()],
+                        key="vr_photo_pick")
+    if pick != "-":
+        r = v.head(60).iloc[[f"{x['_dt']:%d %b %H:%M} · {x['Customer']} · {x['Staff']}" for _, x in v.head(60).iterrows()].index(pick)]
+        st.caption(f"Checks: {r.get('Checks', '-')} · Fix done: {r.get('Fix done', '-')}")
+        _visit_show_photos(r["Photos"], "vr")
+    if has_permission("reports"):
+        try:
+            st.download_button("📥 Download visits (Excel)", data=_report_excel_bytes({"Visits": v.drop(columns=["_dt"]), "By staff": per}),
+                               file_name=f"Shop_Visits_{start}_{end}.xlsx", key="vr_dl",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.warning(f"Could not build the Excel file: {e}")
+
+
+def _visit_problems_body(visits):
+    open_v = visits[visits["Status"].eq("Open")].sort_values("_dt") if not visits.empty else visits
+    if open_v.empty:
+        st.success("No open problems. 🎉")
+        return
+    f1, f2 = st.columns(2)
+    who = f1.selectbox("Follow-up by", ["All"] + VISIT_FOLLOWUP[1:], key="vp_who")
+    pri = f2.multiselect("Priority", ["Urgent", "Normal", "Low"], default=["Urgent", "Normal", "Low"], key="vp_pri")
+    if who != "All":
+        open_v = open_v[open_v["Follow-up by"].eq(who)]
+    open_v = open_v[open_v["Priority"].isin(pri)]
+    st.caption(f"{len(open_v)} open problems, oldest first.")
+    can_fix = has_permission("edit")
+    for _, r in open_v.head(40).iterrows():
+        age = (pd.Timestamp(now_kh().replace(tzinfo=None)) - r["_dt"]).days
+        with st.container(border=True):
+            st.markdown(f"**{'🔴' if r['Priority'] == 'Urgent' else '🟠'} {r['Customer']}** · {r['Problems']}  \n"
+                        f"<span style='color:#6B7280'>{r['_dt']:%d %b %H:%M} by {r['Staff']} · {age} days open · follow-up: {r['Follow-up by']}</span>",
+                        unsafe_allow_html=True)
+            if str(r["Notes"]) not in ("-", ""):
+                st.write(r["Notes"])
+            if can_fix:
+                c1, c2 = st.columns([3, 1])
+                note = c1.text_input("What was done", key=f"vfix_{r['VisitID']}", max_chars=120, label_visibility="collapsed",
+                                     placeholder="What was done to fix it…")
+                if c2.button("✅ Fixed", key=f"vfixb_{r['VisitID']}", use_container_width=True):
+                    vid, by, at = r["VisitID"], current_user() or "-", now_str()
+
+                    def _fix(df, vid=vid, by=by, at=at, note=note):
+                        m = df["VisitID"].eq(vid)
+                        df.loc[m, ["Status", "Fixed by", "Fixed at", "Fix note"]] = ["Fixed", by, at, safe_text(note or "-", 120)]
+                        return df
+                    try:
+                        modify_csv(_visits_path(), VISIT_COLS, _fix)
+                        audit("visit problem fixed", f"{r['Customer']} | {vid}")
+                        st.session_state["flash"] = f"Marked fixed: {r['Customer']}"
+                        _frag_rerun()
+                    except Exception as e:
+                        st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+
+
+VISIT_MIN_MINUTES = 5            # a visit shorter than this is flagged
+
+
+def _visit_flags(r):
+    """Reasons a manager should look closer at a submitted visit."""
+    flags = []
+    loc = str(r.get("Location check", ""))
+    if not loc.startswith("✅"):
+        flags.append("📍 មិនបានបញ្ជាក់ថានៅហាង" + (f" ({_km_loc(loc)})" if loc and loc != "-" else ""))
+    mins = pd.to_numeric(r.get("Minutes"), errors="coerce")
+    if pd.notna(mins) and mins < VISIT_MIN_MINUTES:
+        flags.append(f"⏱️ នៅហាងតែ {int(mins)} នាទី")
+    score = pd.to_numeric(r.get("Check score %"), errors="coerce")
+    if pd.notna(score) and score < 50:
+        flags.append(f"📋 ពិនិត្យហាងល្អតែ {int(score)}%")
+    photos = [p for p in str(r.get("Photos", "")).split(";") if p and p != "-"]
+    if len(photos) <= 1:
+        flags.append("🖼️ មានតែរូបមុខហាង")
+    if str(r.get("Fridge")) in ("Dirty", "Not cold", "Broken") and "Fridge" not in str(r.get("Fix done", "")) \
+            and str(r.get("Problems")) in ("-", ""):
+        flags.append(f"🧊 ទូទឹកកក “{_km(r.get('Fridge'))}” ប៉ុន្តែមិនបានរាយការណ៍បញ្ហា")
+    if str(r.get("Sticker")) in ("Old / faded", "Missing") and str(r.get("Stickers changed")) in ("0", "-", ""):
+        flags.append(f"🏷️ ស្ទីគ័រ “{_km(r.get('Sticker'))}” ប៉ុន្តែមិនបានប្តូរ")
+    if str(r.get("Problems")) not in ("-", "") and str(r.get("Follow-up by")) in ("-", ""):
+        flags.append("👤 មានបញ្ហា ប៉ុន្តែគ្មានអ្នកទទួលបន្ត")
+    if str(r.get("Notes")) in ("-", ""):
+        flags.append("📝 គ្មានកំណត់ចំណាំ")
+    return flags
+
+
+def _visit_review_state(r):
+    rv = str(r.get("Review", "-"))
+    return rv if rv in ("Approved", "Redo") else "To review"
+
+
+def _visit_sheet(r):
+    """The whole submitted form of one visit, easy to read."""
+    yn = lambda ok: "✅" if ok else "❌"
+    st.markdown(f"**{r['Customer']}** · {_km(r.get('Shop type', '-'))} · {_km(r.get('Size', '-'))} · {_km(r.get('Zone', '-'))}")
+    st.caption(f"ដោយ **{r['Staff']}** · រក្សាទុក {r['_dt']:%d %b %Y %H:%M} · Check-in {str(r['Check-in'])[11:16] or '-'} · "
+               f"{r['Minutes'] if str(r['Minutes']) not in ('', '-') else '?'} នាទី · លេខ {r['VisitID']}")
+    loc = str(r["Location check"])
+    (st.success if loc.startswith("✅") else st.warning)(
+        f"{_km_loc(loc)} · GPS ±{r['GPS accuracy m']} m" + (f" · ឆ្ងាយពីទីតាំងហាង {r['Distance m']} m" if str(r["Distance m"]) not in ("-", "") else ""))
+    if str(r["Lat"]) not in ("-", ""):
+        st.link_button("🗺️ កន្លែងដែល Check-in", f"https://www.google.com/maps?q={r['Lat']},{r['Lon']}")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**🔍 ពិនិត្យហាង**")
+        st.markdown(f"- 🧊 ទូទឹកកក: **{_km(r['Fridge'])}**\n- 🥟 ការតាំង / FIFO: **{_km(r['Display FIFO'])}**\n"
+                    f"- នំចាស់ / ខូច: **{r['Old/damaged pcs']} pcs**\n- 🏷️ ស្ទីគ័រ: **{_km(r['Sticker'])}** · បានប្តូរ **{r['Stickers changed']}**\n"
+                    f"- 🛠️ បានជួសជុលថ្ងៃនេះ: **{_km_list(r.get('Fix done', '-'))}**")
+        checks = [c.rsplit(": ", 1) for c in str(r.get("Checks", "")).split("; ") if ": " in c]
+        if checks:
+            st.markdown(f"**📋 បញ្ជីពិនិត្យ** (ល្អ {r.get('Check score %', '-')}%)")
+            st.markdown("\n".join(f"- {yn(v == 'OK')} {_km(k)}" for k, v in checks))
+    with c2:
+        st.markdown("**📈 ការលក់**")
+        st.markdown(f"- ម្ចាស់ហាងថា: **{_km(r['Customer says sales'])}** · មូលហេតុ: **{_km(r['Sales reason'])}**\n"
+                    f"- តាម Sale Journal: **{r['App trend %']}%**\n- គូប្រជែង: **{r['Competitor']}**")
+        st.markdown("**⚠️ បញ្ហា និងសំណើ**")
+        st.markdown(f"- បញ្ហា: **{_km_list(r['Problems'])}**\n- អាទិភាព: **{_km(r['Priority'])}** · អ្នកទទួលបន្ត: **{_km(r['Follow-up by'])}**\n"
+                    f"- ស្ថានភាព: **{_km(r['Status'])}**\n- ការពេញចិត្តរបស់ហាង: **{r['Satisfaction']} / 5**\n- សំណើ: {r['Customer request']}")
+    st.markdown(f"**📝 កំណត់ចំណាំ:** {r['Notes']}")
+    _visit_show_photos(r["Photos"], f"rv_{r['VisitID']}")
+
+
+def _visit_review_body(visits):
+    st.markdown("#### ✅ ពិនិត្យរបាយការណ៍ចុះហាង")
+    st.caption("បើករបាយការណ៍នីមួយៗ ដើម្បីមើលអ្វីដែលបុគ្គលិកបានបំពេញ។ ⚑ សម្គាល់ចំណុចត្រូវពិនិត្យ។ អនុម័ត ឬបញ្ជូនត្រឡប់ "
+               "with **Redo** and a note — staff see the note in their plan.")
+    if visits.empty:
+        st.info("មិនទាន់មានការចុះហាងទេ។")
+        return
+    today = today_kh()
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    start = c1.date_input("ពីថ្ងៃ", today - timedelta(days=6), key="rv_from")
+    end = c2.date_input("ដល់ថ្ងៃ", today, key="rv_to")
+    staff = c3.selectbox("បុគ្គលិក", ["All"] + sorted(visits["Staff"].unique()), key="rv_staff", format_func=_km)
+    state = c4.selectbox("បង្ហាញ", ["To review", "Redo", "Approved", "All"], key="rv_state", format_func=_km)
+    v = visits[(visits["_dt"].dt.date >= start) & (visits["_dt"].dt.date <= end)].copy()
+    if staff != "All":
+        v = v[v["Staff"].eq(staff)]
+    v["_state"] = [_visit_review_state(r) for r in v.to_dict("records")]
+    counts = v["_state"].value_counts()
+    st.caption(f"⏳ រង់ចាំពិនិត្យ {counts.get('To review', 0)} · 🔁 ត្រូវធ្វើឡើងវិញ {counts.get('Redo', 0)} · ✅ បានអនុម័ត {counts.get('Approved', 0)}")
+    if state != "All":
+        v = v[v["_state"].eq(state)]
+    if v.empty:
+        st.success("គ្មានអ្វីទេ។ 🎉")
+        return
+    can = has_permission("edit")
+    icon = {"To review": "⏳", "Redo": "🔁", "Approved": "✅"}
+    for r in v.sort_values("_dt", ascending=False).head(40).to_dict("records"):
+        flags = _visit_flags(r)
+        head = (f"{icon[r['_state']]} {r['_dt']:%d %b %H:%M} · {r['Customer']} · {r['Staff']} · "
+                f"{'📍✅' if str(r['Location check']).startswith('✅') else '📍⚠️'}" + (f" · ⚑ {len(flags)}" if flags else " · គ្រប់ចំណុច"))
+        with st.expander(head):
+            if flags:
+                st.warning("**ត្រូវពិនិត្យ:** " + " · ".join(flags))
+            if r["_state"] != "To review":
+                st.caption(f"{icon[r['_state']]} {_km(r['_state'])} ដោយ {r.get('Reviewed by', '-')} ថ្ងៃ {str(r.get('Reviewed at', '-'))[:16]}"
+                           + (f" — “{r['Review note']}”" if str(r.get("Review note", "-")) not in ("-", "") else ""))
+            _visit_sheet(r)
+            if can:
+                st.divider()
+                n1, n2, n3 = st.columns([3, 1, 1])
+                note = n1.text_input("កំណត់ចំណាំទៅបុគ្គលិក", key=f"rvn_{r['VisitID']}", max_chars=150,
+                                     placeholder="ឧ. ថតរូប AFTER មុំដូច BEFORE", label_visibility="collapsed")
+                for col, verdict, label, kind in ((n2, "Approved", "✅ អនុម័ត", "primary"), (n3, "Redo", "🔁 ធ្វើឡើងវិញ", "secondary")):
+                    if col.button(label, key=f"rv_{verdict}_{r['VisitID']}", use_container_width=True, type=kind):
+                        if verdict == "Redo" and not note.strip():
+                            st.error("សូមសរសេរអ្វីដែលបុគ្គលិកត្រូវធ្វើឡើងវិញ។")
+                            continue
+                        vid, by, at = r["VisitID"], current_user() or "-", now_str()
+
+                        def _rev(df, vid=vid, verdict=verdict, by=by, at=at, note=note):
+                            for c in ("Review", "Reviewed by", "Reviewed at", "Review note"):
+                                if c not in df:
+                                    df[c] = "-"
+                            df.loc[df["VisitID"].eq(vid), ["Review", "Reviewed by", "Reviewed at", "Review note"]] = \
+                                [verdict, by, at, safe_text(note or "-", 150)]
+                            return df
+                        try:
+                            modify_csv(_visits_path(), VISIT_COLS, _rev)
+                            audit("visit review", f"{r['Customer']} | {verdict} | {vid}")
+                            st.session_state["flash"] = f"{_km(verdict)}: {r['Customer']}"
+                            _frag_rerun()
+                        except Exception as e:
+                            st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+
+
+def _visit_redo_notice(visits, user, customer=None):
+    """Staff see the visits a manager sent back."""
+    if visits.empty or "Review" not in visits:
+        return
+    redo = visits[visits["Review"].eq("Redo") & visits["Staff"].eq(user)].sort_values("_dt", ascending=False)
+    if customer is not None:
+        redo = redo[redo["Customer"].map(norm_name) == norm_name(customer)]
+    for r in redo.head(5).to_dict("records"):
+        later = visits[(visits["Customer"].map(norm_name) == norm_name(r["Customer"])) & (visits["_dt"] > r["_dt"])]
+        if later.empty:
+            st.error(f"🔁 ត្រូវធ្វើឡើងវិញ **{r['Customer']}** (ចុះហាងថ្ងៃ {r['_dt']:%d %b}) — {r.get('Reviewed by', 'Admin')}: “{r.get('Review note', '')}”")
+
+
+def _visit_show_photos(photos, key_prefix):
+    """Shop front first, then BEFORE | AFTER side by side, then the rest."""
+    files = [p for p in str(photos).split(";") if p and p != "-"]
+    role = lambda n: n.rsplit("_", 1)[-1].split(".")[0]
+    label = {"front": "📸 មុខហាង", "before": "🅱️ BEFORE", "after": "🅰️ AFTER"}
+    order = {"front": 0, "before": 1, "after": 2}
+    files.sort(key=lambda n: order.get(role(n), 3))
+    pair = [f for f in files if role(f) in ("before", "after")]
+    others = [f for f in files if f not in pair]
+
+    def _img(col, name):
+        try:
+            col.image(_visit_photo_load(name), use_container_width=True, caption=label.get(role(name), "រូបថត"))
+        except Exception as e:
+            col.warning(f"{name}: {str(e)[:80]}")
+    if others[:1]:
+        _img(st.columns([2, 1])[0], others[0])
+    if pair:
+        cols = st.columns(2)
+        for i, name in enumerate(pair[:2]):
+            _img(cols[i], name)
+    rest = others[1:]
+    if rest:
+        cols = st.columns(min(3, len(rest)))
+        for i, name in enumerate(rest):
+            _img(cols[i % len(cols)], name)
+
+
+def _visit_settings_admin(route):
+    st.markdown("#### 📅 How often to visit")
+    cfg = _visit_settings()
+    with st.form("visit_cfg"):
+        c1, c2 = st.columns(2)
+        big_pcs = c1.number_input("🟢 Big shop = at least this many pcs in 28 days", 100, 20000, cfg["big_pcs"], 50)
+        medium_pcs = c2.number_input("🟡 Medium shop = at least this many pcs in 28 days", 1, 20000, cfg["medium_pcs"], 50)
+        d1, d2, d3, d4 = st.columns(4)
+        big_days = d1.number_input("Visit 🟢 Big every (days)", 7, 365, cfg["big_days"], 1)
+        medium_days = d2.number_input("Visit 🟡 Medium every (days)", 7, 365, cfg["medium_days"], 1)
+        small_days = d3.number_input("Visit ⚪ Small every (days)", 7, 365, cfg["small_days"], 1)
+        staff_n = d4.number_input("Staff doing visits", 1, 20, cfg["staff"], 1)
+        save = st.form_submit_button("💾 Save", type="primary")
+    if save:
+        if medium_pcs >= big_pcs:
+            st.error("Medium must be smaller than Big.")
+        else:
+            try:
+                _visit_settings_save({"big_pcs": int(big_pcs), "medium_pcs": int(medium_pcs), "big_days": int(big_days),
+                                      "medium_days": int(medium_days), "small_days": int(small_days), "staff": int(staff_n)})
+                audit("visit settings", f"{big_pcs}/{medium_pcs} pcs, {big_days}/{medium_days}/{small_days} days, {staff_n} staff")
+                st.session_state["flash"] = "Visit frequency saved"
+                _frag_rerun()
+            except Exception as e:
+                st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+    if not route.empty:
+        sizes = route.groupby("Size").agg(Shops=("Customer", "size"), Every=("Every (days)", "first")).reset_index()
+        sizes["Visits needed / month"] = (sizes["Shops"] * 30 / sizes["Every"]).round(0)
+        need = int(sizes["Visits needed / month"].fillna(0).sum())
+        cap = VISIT_DAILY_TARGET * VISIT_WORK_DAYS * cfg["staff"]
+        _si_show(sizes.rename(columns={"Every": "Every (days)"}))
+        msg = (f"Needs about **{need} visits a month**. {cfg['staff']} staff × {VISIT_DAILY_TARGET} a day × {VISIT_WORK_DAYS} days "
+               f"= **{cap}**.")
+        if need > cap:
+            st.warning(msg + f" That is {need - cap} too many: visit Small or Medium shops less often, or do "
+                             f"{math.ceil(need / VISIT_WORK_DAYS / cfg['staff'])} visits a day.")
+        else:
+            st.success(msg + " The plan fits. 👍")
+        st.caption("Shops with no orders in 28 days are not scheduled; they appear only when they have an open problem.")
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def _visit_effect(sig, _visits, _daily, window=14):
+    """Bun pcs in the 14 days before vs after each visit, compared with all Phnom Penh shops in the same days."""
+    visits, daily = _visits, _daily
+    if visits.empty or daily.empty:
+        return pd.DataFrame()
+    today = pd.Timestamp(today_kh())
+    tot = daily.groupby("D")["Pcs"].sum()
+    by_key = {k: g.set_index("D")["Pcs"] for k, g in daily.groupby("Key")}
+    rows = []
+    for _, r in visits.iterrows():
+        d = pd.Timestamp(r["_dt"]).normalize()
+        k = norm_name(r["Customer"])
+        ser = by_key.get(k, pd.Series(dtype=float))
+        b0, b1, a0, a1 = d - pd.Timedelta(days=window), d - pd.Timedelta(days=1), d + pd.Timedelta(days=1), d + pd.Timedelta(days=window)
+        ready = a1 <= today
+        before = float(ser[(ser.index >= b0) & (ser.index <= b1)].sum())
+        after = float(ser[(ser.index >= a0) & (ser.index <= min(a1, today))].sum())
+        days_after = max(0, (min(a1, today) - d).days)
+        tb = float(tot[(tot.index >= b0) & (tot.index <= b1)].sum())
+        ta = float(tot[(tot.index >= a0) & (tot.index <= min(a1, today))].sum())
+        # compare like with like while the 14 days after are not finished yet
+        scale = window / days_after if days_after else None
+        after_full, ta_full = (after * scale, ta * scale) if scale else (None, None)
+        shop_pct = (after_full - before) / before * 100 if (scale and before > 0) else None
+        all_pct = (ta_full - tb) / tb * 100 if (scale and tb > 0) else None
+        actions = [a for a in str(r.get("Fix done", "-")).split("; ") if a and a != "-"]
+        if str(r.get("Status")) == "Fixed":
+            actions.append("Problem fixed later")
+        rows.append({"Date": f"{d:%Y-%m-%d}", "Staff": r["Staff"], "Customer": r["Customer"], "Zone": r.get("Zone", "-"),
+                     "Actions": ", ".join(actions) or "Visit only",
+                     "Pcs 14 d before": int(before), "Pcs 14 d after": int(after),
+                     "Shop change %": None if shop_pct is None else round(shop_pct),
+                     "All PP shops %": None if all_pct is None else round(all_pct),
+                     "Lift %": None if (shop_pct is None or all_pct is None) else round(shop_pct - all_pct),
+                     "Result": "✅ 14 days done" if ready else (f"⏳ {days_after} of 14 days" if days_after else "⏳ waiting")})
+    return pd.DataFrame(rows)
+
+
+def _visit_effect_body(visits, daily):
+    st.markdown("#### 📈 Did the visit help?")
+    st.caption("For each visit: the shop's bun pcs in the 14 days **before** vs the 14 days **after**. "
+               "**Lift** removes the normal ups and downs by comparing with all Phnom Penh shops in the same days: "
+               "Lift +15% = this shop grew 15 points more than the market.")
+    eff = _visit_effect(_si_frame_sig(visits) + _si_frame_sig(daily), visits, daily)
+    if eff.empty:
+        st.info("No visits yet, or no sales data.")
+        return
+    done = eff[eff["Result"].str.startswith("✅") & eff["Lift %"].notna()]
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Visits with 14 days of results", f"{len(done):,}", f"{len(eff) - len(done)} still waiting", delta_color="off")
+    k2.metric("Average lift", f"{done['Lift %'].mean():+.0f}%" if len(done) else "—")
+    k3.metric("Shops that grew more than the market", f"{(done['Lift %'] > 0).mean() * 100:.0f}%" if len(done) else "—")
+    if len(done):
+        st.markdown("**By action** — which work raises sales")
+        act = done.assign(Action=done["Actions"].str.split(", ")).explode("Action")
+        _si_show(act.groupby("Action").agg(Visits=("Customer", "size"), **{"Avg lift %": ("Lift %", "mean"),
+                 "Grew more than market": ("Lift %", lambda s: f"{(s > 0).mean() * 100:.0f}%")}).round(1)
+                 .sort_values("Avg lift %", ascending=False).reset_index())
+        st.markdown("**By staff**")
+        _si_show(done.groupby("Staff").agg(Visits=("Customer", "size"), **{"Avg lift %": ("Lift %", "mean")}).round(1).reset_index())
+    else:
+        st.info("Results appear 14 days after each visit.")
+    st.markdown("**Every visit**")
+    _si_show(eff.sort_values("Date", ascending=False).reset_index(drop=True), money=("Pcs 14 d before", "Pcs 14 d after"),
+             height=min(460, 60 + 36 * len(eff)))
+
+
+def _visit_scorecard_body(visits, daily, names):
+    st.markdown("#### 🏅 Monthly scorecard")
+    if visits.empty:
+        st.info("មិនទាន់មានការចុះហាងទេ។")
+        return
+    months = sorted(visits["_dt"].dt.strftime("%Y-%m").unique(), reverse=True)
+    c1, c2 = st.columns(2)
+    month = c1.selectbox("Month", months, key="vs_month")
+    staff_all = sorted(visits["Staff"].unique())
+    who = c2.selectbox("Staff", staff_all, key="vs_staff") if len(staff_all) > 1 else staff_all[0]
+    m0 = pd.Timestamp(month + "-01")
+    m1 = m0 + pd.offsets.MonthEnd(0)
+    v = visits[(visits["_dt"] >= m0) & (visits["_dt"] <= m1 + pd.Timedelta(hours=23, minutes=59)) & (visits["Staff"] == who)].copy()
+    for c in ("Minutes", "Stickers changed", "Check score %", "Satisfaction"):
+        v[c] = pd.to_numeric(v[c], errors="coerce")
+    day_counts = v.assign(Day=v["_dt"].dt.date, Key=v["Customer"].map(norm_name)).groupby("Day")["Key"].nunique()
+    fixed = visits[(visits["Fixed by"] != "-") & pd.to_datetime(visits["Fixed at"], errors="coerce").between(m0, m1 + pd.Timedelta(days=1))]
+    eff = _visit_effect(_si_frame_sig(visits) + _si_frame_sig(daily), visits, daily)
+    eff_m = eff[(eff["Staff"] == who) & eff["Date"].str.startswith(month) & eff["Lift %"].notna()] if not eff.empty else eff
+    zone_chg = None
+    if not daily.empty:
+        p0, p1 = m0 - pd.offsets.MonthBegin(1), m0 - pd.Timedelta(days=1)
+        last_day = min(m1, pd.Timestamp(today_kh()))
+        n_days = (last_day - m0).days + 1
+        cur = daily[(daily["D"] >= m0) & (daily["D"] <= last_day)]["Pcs"].sum()
+        prev = daily[(daily["D"] >= p0) & (daily["D"] <= min(p1, p0 + pd.Timedelta(days=n_days - 1)))]["Pcs"].sum()
+        zone_chg = (cur - prev) / prev * 100 if prev > 0 else None
+    st.markdown(f"**{who} · {m0:%B %Y}**")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Visits", f"{len(v):,}", f"{v['Customer'].nunique()} shops", delta_color="off")
+    a2.metric("Visits per working day", f"{day_counts.mean():.1f}" if len(day_counts) else "—",
+              f"{int((day_counts >= VISIT_DAILY_TARGET).sum())} / {len(day_counts)} days hit {VISIT_DAILY_TARGET}", delta_color="off")
+    a3.metric("Confirmed at shop", f"{v['Location check'].str.startswith('✅').mean() * 100:.0f}%" if len(v) else "—")
+    a4.metric("Avg minutes per shop", f"{v['Minutes'].mean():.0f}" if v["Minutes"].notna().any() else "—")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Stickers changed", f"{int(v['Stickers changed'].fillna(0).sum()):,}")
+    b2.metric("Problems found / fixed", f"{int((v['Problems'] != '-').sum())} / {len(fixed)}")
+    b3.metric("Shop check score", f"{v['Check score %'].mean():.0f}%" if v["Check score %"].notna().any() else "—")
+    b4.metric("Lift of visited shops", f"{eff_m['Lift %'].mean():+.0f}%" if len(eff_m) else "⏳ wait 14 d")
+    covered = visits.assign(Key=visits["Customer"].map(norm_name))
+    covered = covered[covered["_dt"] >= pd.Timestamp(today_kh()) - pd.Timedelta(days=90)]["Key"].nunique()
+    st.caption(f"Phnom Penh bun pcs this month: {('%+.0f%%' % zone_chg) if zone_chg is not None else '—'} vs the same days last month · "
+               f"shops visited in the last 90 days: {covered} of {len(names)}.")
+    st.markdown("**Month by month**")
+    hist = visits[visits["Staff"] == who].assign(Month=visits["_dt"].dt.strftime("%Y-%m"), Key=visits["Customer"].map(norm_name),
+                                                Day=visits["_dt"].dt.date)
+    hist["Stickers changed"] = pd.to_numeric(hist["Stickers changed"], errors="coerce").fillna(0)
+    trend = hist.groupby("Month").agg(Visits=("VisitID", "size"), Shops=("Key", "nunique"), Days=("Day", "nunique"),
+                                      **{"At shop %": ("Location check", lambda s: round(s.str.startswith("✅").mean() * 100)),
+                                         "Stickers": ("Stickers changed", "sum"),
+                                         "Problems found": ("Problems", lambda s: int((s != "-").sum()))}).reset_index()
+    trend["Visits / day"] = (trend["Visits"] / trend["Days"]).round(1)
+    if not eff.empty:
+        lift = eff[(eff["Staff"] == who) & eff["Lift %"].notna()].assign(Month=lambda f: f["Date"].str[:7]).groupby("Month")["Lift %"].mean().round(0)
+        trend["Avg lift %"] = trend["Month"].map(lift)
+    _si_show(trend.sort_values("Month", ascending=False))
+
+
+def _visit_match_admin(names, have, cands):
+    """Shops without a location + the Customer Map pins whose name looks alike. Admin ticks the right one."""
+    rows = []
+    for k, n in sorted(names.items(), key=lambda x: str(x[1]).upper()):
+        if k in have:
+            continue
+        for score, pid, pname, lat, lon in cands.get(k, []):
+            rows.append({"Use": False, "Shop (Master List)": n, "Pin name in Customer Map": pname,
+                         "Same name %": round(score * 100), "Check": f"https://www.google.com/maps?q={lat},{lon}",
+                         "_lat": lat, "_lon": lon})
+    with st.expander(f"🔗 Match Customer Map pins to shops ({len({r['Shop (Master List)'] for r in rows})} shops have a likely pin)",
+                     expanded=bool(rows)):
+        if not rows:
+            st.caption("No more likely matches. Shops left without a location must be saved at the shop.")
+            return
+        st.caption("These pins are in 📍 Customer Map but their name is spelled differently from the Master List. "
+                   "Tick **Use** on the correct pin (one per shop) and press Save. Open **Check** if you are not sure.")
+        frame = pd.DataFrame(rows)
+        edited = st.data_editor(frame.drop(columns=["_lat", "_lon"]), hide_index=True, use_container_width=True, key="vmatch_editor",
+                                disabled=["Shop (Master List)", "Pin name in Customer Map", "Same name %", "Check"],
+                                column_config={"Use": st.column_config.CheckboxColumn("Use"),
+                                               "Check": st.column_config.LinkColumn("Check", display_text="open map")},
+                                height=min(520, 60 + 35 * len(frame)))
+        picked = frame[edited["Use"].fillna(False).astype(bool).values]
+        dup = picked["Shop (Master List)"].duplicated(keep=False)
+        if dup.any():
+            st.error("Tick only one pin per shop: " + ", ".join(sorted(set(picked.loc[dup, "Shop (Master List)"]))))
+        elif st.button(f"💾 Save {len(picked)} match(es)", type="primary", disabled=picked.empty, key="vmatch_save"):
+            try:
+                rows_out = [{"Date": now_str(), "Customer": r["Shop (Master List)"], "Lat": f"{r['_lat']:.6f}", "Lon": f"{r['_lon']:.6f}",
+                             "Accuracy m": "-", "Source": "Customer Map pin (confirmed)", "By": current_user() or "-",
+                             "Status": "Active", "Note": f"map name: {r['Pin name in Customer Map']}"[:150]} for _, r in picked.iterrows()]
+                append_rows(VISIT_PIN_FILE, rows_out)
+                audit("shop pins matched", f"{len(rows_out)} shops")
+                st.session_state["flash"] = f"Linked {len(rows_out)} shop(s) to their map pin"
+                _frag_rerun()
+            except Exception as e:
+                st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+
+
+def _visit_pins_admin(names):
+    st.markdown("#### 📍 Shop locations")
+    registry = _visit_registry()
+    store = _visit_pin_store()
+    cands, auto = _visit_candidates_for(names, registry)
+    have = {k for k, n in names.items() if _visit_pin(n, registry, store, auto)}
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Phnom Penh shops with a location", f"{len(have)} / {len(names)}")
+    p2.metric("Linked automatically (spelling)", f"{sum(1 for k in auto if k in have and k not in store):,}")
+    p3.metric("Saved / confirmed by staff", f"{sum(1 for k in names if k in store):,}")
+    p4.metric("Still missing", f"{len(names) - len(have):,}")
+    _visit_match_admin(names, have, cands)
+    st.caption("A visit cannot start without a location. Staff save it at the shop with GPS (or a Google Maps link); "
+               "a location saved at the shop is used before the 📍 Customer Map pin. Remove a location here if it is wrong.")
+    try:
+        df = read_raw(VISIT_PIN_FILE, VISIT_PIN_COLS)
+    except Exception as e:
+        st.warning("Shop locations could not be read: " + str(e)[:120])
+        return
+    act = df[df["Status"].eq("Active")].sort_values("_dt", ascending=False)
+    if act.empty:
+        st.info("No locations saved by staff yet.")
+    else:
+        show = act.assign(Map=[f"https://www.google.com/maps?q={a},{b}" for a, b in zip(act["Lat"], act["Lon"])])[
+            ["Date", "Customer", "Source", "Accuracy m", "By", "Note", "Map"]].reset_index(drop=True)
+        try:
+            st.dataframe(show, hide_index=True, use_container_width=True,
+                         column_config={"Map": st.column_config.LinkColumn("Map", display_text="open")},
+                         height=min(420, 60 + 35 * len(show)))
+        except Exception:
+            st.dataframe(show, hide_index=True, use_container_width=True)
+        pick = st.selectbox("Remove a wrong location", ["-"] + [f"{r['Date']} · {r['Customer']}" for _, r in act.iterrows()], key="vpin_rm")
+        if pick != "-" and st.button("🗑️ Remove this location", key="vpin_rm_btn"):
+            d, c = pick.split(" · ", 1)
+
+            def _rm(frame, d=d, c=c):
+                m = frame["Date"].eq(d) & frame["Customer"].eq(c) & frame["Status"].eq("Active")
+                frame.loc[m, "Status"] = "Removed"
+                frame.loc[m, "Note"] = safe_text(f"removed by {current_user() or '-'} {now_str()}", 120)
+                return frame
+            try:
+                modify_csv(VISIT_PIN_FILE, VISIT_PIN_COLS, _rm)
+                audit("shop pin removed", pick)
+                st.session_state["flash"] = "Location removed"
+                _frag_rerun()
+            except Exception as e:
+                st.error("Could not remove: " + str(e)[:150])
+    missing = sorted(n for k, n in names.items() if k not in have)
+    if missing:
+        with st.expander(f"Shops still without a location ({len(missing)})"):
+            st.write(", ".join(missing))
+
+
+# ---------- 🆕 new customers from the NPHK Leads Report ----------
+LEAD_COLS = ["Date", "Customer", "Phone", "Channel", "Sales rep", "Province", "Package", "Qty", "Lead status",
+             "Map link", "Lat", "Lon", "Map note", "Notes", "Master name", "Imported at", "Imported by"]
+LEAD_FIRST_VISIT_DAYS = 7          # a new shop should get its first visit within this many days of the sale
+LEAD_NEW_DAYS = 45                 # a sale this recent still counts as "new customer"
+LEAD_HEADER_MAP = {"DATE": "Date", "CUSTOMER NAME": "Customer", "PHONE NUMBER": "Phone", "CHANNEL": "Channel",
+                   "ASSIGNED SALES REP": "Sales rep", "LOCATION / PROVINCE": "Province", "PRODUCT PACKAGE / MODEL": "Package",
+                   "QUANTITY (QTY)": "Qty", "INQUIRY STATUS": "Lead status", "GOOGLE MAPS URL": "Map link",
+                   "NOTES / REMARKS": "Notes"}
+LEAD_FIRST_VISIT_CHECKS = ["Fridge installed & plugged in", "Stickers / poster put up",
+                           "Owner knows prices & how to heat buns", "Owner has our phone / Telegram"]
+
+
+def _lead_is_pp(province):
+    p = unicodedata.normalize("NFC", str(province or "")).replace(" ", "")
+    return p in ("ភ្នំពេញ", "PhnomPenh", "PHNOMPENH")
+
+
+def _lead_is_sale(status):
+    s = str(status or "").upper()
+    return "CLOSED" in s or "CONFIRM" in s or "ទិញ" in s
+
+
+def _lead_parse_report(data):
+    """NPHK Leads Report .xlsx -> DataFrame with LEAD_COLS fields (header row found by 'CUSTOMER NAME')."""
+    raw = pd.read_excel(io.BytesIO(data), header=None, dtype=object)
+    hdr = None
+    for i in range(min(15, len(raw))):
+        cells = [str(v).strip().upper() for v in raw.iloc[i].tolist()]
+        if "CUSTOMER NAME" in cells:
+            hdr = i
+            break
+    if hdr is None:
+        raise ValueError("this is not a Leads Report: no 'CUSTOMER NAME' column found")
+    cols = [str(v).strip().upper() for v in raw.iloc[hdr].tolist()]
+    df = raw.iloc[hdr + 1:].copy()
+    df.columns = cols
+    out = pd.DataFrame({new: df[old] if old in df else "" for old, new in LEAD_HEADER_MAP.items()})
+    out = out[out["Customer"].notna() & out["Customer"].astype(str).str.strip().ne("")]
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out["Qty"] = pd.to_numeric(out["Qty"], errors="coerce").fillna(0).astype(int).astype(str)
+    for c in out.columns:
+        out[c] = out[c].map(lambda v: "-" if v is None or (isinstance(v, float) and math.isnan(v)) or str(v).strip() in ("", "nan", "NaT") else re.sub(r"\s+", " ", str(v)).strip())
+    return out.reset_index(drop=True)
+
+
+def _lead_read():
+    try:
+        return read_raw(LEADS_FILE, LEAD_COLS, max_age=300)
+    except Exception as e:
+        st.warning("New customer list could not be read: " + str(e)[:150])
+        return pd.DataFrame(columns=LEAD_COLS + ["_dt"])
+
+
+def _lead_master_index(snap):
+    """{match key: (Master List name, area)} for every customer in the Master List."""
+    areas = (snap or {}).get("areas", {}) or {}
+    return {_visit_match_key(n): (n, areas.get(n, "Unknown")) for n in (snap or {}).get("customers", [])}
+
+
+def _lead_best_master(name, mindex):
+    import difflib
+    k = _visit_match_key(name)
+    if k in mindex:
+        return mindex[k][0], 1.0
+    best, score = None, 0.0
+    for mk, (mn, _a) in mindex.items():
+        sm = difflib.SequenceMatcher(None, k, mk)
+        if sm.real_quick_ratio() < 0.6 or sm.quick_ratio() < 0.6:
+            continue
+        r = sm.ratio()
+        if len(k) >= 4 and (mk.startswith(k) or k.startswith(mk)):
+            r = max(r, 0.86)
+        if r > score:
+            best, score = mn, r
+    return best, score
+
+
+def _lead_map_coords(url, allow_network=True):
+    """(lat, lon, note) from a Google Maps link; short links are opened when allowed."""
+    if not url or url == "-":
+        return None, None, "no map link"
+    try:
+        a = analyse_map_link(url)
+        if a.get("Map status") != "Ready pin" and allow_network and trusted_map_url(url):
+            a = analyse_map_link(resolve_map_link(url))
+        if a.get("Map status") == "Ready pin":
+            lat, lon = float(a["Latitude"]), float(a["Longitude"])
+            if 10 <= lat <= 15 and 102 <= lon <= 108:
+                return lat, lon, "ok"
+            return None, None, "outside Cambodia"
+        return None, None, a.get("Map status", "no pin")
+    except Exception as e:
+        return None, None, "link could not be opened: " + str(e)[:60]
+
+
+def _lead_active(leads, mindex=None):
+    """New customers that count for visits: confirmed sales in the last LEAD_NEW_DAYS days.
+    -> {norm key of the name used in the visit list: dict(name, date, pp, lat, lon)}"""
+    out = {}
+    if leads is None or leads.empty:
+        return out
+    cut = pd.Timestamp(today_kh()) - pd.Timedelta(days=LEAD_NEW_DAYS)
+    for _, r in leads.iterrows():
+        d = pd.to_datetime(r["Date"], errors="coerce")
+        if pd.isna(d) or d < cut or not _lead_is_sale(r["Lead status"]):
+            continue
+        name = r["Master name"] if r["Master name"] not in ("-", "") else r["Customer"]
+        area = (mindex or {}).get(_visit_match_key(name), (None, None))[1]
+        pp = (area == PP) if area in (PP, "Province") else _lead_is_pp(r["Province"])
+        try:
+            lat, lon = float(r["Lat"]), float(r["Lon"])
+        except Exception:
+            lat = lon = None
+        k = norm_name(name)
+        if k not in out or d > out[k]["date"]:
+            out[k] = {"name": name, "date": d, "pp": pp, "lat": lat, "lon": lon, "lead": r["Customer"],
+                      "in_master": r["Master name"] not in ("-", "")}
+    return out
+
+
+def _lead_checks(leads, mindex):
+    """Problems a person should fix in the Master List or the leads report."""
+    rows = []
+    if leads.empty:
+        return pd.DataFrame(columns=["Problem", "Customer", "Date", "Detail"])
+    seen = {}
+    for _, r in leads.iterrows():
+        name, master = r["Customer"], r["Master name"]
+        if master in ("-", ""):
+            best, sc = _lead_best_master(name, mindex)
+            rows.append({"Problem": "❗ Not in Master List", "Customer": name, "Date": r["Date"],
+                         "Detail": f"closest: {best} ({sc * 100:.0f}%)" if best and sc >= 0.6 else "add this shop to the Master List"})
+        else:
+            area = mindex.get(_visit_match_key(master), (None, None))[1]
+            lp = r["Province"]
+            if lp not in ("-", "") and area in (PP, "Province") and (_lead_is_pp(lp) != (area == PP)):
+                rows.append({"Problem": "⚠️ Province differs", "Customer": name, "Date": r["Date"],
+                             "Detail": f"leads report: {lp} · Master List: {area}"})
+            if _visit_match_key(master) != _visit_match_key(name):
+                rows.append({"Problem": "ℹ️ Spelled differently", "Customer": name, "Date": r["Date"],
+                             "Detail": f"Master List: {master}"})
+        if r["Province"] in ("-", ""):
+            rows.append({"Problem": "⚠️ No province", "Customer": name, "Date": r["Date"], "Detail": "fill LOCATION / PROVINCE"})
+        if r["Map link"] in ("-", ""):
+            rows.append({"Problem": "⚠️ No map link", "Customer": name, "Date": r["Date"], "Detail": "add the shop's Google Maps link"})
+        elif r["Lat"] in ("-", ""):
+            rows.append({"Problem": "⚠️ Map link has no pin", "Customer": name, "Date": r["Date"], "Detail": r["Map note"]})
+        k = _visit_match_key(r["Master name"] if r["Master name"] not in ("-", "") else name)
+        if k in seen:
+            rows.append({"Problem": "⚠️ Listed twice", "Customer": name, "Date": r["Date"], "Detail": f"also on {seen[k]}"})
+        seen[k] = r["Date"]
+    import difflib
+    keys = [(_visit_match_key(n), n) for n in leads["Customer"].unique()]
+    for i, (a, an) in enumerate(keys):
+        for b, bn in keys[i + 1:]:
+            if a != b and difflib.SequenceMatcher(None, a, b).ratio() >= 0.9:
+                rows.append({"Problem": "⚠️ Maybe the same shop", "Customer": an, "Date": "", "Detail": f"and “{bn}”"})
+    return pd.DataFrame(rows)
+
+
+def _lead_import_body(snap, visits):
+    st.markdown("#### 🆕 New customers (from the NPHK Leads Report)")
+    leads = _lead_read()
+    mindex = _lead_master_index(snap)
+    if has_permission("edit"):
+        up = st.file_uploader("Upload the Leads Report (.xlsx)", type=["xlsx"], key="lead_upload",
+                              help="The daily report from Sales & Marketing. Rows already imported are updated, not doubled.")
+        if up is not None:
+            try:
+                new = _lead_parse_report(up.getvalue())
+            except Exception as e:
+                st.error("Could not read the file: " + str(e)[:160])
+                new = None
+            if new is not None:
+                sales = new[new["Lead status"].map(_lead_is_sale)]
+                st.caption(f"{len(new)} rows in the file · {len(sales)} confirmed sales.")
+                if st.button(f"⬆️ Import {len(new)} rows", type="primary", key="lead_import_btn"):
+                    with st.spinner("Matching names and opening map links…"):
+                        old = {(_visit_match_key(c), d): r for (c, d), r in
+                               zip(zip(leads["Customer"], leads["Date"]), leads.to_dict("records"))} if not leads.empty else {}
+                        rows = []
+                        for _, r in new.iterrows():
+                            prev = old.get((_visit_match_key(r["Customer"]), r["Date"]))
+                            master, sc = _lead_best_master(r["Customer"], mindex)
+                            master = master if sc >= 0.999 else (prev["Master name"] if prev else "-")
+                            if prev and prev["Map link"] == r["Map link"] and prev["Lat"] not in ("-", ""):
+                                lat, lon, note = prev["Lat"], prev["Lon"], prev["Map note"]
+                            else:
+                                la, lo, note = _lead_map_coords(r["Map link"])
+                                lat, lon = (f"{la:.6f}", f"{lo:.6f}") if la is not None else ("-", "-")
+                            rows.append({**r.to_dict(), "Lat": lat, "Lon": lon, "Map note": note, "Master name": master or "-",
+                                         "Imported at": now_str(), "Imported by": current_user() or "-"})
+                        keys_new = {(_visit_match_key(r["Customer"]), r["Date"]) for r in rows}
+
+                        def _merge(df, rows=rows, keys_new=keys_new):
+                            df = df.drop(columns=[c for c in ("_dt",) if c in df])
+                            keep = df[[(_visit_match_key(c), d) not in keys_new for c, d in zip(df["Customer"], df["Date"])]]
+                            return pd.concat([keep, pd.DataFrame(rows)], ignore_index=True)
+                        try:
+                            modify_csv(LEADS_FILE, LEAD_COLS, _merge)
+                            audit("leads imported", f"{len(rows)} rows from {up.name}")
+                            st.session_state["flash"] = f"Imported {len(rows)} new-customer rows"
+                            st.session_state.pop("lead_upload", None)
+                            _frag_rerun()
+                        except Exception as e:
+                            st.error("Could not save: " + str(e)[:160])
+    if leads.empty:
+        st.info("No leads imported yet. Upload the NPHK Leads Report above.")
+        return
+    active = _lead_active(leads, mindex)
+    visited = {}
+    if not visits.empty:
+        vv = visits.assign(Key=visits["Customer"].map(norm_name))
+        visited = vv.groupby("Key")["_dt"].max().to_dict()
+    pp = {k: v for k, v in active.items() if v["pp"]}
+    waiting = {k: v for k, v in pp.items() if not (k in visited and visited[k] >= v["date"])}
+    late = {k: v for k, v in waiting.items() if (pd.Timestamp(today_kh()) - v["date"]).days > LEAD_FIRST_VISIT_DAYS}
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("New customers (last 45 days)", f"{len(active):,}", f"{len(pp)} in Phnom Penh", delta_color="off")
+    k2.metric("Phnom Penh: first visit done", f"{len(pp) - len(waiting)} / {len(pp)}")
+    k3.metric(f"First visit late (> {LEAD_FIRST_VISIT_DAYS} days)", f"{len(late):,}")
+    k4.metric("Not in Master List", f"{int(leads['Master name'].isin(['-', '']).sum()):,}")
+
+    # ---- link names to the Master List
+    unl = leads[leads["Master name"].isin(["-", ""])].copy()
+    if not unl.empty and has_permission("edit"):
+        with st.expander(f"🔗 Link {len(unl)} leads to their Master List name", expanded=True):
+            st.caption("Choose the same shop's name in the Master List. Leave empty if the shop is not in the Master List yet "
+                       "(add it there first). Linked shops get their sales history, zone and map location.")
+            options = [""] + sorted(n for n, _a in mindex.values())
+            unl["Master List name"] = [(lambda b: b[0] if b[0] and b[1] >= 0.86 else "")(_lead_best_master(n, mindex)) for n in unl["Customer"]]
+            view = unl[["Date", "Customer", "Province", "Master List name"]].reset_index()
+            ed = st.data_editor(view, hide_index=True, use_container_width=True, key="lead_link_editor",
+                                disabled=["index", "Date", "Customer", "Province"],
+                                column_config={"index": None, "Master List name": st.column_config.SelectboxColumn(
+                                    "Master List name", options=options, help="Suggested when the names are very close — check it")},
+                                height=min(480, 60 + 35 * len(view)))
+            chosen = ed[ed["Master List name"].fillna("").ne("")]
+            if st.button(f"💾 Save {len(chosen)} link(s)", type="primary", disabled=chosen.empty, key="lead_link_save"):
+                pairs = {(r["Customer"], r["Date"]): r["Master List name"] for _, r in chosen.iterrows()}
+
+                def _link(df, pairs=pairs):
+                    for (c, d), m in pairs.items():
+                        df.loc[df["Customer"].eq(c) & df["Date"].eq(d), "Master name"] = m
+                    return df
+                try:
+                    modify_csv(LEADS_FILE, LEAD_COLS, _link)
+                    audit("leads linked", f"{len(pairs)}")
+                    st.session_state["flash"] = f"Linked {len(pairs)} lead(s)"
+                    _frag_rerun()
+                except Exception as e:
+                    st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:150])
+
+    st.markdown("**🗓️ First visit for new Phnom Penh shops**")
+    if pp:
+        rows = []
+        for k, v in sorted(pp.items(), key=lambda x: x[1]["date"]):
+            days = (pd.Timestamp(today_kh()) - v["date"]).days
+            done = k in visited and visited[k] >= v["date"]
+            rows.append({"Sold on": f"{v['date']:%d %b}", "Shop": v["name"], "Days since sale": days,
+                         "First visit": f"✅ {visited[k]:%d %b}" if done else ("🔴 late" if days > LEAD_FIRST_VISIT_DAYS else "⏳ to do"),
+                         "Map": "📍 yes" if v["lat"] is not None else "⚠️ no pin",
+                         "In Master List": "yes" if v["in_master"] else "❗ no"})
+        _si_show(pd.DataFrame(rows))
+    else:
+        st.caption("No new Phnom Penh customers in the last 45 days.")
+    st.markdown("**🧹 Things to fix in the Master List / leads report**")
+    chk = _lead_checks(leads, mindex)
+    if chk.empty:
+        st.success("Everything matches. 🎉")
+    else:
+        st.caption(" · ".join(f"{p}: {n}" for p, n in chk["Problem"].value_counts().items()))
+        _si_show(chk, height=min(460, 60 + 35 * len(chk)))
+    with st.expander("All imported leads"):
+        _si_show(leads.drop(columns=["_dt"], errors="ignore"))
+
+
+def _visit_start(customer):
+    """Button callback: runs before the page is drawn again, so it may switch the section."""
+    st.session_state["visit_customer"] = customer
+    st.session_state.pop("visit_customer_box", None)
+    st.session_state["visit_zone_force"] = True
+    st.session_state["visit_view"] = "📝 New visit"
+
+
+def _visit_test_clear():
+    try:
+        with _sync_state()["lock"], file_lock(VISITS_TEST_FILE):
+            _write_atomic(VISITS_TEST_FILE, (",".join(VISIT_COLS) + "\n").encode("utf-8-sig"))
+            if USE_DROPBOX:
+                try:
+                    pull(VISITS_TEST_FILE, force=True)
+                except Exception:
+                    pass
+                _write_atomic(VISITS_TEST_FILE, (",".join(VISIT_COLS) + "\n").encode("utf-8-sig"))
+                push(VISITS_TEST_FILE)
+        for k in [k for k in st.session_state if str(k).startswith(("visit_gps", "visit_customer"))]:
+            st.session_state.pop(k, None)
+        audit("shop visit TEST cleared")
+        st.session_state["flash"] = "🧪 Test visits deleted"
+    except Exception as e:
+        st.session_state["visit_gps_error"] = "Could not clear test visits: " + str(e)[:120]
+
+
+def tab_shop_visits():
+    """Shop Visits runs as a fragment: tapping inside it redraws only this section, not the whole app."""
+    want_live = (st.session_state.get("visit_view") == "📊 Visit report" and bool(st.session_state.get("vr_live")))
+    st.session_state["_visit_live_wrapper"] = want_live
+    try:
+        (_shop_visits_live if want_live else _shop_visits_fragment)()
+    except Exception as e:
+        if "fragment" in str(e).lower():
+            _shop_visits_body()           # older Streamlit without fragments
+        else:
+            raise
+
+
+@st.fragment
+def _shop_visits_fragment():
+    _shop_visits_body()
+
+
+@st.fragment(run_every=30)
+def _shop_visits_live():
+    _shop_visits_body()
+
+
+def _shop_visits_body():
+    if _vf_draft_restore():                              # before any switch is drawn (it may turn Test mode on)
+        st.session_state["visit_view"] = "📝 New visit"
+        st.toast("បានយករបាយការណ៍ដែលមិនទាន់រួចមកវិញ។ សូមបន្តពីកន្លែងដែលបានឈប់។", icon="↩️")
+    _flash = st.session_state.pop("flash", None)        # saves redraw only Shop Visits, so show their message here
+    if _flash:
+        st.toast(_flash, icon="✅")
+    h1, h2, h3 = st.columns([3, 1.3, 2])
+    h1.markdown("### 🏪 ចុះជួបហាង (Shop Visits)")
+    _visit_phone_mode()
+    h2.toggle("📱 Phone mode", key="visit_phone", help="ប៊ូតុងធំ និងទម្រង់ជាជំហានៗ។ បើកដោយស្វ័យប្រវត្តិលើទូរស័ព្ទ។")
+    if _visit_phone_mode():
+        st.markdown(VISIT_PHONE_CSS, unsafe_allow_html=True)
+    if current_role() == "admin":
+        h3.toggle("🧪 Test mode (practice — not in real reports)", key="visit_test_mode",
+                  on_change=lambda: [st.session_state.pop(k, None) for k in ("visit_gps", "visit_customer", "visit_customer_box", "visit_draft")])
+    if _visit_test_mode():
+        b1, b2 = st.columns([4, 1])
+        b1.warning("🧪 **TEST MODE.** You can fill in visits from anywhere: no real GPS or shop location needed, any photo is "
+                   "accepted. Test visits are saved separately and never appear in the real plan, reports or scorecard. "
+                   "Switch it off to see real data again.")
+        b2.button("🗑️ Delete all test visits", key="visit_test_clear", on_click=_visit_test_clear, use_container_width=True)
+    views = ["📋 Today's plan", "📝 New visit", "🆕 New customers"]
+    if has_permission("reports"):
+        views += ["✅ Review visits", "📊 Visit report", "🔴 Open problems", "📈 Did it help?", "🏅 Scorecard"]
+    if current_role() == "admin":
+        views.append("⚙️ Shops & zones")
+    if st.session_state.get("visit_view") not in views:
+        st.session_state["visit_view"] = views[0]
+    if _visit_phone_mode():
+        view = st.selectbox("ផ្នែក", views, key="visit_view", label_visibility="collapsed", format_func=_km)
+    else:
+        view = st.radio("ផ្នែក", views, horizontal=True, key="visit_view", label_visibility="collapsed", format_func=_km)
+    if (view == "📊 Visit report" and bool(st.session_state.get("vr_live"))) != st.session_state.get("_visit_live_wrapper", False):
+        st.rerun()                        # switch between the normal and the auto-refresh wrapper
+    visits = _visit_read()
+    if view == "📝 New visit":
+        if not has_permission("edit"):
+            st.info("គណនីរបស់អ្នកអាចមើលបាន ប៉ុន្តែមិនអាចកត់ត្រាការចុះហាងបានទេ។")
+            return
+        stats, names, _areas = _visit_customer_stats()
+        _visit_new_form(visits, stats, names)
+    elif view == "📋 Today's plan":
+        user = current_user() or "-"
+        stats, names, areas = _visit_customer_stats()
+        if not names:
+            st.info("រកមិនឃើញអតិថិជននៅភ្នំពេញទេ។ សូមពិនិត្យតំបន់ក្នុង Master List។")
+            return
+        _visit_progress(visits, user)
+        _visit_redo_notice(visits, user)
+        zone_map = _visit_zone_map(names)
+        zone_src = {k: v[1] for k, v in _visit_zone_info(names).items()}
+        all_route = _visit_route(visits, stats, names, areas, zone_map)
+        due_all = _visit_is_due(all_route)
+        zone = _visit_zone_picker(zone_map, "visit_zone_plan", Counter(due_all["Area"]))
+        route = all_route[all_route["Area"].eq(zone)].reset_index(drop=True) if zone else all_route
+        st.caption(f"📅 ហាងនៅភ្នំពេញ {len(due_all)} ត្រូវចុះឥឡូវ · ក្នុងតំបន់នេះ {len(_visit_is_due(route))}។")
+        if route.empty:
+            st.info("មិនទាន់មានហាងក្នុងតំបន់នេះទេ។")
+            return
+        registry = _visit_registry()
+        pin_store = _visit_pin_store()
+        try:
+            _c, auto_pins = _visit_candidates_for(names, registry)
+        except Exception:
+            auto_pins = {}
+        done_today = set(visits.loc[visits["_dt"].dt.date == today_kh(), "Customer"].map(norm_name)) if not visits.empty else set()
+        todo = route[~route["Customer"].map(norm_name).isin(done_today)]
+        st.markdown(f"**⭐ ហាងណែនាំ {VISIT_DAILY_TARGET} សម្រាប់ថ្ងៃនេះ** — ហាងសំខាន់បំផុតក្នុងតំបន់នេះ")
+        q = st.text_input("🔎 ស្វែងរកហាងក្នុងតំបន់នេះ", key="vroute_q", max_chars=60)
+        r = todo if not q.strip() else todo[todo["Customer"].str.contains(q.strip(), case=False, regex=False)]
+        for n, (i, row) in enumerate(r.head(VISIT_DAILY_TARGET + 12).iterrows()):
+            if n == VISIT_DAILY_TARGET and not q.strip():
+                st.markdown("**ហាងផ្សេងទៀតក្នុងតំបន់នេះ**")
+            link, exact = _visit_map_link(row["Customer"], registry, pin_store, auto_pins)
+            with st.container(border=True):
+                c1, c2, c3 = st.columns([4, 1, 1])
+                c1.markdown(f"**{'⭐ ' if n < VISIT_DAILY_TARGET and not q.strip() else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
+                            f"<span style='color:#6B7280'>{_km(row['Size'])} · ចុះហាងចុងក្រោយ {_km_days(row['Last visit'])} · {row['Pcs 28 days']:,} pcs ក្នុង ២៨ ថ្ងៃ"
+                            f" · {zone_src.get(norm_name(row['Customer']), '')}</span>",
+                            unsafe_allow_html=True)
+                c2.link_button("🧭 ទៅ" if exact else "⚠️ គ្មានទីតាំង", link, use_container_width=True,
+                               help="ផ្លូវទៅទីតាំងហាងដែលបានរក្សាទុក" if exact
+                               else "No saved location yet: this searches the name on Google Maps. Save the real location at the shop.")
+                c3.button("ចាប់ផ្តើម ▶", key=f"vstart_{i}", use_container_width=True,
+                          on_click=_visit_start, args=(row["Customer"],))
+        if done_today & set(route["Customer"].map(norm_name)):
+            st.caption("✅ បានចុះរួចថ្ងៃនេះ (ដោយអ្នកណាម្នាក់): " + ", ".join(route.loc[route["Customer"].map(norm_name).isin(done_today), "Customer"]))
+    elif view == "⚙️ Shops & zones":
+        stats, names, areas = _visit_customer_stats()
+        _visit_settings_admin(_visit_route(visits, stats, names, areas, _visit_zone_map(names)))
+        st.divider()
+        _visit_pins_admin(names)
+        st.divider()
+        _visit_zones_admin(names, visits)
+    elif view == "✅ Review visits":
+        _visit_review_body(visits)
+    elif view == "🆕 New customers":
+        snap, _src, _path, _err = current_snapshot()
+        _visit_customer_stats()
+        _lead_import_body(snap or {}, visits)
+    elif view == "📈 Did it help?":
+        _s, names, _a = _visit_customer_stats()
+        _visit_effect_body(visits, st.session_state.get("_visit_daily", pd.DataFrame()))
+    elif view == "🏅 Scorecard":
+        _s, names, _a = _visit_customer_stats()
+        _visit_scorecard_body(visits, st.session_state.get("_visit_daily", pd.DataFrame()), names)
+    elif view == "📊 Visit report":
+        live = st.toggle("🔄 Live (refresh every 30 s)", key="vr_live")
+        if live != st.session_state.get("_visit_live_wrapper", False):
+            st.rerun()
+        if live:
+            st.caption(f"Live · updated {now_kh():%H:%M:%S}")
+        _visit_report_body(visits)
+    elif view == "🔴 Open problems":
+        _visit_problems_body(visits)
+
+
 ROLE = require_login()                     # nothing below runs until the person is logged in
+_visit_read_gps_params()                   # a shop check-in comes back in the address bar
+if "main_section" not in st.session_state:  # new session (phone woke up / reconnected) with an unfinished visit
+    try:
+        _dp = _vf_draft_path(current_user())
+        if os.path.exists(_dp) and time.time() - os.path.getmtime(_dp) < VF_DRAFT_KEEP_H * 3600:
+            st.session_state["main_section"] = "🏪 Shop Visits"
+    except Exception:
+        pass
 
 _flash = st.session_state.pop("flash", None)
 if _flash:
@@ -8247,6 +11603,8 @@ elif _perms.get("reports"):
     labels.append("📑 Reports")
 if _perms.get("view") or _perms.get("reports"):
     labels.append("📞 Customer Follow-ups")
+if ROLE in ("admin", "staff", "sales") and (_perms.get("edit") or _perms.get("reports")):
+    labels.append("🏪 Shop Visits")
 if ROLE == "admin":
     labels.append("🤖 4. Admin: Bot, Users & Security")
 if not labels:
@@ -8276,5 +11634,7 @@ elif _label.startswith("🎯"):
     tab_sales_insights()
 elif _label.startswith("📞"):
     tab_followups()
+elif _label.startswith("🏪"):
+    tab_shop_visits()
 else:
     tab_bot()
