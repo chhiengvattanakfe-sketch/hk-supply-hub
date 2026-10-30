@@ -154,7 +154,8 @@ LIVE_REFRESH_SECONDS = 20              # dashboard "Live" refresh
 # --- security ---
 REMEMBER_DAYS = 30                     # "Keep me logged in" lasts this long (renews every time the person comes back)
 COOKIE_TOKEN, COOKIE_USER = "hk_remember", "hk_user"
-LOGIN_TTL_HOURS = 12                   # automatic log-out after this many hours
+LOGIN_TTL_HOURS = 12                   # the session is re-checked after this many hours (a remembered phone logs in again by itself)
+REMEMBER_MAX_DEVICES = 40              # phones / browsers that can stay logged in per account (shared accounts need many)
 MAX_FAILS = 5                          # wrong codes before a temporary lock-out
 LOCKOUT_MIN = 5                        # lock-out length (minutes)
 MAX_CASES = 10000
@@ -879,8 +880,8 @@ def issue_remember_token(user, pw_stamp):
         for h in [h for h, r in data.items() if r.get("exp", 0) < now]:
             data.pop(h, None)                                   # forget expired phones
         mine = sorted([(r.get("created", 0), h) for h, r in data.items() if r.get("user") == user])
-        for _, h in mine[:-9]:
-            data.pop(h, None)                                   # at most 10 phones / browsers per person
+        for _, h in mine[:-(REMEMBER_MAX_DEVICES - 1)]:
+            data.pop(h, None)                                   # at most REMEMBER_MAX_DEVICES phones / browsers per person
         data[_tok_hash(token)] = {"user": user, "created": now, "exp": now + REMEMBER_DAYS * 86400, "pw": pw_stamp}
         return data
     return token if _modify_tokens(_add) else None
@@ -914,17 +915,18 @@ def restore_from_cookie():
     h, now = _tok_hash(token), time.time()
     tokens, ok = _tokens_fresh()
     rec = tokens.get(h)
-    if rec is None and ok:
-        tokens, ok = _tokens_fresh(force=True)          # maybe saved by another session a moment ago
+    if rec is None:
+        tokens, ok = _tokens_fresh(force=True)          # maybe saved by another session a moment ago / app just restarted
         rec = tokens.get(h)
     if rec is None:
         if ok:                                          # checked the newest list: this token really does not exist
             st.session_state["cookie_cmd"] = ("clear",)
-        return False
+            return False
+        return "retry"                                  # Dropbox not reachable: try again in a moment, keep the phone's login
     try:
         users = load_users()
     except Exception:
-        return False                                    # cannot check now: keep the token, try again next time
+        return "retry"                                  # cannot check now: keep the token, try again in a moment
     u = users.get(rec["user"])
     if rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
         _modify_tokens(lambda d: (d.pop(h, None), d)[1])
@@ -933,6 +935,7 @@ def restore_from_cookie():
     st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
                              "must_change": bool(u.get("must_change"))})
     st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # refresh the phone's cookie (iPhone/iPad Safari drops old ones)
+    st.session_state.pop("_restore_tries", None)
     audit("login", f"{u['role']} (remembered)")
     if rec.get("exp", 0) - now < (REMEMBER_DAYS - 1) * 86400:     # renew once a day
         def _renew(d):
@@ -950,23 +953,60 @@ def forget_this_device():
     st.session_state["cookie_cmd"] = ("clear",)
 
 
-def _emit_cookie_cmd():
-    """Writes / removes the cookies in the phone's browser (JavaScript, runs once)."""
-    cmd = st.session_state.pop("cookie_cmd", None)
-    if not cmd:
-        return
+def _cookie_js_set(tok, user):
     age = REMEMBER_DAYS * 86400
-    if cmd[0] == "set":
-        tok, user = json.dumps(cmd[1]), json.dumps(cmd[2])
-        js = (f"var s=(window.parent.location.protocol==='https:')?'; Secure':'';"
-              f"window.parent.document.cookie='{COOKIE_TOKEN}='+{tok}+'; max-age={age}; path=/; SameSite=Lax'+s;"
-              f"window.parent.document.cookie='{COOKIE_USER}='+encodeURIComponent({user})+'; max-age={age}; path=/; SameSite=Lax'+s;")
-    else:
-        js = (f"window.parent.document.cookie='{COOKIE_TOKEN}=; max-age=0; path=/';")
+    t, u = json.dumps(tok), json.dumps(user)
+    return (f"var W=window.parent,s=(W.location.protocol==='https:')?'; Secure':'';"
+            f"W.document.cookie='{COOKIE_TOKEN}='+{t}+'; max-age={age}; path=/; SameSite=Lax'+s;"
+            f"W.document.cookie='{COOKIE_USER}='+encodeURIComponent({u})+'; max-age={age}; path=/; SameSite=Lax'+s;"
+            f"try{{W.localStorage.setItem('{COOKIE_TOKEN}',{t});W.localStorage.setItem('{COOKIE_USER}',{u});}}catch(e){{}}")
+
+
+def _emit_cookie_cmd():
+    """Writes / removes the login cookie in the phone's browser.
+    The cookie is written again on every page load while logged in: one write can be lost when the page reloads
+    at once, and iPhone Safari deletes cookies that are not refreshed for 7 days."""
+    cmd = st.session_state.pop("cookie_cmd", None)
+    if cmd and cmd[0] == "set":
+        st.session_state["_remember"] = (cmd[1], cmd[2])
+    elif cmd:
+        st.session_state.pop("_remember", None)
+        js = (f"var W=window.parent;W.document.cookie='{COOKIE_TOKEN}=; max-age=0; path=/';"
+              f"try{{W.localStorage.removeItem('{COOKIE_TOKEN}');}}catch(e){{}}")
+        try:
+            st.components.v1.html(f"<script>try{{{js}}}catch(e){{}}</script>", height=0)
+        except Exception:
+            pass
+        return
+    rem = st.session_state.get("_remember")
+    if not rem:
+        return
+    last = st.session_state.get("_remember_written", 0)
+    if cmd or time.time() - last > 600:                   # write now, then every 10 minutes of use
+        try:
+            st.components.v1.html(f"<script>try{{{_cookie_js_set(rem[0], rem[1])}}}catch(e){{}}</script>", height=0)
+            st.session_state["_remember_written"] = time.time()
+        except Exception:
+            pass
+
+
+def _cookie_rescue():
+    """Login page only: the browser lost the cookie but still has the copy in localStorage -> put it back and reload once."""
+    js = (f"var W=window.parent;try{{var t=W.localStorage.getItem('{COOKIE_TOKEN}');"
+          f"if(t && W.document.cookie.indexOf('{COOKIE_TOKEN}=')<0 && !W.sessionStorage.getItem('hk_rescued')){{"
+          f"W.sessionStorage.setItem('hk_rescued','1');"
+          f"{_cookie_js_set_raw()}"
+          f"W.location.reload();}}}}catch(e){{}}")
     try:
-        st.components.v1.html(f"<script>try{{{js}}}catch(e){{}}</script>", height=0)
+        st.components.v1.html(f"<script>{js}</script>", height=0)
     except Exception:
         pass
+
+
+def _cookie_js_set_raw():
+    age = REMEMBER_DAYS * 86400
+    return (f"var s=(W.location.protocol==='https:')?'; Secure':'';"
+            f"W.document.cookie='{COOKIE_TOKEN}='+t+'; max-age={age}; path=/; SameSite=Lax'+s;")
 
 
 def _clear_session():
@@ -1146,6 +1186,7 @@ def render_landing():
 
 
 def render_login():
+    _cookie_rescue()
     render_landing()
     st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 2, 1])
@@ -1203,7 +1244,14 @@ def render_force_change():
 def require_login():
     """Shows the login page (and stops the app) until the person is logged in. Returns the role."""
     if not session_ok():
-        restore_from_cookie()                              # phone was locked / tab closed: use the saved token
+        got = restore_from_cookie()                        # phone was locked / tab closed / app restarted: use the saved token
+        if got == "retry":
+            tries = st.session_state.get("_restore_tries", 0) + 1
+            st.session_state["_restore_tries"] = tries
+            if tries <= 4:                                 # storage busy right after an app restart: wait instead of logging out
+                st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
+                time.sleep(1.5 * tries)
+                st.rerun()
     _emit_cookie_cmd()
     if session_ok():
         if st.session_state.get("must_change"):
