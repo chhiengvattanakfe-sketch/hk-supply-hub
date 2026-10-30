@@ -12257,11 +12257,71 @@ def _media_priority(stats, names, zone_map, shoots, today):
         rows.append({"Priority": score, "Customer": name, "Zone": zone, "Why": " · ".join(why),
                      "Last photo": (f"{shot_day:%d %b %Y}" if shot_day is not None
                                     else "✅ ថតរួច (មុន · Excel)" if filmed_before else "មិនទាន់"),
-                     "Pcs 28 days": int(pcs28), "_new": any(e[1] in ("fridge", "new") for e in open_events)})
+                     "Pcs 28 days": int(pcs28), "_new": any(e[1] in ("fridge", "new") for e in open_events),
+                     "_reshoot": False})
+    rows += _media_reshoot_rows(rows, stats, names, zone_map, status, last, t)
     out = pd.DataFrame(rows)
     if out.empty:
         return out
     return out.sort_values(["Priority", "Pcs 28 days"], ascending=False).reset_index(drop=True)
+
+
+MEDIA_RESHOOT_TOP = 20            # top-selling Phnom Penh shops (pcs, last 28 days) worth filming again
+MEDIA_RESHOOT_NEAR_KM = 1.5       # filmed shops this close to a new shop / new fridge are filmed again on the same trip
+MEDIA_RESHOOT_MIN_DAYS = 30       # never film the same shop again sooner than this
+
+
+def _media_reshoot_rows(rows, stats, names, zone_map, status, last, t):
+    """🔁 Shops already filmed that are worth filming again: top sellers, and shops near a new shop (same trip)."""
+    on_list = {norm_name(r["Customer"]) for r in rows}
+    pcs = {}
+    for k in names:
+        if not str(zone_map.get(k, "")).startswith("🚫") and not stats.empty and k in stats.index and pd.notna(stats.at[k, "Pcs 28d"]):
+            pcs[k] = float(stats.at[k, "Pcs 28d"])
+    rank = {k: i + 1 for i, (k, v) in enumerate(sorted(pcs.items(), key=lambda kv: -kv[1])) if v > 0}
+    try:
+        registry, store = _visit_registry(), _visit_pin_store()
+        auto = _visit_candidates_for(names, registry)[1]
+    except Exception:
+        registry, store, auto = {"records": {}, "bindings": {}}, {}, {}
+    anchors = []
+    for r in rows:
+        if r.get("_new"):
+            pin = _visit_pin(r["Customer"], registry, store, auto)
+            if pin:
+                anchors.append((r["Customer"], pin))
+    out = []
+    for k, name in names.items():
+        if k in on_list or str(zone_map.get(k, "")).startswith("🚫"):
+            continue
+        stt = status.get(k, ("Not yet", None))
+        ls = last.get(k)
+        shot = pd.to_datetime(ls["_dt"]).normalize() if ls is not None and pd.notna(ls.get("_dt")) else None
+        if stt[0] != "Filmed" and shot is None:
+            continue                                     # never filmed: handled by the main list
+        if stt[0] == "Refused":
+            continue
+        if shot is not None and (t - shot).days < MEDIA_RESHOOT_MIN_DAYS:
+            continue
+        score, why = 0, []
+        rk = rank.get(k)
+        if rk and rk <= MEDIA_RESHOOT_TOP:
+            score += 3
+            why.append(f"⭐ Top sale #{rk}")
+        if anchors:
+            pin = _visit_pin(name, registry, store, auto)
+            if pin:
+                d, near = min((_haversine_m(pin[0], pin[1], a[0], a[1]), an) for an, a in anchors)
+                if d <= MEDIA_RESHOOT_NEAR_KM * 1000:
+                    score += 2
+                    why.append(f"📍 ជិត {near[:28]} ({d / 1000:.1f} km)")
+        if not score:
+            continue
+        out.append({"Priority": score, "Customer": name, "Zone": zone_map.get(k, VISIT_ZONE_NOT_SET),
+                    "Why": "🔁 ថតម្តងទៀត · " + " · ".join(why),
+                    "Last photo": f"{shot:%d %b %Y}" if shot is not None else "✅ ថតរួច (មុន · Excel)",
+                    "Pcs 28 days": int(pcs.get(k, 0)), "_new": False, "_reshoot": True})
+    return out
 
 
 def _media_start(customer):
@@ -12294,8 +12354,13 @@ def _media_plan_body(stats, names, zone_map, shoots, today):
     c4.metric("រូប / វីដេអូ សប្តាហ៍នេះ",
               f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Photos', []))} / "
               f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Videos', []))}")
-    only_new = st.toggle("🆕 បង្ហាញតែ ទូថ្មី និង អតិថិជនថ្មី", key="media_only_new")
+    t1, t2 = st.columns(2)
+    only_new = t1.toggle("🆕 បង្ហាញតែ ទូថ្មី និង អតិថិជនថ្មី", key="media_only_new")
+    with_re = t2.toggle(f"🔁 ថតម្តងទៀត: Top {MEDIA_RESHOOT_TOP} និងហាងជិតហាងថ្មី ({int(plan['_reshoot'].sum())})",
+                        value=True, key="media_with_reshoot")
     view = plan[plan["_new"]] if only_new else plan
+    if not with_re:
+        view = view[~view["_reshoot"]]
     pz = {k: zone_map.get(norm_name(c), VISIT_ZONE_NOT_SET) for k, c in zip(view["Customer"].map(norm_name), view["Customer"])}
     zone = _visit_zone_picker(pz, "media_zone", due=Counter(view["Zone"]))
     if zone:
@@ -12318,6 +12383,7 @@ def _media_plan_body(stats, names, zone_map, shoots, today):
 
 
 MEDIA_PIN_COLORS = {"fridge": [220, 40, 40, 230], "new": [30, 110, 220, 230], "print": [240, 150, 0, 230],
+                    "reshoot": [150, 60, 200, 220],
                     "other": [120, 120, 120, 200], "picked": [20, 160, 70, 255]}
 
 
@@ -12335,11 +12401,11 @@ def _media_map_pick(view, registry, store, auto):
             continue
         why = r["Why"]
         kind = ("picked" if r["Customer"] in picked else "fridge" if "🧊" in why else "new" if "🆕" in why
-                else "print" if "🖨️" in why else "other")
+                else "print" if "🖨️" in why else "reshoot" if "🔁" in why else "other")
         rows.append({"Lat": pin[0], "Lon": pin[1], "Customer": r["Customer"], "label": r["Customer"],
                      "info": why, "color": MEDIA_PIN_COLORS[kind], "radius": 130 if kind in ("fridge", "new", "picked") else 80})
     show_map = st.toggle("🗺️ បង្ហាញផែនទី — ចុចលើចំណុចដើម្បីជ្រើសហាង", value=True, key="media_show_map")
-    st.caption("🔴 ទូថ្មី · 🔵 អតិថិជនថ្មី · 🟠 ត្រូវការ ស្ទីគ័រ/ម៉ឺនុយ/បដា · ⚪ ផ្សេងៗ · 🟢 បានជ្រើស"
+    st.caption("🔴 ទូថ្មី · 🔵 អតិថិជនថ្មី · 🟠 ត្រូវការ ស្ទីគ័រ/ម៉ឺនុយ/បដា · 🟣 ថតម្តងទៀត · ⚪ ផ្សេងៗ · 🟢 បានជ្រើស"
                + (f" · {len(view) - len(rows)} ហាងមិនទាន់មានទីតាំង (មើលក្នុងបញ្ជីខាងក្រោម)" if len(rows) < len(view) else ""))
     if not show_map or not rows:
         return picked
