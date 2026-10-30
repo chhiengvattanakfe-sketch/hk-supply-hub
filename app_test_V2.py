@@ -1702,7 +1702,7 @@ def prune_backups(dbx=None):
 
 _BACKUP_FILES = lambda: (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE,
                          MAP_REGISTRY_FILE, CALLS_FILE, SI_ALIAS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
-                         os.path.join(DATA_DIR, "media_shoots.csv"),
+                         os.path.join(DATA_DIR, "media_shoots.csv"), os.path.join(DATA_DIR, "media_status.csv"),
                          os.path.join(DATA_DIR, "visit_settings.json"))
 
 
@@ -12059,6 +12059,55 @@ def _mkm(v):
     return MEDIA_KM.get(v, v)
 
 
+# Filmed / refused status per shop. Seed = the MEDIA colours of REPORT_UPDATED_ALL.xlsx (TOTAL sheet, 30 Oct 2026):
+# green = Filmed, red = Refused (customer does not allow filming), yellow = Yellow (meaning not given), blank = not yet.
+MEDIA_STATUS_FILE = os.path.join(DATA_DIR, "media_status.csv")
+MEDIA_STATUS_COLS = ["Date", "Customer", "Status", "By", "Source"]
+MEDIA_STATUS_SEED_DATE = "2026-10-30 16:40:00"
+_MEDIA_STATUS_SEED = json.loads(r"""[["VUTHEA SOY ផ្លូវលេខ6A ចំការដូង","Filmed"],["STAF","Refused"],["SUGEK CHIN អ៊ីអន2","Filmed"],["SAIFONG HENG កប់ស្រូវ","Refused"],["MOUYGUECH KONG ផ្លូវកម្ពជាក្រោម","Filmed"],["LIM NGEAN ទឹកល្អក់2 ទួលគោក","Filmed"],["មរតកកាហ្វេ អង្គតាសោម","Filmed"],["CHUU MI បុរីវិមានភ្នំពេញថ្មី","Filmed"],["សឿន ប៊ុនឆៃ បុរីសូនី","Filmed"],["សែបកាហ្វេ​ Station","Filmed"],["Conextion កោះពេជ្រ","Filmed"],["LIM LONG សំរោងធំ","Filmed"],["VUTHEA SOY ទួលគោក","Filmed"],["OUN VY ផ្សារតាប៉ាង ផ្លូវ 49","Filmed"],["AH HORNG OVER វាលស្បូវ","Filmed"],["NHET ROM ប៉េងហួតបឹងស្នោរ","Filmed"],["សារិកា កាហ្វេ","Filmed"],["SENG SOCHEATA ឈូកវ៉ា2","Filmed"],["KANG VUTHY កំពង់ចម្លងព្រែកលាប","Filmed"],["ក្រសួងការពារជាតិ","Refused"],["នំបុ័ងភ្នំពេញ ចោមចៅ","Refused"],["SOU SARITH បឹងកេងកង3","Refused"],["ឥន្រ្ទី បូព៌ា ព្រៃជីសាក់ ចោមចៅ3 ពោធិ៍សែនជ័យ","Filmed"],["BELLA SMITT តាខ្មៅ","Filmed"],["TANGIM COSMETIC ផ្សារស្លាបលែង","Filmed"],["FRIEND COFFEE ជ្រោយចង្វារ","Filmed"],["NHET ROM ស្ទឹងមានជ័យ","Filmed"],["VUTHEA SOY ចំការដូង","Filmed"],["RAK បុរីអ័រគីដេ","Filmed"],["SOK RA បឹងកក់ 2","Filmed"],["THYDA SET","Filmed"],["ជឹម ជ័យសេរីមុនិន្ទ កោះពេជ្រ","Filmed"],["PHAL LA មន្ទីរពេទ្យកុមារជាតិ","Refused"],["AGRO CAFE សាលាកសិកម្មចំការដូង","Filmed"],["VIN MART ទួលគោក","Filmed"],["RAKSMEY NANO ច្បាអំពៅ","Filmed"],["CHIN HOK ទល់មុខឡានទឹក","Filmed"],["KOEM SREYRATH ទួលស្វាយព្រៃ","Filmed"],["នំបុ័ងភ្នំពេញ បូរីសូនី","Refused"],["CHHIM SANDALIN","Filmed"],["ប៊ុនធេង កាហ្វេ ឈូកមាស","Filmed"],["JOLYTA ផ្សារឯករាជ្យ 2","Filmed"],["CHEA MOLIVANN ស្តុបបឹងកក់","Filmed"],["ONE OLYMAPIC MALL អូឡាំព្យា","Refused"],["AEON MAXVALU SUPERMARKET BEONG KAK 51 (EDEN)","Filmed"],["THAISOR NA ជាសុផារ៉ា","Filmed"],["SOKHEA NEANG ទំនប់កប់ស្រូវ","Filmed"],["SOPHAL FREEMAN ផ្សារត្រពាំងឈូក","Refused"],["CHEA SHATAPANA សំណង់12","Filmed"],["SOUPHEA POV កប់ស្រូវ","Filmed"],["SREY POV ស្ទឹងមានជ័យ","Filmed"],["LA BELLA COFFEE ព្រៃទទឹង","Yellow"],["SEAVMEY តាខ្មៅ","Filmed"],["MIE XIANG សែនសុខ","Filmed"],["MI NEA អរិក្សយត្រ","Filmed"],["UTH SIEMHONG ច្បារអំពៅ","Yellow"],["H LYHACH ទួលទំពូង","Filmed"],["ម៉ែ កុលាប បុរីសន្ដិភាព2( Jaunary mis)","Filmed"],["P RESTAURANT","Filmed"],["ដើមកាហ្វេ​ ដេអិន","Filmed"],["ផ្ទះនំបញ្ខុក ឈូកមាស","Filmed"],["SO MALY អូពីរ កំពង់សោម","Filmed"],["VUTHEA SOY CHIP MONG 271","Filmed"],["ជា ទិត្យ សូម៉ាតឿន(ABC ព្រៃ ស )","Refused"],["CHAN THA ផ្សារបឹងត្របែក","Filmed"],["ភឿន ចរិយា ផ្សារដីហ៊ុយ","Filmed"],["X CAFÉ ចំកាដូង","Filmed"],["RISOU COFFEE ( YANO )","Filmed"],["SAMNEANG LUN ទួលកី","Filmed"],["LIM LONG ព្រែកតាទែន","Filmed"],["JEE DA ផ្លូវ60ម៉ែត្រ ចាក់អង្រែក្រោម","Filmed"],["នំបុ័ងភ្នំពេញ ចម្រើនផល","Refused"],["BO KAKNIKA ព្រែកព្នៅ","Yellow"],["OUN POV ចោមចៅ","Refused"],["MR.DAD COFFEE យុគន្ធរ","Filmed"],["AEON MAXVALU EXPRESS BENG KANG 51","Refused"],["SOENG LINGLING បុរីលឹមឈាងហាក់ ចំការដូង","Filmed"],["SORIYA ដួងនៀប 2004","Filmed"],["តេលាម៉ាក់លុច","Filmed"],["សារី ផ្លូវសឡា","Filmed"],["AEON MAXVALU TOUL KORK 337 (3021) MV TK337","Filmed"],["AEON MAXVALU TOUL KORK 315","Filmed"],["TIK TOK CAFÉ សែនសុខ","Filmed"],["កោះកាហ្វេ","Filmed"],["ស្រីឡៃ សម្រស់ធម្មជាតិ លូ 5","Filmed"],["ក្រសួងការងារ","Refused"],["NANFA វត្ដអង្គពោធិ៍ញ្ញាណ","Filmed"],["ទឹម លីហេង ចំការដូង","Filmed"],["KIM CHHENGHONG ជម្ពូវន្ត","Filmed"],["AH RAVY ផ្លូវ 2004","Filmed"],["AEON MAXVALU​ CHROY CHONG VA 3014","Filmed"],["SREYROTH JIMMY កំបូល","Refused"],["EUNG PANHA ទួលគោក","Filmed"],["ណារិន ចន្ធធារ៉ា ឫស្សីកែវ","Filmed"],["កែវ ចាន់សាវីន ពេទ្យរុស្សី","Filmed"],["នំបុ័ងភ្នំពេញ 271","Refused"],["SREY KHOUCH ព្រែកព្នៅ","Yellow"],["VIE VIE តាខ្មៅ","Filmed"],["VIN MART អូឬស្សី","Filmed"],["THE Snow ផ្សារសាំងហាន់ ផ្លូវ 907","Filmed"],["VY DA ឃួនសុធុន","Refused"],["SUN POVNEARY ក្រាំងធ្នង់","Filmed"],["RAKSMEY ROMDOUL","Filmed"],["RATHA UNG ចាក់អង្រែក្រោម","Filmed"],["L RESIDENCEបុរីកីឡា","Filmed"],["BLUEBIRD INTERNATIONL EDUCATION","Refused"],["KHAM CHISOPHEAK ស្តុបដេផន","Filmed"],["NOK NOI COFFEE តាខ្មៅ","Filmed"],["ម៉ែ ម៉េងលី (សាវីមិច ផ្សារទូកមាស)","Filmed"],["CALTEX អង្គតាសោម","Refused"],["ដើមកាហ្វេ បឹងកក់","Filmed"],["AEON MAXVALU TONLE BASSAC MONIVONG  3018","Filmed"],["ចណ្ណាកាហ្វេ","Filmed"],["ចុងភៅមានហេង (កប់ស្រូវ)","Refused"],["នំបុ័ងភ្នំពេញ ជ្រោយចង្វា","Refused"],["PHO MONICA ពេទ្យរុស្សី","Filmed"],["CHIN HOK កោះនរា","Filmed"],["BEE ត្រពាំងថ្លឹង","Refused"],["RADET JASPER ឈូកវ៉ា 2","Filmed"],["THIDA LUCKY ច្បារអំពៅ","Filmed"],["TELA RITHY CAMCO","Filmed"],["Paradise Coffee បឹងកេងកង","Filmed"],["The Station coffee ភ្នំពេញថ្មី","Filmed"],["GALLERY COFFE ជ្រោយចង្វារ","Filmed"],["VUTHEA SOY ជម្ពូវន្ត","Filmed"],["បៀលប្រាយសែនសុខ","Filmed"],["AEON MAXVALU EXPRESS TOUL TOMPUNG","Refused"],["AEON MAXVALU BOEUNG KAK","Refused"],["JUER ODEM","Filmed"],["អ៊ីកាហ្វេ ផ្សារថ្មី","Filmed"],["ហេង សៀវម៉ី កំពង់ចាម","Filmed"],["DARA PICH ព្រែកតាកូវ ក្រុងអរិយក្សត្រ","Filmed"],["Poch Rady បុរីលឹមឆេងហាក់ អូឌឹម","Filmed"],["ម៉ាក់ កូនវិ បែកចាន","Filmed"],["TON CHANNY ស្រែអំបិល កោះកុង","Filmed"],["MAICHEU សៀមរាប","Refused"],["KIM SUN ចំការដូង","Filmed"],["THE FRESH វិមានឯករាជ្យ","Filmed"],["CHIN HOK ភូមិខ្មែរជោគជ័យ អ៊ីអន 3","Filmed"],["YU MI បុរីពិភពថ្មី 1","Filmed"],["PISETH POUV បឹងទំពុន","Refused"],["OLE CAFE ទួលពង្រ","Filmed"],["HAK NYTA ពោធិ៍ចិនតុង","Filmed"],["RASY HR គួរស្រូវ","Yellow"],["VUTHEA SOY ទួលសង្កែ","Filmed"],["ឡឹង បញ្ញា ផ្សារបែកចាន","Filmed"],["SOPHORS VETH ឈូកវ៉ា 1","Filmed"],["ដេប៉ូតេលាគីឡូម៉ែត្រ65 ផ្លូវជាតិលេខ5","Filmed"],["SOPHEAROM MEN ទឹកល្អក់២","Filmed"],["AEON MAXVALU CHAK ANGRE LEU","Filmed"],["AEON MAXVALU CHAKTUMUK51","Filmed"],["THY CHOURY បុរីឡេងណាវ៉ាត់ត្រា","Yellow"],["MOLII COFFEE ដីហុយ","Filmed"],["PTT កំពង់ឆ្នាំង","Refused"],["AEON MAXVALU EXPRESS BENG KANG 51","Refused"],["DIAMOND BICYCLE ឬស្សីកែវ","Filmed"],["PHON SIHOUR ឫស្សីកែវ","Filmed"],["PHAN NA វត្តអង្គតាមិញ","Yellow"],["TOTAL មោងឬស្សី","Refused"],["LEAK KHENA","Refused"],["AEON MAXVALU SUPERMARKET TOUL SANGKE 105","Refused"],["MART វិមានភ្នំពេញ","Refused"],["LY TA MAC COFFEE កាល់ម៉ែត្រ","Filmed"],["HEN SREYROTH ទឹកថ្លា","Filmed"],["ចែ គីមកាហ្វេ អ្នកលឿង","Filmed"],["JOHN MENGHAK វត្ដភ្នំ","Filmed"],["AEON MAXVALU EXPRESS KENG KANG 57","Refused"],["PRAK PHIRUN ទឹកថ្លា","Filmed"],["SN79 MART & TOYS បឹងស្នោរ","Filmed"],["HORN SOTHEA ព្រែកក្ដី","Filmed"],["PHAI VITA ត្រពាំងថ្លឹង","Filmed"],["JUER JUER ចោមចៅ","Filmed"],["CHHUN SOVANN ស្រែអំបិល","Filmed"],["CREAM COFFEE ទួលគោក","Filmed"],["CHEA THEARA រង្វង់មូលមច្ឆា","Filmed"],["SENG WANDEAN ឬស្សីកែវ","Filmed"],["SREYLEAP SENG កំបូល","Yellow"],["L MENG ផ្លូវជាសុផារា","Refused"],["MONYNEATH ទូលគោក","Filmed"],["សៀក នី ស្លាបលែង","Filmed"],["PANHCHAKRITHD ស៊ីសុវត្ដ","Filmed"],["LIMEY HAY ទួលគោក","Filmed"],["AEON MAXVALU STENG MEAN CHEY","Filmed"],["VUTHEA SOY K MALL","Filmed"],["លាង សារ៉ាន ភ្នំពេញថ្មី","Refused"],["វណ្ណ​ នី វេងស្រេង","Filmed"],["SENG KAVEN OCIC","Filmed"],["Melia coffee ក្រាំងធ្នុង","Refused"],["QM SERVICES ទួលទំពូង","Filmed"],["លុយ ផារី ស្ទឹងមានជ័យ","Filmed"],["LITTLE CAFÉ បុរីពិភពថ្មី ត្រពាំងថ្លឹង","Filmed"],["EAN MENGLONG បុរីអង្គភ្នំពេញ","Filmed"],["កង់ទីនសាលា BRIGHT LINE ចំការដូង","Refused"],["VUOCHLY បឹងស្នោរ","Filmed"],["PISEY KO ស្រុកបន្ទាយមាស ជិតផ្សាទូកមាស កំពត","Filmed"],["PTT កប់ស្រូវ","Refused"],["TONG BOREY អូរឡាំពិក","Filmed"],["អ៊ីពៅ ចំការដូង","Filmed"],["CHHAY EANG បឹងសាឡាង ផ្សារដើមគរ","Yellow"],["សំរេច ប្ដូរប្រាក់ ទឹកថ្លា","Refused"],["RY បុរីសុខសាន្ដ","Filmed"],["AEON MAXVALU REOUSSEY KEO 598","Refused"],["SN Coffee 2002","Yellow"],["NK NK បឹងកេងកង","Filmed"],["VANN YAPENG ទួលពង្រ","Refused"],["VIN MART ទួលទំពូង","Filmed"],["HEANG SREY NUOCH បុរីអ័គីដេ","Filmed"],["LY Ly ផ្សារថ្មី","Filmed"],["JAY UNG ស្ពានអាកាស 7 មករា","Filmed"],["SUM CHANNY ក្រាំងធ្នុង","Filmed"],["នំបុ័ងភ្នំពេញ តាំងក្រសាំង","Refused"],["សោ ភា ទួលគោក","Filmed"],["MIE XIANGបឹងបៃតង","Filmed"],["នំបុ័ងភ្នំពេញ ទួលពង្រ","Refused"],["អ៊ឹង ផិចហ័ង GRAND PHNOM PENH","Refused"],["MINI COFFEE ច្បារអំពៅ","Filmed"],["MEN CHAMNAN កប់ស្រូវ","Filmed"],["LAY KONG RETAIL ចំការដូង","Refused"],["SOPHEAP Y វិមានឯករាជ្យ","Refused"],["MINI COFFEE ABA","Filmed"],["35 COFFEE NOKAI 271","Filmed"],["PTT ត្រពាំងអណ្ដើក","Refused"],["CHAN LAKENA CHIP MONG","Filmed"],["កាហ្វេ 21","Filmed"],["នំបុ័ងភ្នំពេញ ឬស្សីកែវ","Refused"],["LV COFFEE បាក់ទូក","Filmed"],["MINI COFFEE បឹងកេងកង1","Filmed"],["KIM CHHENGHONG សែនសុខ","Filmed"],["SY LAUREN តាខ្មៅ","Filmed"],["ស៊ុន រតនៈ បាក់ទូក","Filmed"],["ធារី កប់ស្រូវ","Filmed"],["KANNITHA សាលាពេទ្យ","Filmed"],["SOVAN PANHA ព្រៃស","Filmed"],["SREY NUCH ច្បារអំពៅ","Filmed"],["H LYHACH បឹងត្របែក","Filmed"],["X COFFEE (SOPHORN KOY)","Filmed"],["LAY KONG COFFEE CC2 ចោមចៅ","Refused"],["RAINBO បឹងស្នោរ","Filmed"],["35 COFFEE ស្ពានដែក","Filmed"],["CROIS CAFÉ 271","Filmed"],["PICH COFFEE អគ្គស្នងការនគរបាល ស្ពានក្បាលថ្នល់","Refused"],["AEON MAXVALU SUPERMARKET TUEK THLA","Filmed"],["CHHING GERRA បឹងត្របែក","Refused"],["KIMSOUR SENG បុរីលឺមឈាងហាក់ ចំការដូង","Filmed"],["RAKSMEY NHAN MC PARK ស្ទឹងមានជ័យ","Filmed"],["AEON MAXVALU EXPRESS TOUL TOMPUNG","Refused"],["HENG THIDA សាលាឥន្រ្ដិយ៍ទេវី","Filmed"],["ឥទ្ធិពលកាហ្វេ ​កម្ពុជាក្រោម","Filmed"],["ONNIK COFFEE ទួលទំពូង","Filmed"],["EANG BORA បាវិត","Refused"],["ONNIK COFFEE សាលាយុគន្ធ","Filmed"],["LEANG BUNRUN ទួលគោក","Refused"],["KAFE SOYA HOUSE អង្គតាមិញ","Filmed"],["HAY ផ្លូវឧស្យានអារ៉ាតា","Filmed"],["FLOWER បឹងកក់","Filmed"],["AEON MAXVALU CHERNG EK 50","Refused"],["B MART បឹងកេងកង","Refused"],["MORIKO KREE សាលាចតុមុខ","Filmed"],["ROATH ROMNEA ស្ទឹងមានជ័យ(Reach Reach)","Refused"],["CHHAY BORY តាខ្មៅ","Filmed"],["SENGHEEANG SEAN ព្រៃទា","Filmed"],["KIM SEU LY ត្នោតជ្រុំ","Refused"],["NOREAK 168 SHOP តាំងក្រសាំង","Filmed"],["ហួត លៀងទុយ ស្រែអំបិល","Filmed"],["SUGEK CAFÉ សំរោងអណ្ដែត","Filmed"],["AH THOEUN សំរោងអណ្ដែត","Filmed"],["THE BLUE សាន់សាញ បឹងកក់","Filmed"],["THEARY សាលាកសិកម្មចំការដូង","Refused"],["LT (CN)","Refused"],["MUY SOCHENDA សែនសុខ","Filmed"],["AH HOUY ឧដុង្គ","Filmed"],["SAK COFFEE ភូមិឬស្សី","Filmed"],["SOUN SREYNICH ទួលពង្រ","Filmed"],["AH GECH CORNER ព្រែកលាភ","Refused"],["BONG BEE ចាក់អង្រែ","Refused"],["BORA MEY ព្រៃទា","Filmed"],["BTA WATCH ទួលពង្រ","Refused"],["CHANKHOEUN ផ្សារត្រពាំងឈួក","Filmed"],["HENG CHHUNIM វេងស្រេង","Filmed"],["KRU LAOKRU បុរីអ័រគីដេ","Refused"],["NA RAKSMEY វិទ្យាល័យជម្ពូវន្ត","Filmed"],["NA RY កោះរ៉ុង កំពង់សោម","Filmed"],["PANHCHAKRITHD ក្រោយវាំង","Filmed"],["QM SERVICES ព្រៃស","Filmed"],["CHIN HOK ជ្រោយចង្វារ","Filmed"],["DY DARA ឬស្សីកែវ","Filmed"],["ING KIMLEANG ឬស្សីកែវ","Filmed"],["SIVLANG LIM ឈូកមាស","Filmed"],["SOK SOPHAL ច្បារអំពៅ","Yellow"]]""")
+MEDIA_STATUS_LABEL = {"Filmed": "✅ ថតរួច", "Refused": "🚫 មិនឱ្យថត", "Not yet": "⏳ មិនទាន់ថត", "Yellow": "🟡 ពណ៌លឿង (ក្នុង Excel)"}
+
+
+def _media_status_read():
+    try:
+        return read_raw(MEDIA_STATUS_FILE, MEDIA_STATUS_COLS, max_age=60)
+    except Exception:
+        return pd.DataFrame(columns=MEDIA_STATUS_COLS + ["_dt"])
+
+
+def _media_status_map(names, shoots):
+    """{key: (status, timestamp)} — newest of: Excel seed, saved status changes, and real shoots (a shoot = Filmed)."""
+    seed_t = pd.Timestamp(MEDIA_STATUS_SEED_DATE)
+    by_mk = {_visit_match_key(n): k for k, n in names.items()}
+    def key_of(name):
+        k = norm_name(name)
+        return k if k in names else by_mk.get(_visit_match_key(name), k)
+    out = {}
+    def put(k, status, t):
+        if k not in out or t >= out[k][1]:
+            out[k] = (status, t)
+    for name, status in _MEDIA_STATUS_SEED:
+        put(key_of(name), status, seed_t)
+    st_df = _media_status_read()
+    for r in st_df.to_dict("records"):
+        t = pd.to_datetime(r.get("_dt"), errors="coerce")
+        if pd.notna(t) and r.get("Status") in MEDIA_STATUS_LABEL:
+            put(key_of(r["Customer"]), r["Status"], t)
+    if shoots is not None and not shoots.empty:
+        for name, t in zip(shoots["Customer"], shoots["_dt"]):
+            if pd.notna(t):
+                put(key_of(name), "Filmed", pd.Timestamp(t))
+    return out
+
+
+def _media_status_set(customer, status, source="app"):
+    if not has_permission("edit"):
+        raise PermissionError("Your account needs Create, edit, and submit changes permission.")
+    append_row(MEDIA_STATUS_FILE, {"Date": now_str(), "Customer": customer, "Status": status,
+                                   "By": current_user() or "-", "Source": source})
+    audit("media status", f"{customer} | {status} | {source}")
+
+
 def _media_read():
     try:
         return read_raw(MEDIA_FILE, MEDIA_COLS, max_age=60)
@@ -12164,19 +12213,25 @@ def _media_priority(stats, names, zone_map, shoots, today):
     """Shops for the media team, most urgent first. A journal event counts until the shop is filmed after it."""
     events = _media_events(names, today)
     last = _media_last_shoot(shoots)
+    status = _media_status_map(names, shoots)
     t = pd.Timestamp(today)
     rows = []
     for k, name in names.items():
         zone = zone_map.get(k, VISIT_ZONE_NOT_SET)
         if str(zone).startswith("🚫"):
             continue
+        stt = status.get(k, ("Not yet", None))
+        if stt[0] == "Refused":
+            continue                                           # customer does not allow filming
         ls = last.get(k)
         shot = pd.to_datetime(ls["_dt"]) if ls is not None else None
         shot_day = shot.normalize() if shot is not None and pd.notna(shot) else None
+        filmed_before = shot_day is None and stt[0] == "Filmed"     # green in the Excel file, date unknown
         score, why, open_events = 0, [], []
+        cut = shot_day if shot_day is not None else (stt[1].normalize() if stt[0] == "Filmed" and stt[1] is not None else None)
         for d, kind, sc, label, rem in sorted(events.get(k, []), key=lambda e: -e[2]):
-            if shot_day is not None and shot_day >= d:
-                continue                                   # already filmed after this happened
+            if cut is not None and cut >= d:
+                continue                                   # already filmed after this happened (green = filmed by that date)
             if any(e[1] == kind for e in open_events):
                 continue
             open_events.append((d, kind))
@@ -12184,11 +12239,11 @@ def _media_priority(stats, names, zone_map, shoots, today):
             why.append(f"{label} ({d:%d %b})")
         s = stats.loc[k] if (not stats.empty and k in stats.index) else None
         pcs28 = float(s["Pcs 28d"]) if s is not None and pd.notna(s["Pcs 28d"]) else 0.0
-        if shot_day is None:
+        if shot_day is None and not filmed_before:
             if pcs28 > 0:
                 score += 3
                 why.append("📷 មិនទាន់មានរូប")
-        elif (t - shot_day).days > MEDIA_REFRESH_DAYS and pcs28 > 0:
+        elif shot_day is not None and (t - shot_day).days > MEDIA_REFRESH_DAYS and pcs28 > 0:
             score += 2
             why.append(f"📷 រូបចាស់ ({(t - shot_day).days} ថ្ងៃ)")
         if ls is not None and any(str(ls.get(i, "")) in MEDIA_NEED for i in MEDIA_ITEMS):
@@ -12200,7 +12255,8 @@ def _media_priority(stats, names, zone_map, shoots, today):
         if pcs28 >= 1000:
             score += 1
         rows.append({"Priority": score, "Customer": name, "Zone": zone, "Why": " · ".join(why),
-                     "Last photo": f"{shot_day:%d %b %Y}" if shot_day is not None else "មិនទាន់",
+                     "Last photo": (f"{shot_day:%d %b %Y}" if shot_day is not None
+                                    else "✅ ថតរួច (មុន · Excel)" if filmed_before else "មិនទាន់"),
                      "Pcs 28 days": int(pcs28), "_new": any(e[1] in ("fridge", "new") for e in open_events)})
     out = pd.DataFrame(rows)
     if out.empty:
@@ -12225,6 +12281,12 @@ def _media_plan_body(stats, names, zone_map, shoots, today):
         return
     week_start = pd.Timestamp(today - timedelta(days=today.weekday()))
     done_week = shoots[shoots["_dt"] >= week_start] if not shoots.empty else shoots
+    stmap = _media_status_map(names, shoots)
+    active = [k for k in names if not str(zone_map.get(k, "")).startswith("🚫")]
+    n_f = sum(stmap.get(k, ("",))[0] == "Filmed" for k in active)
+    n_r = sum(stmap.get(k, ("",))[0] == "Refused" for k in active)
+    st.caption(f"ហាងភ្នំពេញ {len(active)}: ✅ ថតរួច {n_f} · 🚫 មិនឱ្យថត {n_r} (មិនបង្ហាញក្នុងបញ្ជី) · "
+               f"⏳ មិនទាន់ថត {len(active) - n_f - n_r}")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("ហាងត្រូវថត", f"{len(plan)}")
     c2.metric("🆕 ទូថ្មី / អតិថិជនថ្មី", f"{int(plan['_new'].sum())}")
@@ -12238,20 +12300,113 @@ def _media_plan_body(stats, names, zone_map, shoots, today):
     zone = _visit_zone_picker(pz, "media_zone", due=Counter(view["Zone"]))
     if zone:
         view = view[view["Zone"] == zone]
-    st.caption(f"{len(view)} ហាង · ចុច ▶ ដើម្បីថត និងបញ្ចូលរូប។ ហាងបាត់ពីបញ្ជីវិញ ពេលថតរួច។")
     registry, store = _visit_registry(), _visit_pin_store()
     try:
         auto = _visit_candidates_for({norm_name(c): c for c in view["Customer"]}, registry)[1]
     except Exception:
         auto = {}
-    for i, r in enumerate(view.head(40).to_dict("records")):
+    picked = _media_map_pick(view, registry, store, auto)
+    if picked:
+        st.markdown(f"**✅ ហាងដែលបានជ្រើសលើផែនទី ({len(picked)})**")
+        order = {c: i for i, c in enumerate(picked)}
+        chosen = view[view["Customer"].isin(picked)].copy()
+        chosen["_o"] = chosen["Customer"].map(order)
+        _media_cards(chosen.sort_values("_o"), registry, store, auto, "mp", removable=True)
+        st.divider()
+    st.caption(f"{len(view)} ហាង · ចុច ▶ ដើម្បីថត និងបញ្ចូលរូប។ ហាងបាត់ពីបញ្ជីវិញ ពេលថតរួច។")
+    _media_cards(view.head(40), registry, store, auto, "mg")
+
+
+MEDIA_PIN_COLORS = {"fridge": [220, 40, 40, 230], "new": [30, 110, 220, 230], "print": [240, 150, 0, 230],
+                    "other": [120, 120, 120, 200], "picked": [20, 160, 70, 255]}
+
+
+def _media_unpick(customer):
+    st.session_state["media_picked"] = [c for c in st.session_state.get("media_picked", []) if c != customer]
+
+
+def _media_map_pick(view, registry, store, auto):
+    """Map of the shops on the list. Tap a pin to add the shop to today's picks (tap again to remove)."""
+    picked = list(st.session_state.get("media_picked", []))
+    rows = []
+    for r in view.to_dict("records"):
+        pin = _visit_pin(r["Customer"], registry, store, auto)
+        if not pin:
+            continue
+        why = r["Why"]
+        kind = ("picked" if r["Customer"] in picked else "fridge" if "🧊" in why else "new" if "🆕" in why
+                else "print" if "🖨️" in why else "other")
+        rows.append({"Lat": pin[0], "Lon": pin[1], "Customer": r["Customer"], "label": r["Customer"],
+                     "info": why, "color": MEDIA_PIN_COLORS[kind], "radius": 130 if kind in ("fridge", "new", "picked") else 80})
+    show_map = st.toggle("🗺️ បង្ហាញផែនទី — ចុចលើចំណុចដើម្បីជ្រើសហាង", value=True, key="media_show_map")
+    st.caption("🔴 ទូថ្មី · 🔵 អតិថិជនថ្មី · 🟠 ត្រូវការ ស្ទីគ័រ/ម៉ឺនុយ/បដា · ⚪ ផ្សេងៗ · 🟢 បានជ្រើស"
+               + (f" · {len(view) - len(rows)} ហាងមិនទាន់មានទីតាំង (មើលក្នុងបញ្ជីខាងក្រោម)" if len(rows) < len(view) else ""))
+    if not show_map or not rows:
+        return picked
+    try:
+        import pydeck as pdk
+        layer = pdk.Layer("ScatterplotLayer", data=rows, id="media_shops", get_position="[Lon, Lat]",
+                          get_fill_color="color", get_radius="radius", radius_min_pixels=6, radius_max_pixels=16,
+                          stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=1, pickable=True)
+        lat = sum(r["Lat"] for r in rows) / len(rows)
+        lon = sum(r["Lon"] for r in rows) / len(rows)
+        deck = pdk.Deck(layers=[layer], map_provider="carto", map_style="light",
+                        initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=12 if len(rows) < 60 else 11),
+                        tooltip={"text": "{label}\n{info}"})
+        ver = st.session_state.get("media_map_ver", 0)
+        try:
+            event = st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key=f"media_map_{ver}", height=430)
+        except TypeError:                                    # older Streamlit: map without tapping
+            st.pydeck_chart(deck)
+            event = None
+        objs = []
+        try:
+            objs = (event.selection.get("objects", {}) or {}).get("media_shops", []) if event is not None else []
+        except Exception:
+            objs = []
+        if objs:
+            name = objs[0].get("Customer")
+            if name:
+                picked = [c for c in picked if c != name] if name in picked else picked + [name]
+                st.session_state["media_picked"] = picked
+                st.session_state["media_map_ver"] = ver + 1           # clear the tap so the next tap counts again
+                st.rerun(scope="fragment") if _fragment_rerun_ok() else st.rerun()
+    except Exception as e:
+        st.caption("ផែនទីមិនអាចបង្ហាញបានទេ: " + str(e)[:120])
+    if picked:
+        st.button("↩️ សម្អាតការជ្រើស", key="media_pick_clear", on_click=lambda: st.session_state.pop("media_picked", None))
+    return picked
+
+
+def _fragment_rerun_ok():
+    try:
+        import inspect
+        return "scope" in inspect.signature(st.rerun).parameters
+    except Exception:
+        return False
+
+
+def _media_cards(view, registry, store, auto, prefix, removable=False):
+    for i, r in enumerate(view.to_dict("records")):
         with st.container(border=True):
             a, b, c = st.columns([5, 1.2, 1.2])
             a.markdown(f"**{r['Customer']}**  \n<small>{r['Why']}<br>📷 រូបចុងក្រោយ: {r['Last photo']} · {r['Pcs 28 days']:,} pcs/28 ថ្ងៃ</small>",
                        unsafe_allow_html=True)
             link, exact = _visit_map_link(r["Customer"], registry, store, auto)
             b.link_button("🧭 ទៅ" if exact else "🔎 រក", link, use_container_width=True)
-            c.button("ថត ▶", key=f"media_go_{i}", use_container_width=True, on_click=_media_start, args=(r["Customer"],))
+            c.button("ថត ▶", key=f"media_go_{prefix}_{i}", use_container_width=True, on_click=_media_start, args=(r["Customer"],))
+            if removable:
+                a.button("✖ ដកចេញ", key=f"media_rm_{prefix}_{i}", on_click=_media_unpick, args=(r["Customer"],))
+            with a.popover("🚫 មិនឱ្យថត"):
+                st.caption("ម្ចាស់ហាងមិនអនុញ្ញាតឱ្យថត? ហាងនឹងចេញពីបញ្ជី។ អាចដាក់វិញក្នុង 📊 របាយការណ៍។")
+                if st.button("✔ បញ្ជាក់", key=f"media_ref_{prefix}_{i}"):
+                    try:
+                        _media_status_set(r["Customer"], "Refused")
+                        _media_unpick(r["Customer"])
+                        st.session_state["flash"] = f"🚫 {r['Customer']}: មិនឱ្យថត"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e)[:120])
 
 
 def _media_form_body(names, zone_map, today):
@@ -12324,6 +12479,7 @@ def _media_form_body(names, zone_map, today):
         return
     prog.empty()
     st.session_state.pop("media_customer", None)
+    _media_unpick(customer)
     st.session_state["flash"] = f"📸 បានរក្សាទុក {customer}: {len(p_names)} រូប · {len(v_names)} វីដេអូ"
     st.session_state["media_view"] = "📋 ផែនការ ថ្ងៃសុក្រ-សៅរ៍"
     st.rerun()
@@ -12406,7 +12562,109 @@ def _media_report_body(shoots, today):
                              f"Media_{today}.xlsx", "media_dl")
 
 
-MEDIA_VIEWS = ["📋 ផែនការ ថ្ងៃសុក្រ-សៅរ៍", "📸 ថតហាង", "🖼️ រូបភាពហាង", "📊 របាយការណ៍"]
+def _media_parse_report_xlsx(data):
+    """[(customer name, status)] from the MEDIA column colours of REPORT_UPDATED_ALL.xlsx (sheet TOTAL)."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data), data_only=True)
+    sheets = (["TOTAL"] if "TOTAL" in wb.sheetnames else []) + [n for n in wb.sheetnames if n != "TOTAL"]
+    for sn in sheets:
+        ws = wb[sn]
+        for r in range(1, min(ws.max_row, 30) + 1):
+            vals = [str(ws.cell(r, c).value or "").strip() for c in range(1, min(ws.max_column, 40) + 1)]
+            if "MEDIA" in [v.upper() for v in vals] and any("ឈ្មោះ" in v for v in vals):
+                mcol = [v.upper() for v in vals].index("MEDIA") + 1
+                ncol = next(i for i, v in enumerate(vals, 1) if "ឈ្មោះ" in v)
+                out = []
+                for rr in range(r + 1, ws.max_row + 1):
+                    name = ws.cell(rr, ncol).value
+                    if not name or not str(name).strip():
+                        continue
+                    f = ws.cell(rr, mcol).fill
+                    rgb = (f.fgColor.rgb if f is not None and f.fill_type == "solid" and f.fgColor is not None
+                           and f.fgColor.type == "rgb" else "")
+                    status = {"FF00B050": "Filmed", "FF92D050": "Filmed", "FF00FF00": "Filmed",
+                              "FFC00000": "Refused", "FFFF0000": "Refused", "FFFFFF00": "Yellow"}.get(str(rgb).upper(), "Not yet")
+                    out.append((re.sub(r"\s+", " ", str(name)).strip(), status))
+                return out, sn
+    raise ValueError("No sheet with a MEDIA column and a customer-name column (ឈ្មោះ…) was found.")
+
+
+def _media_status_body(names, zone_map, shoots):
+    stmap = _media_status_map(names, shoots)
+    rows = []
+    for k, n in names.items():
+        z = zone_map.get(k, VISIT_ZONE_NOT_SET)
+        if str(z).startswith("🚫"):
+            continue
+        s_, t_ = stmap.get(k, ("Not yet", None))
+        rows.append({"Customer": n, "Zone": _km(z), "Status": MEDIA_STATUS_LABEL.get(s_, s_),
+                     "Since": f"{t_:%d %b %Y}" if t_ is not None else ""})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("គ្មានហាង។")
+        return
+    st.markdown("**🎨 ស្ថានភាពថត តាមតំបន់**")
+    show_df(pd.crosstab(df["Zone"], df["Status"], margins=True, margins_name="សរុប").reset_index())
+    f1, f2 = st.columns([2, 3])
+    pick = f1.selectbox("បង្ហាញ", ["ទាំងអស់"] + list(MEDIA_STATUS_LABEL.values()), key="media_st_filter")
+    q = f2.text_input("ស្វែងរកឈ្មោះ", key="media_st_q")
+    view = df if pick == "ទាំងអស់" else df[df["Status"] == pick]
+    if q.strip():
+        view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
+    show_df(view.sort_values(["Status", "Zone", "Customer"]), height=380)
+    if has_permission("edit"):
+        with st.expander("✏️ ប្តូរស្ថានភាពហាង (ឧ. ម្ចាស់ហាងអនុញ្ញាតវិញ)"):
+            c1, c2, c3 = st.columns([3, 2, 1.2])
+            who = c1.selectbox("ហាង", sorted(df["Customer"], key=str.casefold), index=None, key="media_st_shop",
+                               placeholder="វាយឈ្មោះ…")
+            new = c2.selectbox("ស្ថានភាពថ្មី", ["Filmed", "Refused", "Not yet"], format_func=lambda v: MEDIA_STATUS_LABEL[v],
+                               key="media_st_new")
+            if c3.button("💾 រក្សាទុក", key="media_st_save", disabled=not who) and who:
+                try:
+                    _media_status_set(who, new)
+                    st.session_state["flash"] = f"{who}: {MEDIA_STATUS_LABEL[new]}"
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e)[:150])
+        with st.expander("📥 យកស្ថានភាពពី REPORT_UPDATED_ALL.xlsx (ពណ៌ក្នុងជួរ MEDIA)"):
+            st.caption("🟩 បៃតង = ថតរួច · 🟥 ក្រហម = មិនឱ្យថត · ក្រឡាទទេ = មិនទាន់ថត (មិនប្តូរហាងដែលបានថតក្នុង app រួច)។")
+            up = st.file_uploader("ឯកសារ Excel", type=["xlsx"], key="media_st_xl")
+            if up is not None:
+                try:
+                    parsed, sheet = _media_parse_report_xlsx(up.getvalue())
+                except Exception as e:
+                    st.error(str(e)[:200])
+                    parsed, sheet = [], ""
+                if parsed:
+                    by_mk = {_visit_match_key(n): n for n in names.values()}
+                    changes, unknown = [], []
+                    for name, s_ in parsed:
+                        if s_ in ("Not yet", "Yellow"):
+                            continue
+                        app_name = names.get(norm_name(name)) or by_mk.get(_visit_match_key(name))
+                        if not app_name:
+                            unknown.append(name)
+                            continue
+                        cur = stmap.get(norm_name(app_name), ("Not yet", None))[0]
+                        if cur != s_:
+                            changes.append({"Customer": app_name, "From": MEDIA_STATUS_LABEL.get(cur, cur), "To": MEDIA_STATUS_LABEL[s_], "_s": s_})
+                    st.write(f"Sheet **{sheet}**: {len(parsed)} ហាង · ប្តូរ {len(changes)} · មិនស្គាល់ឈ្មោះ {len(unknown)}")
+                    if changes:
+                        show_df(pd.DataFrame(changes).drop(columns="_s"), height=260)
+                        if st.button(f"💾 រក្សាទុក {len(changes)} ការប្តូរ", key="media_st_import", type="primary"):
+                            try:
+                                append_rows(MEDIA_STATUS_FILE, [{"Date": now_str(), "Customer": c["Customer"], "Status": c["_s"],
+                                                                 "By": current_user() or "-", "Source": "Excel " + sheet} for c in changes])
+                                st.session_state["flash"] = f"✅ បានយក {len(changes)} ស្ថានភាពពី Excel"
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e)[:150])
+                    if unknown:
+                        with st.expander(f"ឈ្មោះមិនស្គាល់ ({len(unknown)})"):
+                            st.write(", ".join(unknown[:200]))
+
+
+MEDIA_VIEWS = ["📋 ផែនការ ថ្ងៃសុក្រ-សៅរ៍", "📸 ថតហាង", "🎨 ស្ថានភាពថត", "🖼️ រូបភាពហាង", "📊 របាយការណ៍"]
 
 
 def _media_body():
@@ -12433,7 +12691,9 @@ def _media_body():
         st.warning("រកមិនឃើញអតិថិជននៅភ្នំពេញទេ។ " + (err or ""))
         return
     zone_map = _visit_zone_map(names)
-    if view == "📸 ថតហាង":
+    if view == "🎨 ស្ថានភាពថត":
+        _media_status_body(names, zone_map, shoots)
+    elif view == "📸 ថតហាង":
         _media_form_body(names, zone_map, today)
     else:
         _media_plan_body(stats, names, zone_map, shoots, today)
