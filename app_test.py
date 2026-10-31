@@ -1482,13 +1482,7 @@ def _dropbox_excel():
         chosen = chosen or _pick_remote(names, EXCEL_PATTERN) or _pick_remote(names, EXCEL_FALLBACK_PATTERN)
         if not chosen:
             return None
-        local = os.path.join(DATA_DIR, chosen["name"])
-        with S["lock"]:
-            if (not os.path.exists(local)) or S["xl_hash"].get(chosen["name"]) != chosen["hash"]:
-                _, res = _dbx().files_download(_rpath(chosen["name"]))
-                _write_atomic(local, res.content)
-                S["xl_hash"][chosen["name"]] = chosen["hash"]
-        return local
+        return _dropbox_fetch_journal(chosen)
     except Exception as e:
         bot_log("warn", "Dropbox", f"Cannot fetch the journal: {str(e)[:120]}", "using the saved copy")
         old = [f for f in glob.glob(os.path.join(DATA_DIR, "*.xlsx")) if not os.path.basename(f).startswith("~$")]
@@ -1817,6 +1811,65 @@ def rows_for_day(df, target_date):
 # ==========================================
 # EXCEL JOURNAL SNAPSHOT (fast read-only parse + memory cache + disk cache)
 # ==========================================
+def _dropbox_fetch_journal(chosen):
+    """Local copy of one journal listed in Dropbox (downloaded only when it changed)."""
+    S = _sync_state()
+    local = os.path.join(DATA_DIR, chosen["name"])
+    with S["lock"]:
+        if (not os.path.exists(local)) or S["xl_hash"].get(chosen["name"]) != chosen["hash"]:
+            _, res = _dbx().files_download(_rpath(chosen["name"]))
+            _write_atomic(local, res.content)
+            S["xl_hash"][chosen["name"]] = chosen["hash"]
+    return local
+
+
+JOURNAL_PREV_MONTH_DAYS = 7      # in the first days of a month the previous month's journal is read as well
+
+
+def _ym_add(ym, n):
+    y, m = ym[0], ym[1] + n
+    while m > 12:
+        y, m = y + 1, m - 12
+    while m < 1:
+        y, m = y - 1, m + 12
+    return (y, m)
+
+
+def find_excel_files():
+    """[main journal, neighbour month journals...].
+    Next month's journal is read too as soon as it exists (orders for the 1st are typed on the last day of the
+    month), and in the first days of a month also last month's journal (late entries, reports of last week)."""
+    main = find_excel_file()
+    if not main:
+        return []
+    ym = _journal_ym(os.path.basename(main))
+    if not ym or EXCEL_OVERRIDE:
+        return [main]
+    want = [_ym_add(ym, 1)]
+    t = today_kh()
+    if (t.year, t.month) == ym and t.day <= JOURNAL_PREV_MONTH_DAYS:
+        want.append(_ym_add(ym, -1))
+    out = [main]
+    try:
+        if USE_DROPBOX:
+            names = [x for x in _remote_excel_names() if fnmatch.fnmatchcase(x["name"].lower(), EXCEL_PATTERN.lower())]
+            for w in want:
+                ms = [x for x in names if _journal_ym(x["name"]) == w and x["name"] != os.path.basename(main)]
+                if ms:
+                    out.append(_dropbox_fetch_journal(max(ms, key=lambda x: x["mtime"])))
+        else:
+            fs = [f for f in glob.glob(os.path.join(CURRENT_DIR, EXCEL_PATTERN))
+                  if not os.path.basename(f).startswith("~$") and "conflicted copy" not in os.path.basename(f).lower()
+                  and not os.path.basename(f).lower().endswith("__status.xlsx") and os.path.abspath(f) != os.path.abspath(main)]
+            for w in want:
+                ms = [f for f in fs if _journal_ym(os.path.basename(f)) == w]
+                if ms:
+                    out.append(max(ms, key=os.path.getmtime))
+    except Exception as e:
+        bot_log("warn", "Excel", f"Next / last month journal not read: {str(e)[:120]}", "using this month only")
+    return out
+
+
 def find_excel_file():
     if USE_DROPBOX:
         return _dropbox_excel()
@@ -1995,17 +2048,77 @@ def get_snapshot(path, mtime_ns, size):
     return load_snapshot(path, mtime_ns, size)
 
 
+_MERGED_SNAP = {}
+
+
+def _merge_journal_snapshots(main_path, main, extras):
+    """Main journal + the rows of next / last month's journal that belong to that file's own month.
+    Rows already in the main journal (same day, customer and invoice) are not added twice."""
+    j = main["journal"].copy()
+    j["JournalFile"] = os.path.basename(main_path)
+    have = set(zip(j["Date"], j["Customer"].map(norm_name), j["Invoice"].astype(str)))
+    parts, customers, areas = [j], list(main["customers"]), {}
+    seen = {norm_name(c) for c in customers}
+    for path, snap in extras:
+        ym = _journal_ym(os.path.basename(path))
+        x = snap["journal"]
+        if x.empty or not ym:
+            continue
+        d = pd.to_datetime(x["Date"], errors="coerce")
+        x = x[(d.dt.year == ym[0]) & (d.dt.month == ym[1])]
+        keys = list(zip(x["Date"], x["Customer"].map(norm_name), x["Invoice"].astype(str)))
+        x = x[[k not in have for k in keys]].copy()
+        if x.empty:
+            continue
+        x["JournalFile"] = os.path.basename(path)
+        parts.append(x)
+        for c in snap["customers"]:
+            if norm_name(c) not in seen:
+                customers.append(c)
+                seen.add(norm_name(c))
+        areas.update(snap.get("areas", {}))
+    merged = pd.concat(parts, ignore_index=True, sort=False) if len(parts) > 1 else j
+    for c in merged.columns:
+        if re.fullmatch(r"N\d+", str(c)):
+            merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
+    merged = merged.sort_values("Date", kind="stable").reset_index(drop=True)
+    areas.update(main.get("areas", {}))                        # this month's Master List wins
+    return dict(main, journal=merged, customers=customers, areas=areas,
+                skipped=list(main.get("skipped", [])),
+                journal_files=[os.path.basename(main_path)] + [os.path.basename(p) for p, _ in extras])
+
+
 def current_snapshot():
-    """(snapshot | None, source, path, error text | None). Never raises."""
-    path = find_excel_file()
+    """(snapshot | None, source, path, error text | None). Never raises.
+    path = this month's journal; next month's journal (and last month's in the first days) is merged in."""
+    paths = find_excel_files()
+    path = paths[0] if paths else None
     if not path or not os.path.exists(path):
         return None, None, path, f"No journal file found in {where_text()}"
     try:
         stt = os.stat(path)
         data, src = get_snapshot(path, stt.st_mtime_ns, stt.st_size)
-        return data, src, path, None
     except Exception as e:
         return None, None, path, str(e)
+    extras, sig = [], [(path, stt.st_mtime_ns, stt.st_size)]
+    for p in paths[1:]:
+        try:
+            ps = os.stat(p)
+            extras.append((p, get_snapshot(p, ps.st_mtime_ns, ps.st_size)[0]))
+            sig.append((p, ps.st_mtime_ns, ps.st_size))
+        except Exception as e:
+            bot_log("warn", "Excel", f"Cannot read {os.path.basename(p)}: {str(e)[:120]}", "using this month only")
+    if not extras:
+        return data, src, path, None
+    sig = tuple(sig)
+    if _MERGED_SNAP.get("sig") != sig:
+        try:
+            merged = _merge_journal_snapshots(path, data, extras)
+        except Exception as e:
+            bot_log("warn", "Excel", f"Could not add next / last month journal: {str(e)[:120]}", "using this month only")
+            return data, src, path, None
+        _MERGED_SNAP.update(sig=sig, val=merged)
+    return _MERGED_SNAP["val"], src, path, None
 
 
 def get_customer_list():
