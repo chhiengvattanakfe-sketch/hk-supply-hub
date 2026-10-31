@@ -923,9 +923,10 @@ def issue_remember_token(user, pw_stamp):
 
 def _request_cookie(name):
     try:
-        return st.context.cookies.get(name)
+        v = st.context.cookies.get(name)
     except Exception:
         return None
+    return v if isinstance(v, str) and v else None
 
 
 def _tokens_fresh(force=False):
@@ -943,7 +944,10 @@ def _tokens_fresh(force=False):
 def restore_from_cookie():
     """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, an app restart...).
     The phone's token is only deleted when it is surely invalid — never because Dropbox was slow."""
-    token = _request_cookie(COOKIE_TOKEN)
+    url_tok = _url_token()                              # always read, so it never stays in the address
+    if url_tok:
+        st.session_state["_url_tok"] = url_tok          # kept for the "Reconnecting…" retries below
+    token = st.session_state.get("_url_tok") or _request_cookie(COOKIE_TOKEN)
     if not token:
         return False
     h, now = _tok_hash(token), time.time()
@@ -955,6 +959,8 @@ def restore_from_cookie():
     if rec is None:
         if ok:                                          # checked the newest list: this token really does not exist
             st.session_state["cookie_cmd"] = ("clear",)
+            st.session_state["_rescue_off"] = True
+            st.session_state.pop("_url_tok", None)
             return False
         return "retry"                                  # Dropbox not reachable: try again in a moment, keep the phone's login
     try:
@@ -965,7 +971,11 @@ def restore_from_cookie():
     if rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
         _modify_tokens(lambda d: (d.pop(h, None), d)[1])
         st.session_state["cookie_cmd"] = ("clear",)
+        st.session_state["_rescue_off"] = True
+        st.session_state.pop("_url_tok", None)
         return False
+    st.session_state.pop("_rescue_off", None)
+    st.session_state.pop("_url_tok", None)
     st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
                              "must_change": bool(u.get("must_change"))})
     st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # refresh the phone's cookie (iPhone/iPad Safari drops old ones)
@@ -981,10 +991,11 @@ def restore_from_cookie():
 
 
 def forget_this_device():
-    token = _request_cookie(COOKIE_TOKEN)
+    token = _request_cookie(COOKIE_TOKEN) or st.session_state.pop("_url_tok", None)
     if token:
         _modify_tokens(lambda d: (d.pop(_tok_hash(token), None), d)[1])
     st.session_state["cookie_cmd"] = ("clear",)
+    st.session_state["_rescue_off"] = True
 
 
 def _cookie_js_set(tok, user):
@@ -1024,13 +1035,36 @@ def _emit_cookie_cmd():
             pass
 
 
+URL_TOKEN = "hk_rt"
+
+
+def _url_token():
+    """The saved login handed over in the page address by _cookie_rescue (for phones whose cookie does not reach
+    the server after a screen lock). Read once, then removed from the address at once."""
+    try:
+        tok = st.query_params.get(URL_TOKEN)
+        if URL_TOKEN in st.query_params:
+            del st.query_params[URL_TOKEN]
+    except Exception:
+        return None
+    tok = (tok or "").strip()
+    return tok if 20 <= len(tok) <= 100 else None
+
+
 def _cookie_rescue():
-    """Login page only: the browser lost the cookie but still has the copy in localStorage -> put it back and reload once."""
+    """Login page only. The phone still has its saved login (cookie or localStorage copy) but the server did not
+    receive it -> write the cookie again and reload once, handing the login over in the address as well.
+    Allowed again after 20 s, so it also works after the 2nd, 3rd... screen lock in the same tab."""
+    if st.session_state.get("_rescue_off"):            # the saved login was just found invalid: do not loop
+        return
     js = (f"var W=window.parent;try{{var t=W.localStorage.getItem('{COOKIE_TOKEN}');"
-          f"if(t && W.document.cookie.indexOf('{COOKIE_TOKEN}=')<0 && !W.sessionStorage.getItem('hk_rescued')){{"
-          f"W.sessionStorage.setItem('hk_rescued','1');"
+          f"if(!t){{var m=W.document.cookie.match(/(?:^|; ){COOKIE_TOKEN}=([^;]+)/);t=m?m[1]:'';}}"
+          f"var last=+(W.sessionStorage.getItem('hk_rescued')||0);"
+          f"if(t && Date.now()-last>20000){{"
+          f"W.sessionStorage.setItem('hk_rescued',String(Date.now()));"
           f"{_cookie_js_set_raw()}"
-          f"W.location.reload();}}}}catch(e){{}}")
+          f"var u=new URL(W.location.href);u.searchParams.set('{URL_TOKEN}',t);W.location.replace(u.toString());}}"
+          f"}}catch(e){{}}")
     try:
         st.components.v1.html(f"<script>{js}</script>", height=0)
     except Exception:
@@ -1047,7 +1081,7 @@ def _clear_session():
     st.session_state.pop("_table_drafts", None)
     st.session_state.pop("_task_preferences", None)
     st.session_state.pop("last_customer_upload_export", None)
-    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions"):
+    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions", "_url_tok"):
         st.session_state.pop(k, None)
 
 
@@ -1104,6 +1138,7 @@ def _try_login(username, password, remember=False):
         with guard["lock"]:
             for k in keys:
                 guard["fails"].pop(k, None)
+        st.session_state.pop("_rescue_off", None)
         st.session_state.update({"user": uname, "role": rec["role"], "login_time": time.time(),
                                  "must_change": bool(rec.get("must_change"))})
         audit("login", rec["role"])
@@ -9747,18 +9782,31 @@ def _visit_progress(visits, user):
                 text=f"ថ្ងៃនេះ: បានចុះ {done} / {VISIT_DAILY_TARGET} ហាង" + (" 🎉 ដល់គោលដៅហើយ" if not left else f" · នៅសល់ {left}"))
 
 
-def _visit_zone_picker(zone_map, key, due=None):
-    """Zone selector, remembered for the day so staff pick it once. due = Counter(zone -> shops due now)."""
+VISIT_ALL_ZONES = "🗺️ គ្រប់តំបន់ (ទាំងអស់)"
+
+
+def _visit_zone_picker(zone_map, key, due=None, allow_all=False):
+    """Zone selector, remembered for the day so staff pick it once. due = Counter(zone -> shops due now).
+    allow_all=True adds 'all zones' (returns VISIT_ALL_ZONES)."""
     counts = Counter(zone_map.values())
     due = due or Counter()
     options = [z for z in VISIT_ZONE_NAMES if counts.get(z) and not z.startswith("🚫")]
     if not options:
         return None
+    if allow_all:
+        options = [VISIT_ALL_ZONES] + options
     mem = st.session_state.get("visit_zone_today")
     if st.session_state.get(key) not in options:
-        st.session_state[key] = mem if mem in options else options[0]
-    zone = st.selectbox("🗺️ តំបន់របស់ខ្ញុំថ្ងៃនេះ", options, key=key, format_func=lambda z: f"{_km(z)}  ({counts.get(z, 0)} ហាង" + (f" · ត្រូវចុះ {due[z]}" if due.get(z) else "") + ")")
-    st.session_state["visit_zone_today"] = zone
+        st.session_state[key] = mem if mem in options else options[1 if allow_all else 0]
+    n_all, due_all = sum(counts.get(z, 0) for z in options[1:] if allow_all), sum(due.values())
+
+    def _fmt(z):
+        if z == VISIT_ALL_ZONES:
+            return f"{z}  ({n_all} ហាង" + (f" · ត្រូវចុះ {due_all}" if due_all else "") + ")"
+        return f"{_km(z)}  ({counts.get(z, 0)} ហាង" + (f" · ត្រូវចុះ {due[z]}" if due.get(z) else "") + ")"
+    zone = st.selectbox("🗺️ តំបន់របស់ខ្ញុំថ្ងៃនេះ", options, key=key, format_func=_fmt)
+    if zone != VISIT_ALL_ZONES:
+        st.session_state["visit_zone_today"] = zone        # the New visit form starts in this zone
     return zone
 
 
@@ -10462,6 +10510,10 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
     if zone:
         keys = {k for k in keys if (zone_map or {}).get(k) == zone}
     new = st.session_state.get("_visit_new", {}) or {}
+    try:
+        sticker = _sticker_latest(visits=visits)
+    except Exception:
+        sticker = {}
     rows = []
     for k in keys:
         s = stats.loc[k] if (not stats.empty and k in stats.index) else None
@@ -10498,6 +10550,9 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
             gap = s["Usual gap"]
             if pd.notna(gap) and gap > 0 and s["Days since order"] > 2 * gap and s["Order days"] >= 3:
                 score += 2; why.append(f"⏰ មិនបញ្ជាទិញ {int(s['Days since order'])} ថ្ងៃ (ធម្មតា {gap:.0f})")
+        sk = sticker.get(k)
+        if _sticker_needs(sk):
+            score += 2; why.append(f"🏷️ ត្រូវការស្ទីគ័រ ({sk['src']} {sk['date']:%d %b}) — យកស្ទីគ័រទៅ")
         if size.startswith("🟢"):
             score += 1
         if due_in is not None and due_in > 0 and not why:
@@ -10513,11 +10568,71 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
     return out.sort_values(["Priority", "Pcs 28 days"], ascending=False).reset_index(drop=True)
 
 
+def _visit_unpick(customer):
+    st.session_state["visit_picked"] = [c for c in st.session_state.get("visit_picked", []) if c != customer]
+
+
+def _visit_plan_card(row, key, star, registry, pin_store, auto_pins, zone_src, all_zones=False, removable=False):
+    link, exact = _visit_map_link(row["Customer"], registry, pin_store, auto_pins)
+    with st.container(border=True):
+        if _visit_phone_mode():
+            c1 = st.container()
+            c2, c3 = st.columns(2)
+        else:
+            c1, c2, c3 = st.columns([4, 1, 1])
+        zone_txt = f" · {_km(row['Area'])}" if all_zones else ""
+        c1.markdown(f"**{'⭐ ' if star else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
+                    f"<span style='color:#6B7280'>{_km(row['Size'])} · ចុះហាងចុងក្រោយ {_km_days(row['Last visit'])} · {row['Pcs 28 days']:,} pcs ក្នុង ២៨ ថ្ងៃ"
+                    f"{zone_txt} · {zone_src.get(norm_name(row['Customer']), '')}</span>",
+                    unsafe_allow_html=True)
+        c2.link_button("🧭 ទៅ" if exact else "⚠️ គ្មានទីតាំង", link, use_container_width=True,
+                       help="ផ្លូវទៅទីតាំងហាងដែលបានរក្សាទុក" if exact
+                       else "No saved location yet: this searches the name on Google Maps. Save the real location at the shop.")
+        c3.button("ចាប់ផ្តើម ▶", key=key, use_container_width=True, on_click=_visit_start, args=(row["Customer"],))
+        if removable:
+            c1.button("✖ ដកចេញ", key=f"{key}_rm", on_click=_visit_unpick, args=(row["Customer"],))
+
+
+def _visit_map_pick(route, done_today, registry, store, auto):
+    """Map of the plan's shops (same as the Media Team map). Tap a pin to pick the shops for today's trip."""
+    rows = []
+    for r in route.to_dict("records"):
+        pin = _visit_pin(r["Customer"], registry, store, auto)
+        if not pin:
+            continue
+        why, due = str(r["Why visit"]), r["Due in (days)"]
+        if norm_name(r["Customer"]) in done_today:
+            kind, why = "dark", "✅ បានចុះរួចថ្ងៃនេះ"
+        elif "🔴" in why:
+            kind = "red"
+        elif "🆕 អតិថិជនថ្មី" in why:
+            kind = "blue"
+        elif "🏷️ ត្រូវការស្ទីគ័រ" in why:
+            kind = "purple"
+        elif pd.isna(due) or due <= 0:
+            kind = "orange"
+        else:
+            kind = "grey"
+        rows.append({"Lat": pin[0], "Lon": pin[1], "Customer": r["Customer"], "label": r["Customer"],
+                     "info": f"{why}\n{r['Pcs 28 days']:,} pcs / 28 ថ្ងៃ", "color": PICK_PIN_COLORS[kind],
+                     "radius": 130 if kind in ("red", "blue", "purple") else 100 if kind == "orange" else 60})
+    show_map = st.toggle("🗺️ បង្ហាញផែនទី — ចុចលើចំណុចដើម្បីជ្រើសហាង", value=True, key="visit_show_map")
+    st.caption("🔴 បញ្ហាមិនទាន់ដោះស្រាយ · 🔵 អតិថិជនថ្មី · 🟣 ត្រូវការស្ទីគ័រ · 🟠 ដល់ពេលចុះ · ⚪ មិនទាន់ដល់ពេល · ⚫ ចុះរួចថ្ងៃនេះ · 🟢 បានជ្រើស"
+               + (f" · {len(route) - len(rows)} ហាងមិនទាន់មានទីតាំង" if len(rows) < len(route) else ""))
+    if show_map:
+        picked = _pick_map(rows, "visit_picked", "visit_shops", 320 if _visit_phone_mode() else 430)
+    else:
+        picked = list(st.session_state.get("visit_picked", []))
+    if picked:
+        st.button("↩️ សម្អាតការជ្រើស", key="visit_pick_clear", on_click=lambda: st.session_state.pop("visit_picked", None))
+    return picked
+
+
 def _visit_is_due(route):
     """Rows that need a visit now: due/late, never visited, or with an open problem."""
     if route.empty:
         return route.iloc[0:0]
-    return route[route["Due in (days)"].fillna(0).le(0) | route["Why visit"].str.contains("🔴")]
+    return route[route["Due in (days)"].fillna(0).le(0) | route["Why visit"].str.contains("🔴|🏷️ ត្រូវការស្ទីគ័រ")]
 
 
 def _visit_new_form(visits, stats, names):
@@ -10836,6 +10951,10 @@ def _vf_check(d, ctx, phone):
     fifo = cols[1].radio("🥟 ការតាំង / នំចាស់នៅខាងមុខ (FIFO)", VF_FIFO, format_func=_km, index=_vf_idx(VF_FIFO, d.get("fifo")), horizontal=True, key="vf_fifo")
     old_pcs = cols[2].number_input("នំចាស់ / ខូច ដែលរកឃើញ (pcs)", 0, 5000, int(d.get("old_pcs", 0)), 1, key="vf_old")
     sticker = cols[3].radio("🏷️ ស្ទីគ័រ", VF_STICKER, format_func=_km, index=_vf_idx(VF_STICKER, d.get("sticker")), horizontal=True, key="vf_sticker")
+    try:
+        cols[3].caption(_sticker_text(_sticker_latest().get(ctx.get("key"))))
+    except Exception:
+        pass
     changed = cols[4].number_input("ស្ទីគ័របានប្តូរថ្ងៃនេះ", 0, 100, int(d.get("changed", 0)), 1, key="vf_changed")
     fridge_fixed = st.checkbox("🧽 ខ្ញុំបានសម្អាត / រៀបទូទឹកកក ឬកន្លែងតាំងថ្ងៃនេះ", value=bool(d.get("fridge_fixed")), key="vf_ffix")
     st.caption(f"គូសធីកអ្វីដែលល្អនៅ {_km(ctx['shop_type'])}:")
@@ -10943,6 +11062,7 @@ def _vf_save(a, ctx):
         st.error("មិនអាចរក្សាទុករបាយការណ៍បានទេ: " + str(e)[:160] + "។ ចម្លើយរបស់អ្នកនៅដដែល សូមចុចរក្សាទុកម្តងទៀត។")
         return
     audit("shop visit" + (" (TEST)" if _visit_test_mode() else ""), f"{customer} | {label} | {row['Problems']}")
+    _visit_unpick(customer)                              # done: off the map picks
     _vf_draft_delete()
     for k in [k for k in list(st.session_state) if str(k).startswith(("visit_gps", "visit_customer", "visit_cam", "visit_files",
                                                                      "visit_before", "visit_after", "vf_", "visit_draft", "visit_ctx"))]:
@@ -12091,9 +12211,10 @@ def _shop_visits_body():
         zone_src = {k: v[1] for k, v in _visit_zone_info(names).items()}
         all_route = _visit_route(visits, stats, names, areas, zone_map)
         due_all = _visit_is_due(all_route)
-        zone = _visit_zone_picker(zone_map, "visit_zone_plan", Counter(due_all["Area"]))
-        route = all_route[all_route["Area"].eq(zone)].reset_index(drop=True) if zone else all_route
-        st.caption(f"📅 ហាងនៅភ្នំពេញ {len(due_all)} ត្រូវចុះឥឡូវ · ក្នុងតំបន់នេះ {len(_visit_is_due(route))}។")
+        zone = _visit_zone_picker(zone_map, "visit_zone_plan", Counter(due_all["Area"]), allow_all=True)
+        all_zones = zone == VISIT_ALL_ZONES
+        route = all_route if (all_zones or not zone) else all_route[all_route["Area"].eq(zone)].reset_index(drop=True)
+        st.caption(f"📅 ហាងនៅភ្នំពេញ {len(due_all)} ត្រូវចុះឥឡូវ" + ("" if all_zones else f" · ក្នុងតំបន់នេះ {len(_visit_is_due(route))}") + "។")
         if route.empty:
             st.info("មិនទាន់មានហាងក្នុងតំបន់នេះទេ។")
             return
@@ -12105,24 +12226,23 @@ def _shop_visits_body():
             auto_pins = {}
         done_today = set(visits.loc[visits["_dt"].dt.date == today_kh(), "Customer"].map(norm_name)) if not visits.empty else set()
         todo = route[~route["Customer"].map(norm_name).isin(done_today)]
-        st.markdown(f"**⭐ ហាងណែនាំ {VISIT_DAILY_TARGET} សម្រាប់ថ្ងៃនេះ** — ហាងសំខាន់បំផុតក្នុងតំបន់នេះ")
-        q = st.text_input("🔎 ស្វែងរកហាងក្នុងតំបន់នេះ", key="vroute_q", max_chars=60)
+        card = dict(registry=registry, pin_store=pin_store, auto_pins=auto_pins, zone_src=zone_src, all_zones=all_zones)
+        picked = _visit_map_pick(route, done_today, registry, pin_store, auto_pins)
+        if picked:
+            st.markdown(f"**✅ ហាងដែលបានជ្រើសលើផែនទី ({len(picked)})** — តាមលំដាប់ដែលបានចុច")
+            by_name = {r["Customer"]: r for r in route.to_dict("records")}
+            for n, c in enumerate(picked):
+                if c in by_name:
+                    _visit_plan_card(by_name[c], f"vpk_{n}", star=False, removable=True, **card)
+            st.divider()
+        where = "គ្រប់តំបន់" if all_zones else "ក្នុងតំបន់នេះ"
+        st.markdown(f"**⭐ ហាងណែនាំ {VISIT_DAILY_TARGET} សម្រាប់ថ្ងៃនេះ** — ហាងសំខាន់បំផុត{where}")
+        q = st.text_input(f"🔎 ស្វែងរកហាង{where}", key="vroute_q", max_chars=60)
         r = todo if not q.strip() else todo[todo["Customer"].str.contains(q.strip(), case=False, regex=False)]
         for n, (i, row) in enumerate(r.head(VISIT_DAILY_TARGET + 12).iterrows()):
             if n == VISIT_DAILY_TARGET and not q.strip():
-                st.markdown("**ហាងផ្សេងទៀតក្នុងតំបន់នេះ**")
-            link, exact = _visit_map_link(row["Customer"], registry, pin_store, auto_pins)
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([4, 1, 1])
-                c1.markdown(f"**{'⭐ ' if n < VISIT_DAILY_TARGET and not q.strip() else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
-                            f"<span style='color:#6B7280'>{_km(row['Size'])} · ចុះហាងចុងក្រោយ {_km_days(row['Last visit'])} · {row['Pcs 28 days']:,} pcs ក្នុង ២៨ ថ្ងៃ"
-                            f" · {zone_src.get(norm_name(row['Customer']), '')}</span>",
-                            unsafe_allow_html=True)
-                c2.link_button("🧭 ទៅ" if exact else "⚠️ គ្មានទីតាំង", link, use_container_width=True,
-                               help="ផ្លូវទៅទីតាំងហាងដែលបានរក្សាទុក" if exact
-                               else "No saved location yet: this searches the name on Google Maps. Save the real location at the shop.")
-                c3.button("ចាប់ផ្តើម ▶", key=f"vstart_{i}", use_container_width=True,
-                          on_click=_visit_start, args=(row["Customer"],))
+                st.markdown(f"**ហាងផ្សេងទៀត{where}**")
+            _visit_plan_card(row, f"vstart_{i}", star=n < VISIT_DAILY_TARGET and not q.strip(), **card)
         if done_today & set(route["Customer"].map(norm_name)):
             st.caption("✅ បានចុះរួចថ្ងៃនេះ (ដោយអ្នកណាម្នាក់): " + ", ".join(route.loc[route["Customer"].map(norm_name).isin(done_today), "Customer"]))
     elif view == "⚙️ Shops & zones":
@@ -12290,6 +12410,108 @@ def _media_load(name):
         return f.read()
 
 
+# ---------- 🏷️ sticker status shared by Shop Visits and the Media Team ----------
+# A Shop Visit says Good / Old / Missing (+ how many stickers were changed); the Media Team says the same with
+# MEDIA_STATES. The newest report from either team is the shop's sticker status, and both teams see it.
+STICKER_FROM_VISIT = {"Good": "👍 Has one, still good", "Old / faded": "⚠️ Old — needs a new one",
+                      "Missing": "❌ None — needs one"}
+STICKER_TO_VISIT = {"✅ Put up a new one today": "Good", "👍 Has one, still good": "Good",
+                    "⚠️ Old — needs a new one": "Old / faded", "❌ None — needs one": "Missing"}
+STICKER_SRC_VISIT, STICKER_SRC_MEDIA = "🏪 Shop Visit", "📸 Media"
+_STICKER_MEMO = {}
+
+
+def _sticker_latest(visits=None, shoots=None):
+    """{customer key: {"state", "date", "src", "by"}} = newest sticker report of Shop Visits and Media Team."""
+    if visits is None:
+        visits = _visit_read()
+    if shoots is None:
+        shoots = _media_read()
+
+    def _sig(df):
+        return (len(df), str(df["_dt"].max()) if len(df) and "_dt" in df.columns else "")
+    sig = (_sig(visits), _sig(shoots))
+    if _STICKER_MEMO.get("sig") == sig:
+        return _STICKER_MEMO["val"]
+    found = []
+    if len(visits) and {"Customer", "Sticker", "_dt"} <= set(visits.columns):
+        v = visits[visits["Sticker"].isin(list(STICKER_FROM_VISIT))]
+        changed = pd.to_numeric(v.get("Stickers changed", 0), errors="coerce").fillna(0)
+        state = v["Sticker"].map(STICKER_FROM_VISIT).where(changed <= 0, "✅ Put up a new one today")
+        found.append(pd.DataFrame({"k": v["Customer"].map(norm_name), "state": state, "date": v["_dt"],
+                                   "src": STICKER_SRC_VISIT, "by": v.get("Staff", "-")}))
+    if len(shoots) and {"Customer", "Sticker", "_dt"} <= set(shoots.columns):
+        m = shoots[shoots["Sticker"].isin(MEDIA_STATES)]
+        found.append(pd.DataFrame({"k": m["Customer"].map(norm_name), "state": m["Sticker"], "date": m["_dt"],
+                                   "src": STICKER_SRC_MEDIA, "by": m.get("By", "-")}))
+    out = {}
+    if found:
+        allr = pd.concat(found, ignore_index=True).dropna(subset=["date"]).sort_values("date")
+        for r in allr.drop_duplicates("k", keep="last").to_dict("records"):
+            out[r["k"]] = {"state": r["state"], "date": pd.Timestamp(r["date"]), "src": r["src"], "by": str(r["by"])}
+    _STICKER_MEMO.update(sig=sig, val=out)
+    return out
+
+
+def _sticker_needs(info):
+    return bool(info) and info.get("state") in MEDIA_NEED
+
+
+def _sticker_text(info):
+    """'🏷️ ស្ទីគ័រចុងក្រោយ: ⚠️ ចាស់ — ត្រូវការថ្មី · 📸 Media 25 Oct (dara)'"""
+    if not info:
+        return "🏷️ ស្ទីគ័រ: មិនទាន់មានព័ត៌មាន"
+    return f"🏷️ ស្ទីគ័រចុងក្រោយ: {_mkm(info['state'])} · {info['src']} {info['date']:%d %b} ({info['by']})"
+
+
+PICK_PIN_COLORS = {"red": [220, 40, 40, 230], "blue": [30, 110, 220, 230], "orange": [240, 150, 0, 230],
+                   "purple": [150, 60, 200, 220], "grey": [150, 150, 150, 170], "dark": [70, 70, 70, 150],
+                   "picked": [20, 160, 70, 255]}
+
+
+def _pick_map(rows, state_key, layer_id, height):
+    """Map with tap-to-pick: rows = [{Lat, Lon, Customer, label, info, color, radius}].
+    A tap adds the shop to st.session_state[state_key] (tap again removes it). Returns the picked names."""
+    picked = list(st.session_state.get(state_key, []))
+    if not rows:
+        return picked
+    try:
+        import pydeck as pdk
+        for r in rows:
+            if r["Customer"] in picked:
+                r["color"], r["radius"] = PICK_PIN_COLORS["picked"], 130
+        layer = pdk.Layer("ScatterplotLayer", data=rows, id=layer_id, get_position="[Lon, Lat]",
+                          get_fill_color="color", get_radius="radius", radius_min_pixels=6, radius_max_pixels=16,
+                          stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=1, pickable=True)
+        lat = sum(r["Lat"] for r in rows) / len(rows)
+        lon = sum(r["Lon"] for r in rows) / len(rows)
+        deck = pdk.Deck(layers=[layer], map_provider="carto", map_style="light",
+                        initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=12 if len(rows) < 60 else 11),
+                        tooltip={"text": "{label}\n{info}"})
+        ver_key = state_key + "_ver"
+        ver = st.session_state.get(ver_key, 0)
+        try:
+            event = st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key=f"{layer_id}_{ver}",
+                                    height=height)
+        except TypeError:                                    # older Streamlit: map without tapping
+            st.pydeck_chart(deck)
+            event = None
+        try:
+            objs = (event.selection.get("objects", {}) or {}).get(layer_id, []) if event is not None else []
+        except Exception:
+            objs = []
+        if objs:
+            name = objs[0].get("Customer")
+            if name:
+                picked = [c for c in picked if c != name] if name in picked else picked + [name]
+                st.session_state[state_key] = picked
+                st.session_state[ver_key] = ver + 1           # clear the tap so the next tap counts again
+                st.rerun(scope="fragment") if _fragment_rerun_ok() else st.rerun()
+    except Exception as e:
+        st.caption("ផែនទីមិនអាចបង្ហាញបានទេ: " + str(e)[:120])
+    return picked
+
+
 def _media_last_shoot(shoots):
     """{customer key: newest shoot row}."""
     if shoots.empty:
@@ -12341,6 +12563,7 @@ def _media_priority(stats, names, zone_map, shoots, today):
     events = _media_events(names, today)
     last = _media_last_shoot(shoots)
     status = _media_status_map(names, shoots)
+    sticker = _sticker_latest(shoots=shoots)
     t = pd.Timestamp(today)
     rows = []
     for k, name in names.items():
@@ -12373,8 +12596,11 @@ def _media_priority(stats, names, zone_map, shoots, today):
         elif shot_day is not None and (t - shot_day).days > MEDIA_REFRESH_DAYS and pcs28 > 0:
             score += 2
             why.append(f"📷 រូបចាស់ ({(t - shot_day).days} ថ្ងៃ)")
-        if ls is not None and any(str(ls.get(i, "")) in MEDIA_NEED for i in MEDIA_ITEMS):
-            need = [MEDIA_KM[i] for i in MEDIA_ITEMS if str(ls.get(i, "")) in MEDIA_NEED]
+        need = [MEDIA_KM[i] for i in MEDIA_ITEMS if i != "Sticker" and ls is not None and str(ls.get(i, "")) in MEDIA_NEED]
+        sk = sticker.get(k)
+        if _sticker_needs(sk):                             # newest sticker report of Shop Visits or Media Team
+            need.insert(0, MEDIA_KM["Sticker"] + (f" ({sk['src']} {sk['date']:%d %b})" if sk["src"] == STICKER_SRC_VISIT else ""))
+        if need:
             score += 4
             why.append("🖨️ ត្រូវការ " + ", ".join(need))
         if score <= 0:
@@ -12551,53 +12777,23 @@ def _media_unpick(customer):
 
 def _media_map_pick(view, registry, store, auto):
     """Map of the shops on the list. Tap a pin to add the shop to today's picks (tap again to remove)."""
-    picked = list(st.session_state.get("media_picked", []))
     rows = []
     for r in view.to_dict("records"):
         pin = _visit_pin(r["Customer"], registry, store, auto)
         if not pin:
             continue
         why = r["Why"]
-        kind = ("picked" if r["Customer"] in picked else "fridge" if "🧊" in why else "new" if "🆕" in why
+        kind = ("fridge" if "🧊" in why else "new" if "🆕" in why
                 else "print" if "🖨️" in why else "reshoot" if "🔁" in why else "other")
         rows.append({"Lat": pin[0], "Lon": pin[1], "Customer": r["Customer"], "label": r["Customer"],
-                     "info": why, "color": MEDIA_PIN_COLORS[kind], "radius": 130 if kind in ("fridge", "new", "picked") else 80})
+                     "info": why, "color": MEDIA_PIN_COLORS[kind], "radius": 130 if kind in ("fridge", "new") else 80})
     show_map = st.toggle("🗺️ បង្ហាញផែនទី — ចុចលើចំណុចដើម្បីជ្រើសហាង", value=True, key="media_show_map")
     st.caption("🔴 ទូថ្មី · 🔵 អតិថិជនថ្មី · 🟠 ត្រូវការ ស្ទីគ័រ/ម៉ឺនុយ/បដា · 🟣 ថតម្តងទៀត · ⚪ ផ្សេងៗ · 🟢 បានជ្រើស"
                + (f" · {len(view) - len(rows)} ហាងមិនទាន់មានទីតាំង (មើលក្នុងបញ្ជីខាងក្រោម)" if len(rows) < len(view) else ""))
-    if not show_map or not rows:
-        return picked
-    try:
-        import pydeck as pdk
-        layer = pdk.Layer("ScatterplotLayer", data=rows, id="media_shops", get_position="[Lon, Lat]",
-                          get_fill_color="color", get_radius="radius", radius_min_pixels=6, radius_max_pixels=16,
-                          stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=1, pickable=True)
-        lat = sum(r["Lat"] for r in rows) / len(rows)
-        lon = sum(r["Lon"] for r in rows) / len(rows)
-        deck = pdk.Deck(layers=[layer], map_provider="carto", map_style="light",
-                        initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=12 if len(rows) < 60 else 11),
-                        tooltip={"text": "{label}\n{info}"})
-        ver = st.session_state.get("media_map_ver", 0)
-        try:
-            event = st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key=f"media_map_{ver}",
-                                    height=320 if _media_phone() else 430)
-        except TypeError:                                    # older Streamlit: map without tapping
-            st.pydeck_chart(deck)
-            event = None
-        objs = []
-        try:
-            objs = (event.selection.get("objects", {}) or {}).get("media_shops", []) if event is not None else []
-        except Exception:
-            objs = []
-        if objs:
-            name = objs[0].get("Customer")
-            if name:
-                picked = [c for c in picked if c != name] if name in picked else picked + [name]
-                st.session_state["media_picked"] = picked
-                st.session_state["media_map_ver"] = ver + 1           # clear the tap so the next tap counts again
-                st.rerun(scope="fragment") if _fragment_rerun_ok() else st.rerun()
-    except Exception as e:
-        st.caption("ផែនទីមិនអាចបង្ហាញបានទេ: " + str(e)[:120])
+    if show_map:
+        picked = _pick_map(rows, "media_picked", "media_shops", 320 if _media_phone() else 430)
+    else:
+        picked = list(st.session_state.get("media_picked", []))
     if picked:
         st.button("↩️ សម្អាតការជ្រើស", key="media_pick_clear", on_click=lambda: st.session_state.pop("media_picked", None))
     return picked
@@ -12650,6 +12846,8 @@ def _media_form_body(names, zone_map, today):
     st.session_state["media_customer"] = customer
     if today.weekday() not in MEDIA_DAYS:
         st.caption("ℹ️ ថ្ងៃនេះមិនមែនថ្ងៃសុក្រ/សៅរ៍ទេ — នៅតែអាចបញ្ចូលបាន។")
+    sk = _sticker_latest().get(norm_name(customer))
+    (st.warning if _sticker_needs(sk) else st.caption)(_sticker_text(sk) + (" — សូមយកស្ទីគ័រថ្មីទៅជាមួយ" if _sticker_needs(sk) else ""))
     with st.form("media_form", clear_on_submit=True):
         photos = st.file_uploader(f"2️⃣ រូបថតហាង (រហូតដល់ {MEDIA_PHOTO_MAX})", type=["jpg", "jpeg", "png", "heic", "webp"],
                                   accept_multiple_files=True)
