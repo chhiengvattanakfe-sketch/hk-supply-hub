@@ -42,7 +42,13 @@ APP_PASSWORD = get_secret("APP_PASSWORD", "staff2026")
 VIEWER_PASSWORD = get_secret("VIEWER_PASSWORD", "")
 
 # Dropbox Cloud Paths (Live Operation Mode)
-DBX_EXCEL_PATH = "/dropbox/4- Sale Jounal/10_Sale_Journal_OCT_2026.xlsx"
+DBX_FOLDER = "/dropbox/4- Sale Jounal"
+# The journal is picked by month from the file name (10_Sale_Journal_OCT_2026.xlsx, 11_Sale_Journal_NOV_2026.xlsx ...):
+# this month's file; next month's file is read too as soon as it exists (orders for the 1st are typed on the last
+# day of the month) and last month's file during the first days of a month.
+# To force one file, put its full Dropbox path here, e.g. "/dropbox/4- Sale Jounal/10_Sale_Journal_OCT_2026.xlsx"
+DBX_EXCEL_OVERRIDE = ""
+JOURNAL_PREV_MONTH_DAYS = 7
 DBX_DATA_PATH = "/dropbox/4- Sale Jounal/daily_delivery_expenses.csv"
 DBX_PACKING_PATH = "/dropbox/4- Sale Jounal/daily_packing_progress.csv"
 DBX_AUDIT_PATH = "/dropbox/4- Sale Jounal/system_audit_log.csv"
@@ -319,55 +325,172 @@ def _find_invoice(row, inv_col):
             if re.match(r"^" + re.escape(INVOICE_PREFIX.upper()) + r"\d+$", s): return s
     return "-"
 
+_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+_YM_RE = re.compile(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s​_\-.]*(20\d\d)")
+
+
+def journal_ym(name):
+    """'11_Sale_Journal_NOV_2026.xlsx' -> (2026, 11)"""
+    m = _YM_RE.search(str(name).lower())
+    return (int(m.group(2)), _MONTHS[m.group(1)]) if m else None
+
+
+def _ym_add(ym, n):
+    y, m = ym[0], ym[1] + n
+    while m > 12: y, m = y + 1, m - 12
+    while m < 1: y, m = y - 1, m + 12
+    return (y, m)
+
+
+def _is_journal_name(name):
+    n = name.lower()
+    return (n.endswith(".xlsx") and not n.startswith("~$") and "conflicted copy" not in n
+            and not n.endswith("__status.xlsx") and re.search(r"sale.?jou", n) is not None)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
+def list_journals():
+    """[(name, path, rev, modified)] of the journal files in the Dropbox folder."""
+    out = []
+    res = dbx.files_list_folder(DBX_FOLDER)
+    while True:
+        for e in res.entries:
+            if isinstance(e, dropbox.files.FileMetadata) and _is_journal_name(e.name):
+                out.append((e.name, e.path_display, e.rev, e.server_modified))
+        if not res.has_more: break
+        res = dbx.files_list_folder_continue(res.cursor)
+    return out
+
+
+def pick_journals():
+    """[main path, neighbour month paths...] with their revs."""
+    if DBX_EXCEL_OVERRIDE:
+        return [(DBX_EXCEL_OVERRIDE, "override")]
+    files = list_journals()
+    if not files:
+        return []
+    t = today_kh()
+    now_ym = (t.year, t.month)
+    dated = [(f, journal_ym(f[0])) for f in files]
+    dated = [(f, ym) for f, ym in dated if ym]
+    cur = [f for f, ym in dated if ym == now_ym]
+    past = [(ym, f) for f, ym in dated if ym < now_ym]
+    if cur:
+        main = max(cur, key=lambda f: f[3])
+    elif past:
+        best = max(ym for ym, _ in past)                       # no file for this month yet: latest earlier month
+        main = max((f for ym, f in past if ym == best), key=lambda f: f[3])
+    else:
+        main = max(files, key=lambda f: f[3])
+    out = [(main[1], main[2])]
+    main_ym = journal_ym(main[0])
+    if main_ym:
+        want = [_ym_add(main_ym, 1)]
+        if main_ym == now_ym and t.day <= JOURNAL_PREV_MONTH_DAYS:
+            want.append(_ym_add(main_ym, -1))
+        for w in want:
+            ms = [f for f, ym in dated if ym == w and f[1] != main[1]]
+            if ms:
+                f = max(ms, key=lambda f: f[3])
+                out.append((f[1], f[2]))
+    return out
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=6)
+def read_journal(path, rev):
+    """Reads one journal workbook (cached until the file changes: rev = Dropbox file version)."""
+    _, res = dbx.files_download(path)
+    excel_bytes = io.BytesIO(res.content)
+    df_cust = pd.read_excel(excel_bytes, sheet_name=SHEET_NAME)
+    customers = sorted({str(x).strip() for x in df_cust[COLUMN_NAME].dropna() if str(x).strip()})
+
+    excel_bytes.seek(0)
+    from openpyxl import load_workbook
+    wb = load_workbook(excel_bytes, read_only=True, data_only=True)
+    ws = wb[JOURNAL_SHEET]
+
+    raw_rows = []
+    cases_col = inv_col = rem_col = None
+    for r_i, row in enumerate(ws.iter_rows(values_only=True)):
+        if r_i < 15 and (cases_col is None or inv_col is None or rem_col is None):
+            for c_i, v in enumerate(row):
+                if v is None: continue
+                sv = str(v)
+                if cases_col is None and JOURNAL_CASES_HEADER in sv: cases_col = c_i
+                elif inv_col is None and JOURNAL_INVOICE_HEADER in sv: inv_col = c_i
+                elif rem_col is None and JOURNAL_REMARK_HEADER in sv: rem_col = c_i
+        if len(row) < 2 or row[1] is None: continue
+        name = re.sub(r"\s+", " ", str(row[1])).strip()
+        if not name or name == JOURNAL_HEADER_TEXT: continue
+        qty = row[cases_col] if (cases_col is not None and cases_col < len(row)) else None
+        inv = _find_invoice(row, inv_col)
+        rem = _cell_text(row[rem_col]) if (rem_col is not None and rem_col < len(row)) else ""
+        raw_rows.append((row[0], name, qty, inv, rem or "-"))
+    wb.close()
+
+    from collections import Counter
+    months = Counter((r[0].year, r[0].month) for r in raw_rows if isinstance(r[0], datetime))
+    dominant = months.most_common(1)[0][0] if months else journal_ym(path)
+    out = []
+    for v, name, qty, inv, rem in raw_rows:
+        d = cell_to_date(v, dominant)
+        if d is None: continue
+        try: q = pd.to_numeric(qty, errors="coerce")
+        except Exception: q = None
+        out.append((d, name, q if pd.notna(q) else None, inv, rem))
+
+    journal = pd.DataFrame(out, columns=["Date", "Customer", "Cases", "Invoice", "Remark"])
+    journal["Cases"] = pd.to_numeric(journal["Cases"], errors="coerce")
+    return {"customers": customers, "journal": journal, "cases_col_found": cases_col is not None,
+            "invoice_col_found": inv_col is not None}
+
+
+def _merge(main_path, main, extras):
+    """Main journal + the rows of next / last month's journal dated in that file's own month.
+    An order already in the main journal (same day, customer, invoice) is not added twice."""
+    j = main["journal"].assign(File=os.path.basename(main_path))
+    have = set(zip(j["Date"], j["Customer"].map(norm_name), j["Invoice"].astype(str)))
+    parts, customers = [j], list(main["customers"])
+    seen = {norm_name(c) for c in customers}
+    for path, snap in extras:
+        ym, x = journal_ym(os.path.basename(path)), snap["journal"]
+        if x.empty or not ym: continue
+        x = x[[(d.year, d.month) == ym for d in x["Date"]]]
+        keys = list(zip(x["Date"], x["Customer"].map(norm_name), x["Invoice"].astype(str)))
+        x = x[[k not in have for k in keys]]
+        if x.empty: continue
+        parts.append(x.assign(File=os.path.basename(path)))
+        for c in snap["customers"]:
+            if norm_name(c) not in seen:
+                customers.append(c); seen.add(norm_name(c))
+    journal = pd.concat(parts, ignore_index=True) if len(parts) > 1 else j
+    return dict(main, journal=journal, customers=sorted(customers, key=str.casefold),
+                files=[os.path.basename(main_path)] + [os.path.basename(p) for p, _ in extras])
+
+
 def current_snapshot():
+    """(snapshot | None, source, main journal path, error text | None). Never raises."""
     try:
-        _, res = dbx.files_download(DBX_EXCEL_PATH)
-        excel_bytes = io.BytesIO(res.content)
-        df_cust = pd.read_excel(excel_bytes, sheet_name=SHEET_NAME)
-        customers = sorted({str(x).strip() for x in df_cust[COLUMN_NAME].dropna() if str(x).strip()})
-        
-        excel_bytes.seek(0)
-        from openpyxl import load_workbook
-        wb = load_workbook(excel_bytes, read_only=True, data_only=True)
-        ws = wb[JOURNAL_SHEET]
-        
-        raw_rows = []
-        cases_col = inv_col = rem_col = None
-        for r_i, row in enumerate(ws.iter_rows(values_only=True)):
-            if r_i < 15 and (cases_col is None or inv_col is None or rem_col is None):
-                for c_i, v in enumerate(row):
-                    if v is None: continue
-                    sv = str(v)
-                    if cases_col is None and JOURNAL_CASES_HEADER in sv: cases_col = c_i
-                    elif inv_col is None and JOURNAL_INVOICE_HEADER in sv: inv_col = c_i
-                    elif rem_col is None and JOURNAL_REMARK_HEADER in sv: rem_col = c_i
-            if len(row) < 2 or row[1] is None: continue
-            name = re.sub(r"\s+", " ", str(row[1])).strip()
-            if not name or name == JOURNAL_HEADER_TEXT: continue
-            qty = row[cases_col] if (cases_col is not None and cases_col < len(row)) else None
-            inv = _find_invoice(row, inv_col)
-            rem = _cell_text(row[rem_col]) if (rem_col is not None and rem_col < len(row)) else ""
-            raw_rows.append((row[0], name, qty, inv, rem or "-"))
-        wb.close()
-        
-        from collections import Counter
-        months = Counter((r[0].year, r[0].month) for r in raw_rows if isinstance(r[0], datetime))
-        dominant = months.most_common(1)[0][0] if months else None
-        out = []
-        for v, name, qty, inv, rem in raw_rows:
-            d = cell_to_date(v, dominant)
-            if d is None: continue
-            try: q = pd.to_numeric(qty, errors="coerce")
-            except: q = None
-            out.append((d, name, q if pd.notna(q) else None, inv, rem))
-            
-        journal = pd.DataFrame(out, columns=["Date", "Customer", "Cases", "Invoice", "Remark"])
-        journal["Cases"] = pd.to_numeric(journal["Cases"], errors="coerce")
-        snap = {"customers": customers, "journal": journal, "cases_col_found": cases_col is not None, "invoice_col_found": inv_col is not None}
-        return snap, "fresh", DBX_EXCEL_PATH, None
+        picks = pick_journals()
+        if not picks:
+            return None, None, DBX_FOLDER, f"No sale journal (.xlsx) found in {DBX_FOLDER}"
     except Exception as e:
-        return None, None, DBX_EXCEL_PATH, str(e)
+        return None, None, DBX_FOLDER, f"Cannot list {DBX_FOLDER}: {e}"
+    main_path, main_rev = picks[0]
+    try:
+        main = read_journal(main_path, main_rev)
+    except Exception as e:
+        return None, None, main_path, str(e)
+    extras = []
+    for p, rev in picks[1:]:
+        try:
+            extras.append((p, read_journal(p, rev)))
+        except Exception as e:
+            bot_log("warn", "Excel", f"Cannot read {os.path.basename(p)}: {e}", "using this month only")
+    if not extras:
+        return dict(main, files=[os.path.basename(main_path)]), "fresh", main_path, None
+    return _merge(main_path, main, extras), "fresh", main_path, None
 
 def get_customer_list():
     snap, _, _, err = current_snapshot()
@@ -392,6 +515,7 @@ def run_health_check(auto_fix=True):
         if not snap["customers"]: add("warn", "Excel", "Master List has no customers", "check sheet 'Master List'")
         if not snap["cases_col_found"]: add("warn", "Excel", f"No column '{JOURNAL_CASES_HEADER}' found", "ordered cases will be empty")
         if not snap.get("invoice_col_found", True): add("info", "Excel", f"No column '{JOURNAL_INVOICE_HEADER}' found; using Smart Search.", "-")
+        add("info", "Excel", "Journal in use: " + " + ".join(snap.get("files", [os.path.basename(path)])), "-")
 
     for key, (dbx_p, cols, nums, label) in FILES.items():
         try:
@@ -735,8 +859,9 @@ with st.sidebar:
 
 st.title("🚚 នំប៉ាវហុងកុង Supply Chain Hub")
 
-_, _, _, _err = current_snapshot()
-st.caption(f"{'✅ Connected to Dropbox' if not _err else '❌ Dropbox Sync Error'}  |  🕒 {now_kh():%Y-%m-%d %I:%M %p}")
+_snap, _, _, _err = current_snapshot()
+_files = " + ".join(_snap.get("files", [])) if _snap else ""
+st.caption(f"{'✅ Connected to Dropbox' if not _err else '❌ Dropbox Sync Error: ' + str(_err)[:120]}  |  📄 {_files or '-'}  |  🕒 {now_kh():%Y-%m-%d %I:%M %p}")
 
 labels = ["📊 Live Dashboard"] if ROLE == "viewer" else ["📦 1. Packing Progress", "🚚 2. Log Delivery", "📊 3. Live Dashboard"]
 if ROLE == "admin": labels.append("🤖 4. Health Bot & Security")
