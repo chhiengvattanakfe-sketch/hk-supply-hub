@@ -201,12 +201,13 @@ PERMISSION_LABELS = {
     "view": "View dashboard and task details",
     "edit": "Create, edit, and submit changes",
     "reports": "Reports, summaries, and report exports",
+    "money": "💵 See sales money (riel amounts, prices)",
 }
-DEFAULT_PERMISSIONS_BY_ROLE = {
-    "admin": {"tasks": True, "view": True, "edit": True, "reports": True},
-    "staff": {"tasks": True, "view": True, "edit": True, "reports": True},
-    "sales": {"tasks": False, "view": True, "edit": False, "reports": True},
-    "viewer": {"tasks": False, "view": True, "edit": False, "reports": True},
+DEFAULT_PERMISSIONS_BY_ROLE = {          # sales money is hidden from everyone except Admin unless Admin turns it on
+    "admin": {"tasks": True, "view": True, "edit": True, "reports": True, "money": True},
+    "staff": {"tasks": True, "view": True, "edit": True, "reports": True, "money": False},
+    "sales": {"tasks": False, "view": True, "edit": False, "reports": True, "money": False},
+    "viewer": {"tasks": False, "view": True, "edit": False, "reports": True, "money": False},
 }
 PERMISSION_KEYS = tuple(PERMISSION_LABELS)
 
@@ -258,6 +259,39 @@ def has_permission(permission, username=None):
         return bool(effective_permissions(who).get(permission, False))
     except Exception:
         return False
+
+
+MONEY_LOCK = "🔒"
+_MONEY_EXACT = {"sales", "salesactual", "amount", "price", "sell", "avg sales", "sales basis"}
+_NOT_SALES_MONEY = ("expense", "សេវា", "taxi", "phnom penh ៛")
+
+
+def can_see_money():
+    """Sales money (riel) is shown only to Admin and to users Admin gave '💵 See sales money'."""
+    try:
+        return has_permission("money")
+    except Exception:
+        return False
+
+
+def _is_money_col(col):
+    c = str(col)
+    low = c.strip().lower()
+    if any(w in low for w in _NOT_SALES_MONEY):
+        return False                                   # delivery costs are not sales money: staff enter them
+    return "៛" in c or "riel" in low or low in _MONEY_EXACT
+
+
+def hide_money(df):
+    """Same table without riel columns for people who may not see sales money."""
+    if df is None or can_see_money() or not hasattr(df, "columns"):
+        return df
+    drop = [c for c in df.columns if _is_money_col(c)]
+    return df.drop(columns=drop) if drop else df
+
+
+def money_text(value):
+    return value if can_see_money() else MONEY_LOCK
 
 
 # ==========================================
@@ -2766,7 +2800,11 @@ hr {border-color: var(--line) !important;}
 
 
 def show_df(df, height=None, key=None, selectable=False, column_config=None):
-    """Shows a table. Returns the selection event when row-click is available (else None)."""
+    """Shows a table. Returns the selection event when row-click is available (else None). Riel columns are hidden
+    from people without the 'See sales money' permission."""
+    df = hide_money(df)
+    if column_config:
+        column_config = {k: v for k, v in column_config.items() if not (_is_money_col(k) and not can_see_money())}
     base = {"hide_index": True}
     if height:
         base["height"] = height
@@ -2783,6 +2821,8 @@ def show_df(df, height=None, key=None, selectable=False, column_config=None):
 
 
 def kpi(container, label, value):
+    if _is_money_col(label) and not can_see_money():
+        value = MONEY_LOCK
     try:
         container.metric(label, value, border=True)
     except TypeError:
@@ -4843,7 +4883,7 @@ def _bun_panel(df_scope, selected_date, mobile=False):
         show_df(g, height=420)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            by_type.to_excel(w, index=False, sheet_name="By bun type")
+            hide_money(by_type).to_excel(w, index=False, sheet_name="By bun type")
             g.to_excel(w, index=False, sheet_name="By customer")
         st.download_button("📥 Download bun sales (Excel)", data=buf.getvalue(), file_name=f"Bun_Sales_{selected_date}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="bun_dl")
@@ -5160,7 +5200,7 @@ def tab_sale_order():
     qty = {}
     cols = st.columns(4)
     for i, c in enumerate(ORDER_BUNS):
-        label = f"{c} {names.get(c, '')}" + (f" · ៛{int(sell[c]):,}" if sell.get(c) else "")
+        label = f"{c} {names.get(c, '')}" + (f" · ៛{int(sell[c]):,}" if sell.get(c) and can_see_money() else "")
         qty[c] = cols[i % 4].number_input(label, min_value=0, max_value=1_000_000, step=1, value=0, key=k("q_" + c))
     pcs = sum(qty.values())
     amount = sum(qty[c] * (sell.get(c) or 0) for c in ORDER_BUNS)
@@ -5214,8 +5254,8 @@ def tab_sale_order():
                 append_row(ORDERS_FILE, row)
                 audit("sale_order", f"{customer} | {order_date} | {pcs} pcs")
                 st.session_state["order_gen"] = gen + 1
-                st.session_state["flash"] = f"Order saved: {customer} | {pcs:,} pcs | ៛{int(amount):,} (synced to Dropbox)" if USE_DROPBOX else \
-                    f"Order saved: {customer} | {pcs:,} pcs | ៛{int(amount):,}"
+                _amt = f" | ៛{int(amount):,}" if can_see_money() else ""
+                st.session_state["flash"] = f"Order saved: {customer} | {pcs:,} pcs{_amt}" + (" (synced to Dropbox)" if USE_DROPBOX else "")
                 st.rerun()
             except (RuntimeError, ConflictError) as e:
                 st.error(f"❌ {e}")
@@ -5532,6 +5572,7 @@ def _users_panel():
         "View": "ON" if effective_permissions(u, r).get("view") else "OFF",
         "Edit": "ON" if effective_permissions(u, r).get("edit") else "OFF",
         "Reports": "ON" if effective_permissions(u, r).get("reports") else "OFF",
+        "💵 Money": "ON" if effective_permissions(u, r).get("money") else "OFF",
         "Starter password": "yes" if r.get("must_change") else "",
         "Last login": r.get("last_login", ""), "Password changed": r.get("pw_changed", "")}
         for u, r in sorted(users.items())]))
@@ -5549,12 +5590,14 @@ def _users_panel():
             p_view = st.checkbox(PERMISSION_LABELS["view"], value=perm_values["view"], key=f"perm_view_{perm_user}", disabled=is_admin_target)
             p_edit = st.checkbox(PERMISSION_LABELS["edit"], value=perm_values["edit"], key=f"perm_edit_{perm_user}", disabled=is_admin_target)
             p_reports = st.checkbox(PERMISSION_LABELS["reports"], value=perm_values["reports"], key=f"perm_reports_{perm_user}", disabled=is_admin_target)
+            p_money = st.checkbox(PERMISSION_LABELS["money"], value=perm_values["money"], key=f"perm_money_{perm_user}", disabled=is_admin_target,
+                                  help="OFF = riel amounts, prices and sales money are hidden (🔒). Bun pieces stay visible.")
             save_perms = st.form_submit_button("💾 Save permissions", type="primary")
         if save_perms:
             if is_admin_target:
                 st.info("Admin access remains fully enabled.")
             else:
-                new_perms = {"tasks": p_tasks, "view": p_view, "edit": p_edit, "reports": p_reports}
+                new_perms = {"tasks": p_tasks, "view": p_view, "edit": p_edit, "reports": p_reports, "money": p_money}
                 def _save_perms(u):
                     if perm_user not in u:
                         raise ValueError("That user no longer exists. Refresh and try again.")
@@ -8365,7 +8408,9 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
 def _report_excel_bytes(frames):
-    """Export reports with the same Excel dependency used to read journals."""
+    """Export reports with the same Excel dependency used to read journals. Riel columns are left out for people
+    without the 'See sales money' permission."""
+    frames = {name: hide_money(frame) for name, frame in frames.items()}
     from openpyxl.utils import get_column_letter
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -8717,7 +8762,8 @@ def _si_active_map_section(daily, names, areas, today):
         mx = max(1.0, float(m["Pcs"].max()))
         m["radius"] = (60 + 340 * (m["Pcs"] / mx) ** 0.5).round(0)
         m["label"] = [f"{'🟡 #' + str(r) + ' ' if g == 'top' else ''}{c}" for r, g, c in zip(m["Rank"], m["Group"], m["Customer"])]
-        m["info"] = [f"{int(p):,} pcs · ៛{int(s):,} · {o} ដង · ចុងក្រោយ {l:%d %b}"
+        _money = can_see_money()
+        m["info"] = [f"{int(p):,} pcs" + (f" · ៛{int(s):,}" if _money else "") + f" · {o} ដង · ចុងក្រោយ {l:%d %b}"
                      for p, s, o, l in zip(m["Pcs"], m["Sales"], m["Orders"], m["Last"])]
         m["nav"] = [f"https://www.google.com/maps/dir/?api=1&destination={a},{b}" for a, b in zip(m["Lat"], m["Lon"])]
         try:
@@ -8750,6 +8796,7 @@ def _si_active_map_section(daily, names, areas, today):
     tbl = tbl[["Rank", "ក្រុម", "Customer", "Area", "Pcs", "Sales", "Orders", "ចុងក្រោយ", "Days since", "ទីតាំង", "ផ្លូវ"]].rename(
         columns={"Rank": "លេខ", "Customer": "អតិថិជន", "Area": "តំបន់", "Pcs": "នំ (pcs)", "Sales": "លក់ ៛", "Orders": "ចំនួនដង",
                  "Days since": "ថ្ងៃមុន"})
+    tbl = hide_money(tbl)
     try:
         st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(520, 60 + 35 * len(tbl)),
                      column_config={"លក់ ៛": st.column_config.NumberColumn(format="localized"),
@@ -8847,14 +8894,17 @@ def _sales_insights_body():
     k1, k2, k3 = st.columns(3)
     k1.metric("Customers who ordered", f"{d_mtd['Key'].nunique():,}", _delta(d_mtd["Key"].nunique(), d_prev["Key"].nunique()))
     k2.metric("Paid bun pcs", f"{p_now:,.0f}", _delta(p_now, p_prev))
-    k3.metric("Bun sales ៛", f"{s_now:,.0f}", _delta(s_now, s_prev))
+    if can_see_money():
+        k3.metric("Bun sales ៛", f"{s_now:,.0f}", _delta(s_now, s_prev))
+    else:
+        k3.metric("Bun sales ៛", MONEY_LOCK)
     st.markdown("**Customers to watch**")
     k4, k5, k6 = st.columns(3)
     k4.metric("Late vs their habit", f"{len(missing):,}")
     k5.metric("Bought last month, not yet now", f"{len(lost_month):,}")
-    k6.metric("Sales at risk ៛ (est.)", f"{int(missing['Lost sales ៛ (est.)'].sum()) if len(missing) else 0:,}")
+    k6.metric("Sales at risk ៛ (est.)", money_text(f"{int(missing['Lost sales ៛ (est.)'].sum()) if len(missing) else 0:,}"))
 
-    care_measure = "Sales" if str(st.session_state.get("si_care_measure", "")).startswith("💵") else "Pcs"
+    care_measure = "Sales" if (str(st.session_state.get("si_care_measure", "")).startswith("💵") and can_see_money()) else "Pcs"
     care = _si_care_cached(sig + "|" + _si_frame_sig(habits), today, care_measure, daily, df, codes, habits, names, areas, avgs)
     care_unit = "pcs" if care_measure == "Pcs" else "៛"
     top = pd.DataFrame()
@@ -8886,7 +8936,10 @@ def _sales_insights_body():
     if t_top:
         c1, c2 = st.columns([2, 2])
         period = c1.selectbox("Period", SI_PERIODS, key="si_period")
-        metric_label = c2.radio("Rank by", list(SI_METRICS), horizontal=True, key="si_metric")
+        rank_opts = [m for m in SI_METRICS if can_see_money() or not _is_money_col(m)]
+        if st.session_state.get("si_metric") not in rank_opts:
+            st.session_state["si_metric"] = rank_opts[0]
+        metric_label = c2.radio("Rank by", rank_opts, horizontal=True, key="si_metric")
         metric = SI_METRICS[metric_label]
         if metric == "Sales" and not daily["Sales"].sum():
             st.info("No sell prices found in the journal header; ranking by Cases instead.")
@@ -8897,7 +8950,7 @@ def _sales_insights_body():
             st.info(f"No orders in this period ({start} → {end}).")
         else:
             st.caption(f"{start} → {end} · Top 20 hold {top['Share %'].sum():.0f}% of all {metric_label} in this period.")
-            _si_bar(top, "Customer", metric_label if metric_label in top.columns else "Sales ៛")
+            _si_bar(top, "Customer", metric_label if metric_label in top.columns else ("Sales ៛" if can_see_money() else "Bun pcs"))
             _si_show(top, money=("Sales ៛", "Avg order ៛", "Bun pcs"), pct=("Share %",), height=760)
             part = df[(df["D"] >= pd.Timestamp(start)) & (df["D"] <= pd.Timestamp(end))]
             if len(part) and codes:
@@ -8973,7 +9026,8 @@ def _sales_insights_body():
             sel = st.session_state.get("si_seg_sel")
             if sel not in segs:
                 sel = None
-            st.radio("Measure customers by", ["🥟 Bun pcs", "💵 Sales ៛"], horizontal=True, key="si_care_measure")
+            if can_see_money():
+                st.radio("Measure customers by", ["🥟 Bun pcs", "💵 Sales ៛"], horizontal=True, key="si_care_measure")
             st.caption("👆 Click a card to filter the lists below. Click it again (or 📋 All) to clear.")
             cards = [(None, f"📋 All · {len(care)}")] + [(sg, f"{sg} · {cnt[sg]}") for sg in segs]
             for i in range(0, len(cards), 4):
