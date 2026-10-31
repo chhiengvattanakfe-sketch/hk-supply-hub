@@ -1219,8 +1219,40 @@ def render_landing():
 # ===== END LANDING PAGE =====
 
 
+_INAPP_UA = (("telegram", "Telegram"), ("fban", "Facebook"), ("fbav", "Facebook"), ("messenger", "Messenger"),
+             ("instagram", "Instagram"), ("line/", "LINE"), ("zalo", "Zalo"), ("wechat", "WeChat"), ("micromessenger", "WeChat"),
+             ("tiktok", "TikTok"), ("; wv)", "an app's built-in browser"))
+
+
+def _inapp_browser():
+    """Name of the chat / social app whose built-in browser is showing the page (they forget logins), else ''."""
+    try:
+        ua = (st.context.headers.get("User-Agent") or "").lower()
+    except Exception:
+        return ""
+    return next((name for key, name in _INAPP_UA if key in ua), "")
+
+
+def _remember_state():
+    """'on' when this browser sent a valid saved login with this page, 'off' otherwise."""
+    tok = _request_cookie(COOKIE_TOKEN)
+    if not tok:
+        return "off"
+    rec = _read_tokens().get(_tok_hash(tok))
+    return "on" if rec and rec.get("user") == current_user() else "off"
+
+
+LOGIN_TIPS_KM = ("បើកកម្មវិធីក្នុង **Chrome** (Android) ឬ **Safari** (iPhone) ផ្ទាល់ — កុំបើកពី link ក្នុង Telegram / Facebook "
+                 "(browser ក្នុង app ទាំងនោះលុប login រាល់ពេលបិទ) និងកុំប្រើ Private / Incognito tab។ "
+                 "ពេល Log in ត្រូវធីក ✅ Keep me logged in។")
+
+
 def render_login():
     _cookie_rescue()
+    app = _inapp_browser()
+    if app:
+        st.warning(f"⚠️ អ្នកកំពុងបើកក្នុង browser របស់ {app}។ វាមិនចាំ login ទេ ដូច្នេះអ្នកត្រូវ Log in រាល់ពេល។ "
+                   "ចុច ⋮ ឬ ••• រួចជ្រើស **Open in Chrome / Open in Safari**។")
     render_landing()
     st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 2, 1])
@@ -12955,7 +12987,14 @@ if _assignment_warning:
 USER = current_user()
 with st.sidebar:
     st.markdown(f"### 👤 {USER}")
-    st.caption(f"{ROLE_LABEL.get(ROLE, ROLE)} | auto log-out after {LOGIN_TTL_HOURS} h")
+    st.caption(f"{ROLE_LABEL.get(ROLE, ROLE)}")
+    if _remember_state() == "on":
+        st.caption("🔐 Auto-login: ✅ ចាំលើឧបករណ៍នេះ")
+    else:
+        st.caption("🔐 Auto-login: ⚠️ មិនទាន់ចាំលើ browser នេះ — ចុច Refresh ម្តង។ បើនៅតែត្រូវ Log in រាល់ពេល៖ " + LOGIN_TIPS_KM)
+        _app = _inapp_browser()
+        if _app:
+            st.warning(f"អ្នកកំពុងប្រើ browser ក្នុង {_app} — វាលុប login។ សូមបើកក្នុង Chrome / Safari។")
     with st.expander("🔑 Change my password"):
         with st.form("chg_pw_form", clear_on_submit=True):
             _c = st.text_input("Current password", type="password", max_chars=100)
