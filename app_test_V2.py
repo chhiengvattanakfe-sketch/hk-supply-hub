@@ -969,6 +969,7 @@ def restore_from_cookie(token=None):
         rec = tokens.get(h)
     if rec is None:
         if ok:                                          # checked the newest list: this token really does not exist
+            st.session_state["_login_diag"] = "unknown"
             st.session_state["cookie_cmd"] = ("clear",)
             st.session_state["_rescue_off"] = True
             st.session_state.pop("_url_tok", None)
@@ -981,12 +982,15 @@ def restore_from_cookie(token=None):
     u = users.get(rec["user"])
     if rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
         _modify_tokens(lambda d: (d.pop(h, None), d)[1])
+        st.session_state["_login_diag"] = ("expired" if rec.get("exp", 0) < now else
+                                           "inactive" if not u or not u.get("active", True) else "pwchanged")
         st.session_state["cookie_cmd"] = ("clear",)
         st.session_state["_rescue_off"] = True
         st.session_state.pop("_url_tok", None)
         return False
     st.session_state.pop("_rescue_off", None)
     st.session_state.pop("_url_tok", None)
+    st.session_state.pop("_login_diag", None)
     st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
                              "must_change": bool(u.get("must_change"))})
     st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # write the cookie again (iPhone Safari drops old ones)
@@ -1191,6 +1195,7 @@ def _try_login(username, password, remember=False):
             for k in keys:
                 guard["fails"].pop(k, None)
         st.session_state.pop("_rescue_off", None)
+        st.session_state.pop("_login_diag", None)
         st.session_state.update({"user": uname, "role": rec["role"], "login_time": time.time(),
                                  "must_change": bool(rec.get("must_change"))})
         audit("login", rec["role"])
@@ -1198,6 +1203,9 @@ def _try_login(username, password, remember=False):
             tok = issue_remember_token(uname, rec.get("pw_changed", ""))
             if tok:
                 st.session_state["cookie_cmd"] = ("set", tok, uname)
+            else:
+                st.session_state["save_warning"] = ("⚠️ មិនអាចរក្សាទុក login លើទូរស័ព្ទនេះបានទេ (could not save 'Keep me "
+                                                    "logged in' — storage busy). Log out រួច Log in ម្តងទៀត។")
 
         def _stamp(u):
             if uname in u:
@@ -1322,7 +1330,8 @@ def _inapp_browser():
 
 def _remember_state():
     """'on' when this browser sent a valid saved login with this page, 'off' otherwise."""
-    tok = _request_cookie(COOKIE_TOKEN)
+    rem = st.session_state.get("_remember")
+    tok = _request_cookie(COOKIE_TOKEN) or (rem[0] if rem else None)
     if not tok:
         return "off"
     rec = _read_tokens().get(_tok_hash(tok))
@@ -1334,7 +1343,25 @@ LOGIN_TIPS_KM = ("បើកកម្មវិធីក្នុង **Chrome** (A
                  "ពេល Log in ត្រូវធីក ✅ Keep me logged in។")
 
 
+LOGIN_DIAG = {
+    "nophone": "ទូរស័ព្ទ/browser នេះមិនមាន login ដែលបានរក្សាទុកទេ (No saved login on this phone/browser). "
+               "Log in ម្តង ហើយធីក ✅ Keep me logged in។ បើនៅតែកើតម្តងទៀត៖ browser កំពុងលុបទិន្នន័យ "
+               "(Private tab, Telegram/Facebook browser, ឬ link ផ្សេង)។",
+    "unknown": "Server មិនស្គាល់ login ដែលបានរក្សាទុកនៅលើទូរស័ព្ទនេះ (saved login not found on the server — "
+               "the login list was lost or not saved to Dropbox). Log in ម្តងទៀត។",
+    "expired": "Login ដែលបានរក្សាទុកផុតកំណត់ហើយ (saved login expired). Log in ម្តងទៀត។",
+    "inactive": "គណនីនេះត្រូវបានបិទ ឬលុប (account disabled or removed).",
+    "pwchanged": "Password ត្រូវបានប្តូរ — login ចាស់លែងប្រើបាន (password changed). Log in ម្តងទៀត។",
+    "storage": "មិនអាចភ្ជាប់ Dropbox បាន (could not reach storage). សូមរង់ចាំបន្តិច រួចចុច Refresh។",
+}
+
+
 def render_login():
+    _diag = st.session_state.get("_login_diag")
+    if _diag in LOGIN_DIAG:
+        st.caption(f"ℹ️ ហេតុអ្វីត្រូវ Log in (why): {LOGIN_DIAG[_diag]}  [code: {_diag}]")
+    if not USE_DROPBOX:
+        st.caption("⚠️ Admin: Dropbox is not set up, so saved logins are lost every time the app restarts.")
     app = _inapp_browser()
     if app:
         st.warning(f"⚠️ អ្នកកំពុងបើកក្នុង browser របស់ {app}។ វាមិនចាំ login ទេ ដូច្នេះអ្នកត្រូវ Log in រាល់ពេល។ "
@@ -1419,7 +1446,9 @@ def require_login():
                     st.rerun()
                 st.stop()
         st.session_state["_lb_done"] = True
-        if tok != "none":
+        if tok == "none":
+            st.session_state["_login_diag"] = "nophone"
+        else:
             got = restore_from_cookie(tok)
             if got == "retry":
                 n = st.session_state.get("_lb_retry", 0) + 1
@@ -1428,6 +1457,7 @@ def require_login():
                     st.session_state["_lb_done"] = False
                     time.sleep(0.3)
                     st.rerun()
+                st.session_state["_login_diag"] = "storage"
         box.empty()                                    # remove the "Reconnecting" note and the hidden box
 
     _emit_cookie_cmd()
