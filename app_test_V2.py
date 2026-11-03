@@ -4213,6 +4213,375 @@ def build_driver_totals(d_from, d_to):
     return out, piv
 
 
+# ---- Write driver & expenses straight into the Sale Journal (only empty cells, backup first) ----
+JW_DRIVER_HDR, JW_PP_HDR, JW_TAXI_HDR = "អ្នកដឹក", "សេវាដឹក", "តាក់ស៊ី"
+JW_FIELDS = (("drv", "អ្នកដឹក"), ("pp", "សេវាដឹក (ចំណាយ)"), ("taxi", "សេវាតាក់ស៊ី (ចំណាយ)"))
+
+
+def _jw_col_letter(i0):
+    s, n = "", i0 + 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _jw_col_index(letters):
+    n = 0
+    for ch in letters:
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+def _jw_find_columns(rows):
+    """{'drv'|'pp'|'taxi'|'inv': column index} from the journal header (first 15 rows)."""
+    cols = {}
+    for row in rows[:15]:
+        for i, v in enumerate(row):
+            if v is None:
+                continue
+            t = re.sub(r"\s+", "", str(v))
+            if "drv" not in cols and t == JW_DRIVER_HDR:
+                cols["drv"] = i
+            elif "pp" not in cols and JW_PP_HDR in t and "ចំណាយ" in t and JW_TAXI_HDR not in t:
+                cols["pp"] = i
+            elif "taxi" not in cols and JW_TAXI_HDR in t and "ចំណាយ" in t:
+                cols["taxi"] = i
+            elif "inv" not in cols and JOURNAL_INVOICE_HEADER in t:
+                cols["inv"] = i
+    return cols
+
+
+def _jw_read_sheet(data):
+    """[(excel_row_number, values tuple)] of the journal sheet, plus the header columns."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
+    try:
+        ws = wb[JOURNAL_SHEET]
+        try:
+            ws.reset_dimensions()
+        except Exception:
+            pass
+        out = []
+        for cells in ws.iter_rows():
+            rn = next((getattr(c, "row", None) for c in cells if getattr(c, "row", None)), None)
+            if rn:
+                out.append((rn, tuple(getattr(c, "value", None) for c in cells)))
+    finally:
+        wb.close()
+    return out, _jw_find_columns([v for _, v in out])
+
+
+def _jw_empty(v):
+    return v is None or (isinstance(v, str) and v.strip() in ("", "-"))
+
+
+def _jw_same(old, new):
+    if isinstance(new, (int, float)):
+        n = pd.to_numeric(old, errors="coerce")
+        return pd.notna(n) and float(n) == float(new)
+    return str(old).strip().upper() == str(new).strip().upper()
+
+
+def _xlsx_set_cells(data, sheet_name, cells):
+    """Writes values into cells of one sheet by editing only that sheet's XML (everything else in the file -
+    formulas, formats, pictures, filters - stays byte-for-byte the same). cells = {(row, col_index0): value}.
+    Returns (new bytes, rows that were not found)."""
+    import zipfile
+    zin = zipfile.ZipFile(io.BytesIO(data))
+    wb_xml = zin.read("xl/workbook.xml").decode("utf-8")
+    rid = None
+    for m in re.finditer(r"<(?:\w+:)?sheet\b[^>]*>", wb_xml):
+        tag = m.group(0)
+        nm = re.search(r'\bname="([^"]*)"', tag)
+        if nm and html.unescape(nm.group(1)) == sheet_name:
+            rid = re.search(r'\br:id="([^"]+)"', tag) or re.search(r'\b\w+:id="([^"]+)"', tag)
+            rid = rid.group(1) if rid else None
+            break
+    if not rid:
+        raise RuntimeError(f"Sheet '{sheet_name}' not found in the journal")
+    rels = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+    target = None
+    for m in re.finditer(r"<(?:\w+:)?Relationship\b[^>]*>", rels):
+        if re.search(r'\bId="' + re.escape(rid) + '"', m.group(0)):
+            target = re.search(r'\bTarget="([^"]+)"', m.group(0)).group(1)
+            break
+    if not target:
+        raise RuntimeError("Journal sheet file not found")
+    sheet_path = target.lstrip("/") if target.startswith("/") else "xl/" + target
+    xml = zin.read(sheet_path).decode("utf-8")
+    p = (re.search(r"<(\w+:)?sheetData\b", xml).group(1) or "")
+    row_re = lambda n: re.compile(r"<" + re.escape(p) + r'row\b[^>]*\br="' + str(n) + r'"[^>]*?(/>|>)')
+    cell_re = re.compile(r"<" + re.escape(p) + r'c\b[^>]*\br="([A-Z]+)(\d+)"[^>]*?(?:/>|>.*?</' + re.escape(p) + r"c>)", re.S)
+
+    def style_above(col_letters, rn):
+        for back in range(1, 30):                       # same column, nearest row above that has a style
+            m = row_re(rn - back).search(xml)
+            if not m or m.group(1) == "/>":
+                continue
+            end = xml.index("</" + p + "row>", m.end())
+            for c in cell_re.finditer(xml, m.end(), end):
+                if c.group(1) == col_letters:
+                    s = re.search(r'\bs="(\d+)"', c.group(0)[:c.group(0).find(">") + 1])
+                    if s:
+                        return s.group(1)
+        return None
+
+    def cell_xml(ref, s, value):
+        sa = f' s="{s}"' if s else ""
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f'<{p}c r="{ref}"{sa}><{p}v>{int(value) if float(value).is_integer() else value}</{p}v></{p}c>'
+        return f'<{p}c r="{ref}"{sa} t="inlineStr"><{p}is><{p}t>{html.escape(str(value), quote=False)}</{p}t></{p}is></{p}c>'
+
+    missing = []
+    by_row = {}
+    for (rn, ci), v in cells.items():
+        by_row.setdefault(rn, {})[ci] = v
+    for rn in sorted(by_row):
+        m = row_re(rn).search(xml)
+        if not m:
+            missing.append(rn)
+            continue
+        if m.group(1) == "/>":                          # empty row written as <row .../>: open it
+            open_tag = m.group(0)[:-2].rstrip() + ">"
+            xml = xml[:m.start()] + open_tag + "</" + p + "row>" + xml[m.end():]
+            m = row_re(rn).search(xml)
+        for ci in sorted(by_row[rn]):
+            letters = _jw_col_letter(ci)
+            ref = f"{letters}{rn}"
+            start = m.end()
+            end = xml.index("</" + p + "row>", start)
+            existing, insert_at = None, end
+            for c in cell_re.finditer(xml, start, end):
+                if c.group(1) == letters:
+                    existing = c
+                    break
+                if _jw_col_index(c.group(1)) > ci:
+                    insert_at = c.start()
+                    break
+            if existing:
+                head = existing.group(0)[:existing.group(0).find(">") + 1]
+                s = re.search(r'\bs="(\d+)"', head)
+                new = cell_xml(ref, s.group(1) if s else style_above(letters, rn), by_row[rn][ci])
+                xml = xml[:existing.start()] + new + xml[existing.end():]
+            else:
+                new = cell_xml(ref, style_above(letters, rn), by_row[rn][ci])
+                xml = xml[:insert_at] + new + xml[insert_at:]
+    # ask Excel to recalculate totals that use these cells when the file is opened
+    if re.search(r"<(?:\w+:)?calcPr\b", wb_xml):
+        wb_xml = re.sub(r"<((?:\w+:)?calcPr\b)(?![^>]*fullCalcOnLoad)", r'<\1 fullCalcOnLoad="1"', wb_xml, count=1)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as zout:
+        for item in zin.infolist():
+            if item.filename == sheet_path:
+                payload = xml.encode("utf-8")
+            elif item.filename == "xl/workbook.xml":
+                payload = wb_xml.encode("utf-8")
+            else:
+                payload = zin.read(item.filename)
+            zout.writestr(item, payload, compress_type=item.compress_type)
+    zin.close()
+    return out.getvalue(), missing
+
+
+def _jw_journal_files(months):
+    """{(year, month): (name, local path or None)} - the journal file of each month."""
+    out = {}
+    if USE_DROPBOX:
+        names = [x for x in _remote_excel_names() if fnmatch.fnmatchcase(x["name"].lower(), EXCEL_PATTERN.lower())]
+        for ym in months:
+            ms = [x for x in names if _journal_ym(x["name"]) == ym]
+            if ms:
+                out[ym] = (max(ms, key=lambda x: x["mtime"])["name"], None)
+    else:
+        fs = [f for f in glob.glob(os.path.join(CURRENT_DIR, EXCEL_PATTERN))
+              if not os.path.basename(f).startswith("~$") and "conflicted copy" not in os.path.basename(f).lower()
+              and not os.path.basename(f).lower().endswith("__status.xlsx")]
+        for ym in months:
+            ms = [f for f in fs if _journal_ym(os.path.basename(f)) == ym]
+            if ms:
+                f = max(ms, key=os.path.getmtime)
+                out[ym] = (os.path.basename(f), f)
+    return out
+
+
+def _jw_download(name, path):
+    """(bytes, revision) of the journal right now."""
+    if USE_DROPBOX:
+        md, res = _dbx().files_download(_rpath(name))
+        return res.content, md.rev
+    with open(path, "rb") as f:
+        return f.read(), str(os.path.getmtime(path))
+
+
+def plan_journal_write(d_from, d_to, overwrite=False):
+    """What would be written. -> (plan dict | None, preview DataFrame, problems DataFrame, error)."""
+    fill, _miss, err = build_journal_fill(d_from, d_to)
+    if err:
+        return None, None, None, err
+    fill = fill[(fill["អ្នកដឹក"] != "") | fill["សេវាដឹក (ចំណាយ)"].notna() | fill["សេវាតាក់ស៊ី (ចំណាយ)"].notna()]
+    if fill.empty:
+        return None, None, None, "No delivery data to write between these dates"
+    months = sorted({(d.year, d.month) for d in fill["Date"]})
+    files = _jw_journal_files(months)
+    plan, preview, problems = {}, [], []
+    for ym in months:
+        sub = fill[[(d.year, d.month) == ym for d in fill["Date"]]]
+        if ym not in files:
+            for r in sub.to_dict("records"):
+                problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": r["Invoice"],
+                                 "Problem": f"No journal file for {ym[1]:02d}/{ym[0]}"})
+            continue
+        name, path = files[ym]
+        data, rev = _jw_download(name, path)
+        rows, cols = _jw_read_sheet(data)
+        need = [k for k in ("drv", "pp", "taxi", "inv") if k not in cols]
+        if need:
+            return None, None, None, (f"{name}: cannot find the column(s) "
+                                      f"{', '.join({'drv': 'អ្នកដឹក', 'pp': 'សេវាដឹក (ចំណាយ)', 'taxi': 'សេវាតាក់ស៊ី (ចំណាយ)', 'inv': 'វិក្កយប័ត្រ'}[k] for k in need)}")
+        by_inv = {}
+        for rn, vals in rows:
+            inv = _cell_text(vals[cols["inv"]]) if cols["inv"] < len(vals) else ""
+            if inv:
+                by_inv.setdefault(inv.casefold(), []).append((rn, vals))
+        cells = {}
+        for r in sub.to_dict("records"):
+            inv = str(r["Invoice"] or "").strip()
+            hits = by_inv.get(inv.casefold(), []) if inv and inv not in ("-", "nan") else []
+            if len(hits) != 1:
+                problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv or "-",
+                                 "Problem": "Invoice not in journal" if not hits else "Invoice is on several rows"})
+                continue
+            rn, vals = hits[0]
+            if norm_name(_cell_text(vals[1] if len(vals) > 1 else "")) != norm_name(r["Customer"]):
+                problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv,
+                                 "Problem": f"Row {rn} has another customer: {_cell_text(vals[1])[:40]}"})
+                continue
+            new = {"drv": r["អ្នកដឹក"] or None,
+                   "pp": None if pd.isna(r["សេវាដឹក (ចំណាយ)"]) else int(r["សេវាដឹក (ចំណាយ)"]),
+                   "taxi": None if pd.isna(r["សេវាតាក់ស៊ី (ចំណាយ)"]) else int(r["សេវាតាក់ស៊ី (ចំណាយ)"])}
+            line = {"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv, "Excel row": rn}
+            changed = False
+            for key, label in JW_FIELDS:
+                v = new[key]
+                ci = cols[key]
+                old = vals[ci] if ci < len(vals) else None
+                if v is None:
+                    line[label] = "" if _jw_empty(old) else f"{_cell_text(old)} (kept)"
+                    continue
+                if not _jw_empty(old) and _jw_same(old, v):
+                    line[label] = f"{v} (already)"
+                elif _jw_empty(old) or overwrite:
+                    if isinstance(old, str) and old.startswith("="):
+                        line[label] = f"{_cell_text(old)[:20]} (formula kept)"
+                        continue
+                    cells[(rn, ci)] = v
+                    line[label] = f"✍️ {v}" + ("" if _jw_empty(old) else f" (was {_cell_text(old)})")
+                    changed = True
+                else:
+                    line[label] = f"{_cell_text(old)} (kept; app says {v})"
+            if changed:
+                preview.append(line)
+        if cells:
+            plan[name] = {"path": path, "rev": rev, "data": data, "cells": cells}
+    return plan, pd.DataFrame(preview), pd.DataFrame(problems), None
+
+
+def apply_journal_write(plan):
+    """Writes the planned cells. Backup first; stops if the journal changed since the preview.
+    -> (cells written, list of messages)."""
+    written, msgs = 0, []
+    stamp = now_kh().strftime("%Y-%m-%d_%H%M%S")
+    for name, job in plan.items():
+        new_data, missing = _xlsx_set_cells(job["data"], JOURNAL_SHEET, job["cells"])
+        if USE_DROPBOX:
+            import dropbox
+            dbx = _dbx()
+            md = dbx.files_get_metadata(_rpath(name))
+            if md.rev != job["rev"]:
+                msgs.append(f"⚠️ {name} was changed by someone just now - nothing written. Press Preview again.")
+                continue
+            try:
+                dbx.files_create_folder_v2(_remote_backup_dir())
+            except Exception as e:
+                if not _is_conflict(e):
+                    raise
+            dbx.files_upload(job["data"], f"{_remote_backup_dir()}/{stamp}_before_fill_{name}",
+                             mode=dropbox.files.WriteMode.add, autorename=True, mute=True)
+            try:
+                dbx.files_upload(new_data, _rpath(name), mode=dropbox.files.WriteMode.update(job["rev"]),
+                                 autorename=False, mute=False)
+            except Exception as e:
+                if _is_conflict(e):
+                    msgs.append(f"⚠️ {name} was changed by someone just now - nothing written. Press Preview again.")
+                    continue
+                raise
+        else:
+            path = job["path"]
+            if str(os.path.getmtime(path)) != job["rev"]:
+                msgs.append(f"⚠️ {name} was changed just now - nothing written. Press Preview again.")
+                continue
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            _write_atomic(os.path.join(BACKUP_DIR, f"{stamp}_before_fill_{name}"), job["data"])
+            _write_atomic(path, new_data)
+        n = len(job["cells"]) - sum(1 for (rn, _ci) in job["cells"] if rn in set(missing))
+        written += n
+        msgs.append(f"✅ {name}: {n} cells written (backup: backups/{stamp}_before_fill_{name})")
+        if missing:
+            msgs.append(f"⚠️ {name}: rows {missing[:10]} not found in the sheet - skipped")
+    try:
+        if USE_DROPBOX:
+            _remote_listing_forget()
+        get_snapshot.clear()
+    except Exception:
+        pass
+    audit("journal_write", f"{written} cells into {', '.join(plan)}")
+    return written, msgs
+
+
+def _journal_write_panel(d_from, d_to):
+    """Admin: put អ្នកដឹក / សេវាដឹក (ចំណាយ) / សេវាតាក់ស៊ី (ចំណាយ) straight into the Sale Journal."""
+    if current_role() != "admin":
+        return
+    st.markdown("**✍️ Write into the Sale Journal (auto-fill)**")
+    st.caption("Fills អ្នកដឹក, សេវាដឹក (ចំណាយ) = Grab/app and សេវាតាក់ស៊ី (ចំណាយ) = taxi, found by invoice number. "
+               "Only EMPTY cells are filled; what is already typed is kept. A backup of the journal is saved first. "
+               "👉 Ask everyone to SAVE and CLOSE the journal in Excel before you press Write.")
+    overwrite = st.checkbox("Also replace values that are different (not recommended)", key="jw_over")
+    if st.button("🔍 Preview what will be written", key="jw_prev"):
+        try:
+            with st.spinner("Reading the journal…"):
+                res = plan_journal_write(d_from, d_to, overwrite)
+            st.session_state["jw_plan"] = (res, d_from, d_to, overwrite)
+        except Exception as e:
+            st.error(f"Could not read the journal: {str(e)[:200]}")
+    saved = st.session_state.get("jw_plan")
+    if not saved or saved[1:] != (d_from, d_to, overwrite):
+        return
+    (plan, preview, problems, err) = saved[0]
+    if err:
+        st.warning(err)
+        return
+    n_cells = sum(len(j["cells"]) for j in plan.values())
+    if problems is not None and not problems.empty:
+        with st.expander(f"⚠️ {len(problems)} delivery(ies) cannot be written (fix the invoice/name, then Preview again)"):
+            show_df(problems)
+    if n_cells == 0:
+        st.info("Nothing new to write - the journal already has these values.")
+        return
+    st.success(f"{n_cells} empty cells on {len(preview)} journal rows will be filled:")
+    show_df(preview)
+    if st.button(f"✍️ Write {n_cells} cells into the journal now", type="primary", key="jw_go"):
+        try:
+            with st.spinner("Writing…"):
+                n, msgs = apply_journal_write(plan)
+            st.session_state.pop("jw_plan", None)
+            for m in msgs:
+                (st.success if m.startswith("✅") else st.warning)(m)
+        except Exception as e:
+            st.error(f"Not written: {str(e)[:200]}")
+
+
 def _journal_fill_panel():
     with st.expander("📋 Journal fill sheet - driver & expenses for the Sale Journal"):
         st.caption("Gives អ្នកដឹក, សេវាដឹក (ចំណាយ) and សេវាតាក់ស៊ី (ចំណាយ) in the same order as your journal, "
@@ -4263,6 +4632,8 @@ def _journal_fill_panel():
         if not miss.empty:
             st.warning(f"{len(miss)} delivery(ies) were not found in the journal (name or date differs):")
             show_df(miss)
+        st.divider()
+        _journal_write_panel(r_from, r_to)
 
 
 def _delivery_log():
