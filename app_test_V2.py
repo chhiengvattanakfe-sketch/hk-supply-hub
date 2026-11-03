@@ -4216,6 +4216,7 @@ def build_driver_totals(d_from, d_to):
 # ---- Write driver & expenses straight into the Sale Journal (only empty cells, backup first) ----
 JW_DRIVER_HDR, JW_PP_HDR, JW_TAXI_HDR = "អ្នកដឹក", "សេវាដឹក", "តាក់ស៊ី"
 JW_FIELDS = (("drv", "អ្នកដឹក"), ("pp", "សេវាដឹក (ចំណាយ)"), ("taxi", "សេវាតាក់ស៊ី (ចំណាយ)"))
+_JW_CACHE = {}          # journal name -> (revision, bytes, rows, columns): read once per journal version
 
 
 def _jw_col_letter(i0):
@@ -4253,7 +4254,7 @@ def _jw_find_columns(rows):
 
 
 def _jw_read_sheet(data):
-    """[(excel_row_number, values tuple)] of the journal sheet, plus the header columns."""
+    """[(excel_row_number, values)] of the journal sheet (only up to the last needed column), plus the columns."""
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
     try:
@@ -4262,18 +4263,26 @@ def _jw_read_sheet(data):
             ws.reset_dimensions()
         except Exception:
             pass
+        head = [tuple(getattr(c, "value", None) for c in cells) for cells in ws.iter_rows(min_row=1, max_row=15)]
+        cols = _jw_find_columns(head)
+        last = max([1] + list(cols.values())) + 1           # FAST: do not build the 40+ columns we never use
         out = []
-        for cells in ws.iter_rows():
+        for cells in ws.iter_rows(max_col=last):
             rn = next((getattr(c, "row", None) for c in cells if getattr(c, "row", None)), None)
             if rn:
                 out.append((rn, tuple(getattr(c, "value", None) for c in cells)))
     finally:
         wb.close()
-    return out, _jw_find_columns([v for _, v in out])
+    return out, cols
 
 
 def _jw_empty(v):
     return v is None or (isinstance(v, str) and v.strip() in ("", "-"))
+
+
+def _jw_zero(v):
+    n = pd.to_numeric(v, errors="coerce")
+    return pd.notna(n) and float(n) == 0
 
 
 def _jw_same(old, new):
@@ -4286,7 +4295,7 @@ def _jw_same(old, new):
 def _xlsx_set_cells(data, sheet_name, cells):
     """Writes values into cells of one sheet by editing only that sheet's XML (everything else in the file -
     formulas, formats, pictures, filters - stays byte-for-byte the same). cells = {(row, col_index0): value}.
-    Returns (new bytes, rows that were not found)."""
+    The sheet is cut into rows once, so it stays fast on a 4,000-row journal. -> (new bytes, rows not found)."""
     import zipfile
     zin = zipfile.ZipFile(io.BytesIO(data))
     wb_xml = zin.read("xl/workbook.xml").decode("utf-8")
@@ -4310,49 +4319,62 @@ def _xlsx_set_cells(data, sheet_name, cells):
         raise RuntimeError("Journal sheet file not found")
     sheet_path = target.lstrip("/") if target.startswith("/") else "xl/" + target
     xml = zin.read(sheet_path).decode("utf-8")
-    p = (re.search(r"<(\w+:)?sheetData\b", xml).group(1) or "")
-    row_re = lambda n: re.compile(r"<" + re.escape(p) + r'row\b[^>]*\br="' + str(n) + r'"[^>]*?(/>|>)')
-    cell_re = re.compile(r"<" + re.escape(p) + r'c\b[^>]*\br="([A-Z]+)(\d+)"[^>]*?(?:/>|>.*?</' + re.escape(p) + r"c>)", re.S)
+    p = re.escape(re.search(r"<(\w+:)?sheetData\b", xml).group(1) or "")
+    pfx = re.search(r"<(\w+:)?sheetData\b", xml).group(1) or ""
+    sd = re.search(r"<" + p + r"sheetData\b[^>]*?(?:/>|>(.*?)</" + p + r"sheetData>)", xml, re.S)
+    body = sd.group(1) or ""
+    row_iter = re.compile(r"<" + p + r'row\b[^>]*?\br="(\d+)"[^>]*?(?:/>|>.*?</' + p + r"row>)", re.S)
+    cell_re = re.compile(r"<" + p + r'c\b[^>]*?\br="([A-Z]+)\d+"[^>]*?(?:/>|>.*?</' + p + r"c>)", re.S)
+    chunks, where, pos = [], {}, 0
+    for m in row_iter.finditer(body):
+        if m.start() > pos:
+            chunks.append(body[pos:m.start()])
+        where[int(m.group(1))] = len(chunks)
+        chunks.append(m.group(0))
+        pos = m.end()
+    chunks.append(body[pos:])
 
-    def style_above(col_letters, rn):
+    def cell_style(chunk, letters):
+        for c in cell_re.finditer(chunk):
+            if c.group(1) == letters:
+                s = re.search(r'\bs="(\d+)"', c.group(0)[:c.group(0).find(">") + 1])
+                return s.group(1) if s else None
+        return None
+
+    def style_above(letters, rn):
         for back in range(1, 30):                       # same column, nearest row above that has a style
-            m = row_re(rn - back).search(xml)
-            if not m or m.group(1) == "/>":
-                continue
-            end = xml.index("</" + p + "row>", m.end())
-            for c in cell_re.finditer(xml, m.end(), end):
-                if c.group(1) == col_letters:
-                    s = re.search(r'\bs="(\d+)"', c.group(0)[:c.group(0).find(">") + 1])
-                    if s:
-                        return s.group(1)
+            i = where.get(rn - back)
+            if i is not None:
+                s = cell_style(chunks[i], letters)
+                if s:
+                    return s
         return None
 
     def cell_xml(ref, s, value):
         sa = f' s="{s}"' if s else ""
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return f'<{p}c r="{ref}"{sa}><{p}v>{int(value) if float(value).is_integer() else value}</{p}v></{p}c>'
-        return f'<{p}c r="{ref}"{sa} t="inlineStr"><{p}is><{p}t>{html.escape(str(value), quote=False)}</{p}t></{p}is></{p}c>'
+            v = int(value) if float(value).is_integer() else value
+            return f'<{pfx}c r="{ref}"{sa}><{pfx}v>{v}</{pfx}v></{pfx}c>'
+        return f'<{pfx}c r="{ref}"{sa} t="inlineStr"><{pfx}is><{pfx}t>{html.escape(str(value), quote=False)}</{pfx}t></{pfx}is></{pfx}c>'
 
-    missing = []
-    by_row = {}
+    by_row, missing = {}, []
     for (rn, ci), v in cells.items():
         by_row.setdefault(rn, {})[ci] = v
-    for rn in sorted(by_row):
-        m = row_re(rn).search(xml)
-        if not m:
+    for rn, values in by_row.items():
+        i = where.get(rn)
+        if i is None:
             missing.append(rn)
             continue
-        if m.group(1) == "/>":                          # empty row written as <row .../>: open it
-            open_tag = m.group(0)[:-2].rstrip() + ">"
-            xml = xml[:m.start()] + open_tag + "</" + p + "row>" + xml[m.end():]
-            m = row_re(rn).search(xml)
-        for ci in sorted(by_row[rn]):
+        row = chunks[i]
+        if row.endswith("/>"):                          # empty row written as <row .../>: open it
+            row = row[:-2].rstrip() + ">" + "</" + pfx + "row>"
+        open_end = row.index(">") + 1
+        inner, close = row[open_end:-len("</" + pfx + "row>")], "</" + pfx + "row>"
+        for ci in sorted(values):
             letters = _jw_col_letter(ci)
             ref = f"{letters}{rn}"
-            start = m.end()
-            end = xml.index("</" + p + "row>", start)
-            existing, insert_at = None, end
-            for c in cell_re.finditer(xml, start, end):
+            existing, insert_at = None, len(inner)
+            for c in cell_re.finditer(inner):
                 if c.group(1) == letters:
                     existing = c
                     break
@@ -4362,11 +4384,14 @@ def _xlsx_set_cells(data, sheet_name, cells):
             if existing:
                 head = existing.group(0)[:existing.group(0).find(">") + 1]
                 s = re.search(r'\bs="(\d+)"', head)
-                new = cell_xml(ref, s.group(1) if s else style_above(letters, rn), by_row[rn][ci])
-                xml = xml[:existing.start()] + new + xml[existing.end():]
+                new = cell_xml(ref, s.group(1) if s else style_above(letters, rn), values[ci])
+                inner = inner[:existing.start()] + new + inner[existing.end():]
             else:
-                new = cell_xml(ref, style_above(letters, rn), by_row[rn][ci])
-                xml = xml[:insert_at] + new + xml[insert_at:]
+                new = cell_xml(ref, style_above(letters, rn), values[ci])
+                inner = inner[:insert_at] + new + inner[insert_at:]
+        chunks[i] = row[:open_end] + inner + close
+    new_body = "".join(chunks)
+    xml = xml[:sd.start(1)] + new_body + xml[sd.end(1):] if sd.group(1) is not None else xml
     # ask Excel to recalculate totals that use these cells when the file is opened
     if re.search(r"<(?:\w+:)?calcPr\b", wb_xml):
         wb_xml = re.sub(r"<((?:\w+:)?calcPr\b)(?![^>]*fullCalcOnLoad)", r'<\1 fullCalcOnLoad="1"', wb_xml, count=1)
@@ -4405,13 +4430,36 @@ def _jw_journal_files(months):
     return out
 
 
-def _jw_download(name, path):
-    """(bytes, revision) of the journal right now."""
+def _jw_load(name, path):
+    """(bytes, revision, rows, columns) of the journal right now. Not downloaded / read again while unchanged."""
+    if USE_DROPBOX:
+        rev = _dbx().files_get_metadata(_rpath(name)).rev      # small call: is our copy still the newest?
+    else:
+        rev = str(os.path.getmtime(path))
+    hit = _JW_CACHE.get(name)
+    if hit and hit[0] == rev:
+        return hit[1], rev, hit[2], hit[3]
     if USE_DROPBOX:
         md, res = _dbx().files_download(_rpath(name))
-        return res.content, md.rev
-    with open(path, "rb") as f:
-        return f.read(), str(os.path.getmtime(path))
+        data, rev = res.content, md.rev
+    else:
+        with open(path, "rb") as f:
+            data = f.read()
+    rows, cols = _jw_read_sheet(data)
+    _JW_CACHE.clear()                                   # keep only one journal in memory
+    _JW_CACHE[name] = (rev, data, rows, cols)
+    return data, rev, rows, cols
+
+
+def _jw_pending_keys(d_from, d_to):
+    """(day, customer) whose transport expense is not entered yet in the app: never written as 0."""
+    disp = read_raw(DATA_FILE, DISPATCH_COLS)
+    if disp.empty or "_dt" not in disp.columns:
+        return set()
+    day = disp["_dt"].dt.normalize()
+    disp = disp[(day >= pd.Timestamp(d_from)) & (day <= pd.Timestamp(d_to))]
+    disp = disp[disp["Expense_Status"].astype(str).eq("Pending") | disp["Local_Driver"].astype(str).eq(PENDING_VIA)]
+    return {(d.date(), re.sub(r"\s+", " ", str(c)).strip()) for d, c in zip(disp["_dt"], disp["Customer"])}
 
 
 def plan_journal_write(d_from, d_to, overwrite=False):
@@ -4422,6 +4470,7 @@ def plan_journal_write(d_from, d_to, overwrite=False):
     fill = fill[(fill["អ្នកដឹក"] != "") | fill["សេវាដឹក (ចំណាយ)"].notna() | fill["សេវាតាក់ស៊ី (ចំណាយ)"].notna()]
     if fill.empty:
         return None, None, None, "No delivery data to write between these dates"
+    pending = _jw_pending_keys(d_from, d_to)
     months = sorted({(d.year, d.month) for d in fill["Date"]})
     files = _jw_journal_files(months)
     plan, preview, problems = {}, [], []
@@ -4433,8 +4482,7 @@ def plan_journal_write(d_from, d_to, overwrite=False):
                                  "Problem": f"No journal file for {ym[1]:02d}/{ym[0]}"})
             continue
         name, path = files[ym]
-        data, rev = _jw_download(name, path)
-        rows, cols = _jw_read_sheet(data)
+        data, rev, rows, cols = _jw_load(name, path)
         need = [k for k in ("drv", "pp", "taxi", "inv") if k not in cols]
         if need:
             return None, None, None, (f"{name}: cannot find the column(s) "
@@ -4447,6 +4495,10 @@ def plan_journal_write(d_from, d_to, overwrite=False):
         cells = {}
         for r in sub.to_dict("records"):
             inv = str(r["Invoice"] or "").strip()
+            if (r["Date"], re.sub(r"\s+", " ", str(r["Customer"])).strip()) in pending:
+                problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv or "-",
+                                 "Problem": "⏳ Expense not entered in the app yet (Delivery → expenses)"})
+                continue
             hits = by_inv.get(inv.casefold(), []) if inv and inv not in ("-", "nan") else []
             if len(hits) != 1:
                 problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv or "-",
@@ -4469,14 +4521,18 @@ def plan_journal_write(d_from, d_to, overwrite=False):
                 if v is None:
                     line[label] = "" if _jw_empty(old) else f"{_cell_text(old)} (kept)"
                     continue
+                if isinstance(old, str) and old.startswith("="):
+                    line[label] = "formula (kept)"
+                    continue
                 if not _jw_empty(old) and _jw_same(old, v):
                     line[label] = f"{v} (already)"
-                elif _jw_empty(old) or overwrite:
-                    if isinstance(old, str) and old.startswith("="):
-                        line[label] = f"{_cell_text(old)[:20]} (formula kept)"
-                        continue
+                    continue
+                zero_to_amount = key != "drv" and _jw_zero(old) and isinstance(v, int) and v > 0
+                if _jw_empty(old) or zero_to_amount or overwrite:
                     cells[(rn, ci)] = v
-                    line[label] = f"✍️ {v}" + ("" if _jw_empty(old) else f" (was {_cell_text(old)})")
+                    line[label] = f"✍️ {v:,}" if isinstance(v, int) else f"✍️ {v}"
+                    if not _jw_empty(old):
+                        line[label] += f" (was {_cell_text(old)})"
                     changed = True
                 else:
                     line[label] = f"{_cell_text(old)} (kept; app says {v})"
@@ -4488,7 +4544,7 @@ def plan_journal_write(d_from, d_to, overwrite=False):
 
 
 def apply_journal_write(plan):
-    """Writes the planned cells. Backup first; stops if the journal changed since the preview.
+    """Writes the planned cells. Backup first; stops if the journal changed since it was read.
     -> (cells written, list of messages)."""
     written, msgs = 0, []
     stamp = now_kh().strftime("%Y-%m-%d_%H%M%S")
@@ -4497,9 +4553,8 @@ def apply_journal_write(plan):
         if USE_DROPBOX:
             import dropbox
             dbx = _dbx()
-            md = dbx.files_get_metadata(_rpath(name))
-            if md.rev != job["rev"]:
-                msgs.append(f"⚠️ {name} was changed by someone just now - nothing written. Press Preview again.")
+            if dbx.files_get_metadata(_rpath(name)).rev != job["rev"]:
+                msgs.append(f"⚠️ {name} was just changed by someone - nothing written. Press the button again.")
                 continue
             try:
                 dbx.files_create_folder_v2(_remote_backup_dir())
@@ -4509,24 +4564,31 @@ def apply_journal_write(plan):
             dbx.files_upload(job["data"], f"{_remote_backup_dir()}/{stamp}_before_fill_{name}",
                              mode=dropbox.files.WriteMode.add, autorename=True, mute=True)
             try:
-                dbx.files_upload(new_data, _rpath(name), mode=dropbox.files.WriteMode.update(job["rev"]),
-                                 autorename=False, mute=False)
+                md = dbx.files_upload(new_data, _rpath(name), mode=dropbox.files.WriteMode.update(job["rev"]),
+                                      autorename=False, mute=False)
             except Exception as e:
                 if _is_conflict(e):
-                    msgs.append(f"⚠️ {name} was changed by someone just now - nothing written. Press Preview again.")
+                    msgs.append(f"⚠️ {name} was just changed by someone - nothing written. Press the button again.")
                     continue
                 raise
+            new_rev = md.rev
         else:
             path = job["path"]
             if str(os.path.getmtime(path)) != job["rev"]:
-                msgs.append(f"⚠️ {name} was changed just now - nothing written. Press Preview again.")
+                msgs.append(f"⚠️ {name} was just changed - nothing written. Press the button again.")
                 continue
             os.makedirs(BACKUP_DIR, exist_ok=True)
             _write_atomic(os.path.join(BACKUP_DIR, f"{stamp}_before_fill_{name}"), job["data"])
             _write_atomic(path, new_data)
-        n = len(job["cells"]) - sum(1 for (rn, _ci) in job["cells"] if rn in set(missing))
+            new_rev = str(os.path.getmtime(path))
+        _JW_CACHE.pop(name, None)
+        try:                                            # remember the written version: the next check is instant
+            _JW_CACHE[name] = (new_rev, new_data, *_jw_read_sheet(new_data))
+        except Exception:
+            pass
+        n = sum(1 for (rn, _ci) in job["cells"] if rn not in set(missing))
         written += n
-        msgs.append(f"✅ {name}: {n} cells written (backup: backups/{stamp}_before_fill_{name})")
+        msgs.append(f"✅ {name}: {n} cells written · backup: backups/{stamp}_before_fill_{name}")
         if missing:
             msgs.append(f"⚠️ {name}: rows {missing[:10]} not found in the sheet - skipped")
     try:
@@ -4539,47 +4601,55 @@ def apply_journal_write(plan):
     return written, msgs
 
 
-def _journal_write_panel(d_from, d_to):
-    """Admin: put អ្នកដឹក / សេវាដឹក (ចំណាយ) / សេវាតាក់ស៊ី (ចំណាយ) straight into the Sale Journal."""
+def _journal_autofill_panel():
+    """Admin: one place to put អ្នកដឹក / ចំណាយapp / ចំណាយtaxi straight into the Sale Journal."""
     if current_role() != "admin":
         return
-    st.markdown("**✍️ Write into the Sale Journal (auto-fill)**")
-    st.caption("Fills អ្នកដឹក, សេវាដឹក (ចំណាយ) = Grab/app and សេវាតាក់ស៊ី (ចំណាយ) = taxi, found by invoice number. "
-               "Only EMPTY cells are filled; what is already typed is kept. A backup of the journal is saved first. "
-               "👉 Ask everyone to SAVE and CLOSE the journal in Excel before you press Write.")
-    overwrite = st.checkbox("Also replace values that are different (not recommended)", key="jw_over")
-    if st.button("🔍 Preview what will be written", key="jw_prev"):
-        try:
-            with st.spinner("Reading the journal…"):
-                res = plan_journal_write(d_from, d_to, overwrite)
-            st.session_state["jw_plan"] = (res, d_from, d_to, overwrite)
-        except Exception as e:
-            st.error(f"Could not read the journal: {str(e)[:200]}")
-    saved = st.session_state.get("jw_plan")
-    if not saved or saved[1:] != (d_from, d_to, overwrite):
-        return
-    (plan, preview, problems, err) = saved[0]
-    if err:
-        st.warning(err)
-        return
-    n_cells = sum(len(j["cells"]) for j in plan.values())
-    if problems is not None and not problems.empty:
-        with st.expander(f"⚠️ {len(problems)} delivery(ies) cannot be written (fix the invoice/name, then Preview again)"):
-            show_df(problems)
-    if n_cells == 0:
-        st.info("Nothing new to write - the journal already has these values.")
-        return
-    st.success(f"{n_cells} empty cells on {len(preview)} journal rows will be filled:")
-    show_df(preview)
-    if st.button(f"✍️ Write {n_cells} cells into the journal now", type="primary", key="jw_go"):
-        try:
-            with st.spinner("Writing…"):
-                n, msgs = apply_journal_write(plan)
-            st.session_state.pop("jw_plan", None)
-            for m in msgs:
-                (st.success if m.startswith("✅") else st.warning)(m)
-        except Exception as e:
-            st.error(f"Not written: {str(e)[:200]}")
+    with st.expander("✍️ Auto-fill Sale Journal — អ្នកដឹក · ចំណាយapp · ចំណាយtaxi", expanded=False):
+        st.caption("Writes the driver (VUTHEA / TOU), សេវាដឹក (ចំណាយ) = Grab/app and សេវាតាក់ស៊ី (ចំណាយ) = taxi "
+                   "from the Delivery tab into the journal, found by invoice number. Only EMPTY cells are filled "
+                   "(a 0 becomes the real amount); anything typed by hand is kept. A backup is saved first. "
+                   "Pressing it again is safe.")
+        st.info("👉 Before you press: everyone SAVE and CLOSE the journal in Excel.")
+        c1, c2 = st.columns(2)
+        d_from = c1.date_input("From", value=today_kh().replace(day=1), key="jw_from")
+        d_to = c2.date_input("To", value=today_kh(), key="jw_to")
+        overwrite = st.checkbox("Also replace values typed by hand that are different (not recommended)", key="jw_over")
+        b1, b2 = st.columns(2)
+        go_now = b1.button("⚡ Fill journal now", type="primary", key="jw_now", use_container_width=True)
+        go_prev = b2.button("🔍 Preview only", key="jw_prev", use_container_width=True)
+        if go_now or go_prev:
+            t0 = time.time()
+            try:
+                with st.spinner("Reading the journal…"):
+                    plan, preview, problems, err = plan_journal_write(d_from, d_to, overwrite)
+            except Exception as e:
+                st.error(f"Could not read the journal: {str(e)[:200]}")
+                return
+            if err:
+                st.warning(err)
+                return
+            n_cells = sum(len(j["cells"]) for j in plan.values())
+            if go_now and n_cells:
+                try:
+                    with st.spinner(f"Writing {n_cells} cells…"):
+                        _n, msgs = apply_journal_write(plan)
+                    for m in msgs:
+                        (st.success if m.startswith("✅") else st.warning)(m)
+                except Exception as e:
+                    st.error(f"Not written: {str(e)[:200]}")
+                    return
+            elif n_cells:
+                st.success(f"{n_cells} cells on {len(preview)} rows are ready. Press ⚡ Fill journal now to write them.")
+            else:
+                st.info("✅ Nothing new to write — the journal already has everything the app knows.")
+            st.caption(f"⏱️ {time.time() - t0:.1f} s")
+            if preview is not None and not preview.empty:
+                st.markdown("**" + ("Written" if go_now else "Will be written") + "** (✍️ = new value)")
+                show_df(preview)
+            if problems is not None and not problems.empty:
+                st.warning(f"{len(problems)} delivery(ies) not written — fix them, then press again:")
+                show_df(problems)
 
 
 def _journal_fill_panel():
@@ -4632,8 +4702,6 @@ def _journal_fill_panel():
         if not miss.empty:
             st.warning(f"{len(miss)} delivery(ies) were not found in the journal (name or date differs):")
             show_df(miss)
-        st.divider()
-        _journal_write_panel(r_from, r_to)
 
 
 def _delivery_log():
@@ -4646,6 +4714,7 @@ def _delivery_log():
                          label_cols=["Customer", "Cases"])
 
     if can_reports:
+        _journal_autofill_panel()
         _journal_fill_panel()
     elif can_view:
         st.caption("Journal fill report is disabled for your account.")
