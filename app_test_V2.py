@@ -13548,15 +13548,23 @@ def _resolve_record_invoice(row):
     return matches[0]
 
 
+_STATUS_RAW_MEMO = {}
+
+
 def _make_invoice_status_csv(source, packing, deliveries, holds):
     """Export exact invoice status, conservatively skipping ambiguous legacy rows."""
-    from openpyxl import load_workbook
-    wb = load_workbook(io.BytesIO(source), read_only=True, data_only=True)
-    try:
-        ws = wb[JOURNAL_SHEET]; ws.reset_dimensions()
-        raw = list(ws.iter_rows(values_only=True))
-    finally:
-        wb.close()
+    key = hashlib.sha1(source).digest()
+    if _STATUS_RAW_MEMO.get("key") == key:
+        raw = _STATUS_RAW_MEMO["raw"]                    # journal unchanged: only packing / delivery changed
+    else:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(source), read_only=True, data_only=True)
+        try:
+            ws = wb[JOURNAL_SHEET]; ws.reset_dimensions()
+            raw = list(ws.iter_rows(values_only=True))
+        finally:
+            wb.close()
+        _STATUS_RAW_MEMO.update(key=key, raw=raw)
     ci = next((i for row in raw[:15] for i,v in enumerate(row) if v is not None and JOURNAL_CASES_HEADER in str(v)), None)
     ii = next((i for row in raw[:15] for i,v in enumerate(row) if v is not None and JOURNAL_INVOICE_HEADER in str(v)), None)
     if ci is None or ii is None:
@@ -13824,23 +13832,31 @@ def sync_journal_status_copy(force=False):
             with open(source_path, "rb") as f:
                 source = f.read()
             base = os.path.splitext(source_name)[0] + "__INVOICE_STATUS.csv"
+        # Downloads happen outside the shared lock (pull only downloads a file that changed, using the folder
+        # listing kept fresh in the background), so taps in the app never wait for this job.
+        inputs = ((PACKING_FILE, PACKING_COLS), (DATA_FILE, DISPATCH_COLS), (HOLD_FILE, HOLD_COLS))
+        for path, _cols in inputs:
+            pull(path, max_age=0)
+        def _ver(p):
+            return _sync_state()["rev"].get(p) if USE_DROPBOX else str(_file_sig(p))
+        versions = {p: _ver(p) for p, _c in inputs}
+        src_ver = source_md.rev if USE_DROPBOX else hashlib.sha1(source).hexdigest()
+        fingerprint = hashlib.sha256((STATUS_COPY_VERSION + src_ver + "|" + "|".join(str(versions[p]) for p, _c in inputs)).encode()).hexdigest()
+        local_out = os.path.join(DATA_DIR, STATUS_COPY_FOLDER, base)
+        if state["fingerprint"] == (source_name, fingerprint) and os.path.exists(local_out):
+            return                                           # nothing changed: no reading, no rebuilding
         # Strict reads: no cached/offline fallback is allowed for publishing highlights.
-        frames, signatures = [], []
-        with _sync_state()["lock"]:
-            for path, cols in ((PACKING_FILE, PACKING_COLS), (DATA_FILE, DISPATCH_COLS), (HOLD_FILE, HOLD_COLS)):
-                pull(path, force=True)
+        frames = []
+        with _sync_state()["lock"]:                          # local reads only (fast)
+            for path, cols in inputs:
                 if path in (PACKING_FILE, DATA_FILE) and not os.path.exists(path):
                     raise ValueError(os.path.basename(path) + " is missing; status copy postponed")
                 frame = _csv_read(path, cols)
                 if frame["_dt"].isna().any():
                     raise ValueError(os.path.basename(path) + " has invalid dates; correct them before highlighting")
                 frames.append(frame)
-                signatures.append(frame.drop(columns=["_dt"]).to_csv(index=False).encode("utf-8"))
-            versions = {p: _sync_state()["rev"].get(p) for p in (PACKING_FILE, DATA_FILE, HOLD_FILE)}
-        fingerprint = hashlib.sha256(STATUS_COPY_VERSION.encode() + source + b"\0".join(signatures)).hexdigest()
-        local_out = os.path.join(DATA_DIR, STATUS_COPY_FOLDER, base)
-        if state["fingerprint"] == (source_name, fingerprint) and os.path.exists(local_out):
-            return
+            if any(_ver(p) != versions[p] for p, _c in inputs):
+                raise ConflictError("Packing/delivery data changed while reading; retrying next minute")
         data, stats = _make_invoice_status_csv(source, *frames)
         if USE_DROPBOX:
             import dropbox
