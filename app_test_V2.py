@@ -941,6 +941,18 @@ def _tokens_fresh(force=False):
     return _read_tokens(), True
 
 
+def _users_quick():
+    """Accounts from the local copy (instant); Dropbox only when there is no local copy yet (app just started).
+    session_ok() still checks Dropbox on the following page loads, so a removed account is still logged out."""
+    try:
+        users = _read_users_file()
+        if users:
+            return users
+    except Exception:
+        pass
+    return load_users()
+
+
 def restore_from_cookie(token=None):
     """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, an app restart...).
     The phone's token is only deleted when it is surely invalid — never because Dropbox was slow."""
@@ -951,10 +963,9 @@ def restore_from_cookie(token=None):
     if not token:
         return False
     h, now = _tok_hash(token), time.time()
-    tokens, ok = _tokens_fresh()
-    rec = tokens.get(h)
+    rec, ok = _read_tokens().get(h), True               # FAST: local copy first, no Dropbox wait
     if rec is None:
-        tokens, ok = _tokens_fresh(force=True)          # maybe saved by another session a moment ago / app just restarted
+        tokens, ok = _tokens_fresh(force=True)          # not here yet (saved on another server / app just restarted)
         rec = tokens.get(h)
     if rec is None:
         if ok:                                          # checked the newest list: this token really does not exist
@@ -964,7 +975,7 @@ def restore_from_cookie(token=None):
             return False
         return "retry"                                  # Dropbox not reachable: try again in a moment, keep the phone's login
     try:
-        users = load_users()
+        users = _users_quick()
     except Exception:
         return "retry"
     u = users.get(rec["user"])
@@ -1101,7 +1112,7 @@ def _login_bridge():
   var tries = 0;
   function send(){{
     var el = W.document.querySelector('input[aria-label="{LOGIN_BRIDGE}"]');
-    if (!el) {{ if (++tries < 50) setTimeout(send, 100); return; }}
+    if (!el) {{ if (++tries < 500) setTimeout(send, 10); return; }}
     var set = Object.getOwnPropertyDescriptor(W.HTMLInputElement.prototype, 'value').set;
     set.call(el, t || 'none');
     el.dispatchEvent(new Event('input', {{bubbles:true}}));
@@ -1389,28 +1400,24 @@ def require_login():
         if got == "retry":
             tries = st.session_state.get("_restore_tries", 0) + 1
             st.session_state["_restore_tries"] = tries
-            if tries <= 4:                             # storage busy right after an app restart: wait instead of logging out
+            if tries <= 4:                             # storage busy right after an app restart: short wait, try again
                 st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
-                time.sleep(1.5 * tries)
+                time.sleep(0.3)
                 st.rerun()
-    _emit_cookie_cmd()
-    if session_ok():
-        st.session_state.pop("_restore_tries", None)
-        if st.session_state.get("must_change"):
-            render_force_change()
-            st.stop()
-        return st.session_state["role"]
 
     # The cookie did not reach the server (common after a screen lock on phones):
-    # ask the phone itself for its saved login before showing the password form.
-    if not st.session_state.get("_lb_done") and not st.session_state.get("_rescue_off"):
-        st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
-        tok = _login_bridge()
-        if tok is None:                                # waiting for the phone's answer (well under 1 second)
-            if st.button("🔐 Log in with password", key="lb_skip"):
-                st.session_state["_lb_done"] = True
-                st.rerun()
-            st.stop()
+    # ask the phone itself for its saved login, then continue in the SAME run (no extra page reload).
+    if (not st.session_state.get("user") and not st.session_state.get("_lb_done")
+            and not st.session_state.get("_rescue_off")):
+        box = st.empty()
+        with box.container():
+            st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
+            tok = _login_bridge()
+            if tok is None:                            # waiting for the phone's answer
+                if st.button("🔐 Log in with password", key="lb_skip"):
+                    st.session_state["_lb_done"] = True
+                    st.rerun()
+                st.stop()
         st.session_state["_lb_done"] = True
         if tok != "none":
             got = restore_from_cookie(tok)
@@ -1419,8 +1426,17 @@ def require_login():
                 st.session_state["_lb_retry"] = n
                 if n <= 3:                             # Dropbox slow right after waking: ask again
                     st.session_state["_lb_done"] = False
-                    time.sleep(1.5 * n)
-        st.rerun()
+                    time.sleep(0.3)
+                    st.rerun()
+        box.empty()                                    # remove the "Reconnecting" note and the hidden box
+
+    _emit_cookie_cmd()
+    if session_ok():
+        st.session_state.pop("_restore_tries", None)
+        if st.session_state.get("must_change"):
+            render_force_change()
+            st.stop()
+        return st.session_state["role"]
 
     st.session_state.pop("_restore_tries", None)
     render_login()
