@@ -876,9 +876,10 @@ def issue_remember_token(user, pw_stamp):
 
 def _request_cookie(name):
     try:
-        return st.context.cookies.get(name)
+        v = st.context.cookies.get(name)
     except Exception:
         return None
+    return v if isinstance(v, str) and v else None
 
 
 def _tokens_fresh(force=False):
@@ -893,34 +894,60 @@ def _tokens_fresh(force=False):
     return _read_tokens(), True
 
 
-def restore_from_cookie():
+def _users_quick():
+    """Accounts from the local copy (instant); Dropbox only when there is no local copy yet (app just started).
+    session_ok() still checks Dropbox on the following page loads, so a removed account is still logged out."""
+    try:
+        users = _read_users_file()
+        if users:
+            return users
+    except Exception:
+        pass
+    return load_users()
+
+
+def restore_from_cookie(token=None):
     """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, an app restart...).
     The phone's token is only deleted when it is surely invalid — never because Dropbox was slow."""
-    token = _request_cookie(COOKIE_TOKEN)
+    url_tok = _url_token()                              # always read, so it never stays in the address
+    if url_tok:
+        st.session_state["_url_tok"] = url_tok
+    token = token or st.session_state.get("_url_tok") or _request_cookie(COOKIE_TOKEN)
     if not token:
         return False
     h, now = _tok_hash(token), time.time()
-    tokens, ok = _tokens_fresh()
-    rec = tokens.get(h)
-    if rec is None and ok:
-        tokens, ok = _tokens_fresh(force=True)          # maybe saved by another session a moment ago
+    rec, ok = _read_tokens().get(h), True               # FAST: local copy first, no Dropbox wait
+    if rec is None:
+        tokens, ok = _tokens_fresh(force=True)          # not here yet (saved on another server / app just restarted)
         rec = tokens.get(h)
     if rec is None:
         if ok:                                          # checked the newest list: this token really does not exist
+            st.session_state["_login_diag"] = "unknown"
             st.session_state["cookie_cmd"] = ("clear",)
-        return False
+            st.session_state["_rescue_off"] = True
+            st.session_state.pop("_url_tok", None)
+            return False
+        return "retry"                                  # Dropbox not reachable: try again in a moment, keep the phone's login
     try:
-        users = load_users()
+        users = _users_quick()
     except Exception:
-        return False                                    # cannot check now: keep the token, try again next time
+        return "retry"
     u = users.get(rec["user"])
     if rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
         _modify_tokens(lambda d: (d.pop(h, None), d)[1])
+        st.session_state["_login_diag"] = ("expired" if rec.get("exp", 0) < now else
+                                           "inactive" if not u or not u.get("active", True) else "pwchanged")
         st.session_state["cookie_cmd"] = ("clear",)
+        st.session_state["_rescue_off"] = True
+        st.session_state.pop("_url_tok", None)
         return False
+    st.session_state.pop("_rescue_off", None)
+    st.session_state.pop("_url_tok", None)
+    st.session_state.pop("_login_diag", None)
     st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
                              "must_change": bool(u.get("must_change"))})
-    st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # refresh the phone's cookie (iPhone/iPad Safari drops old ones)
+    st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # write the cookie again (iPhone Safari drops old ones)
+    st.session_state.pop("_restore_tries", None)
     audit("login", f"{u['role']} (remembered)")
     if rec.get("exp", 0) - now < (REMEMBER_DAYS - 1) * 86400:     # renew once a day
         def _renew(d):
@@ -932,36 +959,138 @@ def restore_from_cookie():
 
 
 def forget_this_device():
-    token = _request_cookie(COOKIE_TOKEN)
+    token = _request_cookie(COOKIE_TOKEN) or st.session_state.pop("_url_tok", None)
     if token:
         _modify_tokens(lambda d: (d.pop(_tok_hash(token), None), d)[1])
     st.session_state["cookie_cmd"] = ("clear",)
+    st.session_state["_rescue_off"] = True
+
+
+def _cookie_js_set(tok, user):
+    age = REMEMBER_DAYS * 86400
+    t, u = json.dumps(tok), json.dumps(user)
+    return (f"var W=window.parent,s=(W.location.protocol==='https:')?'; Secure':'';"
+            f"W.document.cookie='{COOKIE_TOKEN}='+{t}+'; max-age={age}; path=/; SameSite=Lax'+s;"
+            f"W.document.cookie='{COOKIE_USER}='+encodeURIComponent({u})+'; max-age={age}; path=/; SameSite=Lax'+s;"
+            f"try{{W.localStorage.setItem('{COOKIE_TOKEN}',{t});W.localStorage.setItem('{COOKIE_USER}',{u});}}catch(e){{}}")
 
 
 def _emit_cookie_cmd():
-    """Writes / removes the cookies in the phone's browser (JavaScript, runs once)."""
+    """Writes / removes the login cookie in the phone's browser.
+    The cookie is written again on every page load while logged in: one write can be lost when the page reloads
+    at once, and iPhone Safari deletes cookies that are not refreshed for 7 days."""
     cmd = st.session_state.pop("cookie_cmd", None)
-    if not cmd:
+    if cmd and cmd[0] == "set":
+        st.session_state["_remember"] = (cmd[1], cmd[2])
+    elif cmd:
+        st.session_state.pop("_remember", None)
+        js = (f"var W=window.parent;W.document.cookie='{COOKIE_TOKEN}=; max-age=0; path=/';"
+              f"try{{W.localStorage.removeItem('{COOKIE_TOKEN}');}}catch(e){{}}")
+        try:
+            st.components.v1.html(f"<script>try{{{js}}}catch(e){{}}</script>", height=0)
+        except Exception:
+            pass
         return
-    age = REMEMBER_DAYS * 86400
-    if cmd[0] == "set":
-        tok, user = json.dumps(cmd[1]), json.dumps(cmd[2])
-        js = (f"var s=(window.parent.location.protocol==='https:')?'; Secure':'';"
-              f"window.parent.document.cookie='{COOKIE_TOKEN}='+{tok}+'; max-age={age}; path=/; SameSite=Lax'+s;"
-              f"window.parent.document.cookie='{COOKIE_USER}='+encodeURIComponent({user})+'; max-age={age}; path=/; SameSite=Lax'+s;")
-    else:
-        js = (f"window.parent.document.cookie='{COOKIE_TOKEN}=; max-age=0; path=/';")
+    rem = st.session_state.get("_remember")
+    if not rem:
+        return
+    last = st.session_state.get("_remember_written", 0)
+    if cmd or time.time() - last > 600:                   # write now, then every 10 minutes of use
+        try:
+            st.components.v1.html(f"<script>try{{{_cookie_js_set(rem[0], rem[1])}}}catch(e){{}}</script>", height=0)
+            st.session_state["_remember_written"] = time.time()
+        except Exception:
+            pass
+
+
+URL_TOKEN = "hk_rt"
+
+
+def _url_token():
+    """The saved login handed over in the page address by _cookie_rescue (for phones whose cookie does not reach
+    the server after a screen lock). Read once, then removed from the address at once."""
     try:
-        st.components.v1.html(f"<script>try{{{js}}}catch(e){{}}</script>", height=0)
+        tok = st.query_params.get(URL_TOKEN)
+        if URL_TOKEN in st.query_params:
+            del st.query_params[URL_TOKEN]
+    except Exception:
+        return None
+    tok = (tok or "").strip()
+    return tok if 20 <= len(tok) <= 100 else None
+
+
+def _cookie_rescue():
+    """Login page only. The phone still has its saved login (cookie or localStorage copy) but the server did not
+    receive it -> write the cookie again and reload once, handing the login over in the address as well.
+    Allowed again after 20 s, so it also works after the 2nd, 3rd... screen lock in the same tab."""
+    if st.session_state.get("_rescue_off"):            # the saved login was just found invalid: do not loop
+        return
+    js = (f"var W=window.parent;try{{var t=W.localStorage.getItem('{COOKIE_TOKEN}');"
+          f"if(!t){{var m=W.document.cookie.match(/(?:^|; ){COOKIE_TOKEN}=([^;]+)/);t=m?m[1]:'';}}"
+          f"var last=+(W.sessionStorage.getItem('hk_rescued')||0);"
+          f"if(t && Date.now()-last>20000){{"
+          f"W.sessionStorage.setItem('hk_rescued',String(Date.now()));"
+          f"{_cookie_js_set_raw()}"
+          f"var u=new URL(W.location.href);u.searchParams.set('{URL_TOKEN}',t);W.location.replace(u.toString());}}"
+          f"}}catch(e){{}}")
+    try:
+        st.components.v1.html(f"<script>{js}</script>", height=0)
     except Exception:
         pass
+
+
+def _cookie_js_set_raw():
+    age = REMEMBER_DAYS * 86400
+    return (f"var s=(W.location.protocol==='https:')?'; Secure':'';"
+            f"W.document.cookie='{COOKIE_TOKEN}='+t+'; max-age={age}; path=/; SameSite=Lax'+s;")
+
+
+LOGIN_BRIDGE = "hk_login_bridge"
+
+
+def _login_bridge():
+    """Reads the saved login from this phone (localStorage, then cookie) and hands it to Python through a hidden
+    box — the same trick as the Shop Visits GPS check-in. No page reload, no need for the cookie to reach the server.
+    Returns the token, "none" when the phone has no saved login, or None while still waiting for the phone."""
+    n = st.session_state.get("_lb_n", 0)
+    st.markdown(f"""<style>div[data-testid="stTextInput"]:has(input[aria-label="{LOGIN_BRIDGE}"])
+        {{position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0}}</style>""",
+                unsafe_allow_html=True)
+    raw = st.text_input(LOGIN_BRIDGE, key=f"lb_{n}", label_visibility="collapsed")
+    if raw:
+        st.session_state["_lb_n"] = n + 1               # next time a fresh, empty box
+        return raw.strip()
+    st.components.v1.html(f"""<script>
+/* try {n} */
+(function(){{
+  var W = window.parent, t = '';
+  try {{ t = W.localStorage.getItem('{COOKIE_TOKEN}') || ''; }} catch(e) {{}}
+  if (!t) {{ var m = W.document.cookie.match(/(?:^|; ){COOKIE_TOKEN}=([^;]+)/); t = m ? decodeURIComponent(m[1]) : ''; }}
+  var tries = 0;
+  function send(){{
+    var el = W.document.querySelector('input[aria-label="{LOGIN_BRIDGE}"]');
+    if (!el) {{ if (++tries < 500) setTimeout(send, 10); return; }}
+    var set = Object.getOwnPropertyDescriptor(W.HTMLInputElement.prototype, 'value').set;
+    set.call(el, t || 'none');
+    el.dispatchEvent(new Event('input', {{bubbles:true}}));
+    ['keydown','keypress','keyup'].forEach(function(k){{
+      el.dispatchEvent(new KeyboardEvent(k, {{key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true}}));
+    }});
+    el.dispatchEvent(new Event('blur', {{bubbles:true}}));
+    el.dispatchEvent(new FocusEvent('focusout', {{bubbles:true}}));
+  }}
+  send();
+}})();
+</script>""", height=0)
+    return None
 
 
 def _clear_session():
     st.session_state.pop("_table_drafts", None)
     st.session_state.pop("_task_preferences", None)
     st.session_state.pop("last_customer_upload_export", None)
-    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions"):
+    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions", "_url_tok",
+              "_lb_done", "_lb_retry"):
         st.session_state.pop(k, None)
 
 
@@ -1018,6 +1147,8 @@ def _try_login(username, password, remember=False):
         with guard["lock"]:
             for k in keys:
                 guard["fails"].pop(k, None)
+        st.session_state.pop("_rescue_off", None)
+        st.session_state.pop("_login_diag", None)
         st.session_state.update({"user": uname, "role": rec["role"], "login_time": time.time(),
                                  "must_change": bool(rec.get("must_change"))})
         audit("login", rec["role"])
@@ -1025,6 +1156,9 @@ def _try_login(username, password, remember=False):
             tok = issue_remember_token(uname, rec.get("pw_changed", ""))
             if tok:
                 st.session_state["cookie_cmd"] = ("set", tok, uname)
+            else:
+                st.session_state["save_warning"] = ("⚠️ មិនអាចរក្សាទុក login លើទូរស័ព្ទនេះបានទេ (could not save 'Keep me "
+                                                    "logged in' — storage busy). Log out រួច Log in ម្តងទៀត។")
 
         def _stamp(u):
             if uname in u:
@@ -1133,7 +1267,58 @@ def render_landing():
 # ===== END LANDING PAGE =====
 
 
+_INAPP_UA = (("telegram", "Telegram"), ("fban", "Facebook"), ("fbav", "Facebook"), ("messenger", "Messenger"),
+             ("instagram", "Instagram"), ("line/", "LINE"), ("zalo", "Zalo"), ("wechat", "WeChat"), ("micromessenger", "WeChat"),
+             ("tiktok", "TikTok"), ("; wv)", "an app's built-in browser"))
+
+
+def _inapp_browser():
+    """Name of the chat / social app whose built-in browser is showing the page (they forget logins), else ''."""
+    try:
+        ua = (st.context.headers.get("User-Agent") or "").lower()
+    except Exception:
+        return ""
+    return next((name for key, name in _INAPP_UA if key in ua), "")
+
+
+def _remember_state():
+    """'on' when this browser sent a valid saved login with this page, 'off' otherwise."""
+    rem = st.session_state.get("_remember")
+    tok = _request_cookie(COOKIE_TOKEN) or (rem[0] if rem else None)
+    if not tok:
+        return "off"
+    rec = _read_tokens().get(_tok_hash(tok))
+    return "on" if rec and rec.get("user") == current_user() else "off"
+
+
+LOGIN_TIPS_KM = ("បើកកម្មវិធីក្នុង **Chrome** (Android) ឬ **Safari** (iPhone) ផ្ទាល់ — កុំបើកពី link ក្នុង Telegram / Facebook "
+                 "(browser ក្នុង app ទាំងនោះលុប login រាល់ពេលបិទ) និងកុំប្រើ Private / Incognito tab។ "
+                 "ពេល Log in ត្រូវធីក ✅ Keep me logged in។")
+
+
+LOGIN_DIAG = {
+    "nophone": "ទូរស័ព្ទ/browser នេះមិនមាន login ដែលបានរក្សាទុកទេ (No saved login on this phone/browser). "
+               "Log in ម្តង ហើយធីក ✅ Keep me logged in។ បើនៅតែកើតម្តងទៀត៖ browser កំពុងលុបទិន្នន័យ "
+               "(Private tab, Telegram/Facebook browser, ឬ link ផ្សេង)។",
+    "unknown": "Server មិនស្គាល់ login ដែលបានរក្សាទុកនៅលើទូរស័ព្ទនេះ (saved login not found on the server — "
+               "the login list was lost or not saved to Dropbox). Log in ម្តងទៀត។",
+    "expired": "Login ដែលបានរក្សាទុកផុតកំណត់ហើយ (saved login expired). Log in ម្តងទៀត។",
+    "inactive": "គណនីនេះត្រូវបានបិទ ឬលុប (account disabled or removed).",
+    "pwchanged": "Password ត្រូវបានប្តូរ — login ចាស់លែងប្រើបាន (password changed). Log in ម្តងទៀត។",
+    "storage": "មិនអាចភ្ជាប់ Dropbox បាន (could not reach storage). សូមរង់ចាំបន្តិច រួចចុច Refresh។",
+}
+
+
 def render_login():
+    _diag = st.session_state.get("_login_diag")
+    if _diag in LOGIN_DIAG:
+        st.caption(f"ℹ️ ហេតុអ្វីត្រូវ Log in (why): {LOGIN_DIAG[_diag]}  [code: {_diag}]")
+    if not USE_DROPBOX:
+        st.caption("⚠️ Admin: Dropbox is not set up, so saved logins are lost every time the app restarts.")
+    app = _inapp_browser()
+    if app:
+        st.warning(f"⚠️ អ្នកកំពុងបើកក្នុង browser របស់ {app}។ វាមិនចាំ login ទេ ដូច្នេះអ្នកត្រូវ Log in រាល់ពេល។ "
+                   "ចុច ⋮ ឬ ••• រួចជ្រើស **Open in Chrome / Open in Safari**។")
     render_landing()
     st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 2, 1])
@@ -1191,13 +1376,52 @@ def render_force_change():
 def require_login():
     """Shows the login page (and stops the app) until the person is logged in. Returns the role."""
     if not session_ok():
-        restore_from_cookie()                              # phone was locked / tab closed: use the saved token
+        got = restore_from_cookie()                    # cookie reached the server: log in at once
+        if got == "retry":
+            tries = st.session_state.get("_restore_tries", 0) + 1
+            st.session_state["_restore_tries"] = tries
+            if tries <= 4:                             # storage busy right after an app restart: short wait, try again
+                st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
+                time.sleep(0.3)
+                st.rerun()
+
+    # The cookie did not reach the server (common after a screen lock on phones):
+    # ask the phone itself for its saved login, then continue in the SAME run (no extra page reload).
+    if (not st.session_state.get("user") and not st.session_state.get("_lb_done")
+            and not st.session_state.get("_rescue_off")):
+        box = st.empty()
+        with box.container():
+            st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
+            tok = _login_bridge()
+            if tok is None:                            # waiting for the phone's answer
+                if st.button("🔐 Log in with password", key="lb_skip"):
+                    st.session_state["_lb_done"] = True
+                    st.rerun()
+                st.stop()
+        st.session_state["_lb_done"] = True
+        if tok == "none":
+            st.session_state["_login_diag"] = "nophone"
+        else:
+            got = restore_from_cookie(tok)
+            if got == "retry":
+                n = st.session_state.get("_lb_retry", 0) + 1
+                st.session_state["_lb_retry"] = n
+                if n <= 3:                             # Dropbox slow right after waking: ask again
+                    st.session_state["_lb_done"] = False
+                    time.sleep(0.3)
+                    st.rerun()
+                st.session_state["_login_diag"] = "storage"
+        box.empty()                                    # remove the "Reconnecting" note and the hidden box
+
     _emit_cookie_cmd()
     if session_ok():
+        st.session_state.pop("_restore_tries", None)
         if st.session_state.get("must_change"):
             render_force_change()
             st.stop()
         return st.session_state["role"]
+
+    st.session_state.pop("_restore_tries", None)
     render_login()
     st.stop()
 
@@ -11622,6 +11846,9 @@ if "main_section" not in st.session_state:  # new session (phone woke up / recon
 _flash = st.session_state.pop("flash", None)
 if _flash:
     st.toast(_flash, icon="✅")
+_save_warning = st.session_state.pop("save_warning", None)
+if _save_warning:
+    st.warning(_save_warning)
 _assignment_warning = st.session_state.pop("assignment_warning", None)
 if _assignment_warning:
     st.warning(_assignment_warning)
