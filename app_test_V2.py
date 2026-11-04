@@ -941,59 +941,44 @@ def _tokens_fresh(force=False):
     return _read_tokens(), True
 
 
-def _users_quick():
-    """Accounts from the local copy (instant); Dropbox only when there is no local copy yet (app just started).
-    session_ok() still checks Dropbox on the following page loads, so a removed account is still logged out."""
-    try:
-        users = _read_users_file()
-        if users:
-            return users
-    except Exception:
-        pass
-    return load_users()
-
-
-def restore_from_cookie(token=None):
+def restore_from_cookie():
     """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, an app restart...).
     The phone's token is only deleted when it is surely invalid — never because Dropbox was slow."""
     url_tok = _url_token()                              # always read, so it never stays in the address
     if url_tok:
-        st.session_state["_url_tok"] = url_tok
-    token = token or st.session_state.get("_url_tok") or _request_cookie(COOKIE_TOKEN)
+        st.session_state["_url_tok"] = url_tok          # kept for the "Reconnecting…" retries below
+    token = st.session_state.get("_url_tok") or _request_cookie(COOKIE_TOKEN)
     if not token:
         return False
     h, now = _tok_hash(token), time.time()
-    rec, ok = _read_tokens().get(h), True               # FAST: local copy first, no Dropbox wait
+    tokens, ok = _tokens_fresh()
+    rec = tokens.get(h)
     if rec is None:
-        tokens, ok = _tokens_fresh(force=True)          # not here yet (saved on another server / app just restarted)
+        tokens, ok = _tokens_fresh(force=True)          # maybe saved by another session a moment ago / app just restarted
         rec = tokens.get(h)
     if rec is None:
         if ok:                                          # checked the newest list: this token really does not exist
-            st.session_state["_login_diag"] = "unknown"
             st.session_state["cookie_cmd"] = ("clear",)
             st.session_state["_rescue_off"] = True
             st.session_state.pop("_url_tok", None)
             return False
         return "retry"                                  # Dropbox not reachable: try again in a moment, keep the phone's login
     try:
-        users = _users_quick()
+        users = load_users()
     except Exception:
-        return "retry"
+        return "retry"                                  # cannot check now: keep the token, try again in a moment
     u = users.get(rec["user"])
     if rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
         _modify_tokens(lambda d: (d.pop(h, None), d)[1])
-        st.session_state["_login_diag"] = ("expired" if rec.get("exp", 0) < now else
-                                           "inactive" if not u or not u.get("active", True) else "pwchanged")
         st.session_state["cookie_cmd"] = ("clear",)
         st.session_state["_rescue_off"] = True
         st.session_state.pop("_url_tok", None)
         return False
     st.session_state.pop("_rescue_off", None)
     st.session_state.pop("_url_tok", None)
-    st.session_state.pop("_login_diag", None)
     st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
                              "must_change": bool(u.get("must_change"))})
-    st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # write the cookie again (iPhone Safari drops old ones)
+    st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # refresh the phone's cookie (iPhone/iPad Safari drops old ones)
     st.session_state.pop("_restore_tries", None)
     audit("login", f"{u['role']} (remembered)")
     if rec.get("exp", 0) - now < (REMEMBER_DAYS - 1) * 86400:     # renew once a day
@@ -1092,52 +1077,11 @@ def _cookie_js_set_raw():
             f"W.document.cookie='{COOKIE_TOKEN}='+t+'; max-age={age}; path=/; SameSite=Lax'+s;")
 
 
-LOGIN_BRIDGE = "hk_login_bridge"
-
-
-def _login_bridge():
-    """Reads the saved login from this phone (localStorage, then cookie) and hands it to Python through a hidden
-    box — the same trick as the Shop Visits GPS check-in. No page reload, no need for the cookie to reach the server.
-    Returns the token, "none" when the phone has no saved login, or None while still waiting for the phone."""
-    n = st.session_state.get("_lb_n", 0)
-    st.markdown(f"""<style>div[data-testid="stTextInput"]:has(input[aria-label="{LOGIN_BRIDGE}"])
-        {{position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0}}</style>""",
-                unsafe_allow_html=True)
-    raw = st.text_input(LOGIN_BRIDGE, key=f"lb_{n}", label_visibility="collapsed")
-    if raw:
-        st.session_state["_lb_n"] = n + 1               # next time a fresh, empty box
-        return raw.strip()
-    st.components.v1.html(f"""<script>
-/* try {n} */
-(function(){{
-  var W = window.parent, t = '';
-  try {{ t = W.localStorage.getItem('{COOKIE_TOKEN}') || ''; }} catch(e) {{}}
-  if (!t) {{ var m = W.document.cookie.match(/(?:^|; ){COOKIE_TOKEN}=([^;]+)/); t = m ? decodeURIComponent(m[1]) : ''; }}
-  var tries = 0;
-  function send(){{
-    var el = W.document.querySelector('input[aria-label="{LOGIN_BRIDGE}"]');
-    if (!el) {{ if (++tries < 500) setTimeout(send, 10); return; }}
-    var set = Object.getOwnPropertyDescriptor(W.HTMLInputElement.prototype, 'value').set;
-    set.call(el, t || 'none');
-    el.dispatchEvent(new Event('input', {{bubbles:true}}));
-    ['keydown','keypress','keyup'].forEach(function(k){{
-      el.dispatchEvent(new KeyboardEvent(k, {{key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true}}));
-    }});
-    el.dispatchEvent(new Event('blur', {{bubbles:true}}));
-    el.dispatchEvent(new FocusEvent('focusout', {{bubbles:true}}));
-  }}
-  send();
-}})();
-</script>""", height=0)
-    return None
-
-
 def _clear_session():
     st.session_state.pop("_table_drafts", None)
     st.session_state.pop("_task_preferences", None)
     st.session_state.pop("last_customer_upload_export", None)
-    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions", "_url_tok",
-              "_lb_done", "_lb_retry"):
+    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions", "_url_tok"):
         st.session_state.pop(k, None)
 
 
@@ -1195,7 +1139,6 @@ def _try_login(username, password, remember=False):
             for k in keys:
                 guard["fails"].pop(k, None)
         st.session_state.pop("_rescue_off", None)
-        st.session_state.pop("_login_diag", None)
         st.session_state.update({"user": uname, "role": rec["role"], "login_time": time.time(),
                                  "must_change": bool(rec.get("must_change"))})
         audit("login", rec["role"])
@@ -1203,9 +1146,6 @@ def _try_login(username, password, remember=False):
             tok = issue_remember_token(uname, rec.get("pw_changed", ""))
             if tok:
                 st.session_state["cookie_cmd"] = ("set", tok, uname)
-            else:
-                st.session_state["save_warning"] = ("⚠️ មិនអាចរក្សាទុក login លើទូរស័ព្ទនេះបានទេ (could not save 'Keep me "
-                                                    "logged in' — storage busy). Log out រួច Log in ម្តងទៀត។")
 
         def _stamp(u):
             if uname in u:
@@ -1330,8 +1270,7 @@ def _inapp_browser():
 
 def _remember_state():
     """'on' when this browser sent a valid saved login with this page, 'off' otherwise."""
-    rem = st.session_state.get("_remember")
-    tok = _request_cookie(COOKIE_TOKEN) or (rem[0] if rem else None)
+    tok = _request_cookie(COOKIE_TOKEN)
     if not tok:
         return "off"
     rec = _read_tokens().get(_tok_hash(tok))
@@ -1343,25 +1282,8 @@ LOGIN_TIPS_KM = ("បើកកម្មវិធីក្នុង **Chrome** (A
                  "ពេល Log in ត្រូវធីក ✅ Keep me logged in។")
 
 
-LOGIN_DIAG = {
-    "nophone": "ទូរស័ព្ទ/browser នេះមិនមាន login ដែលបានរក្សាទុកទេ (No saved login on this phone/browser). "
-               "Log in ម្តង ហើយធីក ✅ Keep me logged in។ បើនៅតែកើតម្តងទៀត៖ browser កំពុងលុបទិន្នន័យ "
-               "(Private tab, Telegram/Facebook browser, ឬ link ផ្សេង)។",
-    "unknown": "Server មិនស្គាល់ login ដែលបានរក្សាទុកនៅលើទូរស័ព្ទនេះ (saved login not found on the server — "
-               "the login list was lost or not saved to Dropbox). Log in ម្តងទៀត។",
-    "expired": "Login ដែលបានរក្សាទុកផុតកំណត់ហើយ (saved login expired). Log in ម្តងទៀត។",
-    "inactive": "គណនីនេះត្រូវបានបិទ ឬលុប (account disabled or removed).",
-    "pwchanged": "Password ត្រូវបានប្តូរ — login ចាស់លែងប្រើបាន (password changed). Log in ម្តងទៀត។",
-    "storage": "មិនអាចភ្ជាប់ Dropbox បាន (could not reach storage). សូមរង់ចាំបន្តិច រួចចុច Refresh។",
-}
-
-
 def render_login():
-    _diag = st.session_state.get("_login_diag")
-    if _diag in LOGIN_DIAG:
-        st.caption(f"ℹ️ ហេតុអ្វីត្រូវ Log in (why): {LOGIN_DIAG[_diag]}  [code: {_diag}]")
-    if not USE_DROPBOX:
-        st.caption("⚠️ Admin: Dropbox is not set up, so saved logins are lost every time the app restarts.")
+    _cookie_rescue()
     app = _inapp_browser()
     if app:
         st.warning(f"⚠️ អ្នកកំពុងបើកក្នុង browser របស់ {app}។ វាមិនចាំ login ទេ ដូច្នេះអ្នកត្រូវ Log in រាល់ពេល។ "
@@ -1423,52 +1345,20 @@ def render_force_change():
 def require_login():
     """Shows the login page (and stops the app) until the person is logged in. Returns the role."""
     if not session_ok():
-        got = restore_from_cookie()                    # cookie reached the server: log in at once
+        got = restore_from_cookie()                        # phone was locked / tab closed / app restarted: use the saved token
         if got == "retry":
             tries = st.session_state.get("_restore_tries", 0) + 1
             st.session_state["_restore_tries"] = tries
-            if tries <= 4:                             # storage busy right after an app restart: short wait, try again
+            if tries <= 4:                                 # storage busy right after an app restart: wait instead of logging out
                 st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
-                time.sleep(0.3)
+                time.sleep(1.5 * tries)
                 st.rerun()
-
-    # The cookie did not reach the server (common after a screen lock on phones):
-    # ask the phone itself for its saved login, then continue in the SAME run (no extra page reload).
-    if (not st.session_state.get("user") and not st.session_state.get("_lb_done")
-            and not st.session_state.get("_rescue_off")):
-        box = st.empty()
-        with box.container():
-            st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
-            tok = _login_bridge()
-            if tok is None:                            # waiting for the phone's answer
-                if st.button("🔐 Log in with password", key="lb_skip"):
-                    st.session_state["_lb_done"] = True
-                    st.rerun()
-                st.stop()
-        st.session_state["_lb_done"] = True
-        if tok == "none":
-            st.session_state["_login_diag"] = "nophone"
-        else:
-            got = restore_from_cookie(tok)
-            if got == "retry":
-                n = st.session_state.get("_lb_retry", 0) + 1
-                st.session_state["_lb_retry"] = n
-                if n <= 3:                             # Dropbox slow right after waking: ask again
-                    st.session_state["_lb_done"] = False
-                    time.sleep(0.3)
-                    st.rerun()
-                st.session_state["_login_diag"] = "storage"
-        box.empty()                                    # remove the "Reconnecting" note and the hidden box
-
     _emit_cookie_cmd()
     if session_ok():
-        st.session_state.pop("_restore_tries", None)
         if st.session_state.get("must_change"):
             render_force_change()
             st.stop()
         return st.session_state["role"]
-
-    st.session_state.pop("_restore_tries", None)
     render_login()
     st.stop()
 
@@ -3896,7 +3786,8 @@ def _claim_tab(me, ctx):
         st.info("No customers to choose right now.")
     else:
         assigned = ctx["assigned"]
-        rows = [{"Take ✅": False, "Customer": r["Customer"], "Province": r["Province"], "Status": r["Status"],
+        rows = [{"Take ✅": False, "Customer": r["Customer"], SALE_NOTE_COL: sale_note_label(r.get("Journal Note")),
+                 "Province": r["Province"], "Status": r["Status"],
                  "Packed": int(r["Packed Cases"]), "Ordered": None if pd.isna(r["កេស"]) else int(r["កេស"]),
                  "Taken by": assigned.get(r["Customer"], "-")} for r in recs]
         _reload_draft_button("claim", me)
@@ -3906,7 +3797,8 @@ def _claim_tab(me, ctx):
             select_all = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
             edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
                 disabled=[c for c in d.columns if c != "Take ✅"],
-                column_config={"Take ✅": st.column_config.CheckboxColumn("Take ✅")})
+                column_config={"Take ✅": st.column_config.CheckboxColumn("Take ✅"),
+                               SALE_NOTE_COL: st.column_config.TextColumn(SALE_NOTE_COL, width="medium")})
             submitted = st.form_submit_button("✅ Save selected delivery customers", type="primary")
         if submitted:
             new, blocked = [], []
@@ -3974,7 +3866,8 @@ def _send_tab(me, ctx):
         ordered = None if pd.isna(r["កេស"]) else int(r["កេស"])
         packed, sent = int(r["Packed Cases"]), int(r["Sent Cases"])
         left = (packed - sent) if packed > sent else ((ordered - sent) if (ordered and ordered > sent) else 1)
-        rows.append({"Sent ✅": False, "Customer": r["Customer"], "Invoice": "", "Cases": int(left), "Via": "Use default", "Taxi station": "",
+        rows.append({"Sent ✅": False, "Customer": r["Customer"], SALE_NOTE_COL: sale_note_label(r.get("Journal Note")),
+                     "Invoice": "", "Cases": int(left), "Via": "Use default", "Taxi station": "",
                      "Note": "", "Status": r["Status"], "Province": r["Province"],
                      "Saved sent cases": sent, "Saved packed cases": packed, "Saved order cases": ordered if ordered is not None else -1})
     _reload_draft_button("send", me)
@@ -3986,13 +3879,14 @@ def _send_tab(me, ctx):
         default_via = PENDING_VIA
         select_all_send = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
         edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
-            column_order=["Sent ✅", "Customer", "Cases", "Invoice", "Note", "Status"],
-            disabled=["Customer", "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
+            column_order=["Sent ✅", "Customer", SALE_NOTE_COL, "Cases", "Invoice", "Note", "Status"],
+            disabled=["Customer", SALE_NOTE_COL, "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
             column_config={"Sent ✅": st.column_config.CheckboxColumn("Sent ✅"),
                 "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1),
                 "Via": st.column_config.SelectboxColumn("Via", options=["Use default", PENDING_VIA] + via_options()),
                 "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
-                "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT)})
+                "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT),
+                SALE_NOTE_COL: st.column_config.TextColumn(SALE_NOTE_COL, width="medium")})
         submitted = st.form_submit_button("🚚 Save selected deliveries", type="primary")
     if submitted:
         selected_rows = [r for r in edited.to_dict("records") if select_all_send or r["Sent ✅"]]
@@ -4213,446 +4107,6 @@ def build_driver_totals(d_from, d_to):
     return out, piv
 
 
-# ---- Write driver & expenses straight into the Sale Journal (only empty cells, backup first) ----
-JW_DRIVER_HDR, JW_PP_HDR, JW_TAXI_HDR = "អ្នកដឹក", "សេវាដឹក", "តាក់ស៊ី"
-JW_FIELDS = (("drv", "អ្នកដឹក"), ("pp", "សេវាដឹក (ចំណាយ)"), ("taxi", "សេវាតាក់ស៊ី (ចំណាយ)"))
-_JW_CACHE = {}          # journal name -> (revision, bytes, rows, columns): read once per journal version
-
-
-def _jw_col_letter(i0):
-    s, n = "", i0 + 1
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-def _jw_col_index(letters):
-    n = 0
-    for ch in letters:
-        n = n * 26 + (ord(ch) - 64)
-    return n - 1
-
-
-def _jw_find_columns(rows):
-    """{'drv'|'pp'|'taxi'|'inv': column index} from the journal header (first 15 rows)."""
-    cols = {}
-    for row in rows[:15]:
-        for i, v in enumerate(row):
-            if v is None:
-                continue
-            t = re.sub(r"\s+", "", str(v))
-            if "drv" not in cols and t == JW_DRIVER_HDR:
-                cols["drv"] = i
-            elif "pp" not in cols and JW_PP_HDR in t and "ចំណាយ" in t and JW_TAXI_HDR not in t:
-                cols["pp"] = i
-            elif "taxi" not in cols and JW_TAXI_HDR in t and "ចំណាយ" in t:
-                cols["taxi"] = i
-            elif "inv" not in cols and JOURNAL_INVOICE_HEADER in t:
-                cols["inv"] = i
-    return cols
-
-
-def _jw_read_sheet(data):
-    """[(excel_row_number, values)] of the journal sheet (only up to the last needed column), plus the columns."""
-    from openpyxl import load_workbook
-    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
-    try:
-        ws = wb[JOURNAL_SHEET]
-        try:
-            ws.reset_dimensions()
-        except Exception:
-            pass
-        head = [tuple(getattr(c, "value", None) for c in cells) for cells in ws.iter_rows(min_row=1, max_row=15)]
-        cols = _jw_find_columns(head)
-        last = max([1] + list(cols.values())) + 1           # FAST: do not build the 40+ columns we never use
-        out = []
-        for cells in ws.iter_rows(max_col=last):
-            rn = next((getattr(c, "row", None) for c in cells if getattr(c, "row", None)), None)
-            if rn:
-                out.append((rn, tuple(getattr(c, "value", None) for c in cells)))
-    finally:
-        wb.close()
-    return out, cols
-
-
-def _jw_empty(v):
-    return v is None or (isinstance(v, str) and v.strip() in ("", "-"))
-
-
-def _jw_zero(v):
-    n = pd.to_numeric(v, errors="coerce")
-    return pd.notna(n) and float(n) == 0
-
-
-def _jw_same(old, new):
-    if isinstance(new, (int, float)):
-        n = pd.to_numeric(old, errors="coerce")
-        return pd.notna(n) and float(n) == float(new)
-    return str(old).strip().upper() == str(new).strip().upper()
-
-
-def _xlsx_set_cells(data, sheet_name, cells):
-    """Writes values into cells of one sheet by editing only that sheet's XML (everything else in the file -
-    formulas, formats, pictures, filters - stays byte-for-byte the same). cells = {(row, col_index0): value}.
-    The sheet is cut into rows once, so it stays fast on a 4,000-row journal. -> (new bytes, rows not found)."""
-    import zipfile
-    zin = zipfile.ZipFile(io.BytesIO(data))
-    wb_xml = zin.read("xl/workbook.xml").decode("utf-8")
-    rid = None
-    for m in re.finditer(r"<(?:\w+:)?sheet\b[^>]*>", wb_xml):
-        tag = m.group(0)
-        nm = re.search(r'\bname="([^"]*)"', tag)
-        if nm and html.unescape(nm.group(1)) == sheet_name:
-            rid = re.search(r'\br:id="([^"]+)"', tag) or re.search(r'\b\w+:id="([^"]+)"', tag)
-            rid = rid.group(1) if rid else None
-            break
-    if not rid:
-        raise RuntimeError(f"Sheet '{sheet_name}' not found in the journal")
-    rels = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
-    target = None
-    for m in re.finditer(r"<(?:\w+:)?Relationship\b[^>]*>", rels):
-        if re.search(r'\bId="' + re.escape(rid) + '"', m.group(0)):
-            target = re.search(r'\bTarget="([^"]+)"', m.group(0)).group(1)
-            break
-    if not target:
-        raise RuntimeError("Journal sheet file not found")
-    sheet_path = target.lstrip("/") if target.startswith("/") else "xl/" + target
-    xml = zin.read(sheet_path).decode("utf-8")
-    p = re.escape(re.search(r"<(\w+:)?sheetData\b", xml).group(1) or "")
-    pfx = re.search(r"<(\w+:)?sheetData\b", xml).group(1) or ""
-    sd = re.search(r"<" + p + r"sheetData\b[^>]*?(?:/>|>(.*?)</" + p + r"sheetData>)", xml, re.S)
-    body = sd.group(1) or ""
-    row_iter = re.compile(r"<" + p + r'row\b[^>]*?\br="(\d+)"[^>]*?(?:/>|>.*?</' + p + r"row>)", re.S)
-    cell_re = re.compile(r"<" + p + r'c\b[^>]*?\br="([A-Z]+)\d+"[^>]*?(?:/>|>.*?</' + p + r"c>)", re.S)
-    chunks, where, pos = [], {}, 0
-    for m in row_iter.finditer(body):
-        if m.start() > pos:
-            chunks.append(body[pos:m.start()])
-        where[int(m.group(1))] = len(chunks)
-        chunks.append(m.group(0))
-        pos = m.end()
-    chunks.append(body[pos:])
-
-    def cell_style(chunk, letters):
-        for c in cell_re.finditer(chunk):
-            if c.group(1) == letters:
-                s = re.search(r'\bs="(\d+)"', c.group(0)[:c.group(0).find(">") + 1])
-                return s.group(1) if s else None
-        return None
-
-    def style_above(letters, rn):
-        for back in range(1, 30):                       # same column, nearest row above that has a style
-            i = where.get(rn - back)
-            if i is not None:
-                s = cell_style(chunks[i], letters)
-                if s:
-                    return s
-        return None
-
-    def cell_xml(ref, s, value):
-        sa = f' s="{s}"' if s else ""
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            v = int(value) if float(value).is_integer() else value
-            return f'<{pfx}c r="{ref}"{sa}><{pfx}v>{v}</{pfx}v></{pfx}c>'
-        return f'<{pfx}c r="{ref}"{sa} t="inlineStr"><{pfx}is><{pfx}t>{html.escape(str(value), quote=False)}</{pfx}t></{pfx}is></{pfx}c>'
-
-    by_row, missing = {}, []
-    for (rn, ci), v in cells.items():
-        by_row.setdefault(rn, {})[ci] = v
-    for rn, values in by_row.items():
-        i = where.get(rn)
-        if i is None:
-            missing.append(rn)
-            continue
-        row = chunks[i]
-        if row.endswith("/>"):                          # empty row written as <row .../>: open it
-            row = row[:-2].rstrip() + ">" + "</" + pfx + "row>"
-        open_end = row.index(">") + 1
-        inner, close = row[open_end:-len("</" + pfx + "row>")], "</" + pfx + "row>"
-        for ci in sorted(values):
-            letters = _jw_col_letter(ci)
-            ref = f"{letters}{rn}"
-            existing, insert_at = None, len(inner)
-            for c in cell_re.finditer(inner):
-                if c.group(1) == letters:
-                    existing = c
-                    break
-                if _jw_col_index(c.group(1)) > ci:
-                    insert_at = c.start()
-                    break
-            if existing:
-                head = existing.group(0)[:existing.group(0).find(">") + 1]
-                s = re.search(r'\bs="(\d+)"', head)
-                new = cell_xml(ref, s.group(1) if s else style_above(letters, rn), values[ci])
-                inner = inner[:existing.start()] + new + inner[existing.end():]
-            else:
-                new = cell_xml(ref, style_above(letters, rn), values[ci])
-                inner = inner[:insert_at] + new + inner[insert_at:]
-        chunks[i] = row[:open_end] + inner + close
-    new_body = "".join(chunks)
-    xml = xml[:sd.start(1)] + new_body + xml[sd.end(1):] if sd.group(1) is not None else xml
-    # ask Excel to recalculate totals that use these cells when the file is opened
-    if re.search(r"<(?:\w+:)?calcPr\b", wb_xml):
-        wb_xml = re.sub(r"<((?:\w+:)?calcPr\b)(?![^>]*fullCalcOnLoad)", r'<\1 fullCalcOnLoad="1"', wb_xml, count=1)
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w") as zout:
-        for item in zin.infolist():
-            if item.filename == sheet_path:
-                payload = xml.encode("utf-8")
-            elif item.filename == "xl/workbook.xml":
-                payload = wb_xml.encode("utf-8")
-            else:
-                payload = zin.read(item.filename)
-            zout.writestr(item, payload, compress_type=item.compress_type)
-    zin.close()
-    return out.getvalue(), missing
-
-
-def _jw_journal_files(months):
-    """{(year, month): (name, local path or None)} - the journal file of each month."""
-    out = {}
-    if USE_DROPBOX:
-        names = [x for x in _remote_excel_names() if fnmatch.fnmatchcase(x["name"].lower(), EXCEL_PATTERN.lower())]
-        for ym in months:
-            ms = [x for x in names if _journal_ym(x["name"]) == ym]
-            if ms:
-                out[ym] = (max(ms, key=lambda x: x["mtime"])["name"], None)
-    else:
-        fs = [f for f in glob.glob(os.path.join(CURRENT_DIR, EXCEL_PATTERN))
-              if not os.path.basename(f).startswith("~$") and "conflicted copy" not in os.path.basename(f).lower()
-              and not os.path.basename(f).lower().endswith("__status.xlsx")]
-        for ym in months:
-            ms = [f for f in fs if _journal_ym(os.path.basename(f)) == ym]
-            if ms:
-                f = max(ms, key=os.path.getmtime)
-                out[ym] = (os.path.basename(f), f)
-    return out
-
-
-def _jw_load(name, path):
-    """(bytes, revision, rows, columns) of the journal right now. Not downloaded / read again while unchanged."""
-    if USE_DROPBOX:
-        rev = _dbx().files_get_metadata(_rpath(name)).rev      # small call: is our copy still the newest?
-    else:
-        rev = str(os.path.getmtime(path))
-    hit = _JW_CACHE.get(name)
-    if hit and hit[0] == rev:
-        return hit[1], rev, hit[2], hit[3]
-    if USE_DROPBOX:
-        md, res = _dbx().files_download(_rpath(name))
-        data, rev = res.content, md.rev
-    else:
-        with open(path, "rb") as f:
-            data = f.read()
-    rows, cols = _jw_read_sheet(data)
-    _JW_CACHE.clear()                                   # keep only one journal in memory
-    _JW_CACHE[name] = (rev, data, rows, cols)
-    return data, rev, rows, cols
-
-
-def _jw_pending_keys(d_from, d_to):
-    """(day, customer) whose transport expense is not entered yet in the app: never written as 0."""
-    disp = read_raw(DATA_FILE, DISPATCH_COLS)
-    if disp.empty or "_dt" not in disp.columns:
-        return set()
-    day = disp["_dt"].dt.normalize()
-    disp = disp[(day >= pd.Timestamp(d_from)) & (day <= pd.Timestamp(d_to))]
-    disp = disp[disp["Expense_Status"].astype(str).eq("Pending") | disp["Local_Driver"].astype(str).eq(PENDING_VIA)]
-    return {(d.date(), re.sub(r"\s+", " ", str(c)).strip()) for d, c in zip(disp["_dt"], disp["Customer"])}
-
-
-def plan_journal_write(d_from, d_to, overwrite=False):
-    """What would be written. -> (plan dict | None, preview DataFrame, problems DataFrame, error)."""
-    fill, _miss, err = build_journal_fill(d_from, d_to)
-    if err:
-        return None, None, None, err
-    fill = fill[(fill["អ្នកដឹក"] != "") | fill["សេវាដឹក (ចំណាយ)"].notna() | fill["សេវាតាក់ស៊ី (ចំណាយ)"].notna()]
-    if fill.empty:
-        return None, None, None, "No delivery data to write between these dates"
-    pending = _jw_pending_keys(d_from, d_to)
-    months = sorted({(d.year, d.month) for d in fill["Date"]})
-    files = _jw_journal_files(months)
-    plan, preview, problems = {}, [], []
-    for ym in months:
-        sub = fill[[(d.year, d.month) == ym for d in fill["Date"]]]
-        if ym not in files:
-            for r in sub.to_dict("records"):
-                problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": r["Invoice"],
-                                 "Problem": f"No journal file for {ym[1]:02d}/{ym[0]}"})
-            continue
-        name, path = files[ym]
-        data, rev, rows, cols = _jw_load(name, path)
-        need = [k for k in ("drv", "pp", "taxi", "inv") if k not in cols]
-        if need:
-            return None, None, None, (f"{name}: cannot find the column(s) "
-                                      f"{', '.join({'drv': 'អ្នកដឹក', 'pp': 'សេវាដឹក (ចំណាយ)', 'taxi': 'សេវាតាក់ស៊ី (ចំណាយ)', 'inv': 'វិក្កយប័ត្រ'}[k] for k in need)}")
-        by_inv = {}
-        for rn, vals in rows:
-            inv = _cell_text(vals[cols["inv"]]) if cols["inv"] < len(vals) else ""
-            if inv:
-                by_inv.setdefault(inv.casefold(), []).append((rn, vals))
-        cells = {}
-        for r in sub.to_dict("records"):
-            inv = str(r["Invoice"] or "").strip()
-            if (r["Date"], re.sub(r"\s+", " ", str(r["Customer"])).strip()) in pending:
-                problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv or "-",
-                                 "Problem": "⏳ Expense not entered in the app yet (Delivery → expenses)"})
-                continue
-            hits = by_inv.get(inv.casefold(), []) if inv and inv not in ("-", "nan") else []
-            if len(hits) != 1:
-                problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv or "-",
-                                 "Problem": "Invoice not in journal" if not hits else "Invoice is on several rows"})
-                continue
-            rn, vals = hits[0]
-            if norm_name(_cell_text(vals[1] if len(vals) > 1 else "")) != norm_name(r["Customer"]):
-                problems.append({"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv,
-                                 "Problem": f"Row {rn} has another customer: {_cell_text(vals[1])[:40]}"})
-                continue
-            new = {"drv": r["អ្នកដឹក"] or None,
-                   "pp": None if pd.isna(r["សេវាដឹក (ចំណាយ)"]) else int(r["សេវាដឹក (ចំណាយ)"]),
-                   "taxi": None if pd.isna(r["សេវាតាក់ស៊ី (ចំណាយ)"]) else int(r["សេវាតាក់ស៊ី (ចំណាយ)"])}
-            line = {"Date": r["Date"], "Customer": r["Customer"], "Invoice": inv, "Excel row": rn}
-            changed = False
-            for key, label in JW_FIELDS:
-                v = new[key]
-                ci = cols[key]
-                old = vals[ci] if ci < len(vals) else None
-                if v is None:
-                    line[label] = "" if _jw_empty(old) else f"{_cell_text(old)} (kept)"
-                    continue
-                if isinstance(old, str) and old.startswith("="):
-                    line[label] = "formula (kept)"
-                    continue
-                if not _jw_empty(old) and _jw_same(old, v):
-                    line[label] = f"{v} (already)"
-                    continue
-                zero_to_amount = key != "drv" and _jw_zero(old) and isinstance(v, int) and v > 0
-                if _jw_empty(old) or zero_to_amount or overwrite:
-                    cells[(rn, ci)] = v
-                    line[label] = f"✍️ {v:,}" if isinstance(v, int) else f"✍️ {v}"
-                    if not _jw_empty(old):
-                        line[label] += f" (was {_cell_text(old)})"
-                    changed = True
-                else:
-                    line[label] = f"{_cell_text(old)} (kept; app says {v})"
-            if changed:
-                preview.append(line)
-        if cells:
-            plan[name] = {"path": path, "rev": rev, "data": data, "cells": cells}
-    return plan, pd.DataFrame(preview), pd.DataFrame(problems), None
-
-
-def apply_journal_write(plan):
-    """Writes the planned cells. Backup first; stops if the journal changed since it was read.
-    -> (cells written, list of messages)."""
-    written, msgs = 0, []
-    stamp = now_kh().strftime("%Y-%m-%d_%H%M%S")
-    for name, job in plan.items():
-        new_data, missing = _xlsx_set_cells(job["data"], JOURNAL_SHEET, job["cells"])
-        if USE_DROPBOX:
-            import dropbox
-            dbx = _dbx()
-            if dbx.files_get_metadata(_rpath(name)).rev != job["rev"]:
-                msgs.append(f"⚠️ {name} was just changed by someone - nothing written. Press the button again.")
-                continue
-            try:
-                dbx.files_create_folder_v2(_remote_backup_dir())
-            except Exception as e:
-                if not _is_conflict(e):
-                    raise
-            dbx.files_upload(job["data"], f"{_remote_backup_dir()}/{stamp}_before_fill_{name}",
-                             mode=dropbox.files.WriteMode.add, autorename=True, mute=True)
-            try:
-                md = dbx.files_upload(new_data, _rpath(name), mode=dropbox.files.WriteMode.update(job["rev"]),
-                                      autorename=False, mute=False)
-            except Exception as e:
-                if _is_conflict(e):
-                    msgs.append(f"⚠️ {name} was just changed by someone - nothing written. Press the button again.")
-                    continue
-                raise
-            new_rev = md.rev
-        else:
-            path = job["path"]
-            if str(os.path.getmtime(path)) != job["rev"]:
-                msgs.append(f"⚠️ {name} was just changed - nothing written. Press the button again.")
-                continue
-            os.makedirs(BACKUP_DIR, exist_ok=True)
-            _write_atomic(os.path.join(BACKUP_DIR, f"{stamp}_before_fill_{name}"), job["data"])
-            _write_atomic(path, new_data)
-            new_rev = str(os.path.getmtime(path))
-        _JW_CACHE.pop(name, None)
-        try:                                            # remember the written version: the next check is instant
-            _JW_CACHE[name] = (new_rev, new_data, *_jw_read_sheet(new_data))
-        except Exception:
-            pass
-        n = sum(1 for (rn, _ci) in job["cells"] if rn not in set(missing))
-        written += n
-        msgs.append(f"✅ {name}: {n} cells written · backup: backups/{stamp}_before_fill_{name}")
-        if missing:
-            msgs.append(f"⚠️ {name}: rows {missing[:10]} not found in the sheet - skipped")
-    try:
-        if USE_DROPBOX:
-            _remote_listing_forget()
-        get_snapshot.clear()
-    except Exception:
-        pass
-    audit("journal_write", f"{written} cells into {', '.join(plan)}")
-    return written, msgs
-
-
-def _journal_autofill_panel():
-    """Admin: one place to put អ្នកដឹក / ចំណាយapp / ចំណាយtaxi straight into the Sale Journal."""
-    if current_role() != "admin":
-        return
-    with st.expander("✍️ Manual fill (old journals only) — អ្នកដឹក · ចំណាយapp · ចំណាយtaxi", expanded=False):
-        st.caption("Journals from November 2026 fill these columns automatically from the App_Expense sheet - no need to press anything.")
-        st.caption("Writes the driver (VUTHEA / TOU), សេវាដឹក (ចំណាយ) = Grab/app and សេវាតាក់ស៊ី (ចំណាយ) = taxi "
-                   "from the Delivery tab into the journal, found by invoice number. Only EMPTY cells are filled "
-                   "(a 0 becomes the real amount); anything typed by hand is kept. A backup is saved first. "
-                   "Pressing it again is safe.")
-        st.info("👉 Before you press: everyone SAVE and CLOSE the journal in Excel.")
-        c1, c2 = st.columns(2)
-        d_from = c1.date_input("From", value=today_kh().replace(day=1), key="jw_from")
-        d_to = c2.date_input("To", value=today_kh(), key="jw_to")
-        overwrite = st.checkbox("Also replace values typed by hand that are different (not recommended)", key="jw_over")
-        b1, b2 = st.columns(2)
-        go_now = b1.button("⚡ Fill journal now", type="primary", key="jw_now", use_container_width=True)
-        go_prev = b2.button("🔍 Preview only", key="jw_prev", use_container_width=True)
-        if go_now or go_prev:
-            t0 = time.time()
-            try:
-                with st.spinner("Reading the journal…"):
-                    plan, preview, problems, err = plan_journal_write(d_from, d_to, overwrite)
-            except Exception as e:
-                st.error(f"Could not read the journal: {str(e)[:200]}")
-                return
-            if err:
-                st.warning(err)
-                return
-            n_cells = sum(len(j["cells"]) for j in plan.values())
-            if go_now and n_cells:
-                try:
-                    with st.spinner(f"Writing {n_cells} cells…"):
-                        _n, msgs = apply_journal_write(plan)
-                    for m in msgs:
-                        (st.success if m.startswith("✅") else st.warning)(m)
-                except Exception as e:
-                    st.error(f"Not written: {str(e)[:200]}")
-                    return
-            elif n_cells:
-                st.success(f"{n_cells} cells on {len(preview)} rows are ready. Press ⚡ Fill journal now to write them.")
-            else:
-                st.info("✅ Nothing new to write — the journal already has everything the app knows.")
-            st.caption(f"⏱️ {time.time() - t0:.1f} s")
-            if preview is not None and not preview.empty:
-                st.markdown("**" + ("Written" if go_now else "Will be written") + "** (✍️ = new value)")
-                show_df(preview)
-            if problems is not None and not problems.empty:
-                st.warning(f"{len(problems)} delivery(ies) not written — fix them, then press again:")
-                show_df(problems)
-
-
 def _journal_fill_panel():
     with st.expander("📋 Journal fill sheet - driver & expenses for the Sale Journal"):
         st.caption("Gives អ្នកដឹក, សេវាដឹក (ចំណាយ) and សេវាតាក់ស៊ី (ចំណាយ) in the same order as your journal, "
@@ -4715,7 +4169,6 @@ def _delivery_log():
                          label_cols=["Customer", "Cases"])
 
     if can_reports:
-        _journal_autofill_panel()
         _journal_fill_panel()
     elif can_view:
         st.caption("Journal fill report is disabled for your account.")
@@ -4780,6 +4233,94 @@ def _delivery_log():
                              if c in staff_tasks.columns]
                 show_df(staff_tasks[task_cols])
 
+# ---------- 📌 sale notes for delivery staff (urgent / fixed pick-up time) ----------
+SALE_NOTE_COL = "📌 Sale note"
+NOTE_TIME_WORDS = ["កំណត់ម៉ោង", "ម៉ោង", "មកយក", "យកផ្ទាល់", "មុនម៉ោង", "ព្រឹក", "ថ្ងៃត្រង់", "រសៀល", "ល្ងាច",
+                   "PICK UP", "PICKUP", "AM", "PM"]
+_KM_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
+_NOTE_PM_WORDS = ("PM", "រសៀល", "ល្ងាច", "យប់")
+_NOTE_TIME_RES = [
+    re.compile(r"ម៉ោង\s*(\d{1,2})(?:\s*[:.h]\s*(\d{2}))?\s*(AM|PM|ព្រឹក|ថ្ងៃត្រង់|រសៀល|ល្ងាច|យប់)?"),
+    re.compile(r"(?<![\d/])(\d{1,2})\s*[:.h]\s*(\d{2})\s*(AM|PM)?(?![\d/])"),
+    re.compile(r"(?<![\d/])(\d{1,2})\s*()(AM|PM)(?![A-Z])"),
+]
+
+
+def sale_note_time(note):
+    """'មកយកម៉ោង2pm' -> 14*60 ; '10:30' -> 630 ; None when the note gives no clock time."""
+    text = str(note or "").translate(_KM_DIGITS).upper()
+    for rx in _NOTE_TIME_RES:
+        m = rx.search(text)
+        if not m:
+            continue
+        h, mins, word = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "")
+        if h > 23 or mins > 59:
+            continue
+        if word == "AM" or word == "ព្រឹក":
+            h = 0 if h == 12 else h
+        elif word in _NOTE_PM_WORDS or (word == "" and rx is _NOTE_TIME_RES[0] and 1 <= h <= 6):
+            h = h + 12 if h < 12 else h                  # "ម៉ោង2" at a bakery means 2 in the afternoon
+        return h * 60 + mins
+    return None
+
+
+def sale_note_flags(note):
+    """(urgent, timed, minutes) for a journal remark."""
+    text = str(note or "").strip()
+    if text in ("", "-"):
+        return False, False, None
+    up = text.upper()
+    urgent = any(w.upper() in up for w in URGENT_WORDS)
+    minutes = sale_note_time(text)
+    timed = minutes is not None or any(w in up for w in NOTE_TIME_WORDS if not w.isascii()) \
+        or any(re.search(r"\b%s\b" % w, up) for w in NOTE_TIME_WORDS if w.isascii())
+    return urgent, timed, minutes
+
+
+def sale_note_label(note):
+    """'🔥 ⏰ 14:00 · មកយកម៉ោង2pm' — empty when the sale left no note."""
+    text = str(note or "").strip()
+    if text in ("", "-"):
+        return ""
+    urgent, timed, minutes = sale_note_flags(text)
+    head = ("🔥 " if urgent else "") + ("⏰ " if timed else "") + (f"{minutes // 60:02d}:{minutes % 60:02d} · " if minutes is not None else "")
+    return head + text
+
+
+def _sale_notes_alert(ctx, me):
+    """Top of Log Delivery: customers not sent yet whose sale note says urgent or a pick-up time, earliest first."""
+    now_m = now_kh().hour * 60 + now_kh().minute
+    flagged, other = [], []
+    for r in ctx["recs"]:
+        note = str(r.get("Journal Note", "") or "").strip()
+        if note in ("", "-") or r["Status"] in NOT_TO_SEND:
+            continue
+        urgent, timed, minutes = sale_note_flags(note)
+        taken = ctx["assigned"].get(r["Customer"], "")
+        row = (minutes if minutes is not None else 24 * 60, 0 if urgent else 1, r["Customer"], note, r["Status"], taken, minutes, urgent)
+        (flagged if (urgent or timed) else other).append(row)
+    if not flagged and not other:
+        return
+    flagged.sort()
+    if flagged:
+        lines = []
+        for _sort, _u, cust, note, status, taken, minutes, urgent in flagged:
+            when = ""
+            if minutes is not None:
+                left = minutes - now_m
+                when = (f"⏰ **{minutes // 60:02d}:{minutes % 60:02d}**"
+                        + (" 🚨 **ហួសម៉ោងហើយ**" if left < 0 else f" ⚠️ **នៅសល់ {left} នាទី**" if left <= 60 else ""))
+            who = f"👷 {taken}" if taken else "👷 **មិនទាន់មាននរណាយក**"
+            mine = " ⭐" if taken and taken == me else ""
+            lines.append(f"- {'🔥 ' if urgent else ''}{when} **{cust}**{mine} — 📌 {note}  \n  {status} · {who}")
+        st.error(f"**📌 ចំណាំពីផ្នែកលក់ — ប្រញាប់ / កំណត់ម៉ោងយក ({len(flagged)})** · សូមដឹកឱ្យទាន់ ដើម្បីកុំឱ្យអតិថិជនបោះបង់\n\n"
+                 + "\n".join(lines))
+    if other:
+        with st.expander(f"📝 ចំណាំផ្សេងទៀតពីផ្នែកលក់ ({len(other)})"):
+            for *_x, cust, note, status, taken, _m, _u in sorted(other, key=lambda x: x[2]):
+                st.markdown(f"- **{cust}** — {note} <small>· {status}{' · 👷 ' + taken if taken else ''}</small>", unsafe_allow_html=True)
+
+
 def _dispatch_body():
     if not has_permission("tasks") or not has_permission("edit"):
         st.warning("Delivery task editing is disabled for your account.")
@@ -4797,6 +4338,7 @@ def _dispatch_body():
     if me != "-- Select Staff --":
         st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📌 To send <b>{len(mine)}</b></span>"
                     f"<span class='hk-pill'>⏳ Details to complete <b>{n_wait}</b></span></div>", unsafe_allow_html=True)
+    _sale_notes_alert(ctx, me)
     step = st.selectbox("Delivery step", ["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Complete delivery details", "✍️ One customer", "📊 Today's log"], key="phone_delivery_step")
     if me == "-- Select Staff --" and not step.startswith("📊"):
         st.info("Choose your name at the top first.")
@@ -13930,6 +13472,9 @@ def phone_task_editor(frame, **kwargs):
             details = [str(row.get(c, "")) for c in ("Province", "Status", "Taken by") if c in row]
             if details:
                 st.caption(" · ".join(details))
+            note = str(row.get(SALE_NOTE_COL, "") or "")
+            if note:
+                (st.error if note.startswith(("🔥", "⏰")) else st.caption)("📌 " + note)
             for col in columns:
                 if col in disabled or col not in row:
                     continue
@@ -14184,94 +13729,7 @@ def _make_invoice_status_csv(source, packing, deliveries, holds):
 STATUS_COPY_FOLDER = "Auto_Status"
 
 
-STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V3:"
-
-
-DRIVER_EXPENSE_SUFFIX = "__DRIVER_EXPENSE.csv"
-DRIVER_EXPENSE_COLS = ["Invoice", "Customer", "Date", "Driver", "App_Expense", "Taxi_Expense", "Status"]
-
-
-def _make_driver_expense_csv(source, deliveries):
-    """One line per journal invoice: driver code (VUTHEA / TOU), app (Grab) expense, taxi expense.
-    The journal's App_Expense sheet loads this CSV, and អ្នកដឹក / សេវាដឹក (ចំណាយ) / សេវាតាក់ស៊ី (ចំណាយ) look the
-    invoice up there - the app never writes into the journal itself (same idea as App_Status).
-    A customer's expenses of one day go on its FIRST invoice of that day (0 on the others), never counted twice.
-    Expenses not entered yet ('Pending' / 'Fill in later') stay EMPTY, not 0."""
-    key = hashlib.sha1(source).digest()
-    if _STATUS_RAW_MEMO.get("key") == key:
-        raw = _STATUS_RAW_MEMO["raw"]
-    else:
-        from openpyxl import load_workbook
-        wb = load_workbook(io.BytesIO(source), read_only=True, data_only=True)
-        try:
-            ws = wb[JOURNAL_SHEET]
-            ws.reset_dimensions()
-            raw = list(ws.iter_rows(values_only=True))
-        finally:
-            wb.close()
-    ii = next((i for row in raw[:15] for i, v in enumerate(row) if v is not None and JOURNAL_INVOICE_HEADER in str(v)), None)
-    if ii is None:
-        raise RuntimeError("Journal invoice column missing")
-    months = Counter((r[0].year, r[0].month) for r in raw if r and isinstance(r[0], datetime))
-    dominant = months.most_common(1)[0][0] if months else None
-    # deliveries of the app, per day + customer
-    agg = {}
-    for r in deliveries.to_dict("records"):
-        dt = r.get("_dt")
-        if dt is None or pd.isna(dt):
-            dt = parse_dt(r.get("Date"))
-        if dt is None or pd.isna(dt):
-            continue
-        a = agg.setdefault((dt.date(), norm_name(r["Customer"])),
-                           {"drv": "", "pp": 0, "taxi": 0, "pending": False})
-        via = str(r.get("Local_Driver", "")).strip()
-        if DRIVER_CODE.get(via):
-            a["drv"] = DRIVER_CODE[via]
-        a["pp"] += _int(r.get("Phnom_Penh_Expense"))
-        a["taxi"] += _int(r.get("Taxi_Expense"))
-        if via == PENDING_VIA or str(r.get("Expense_Status", "")).strip() == "Pending":
-            a["pending"] = True
-    out, seen_inv, owner, used = [], set(), {}, set()
-    for r in raw:
-        if len(r) <= ii or not r[1]:
-            continue
-        day = cell_to_date(r[0], dominant)
-        inv = _cell_text(r[ii])
-        if not day or not inv or inv == "-":
-            continue
-        ck = (day, norm_name(_cell_text(r[1])))
-        if inv.casefold() in owner and owner[inv.casefold()] != ck:
-            continue                                      # same invoice for two customers/days: leave it to a person
-        owner[inv.casefold()] = ck
-        if inv.casefold() in seen_inv:
-            continue
-        seen_inv.add(inv.casefold())
-        a = agg.get(ck)
-        if a is None:
-            continue
-        first = ck not in used
-        used.add(ck)
-        if a["pending"]:
-            pp = taxi = ""
-        else:
-            pp, taxi = (a["pp"], a["taxi"]) if first else (0, 0)
-        out.append({"Invoice": inv, "Customer": _cell_text(r[1]), "Date": day.isoformat(), "Driver": a["drv"],
-                    "App_Expense": pp, "Taxi_Expense": taxi, "Status": "Pending" if a["pending"] else "Done"})
-    frame = pd.DataFrame(out, columns=DRIVER_EXPENSE_COLS)
-    stats = {"rows": len(frame), "pending": int((frame["Status"] == "Pending").sum()) if len(frame) else 0}
-    return frame.to_csv(index=False).encode("utf-8-sig"), stats
-
-
-def _publish_driver_expense_csv(source, deliveries, status_base):
-    """Writes Auto_Status/<journal>__DRIVER_EXPENSE.csv next to the invoice status CSV."""
-    import dropbox
-    data, stats = _make_driver_expense_csv(source, deliveries)
-    base = status_base.replace("__INVOICE_STATUS.csv", DRIVER_EXPENSE_SUFFIX)
-    if USE_DROPBOX:
-        _dbx().files_upload(data, _rpath(STATUS_COPY_FOLDER + "/" + base),
-                            mode=dropbox.files.WriteMode.overwrite, autorename=False, mute=True)
-    _write_atomic(os.path.join(DATA_DIR, STATUS_COPY_FOLDER, base), data)
-    return stats
+STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V2:"
 
 
 def _journal_status_rows(journal_rows, packing, deliveries, holds):
@@ -14515,13 +13973,8 @@ def sync_journal_status_copy(force=False):
             if os.path.exists(os.path.join(os.path.dirname(local_out), "~$" + base)):
                 raise RuntimeError("Close the status copy in Excel to let it refresh")
         _write_atomic(local_out, data)
-        try:                                             # driver + ចំណាយapp + ចំណាយtaxi for the journal's App_Expense sheet
-            ex = _publish_driver_expense_csv(source, frames[1], base)
-            ex_msg = f" Driver/expense CSV: {ex['rows']} invoices ({ex['pending']} waiting for expenses)."
-        except Exception as e:
-            ex_msg = f" Driver/expense CSV not updated: {str(e)[:120]}"
         state.update(fingerprint=(source_name, fingerprint), path=local_out, error=False,
-                     message=f"Updated {now_kh():%d %b %H:%M} — {stats['highlighted']} invoice statuses ready for Excel." + ex_msg + " "
+                     message=f"Updated {now_kh():%d %b %H:%M} — {stats['highlighted']} invoice statuses ready for Excel. "
                              f"{stats['ambiguous']} ambiguous customer/day matches skipped; {stats['unmatched']} log customer/day matches absent from this journal.")
     except Exception as e:
         state.update(error=True, message="Invoice status update pending: " + str(e)[:220])
@@ -14547,8 +14000,6 @@ def journal_status_copy_panel():
     state = _status_copy_state()
     with st.expander("🟨🟩 Original journal: invoice conditional formatting"):
         st.caption("The app publishes Auto_Status / <journal>__INVOICE_STATUS.csv. Connect this CSV once to the original journal’s App_Status sheet. Excel conditional formatting colors customer names using customer + invoice; the app never saves the sales workbook.")
-        st.caption("Also publishes Auto_Status / <journal>__DRIVER_EXPENSE.csv: the journal's App_Expense sheet loads it and "
-                   "អ្នកដឹក · សេវាដឹក (ចំណាយ) · សេវាតាក់ស៊ី (ចំណាយ) fill themselves by invoice (expenses still pending stay empty).")
         st.caption("Yellow = fully packed · Green = fully sent · Blue = partly sent. Status is matched by customer + invoice. Old records without invoices are used only when there is exactly one matching invoice that day. Existing product and remark colors stay intact.")
         st.caption("Updates within about 60 seconds while an authorized app session is open. In Excel, refresh the App_Status query (or enable refresh every minute). No update runs when the app is asleep or closed.")
         if st.button("Refresh invoice status CSV now", key="journal_highlight_refresh"):
