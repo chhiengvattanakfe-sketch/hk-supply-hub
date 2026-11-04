@@ -7433,7 +7433,8 @@ def _si_prepare(snap, full=False):
         sig = None
     memo = _si_prepare_memo()
     hit = memo.get("v")
-    if sig is not None and hit and hit[0] == sig:
+    # The memo lives across app updates (no restart): a result saved by an older version has another shape.
+    if sig is not None and hit and hit[0] == sig and isinstance(hit[1], tuple) and len(hit[1]) == 5:
         for k, v in hit[2].items():
             st.session_state[k] = v
         return hit[1][:3] if not full else hit[1]
