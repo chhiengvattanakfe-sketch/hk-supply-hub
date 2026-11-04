@@ -3758,11 +3758,52 @@ def _sorted_records(recs):
     return sorted(recs, key=lambda r: (AREA_RANK.get(r["Area"], 9), _REGION_ORDER.get(r["Region"], 99), r["Province"], r["Customer"]))
 
 
+DEL_ZONE_PROVINCE = "🌄 ខេត្ត (Province)"
+DEL_ZONE_ALL = "📍 គ្រប់តំបន់ (All)"
+
+
+def _delivery_zone_of(recs):
+    """{customer: group}: Phnom Penh customers get the same zone as in Shop Visits / Media Team
+    (Admin's choice, else the shop's map pin, else the name); province customers are one group."""
+    pp = {norm_name(r["Customer"]): r["Customer"] for r in recs if r.get("Area") == AREA_LABEL[PP]}
+    try:
+        zmap = _visit_zone_map(pp) if pp else {}
+    except Exception:
+        zmap = {}
+    out = {}
+    for r in recs:
+        if r.get("Area") == AREA_LABEL[PP]:
+            z = zmap.get(norm_name(r["Customer"]), VISIT_ZONE_NOT_SET)
+            out[r["Customer"]] = VISIT_ZONE_NOT_SET if str(z).startswith("🚫") else z
+        else:
+            out[r["Customer"]] = DEL_ZONE_PROVINCE
+    return out
+
+
+def _delivery_zone_rank(z):
+    order = list(VISIT_ZONES) + [VISIT_ZONE_NOT_SET, DEL_ZONE_PROVINCE]
+    return order.index(z) if z in order else len(order)
+
+
 def delivery_context():
     ctx = packing_context()
-    ctx["recs"] = _sorted_records(ctx["df"].to_dict("records")) if not ctx["df"].empty else []
+    recs = _sorted_records(ctx["df"].to_dict("records")) if not ctx["df"].empty else []
+    zones = _delivery_zone_of(recs)
+    for r in recs:
+        r["Zone"] = zones.get(r["Customer"], DEL_ZONE_PROVINCE)
+    ctx["recs"] = sorted(recs, key=lambda r: (_delivery_zone_rank(r["Zone"]), str(r.get("Province", "")), r["Customer"]))
     ctx["assigned"] = current_assignments()
     return ctx
+
+
+def _delivery_zone_picker(recs, key):
+    """Group filter: all, one Phnom Penh zone, or province customers. Remembered while the app is open."""
+    counts = Counter(r["Zone"] for r in recs)
+    options = [DEL_ZONE_ALL] + sorted(counts, key=_delivery_zone_rank)
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = DEL_ZONE_ALL
+    return st.selectbox("📍 ក្រុម / តំបន់ (Group)", options, key=key,
+                        format_func=lambda z: f"{z}  ({len(recs)})" if z == DEL_ZONE_ALL else f"{_km(z)}  ({counts.get(z, 0)})")
 
 
 def _claim_tab(me, ctx):
@@ -3772,14 +3813,16 @@ def _claim_tab(me, ctx):
     st.caption("Choose the customers **you** will deliver today, before you start. Other staff will see they are taken. "
                "You can release a customer again if you cannot go.")
     recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND]
+    zone = _delivery_zone_picker(recs, "claim_zone")
+    if zone != st.session_state.get("_claim_zone_prev", zone):
+        _reset_draft("claim", me)                           # new group: start a fresh tick list
+    st.session_state["_claim_zone_prev"] = zone
     with st.form("claim_filters"):
-        f1, f2 = st.columns(2)
-        area = f1.radio("Show", ["All", AREA_LABEL[PP], AREA_LABEL["Province"]], horizontal=True, key="claim_area")
-        q = f2.text_input("🔎 Search customer", key="claim_q", max_chars=60)
+        q = st.text_input("🔎 Search customer", key="claim_q", max_chars=60)
         if st.form_submit_button("Apply customer filter"):
             _reset_draft("claim", me)
-    if area != "All":
-        recs = [r for r in recs if r["Area"] == area]
+    if zone != DEL_ZONE_ALL:
+        recs = [r for r in recs if r["Zone"] == zone]
     if q.strip():
         recs = [r for r in recs if q.strip().lower() in r["Customer"].lower()]
     if not recs and not _has_editor_draft("claim", me):
@@ -3787,6 +3830,7 @@ def _claim_tab(me, ctx):
     else:
         assigned = ctx["assigned"]
         rows = [{"Take ✅": False, "Customer": r["Customer"], SALE_NOTE_COL: sale_note_label(r.get("Journal Note")),
+                 "Zone": _km(r["Zone"]) if r["Zone"] != DEL_ZONE_PROVINCE else r["Province"],
                  "Province": r["Province"], "Status": r["Status"],
                  "Packed": int(r["Packed Cases"]), "Ordered": None if pd.isna(r["កេស"]) else int(r["កេស"]),
                  "Taken by": assigned.get(r["Customer"], "-")} for r in recs]
@@ -3854,6 +3898,12 @@ def _send_tab(me, ctx):
     assigned = ctx["assigned"]
     recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND
             and (assigned.get(r["Customer"]) == me or (include_free and r["Customer"] not in assigned))]
+    zone = _delivery_zone_picker(recs, "send_zone")
+    if zone != st.session_state.get("_send_zone_prev", zone):
+        _reset_draft("send", me)
+    st.session_state["_send_zone_prev"] = zone
+    if zone != DEL_ZONE_ALL:
+        recs = [r for r in recs if r["Zone"] == zone]
     if search_send.strip():
         q_send = search_send.strip().casefold()
         recs = [r for r in recs if q_send in str(r["Customer"]).casefold()
@@ -3867,6 +3917,7 @@ def _send_tab(me, ctx):
         packed, sent = int(r["Packed Cases"]), int(r["Sent Cases"])
         left = (packed - sent) if packed > sent else ((ordered - sent) if (ordered and ordered > sent) else 1)
         rows.append({"Sent ✅": False, "Customer": r["Customer"], SALE_NOTE_COL: sale_note_label(r.get("Journal Note")),
+                     "Zone": _km(r["Zone"]) if r["Zone"] != DEL_ZONE_PROVINCE else r["Province"],
                      "Invoice": "", "Cases": int(left), "Via": "Use default", "Taxi station": "",
                      "Note": "", "Status": r["Status"], "Province": r["Province"],
                      "Saved sent cases": sent, "Saved packed cases": packed, "Saved order cases": ordered if ordered is not None else -1})
@@ -3879,8 +3930,8 @@ def _send_tab(me, ctx):
         default_via = PENDING_VIA
         select_all_send = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
         edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
-            column_order=["Sent ✅", "Customer", SALE_NOTE_COL, "Cases", "Invoice", "Note", "Status"],
-            disabled=["Customer", SALE_NOTE_COL, "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
+            column_order=["Sent ✅", "Customer", SALE_NOTE_COL, "Cases", "Invoice", "Note", "Zone", "Status"],
+            disabled=["Customer", SALE_NOTE_COL, "Zone", "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
             column_config={"Sent ✅": st.column_config.CheckboxColumn("Sent ✅"),
                 "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1),
                 "Via": st.column_config.SelectboxColumn("Via", options=["Use default", PENDING_VIA] + via_options()),
@@ -4297,7 +4348,9 @@ def _sale_notes_alert(ctx, me):
             continue
         urgent, timed, minutes = sale_note_flags(note)
         taken = ctx["assigned"].get(r["Customer"], "")
-        row = (minutes if minutes is not None else 24 * 60, 0 if urgent else 1, r["Customer"], note, r["Status"], taken, minutes, urgent)
+        zone = r.get("Zone", "")
+        status = f'{r["Status"]} · 📍 {_km(zone) if zone != DEL_ZONE_PROVINCE else r.get("Province", "")}' if zone else r["Status"]
+        row = (minutes if minutes is not None else 24 * 60, 0 if urgent else 1, r["Customer"], note, status, taken, minutes, urgent)
         (flagged if (urgent or timed) else other).append(row)
     if not flagged and not other:
         return
@@ -9928,7 +9981,7 @@ def _visit_zone_from_gps(lat, lon):
     return zone, khan
 
 
-def _visit_zone_info(names):
+def _visit_zone_info(names, cache_key="_visit_zone_cache"):
     """{key: (zone, where it came from)} — Admin's choice, else the real location, else the name. Reused for 2 minutes."""
     try:
         sig = (len(names), hash(tuple(sorted(names))), os.path.getmtime(VISIT_PIN_FILE) if os.path.exists(VISIT_PIN_FILE) else 0,
@@ -9936,7 +9989,7 @@ def _visit_zone_info(names):
                len(st.session_state.get("_visit_new", {}) or {}))
     except Exception:
         sig = None
-    hit = st.session_state.get("_visit_zone_cache")
+    hit = st.session_state.get(cache_key)
     if sig is not None and hit and hit[0] == sig:
         return hit[1]
     over = _visit_zone_overrides()
@@ -9965,7 +10018,7 @@ def _visit_zone_info(names):
             out[k] = (z, "🔤⚠️ ឈ្មោះមាន 2 តំបន់ — សូមពិនិត្យ")
         else:
             out[k] = (z, "🔤 តាមឈ្មោះ")
-    st.session_state["_visit_zone_cache"] = (sig, out)
+    st.session_state[cache_key] = (sig, out)
     return out
 
 
@@ -13469,7 +13522,9 @@ def phone_task_editor(frame, **kwargs):
             row["Invoice"] = ""
         with st.container(border=True):
             st.write("**" + str(row.get("Customer", "Customer")) + "**")
-            details = [str(row.get(c, "")) for c in ("Province", "Status", "Taken by") if c in row]
+            details = [str(row.get(c, "")) for c in ("Zone", "Status", "Taken by") if c in row and row.get(c) not in ("", None)]
+            if "Zone" not in row and "Province" in row:
+                details.insert(0, str(row.get("Province", "")))
             if details:
                 st.caption(" · ".join(details))
             note = str(row.get(SALE_NOTE_COL, "") or "")
