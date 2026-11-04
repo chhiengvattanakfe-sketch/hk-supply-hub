@@ -7180,7 +7180,8 @@ def tab_customer_map():
 SI_HIST_DAILY_FILE = os.path.join(DATA_DIR, "sales_history_daily.csv")      # older months, one row per invoice line
 SI_HIST_MONTHLY_FILE = os.path.join(DATA_DIR, "sales_history_monthly.csv")  # older months, bun pieces per customer per month
 SI_IGNORE_NAMES = {x.upper() for x in IGNORE_NEW} | {"STAF"}          # staff / general sales are not customers
-SI_PERIODS = ["This month", "Last month", "Last 30 days", "Last 90 days", "All time"]
+SI_PERIODS = ["This month", "Last month", "Last 30 days", "Last 90 days", "This year", "All time",
+              "📅 Pick a month", "📅 Custom dates"]
 SI_METRICS = {"Sales ៛": "Sales", "Bun pcs": "Pcs", "Cases": "Cases", "Orders (days)": "Orders"}
 
 
@@ -7195,7 +7196,35 @@ def _si_period(choice, today):
         return today - timedelta(days=29), today
     if choice == "Last 90 days":
         return today - timedelta(days=89), today
+    if choice == "This year":
+        return today.replace(month=1, day=1), today
     return date(2000, 1, 1), today
+
+
+def _si_period_picker(daily, today):
+    """One period for the whole Sales Insights page: preset, any month, or any dates. -> (start, end, label)."""
+    c1, c2 = st.columns([2, 3])
+    choice = c1.selectbox("📅 Period", SI_PERIODS, key="si_period")
+    if choice == "📅 Pick a month":
+        first = (daily["D"].min() if len(daily) else pd.Timestamp(today)).to_period("M")
+        months = list(pd.period_range(first, pd.Timestamp(today).to_period("M"), freq="M"))[::-1]
+        m = c2.selectbox("Month", months, key="si_period_month", format_func=lambda p: p.strftime("%B %Y"))
+        start = m.start_time.date()
+        end = min(m.end_time.date(), today)
+        return start, end, m.strftime("%B %Y")
+    if choice == "📅 Custom dates":
+        lo = daily["D"].min().date() if len(daily) else today - timedelta(days=30)
+        picked = c2.date_input("From → To", value=(max(lo, today - timedelta(days=13)), today), min_value=lo,
+                               max_value=today, key="si_period_dates")
+        if isinstance(picked, (list, tuple)) and len(picked) == 2:
+            start, end = picked
+        else:                                              # only the first day picked so far
+            start = end = picked[0] if isinstance(picked, (list, tuple)) and picked else today
+        return start, end, f"{start:%d %b %Y} → {end:%d %b %Y}"
+    start, end = _si_period(choice, today)
+    if choice == "All time" and len(daily):
+        return start, end, f"All time ({daily['D'].min():%d %b %Y} → {end:%d %b %Y})"
+    return start, end, f"{choice} · {start:%d %b} → {end:%d %b %Y}"
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -7395,7 +7424,7 @@ def _si_prepare_sig():
     return (str(cur), _file_sig(cur) if cur else (0, 0), journals, tuple(_file_sig(p) for p in files), str(today_kh()))
 
 
-def _si_prepare(snap):
+def _si_prepare(snap, full=False):
     """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows.
     Reused by every page and every person until a journal / history / order file changes (was rebuilt on each click)."""
     try:
@@ -7407,7 +7436,7 @@ def _si_prepare(snap):
     if sig is not None and hit and hit[0] == sig:
         for k, v in hit[2].items():
             st.session_state[k] = v
-        return hit[1]
+        return hit[1][:3] if not full else hit[1]
     j, codes = _si_collect_journals(snap)
     history_daily = _si_read_hist(SI_HIST_DAILY_FILE)
     history_monthly = _si_read_hist(SI_HIST_MONTHLY_FILE)
@@ -7415,7 +7444,7 @@ def _si_prepare(snap):
     out = _si_prepare_cached(j, codes, history_daily, history_monthly, sell, today_kh())
     if sig is not None:
         memo["v"] = (sig, out, {k: st.session_state.get(k) for k in _SI_PREP_STATE_KEYS})
-    return out
+    return out[:3] if not full else out
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -7423,11 +7452,11 @@ def _si_prepare_cached(j, codes, history_daily, history_monthly, sell, as_of):
     """Inputs include current orders, both history sources, product codes and prices."""
     j, codes, _n_hist = _si_add_history(j, codes, history_daily, history_monthly)
     if j is None or j.empty:
-        return pd.DataFrame(), pd.DataFrame(), codes
+        return pd.DataFrame(), pd.DataFrame(), codes, pd.DataFrame(), pd.DataFrame()
     df = j.copy()
     df["Customer"] = df["Customer"].astype(str).str.strip()
     df = df[df["Customer"].ne("") & ~df["Customer"].str.upper().isin(SI_IGNORE_NAMES)]
-    df = df[~df["FOC"].fillna(False).astype(bool)]                       # free buns are not orders
+    df["FOC"] = df["FOC"].fillna(False).astype(bool) if "FOC" in df else False     # free buns: kept, flagged
     df["D"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
     df = df.dropna(subset=["D"]).copy()
     df["Key"] = df["Customer"].map(norm_name)
@@ -7449,9 +7478,15 @@ def _si_prepare_cached(j, codes, history_daily, history_monthly, sell, as_of):
     # deposit...) are not bun orders: they would add riel and a fake "order day". Data check lists them.
     df = df[(df["D"] <= pd.Timestamp(as_of)) & (df["Pcs"] > 0)].copy()
     df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
-    daily = df.groupby(["Key", "D"], as_index=False).agg(
-        Customer=("Customer", "first"), Cases=("Cases", "sum"), Sales=("Sales", "sum"), Pcs=("Pcs", "sum"))
-    return daily, df, codes
+    df.loc[df["FOC"], "Sales"] = 0.0                                     # a free gift brings no riel
+    df["FOC pcs"] = df["Pcs"].where(df["FOC"], 0.0)
+
+    def _daily(frame):
+        return frame.groupby(["Key", "D"], as_index=False).agg(
+            Customer=("Customer", "first"), Cases=("Cases", "sum"), Sales=("Sales", "sum"), Pcs=("Pcs", "sum"),
+            **{"FOC pcs": ("FOC pcs", "sum")})
+    paid = df[~df["FOC"]]
+    return _daily(paid), paid, codes, _daily(df), df
 
 
 def _si_names_areas(snap, daily):
@@ -9151,7 +9186,11 @@ def _sales_insights_body():
     if _src == "stale":
         st.warning("The journal could not be read. These figures use the last readable copy; today's orders may be missing.")
     with st.spinner("Reading journals…"):
-        daily, df, codes = _si_prepare(snap)
+        daily_paid, df_paid, codes, daily_all, df_all = _si_prepare(snap, full=True)
+    with_foc = st.toggle("🎁 Count FOC (free) buns too", value=True, key="si_with_foc",
+                         help="On: every bun that left the shop, free ones included (free buns count as 0 ៛). "
+                              "Off: paid buns only.")
+    daily, df = (daily_all, df_all) if with_foc else (daily_paid, df_paid)
     combined = st.session_state.get("si_combined", pd.DataFrame())
     coverage = st.session_state.get("si_journal_coverage", pd.DataFrame())
     skipped = st.session_state.get("si_skipped", pd.DataFrame())
@@ -9192,11 +9231,26 @@ def _sales_insights_body():
     sig = _si_frame_sig(daily) + "|" + _si_frame_sig(mon)
     habits, avgs, no_month = _si_derived(sig, today, lookback, min_orders, factor, dormant_factor, daily, mon, names, areas)
     this_start = today.replace(day=1)
-    d_mtd = daily[(daily["D"] >= pd.Timestamp(this_start)) & (daily["D"] <= pd.Timestamp(today))]
     last_end = this_start - timedelta(days=1)
     last_start = last_end.replace(day=1)
-    same_end = min(last_start + timedelta(days=today.day - 1), last_end)
-    d_prev = daily[(daily["D"] >= pd.Timestamp(last_start)) & (daily["D"] <= pd.Timestamp(same_end))]
+    p_start, p_end, p_label = _si_period_picker(daily, today)
+    if p_start > p_end:
+        p_start, p_end = p_end, p_start
+    if p_start == this_start and p_end == today:             # this month: compare with the same days last month
+        prev_s, prev_e, vs = last_start, min(last_start + timedelta(days=today.day - 1), last_end), "same days last month"
+    elif p_start.year > 2001:
+        length = (p_end - p_start).days + 1
+        prev_e = p_start - timedelta(days=1)
+        prev_s = prev_e - timedelta(days=length - 1)
+        if p_start.day == 1 and (p_end + timedelta(days=1)).day == 1:          # a whole month: the month before
+            prev_s = prev_e.replace(day=1)
+        vs = f"{prev_s:%d %b} → {prev_e:%d %b}"
+    else:
+        prev_s = prev_e = None
+        vs = ""
+    d_mtd = daily[(daily["D"] >= pd.Timestamp(p_start)) & (daily["D"] <= pd.Timestamp(p_end))]
+    d_prev = (daily[(daily["D"] >= pd.Timestamp(prev_s)) & (daily["D"] <= pd.Timestamp(prev_e))]
+              if prev_s else daily.iloc[0:0])
     try:
         no_month, _dups_m, _n_same_m = _si_no_order_split(no_month, daily, names, today.replace(day=1), today)
     except Exception:
@@ -9205,14 +9259,16 @@ def _sales_insights_body():
     missing = habits[habits["Status"] == "Missing"] if not habits.empty else habits
 
     def _delta(now, prev):
-        return f"{(now - prev) / prev * 100:+.0f}% vs same days last month" if prev > 0 else None
+        return f"{(now - prev) / prev * 100:+.0f}% vs {vs}" if (vs and prev > 0) else None
 
     s_now, s_prev = d_mtd["Sales"].sum(), d_prev["Sales"].sum()
     p_now, p_prev = d_mtd["Pcs"].sum(), d_prev["Pcs"].sum()
-    st.markdown(f"**This month so far** · {this_start:%d %b} → {today:%d %b}")
+    foc_now = d_mtd["FOC pcs"].sum() if "FOC pcs" in d_mtd else 0
+    st.markdown(f"**{p_label}**" + (f" · 🎁 includes {foc_now:,.0f} free (FOC) pcs" if with_foc and foc_now else
+                                     " · paid buns only" if not with_foc else ""))
     k1, k2, k3 = st.columns(3)
     k1.metric("Customers who ordered", f"{d_mtd['Key'].nunique():,}", _delta(d_mtd["Key"].nunique(), d_prev["Key"].nunique()))
-    k2.metric("Paid bun pcs", f"{p_now:,.0f}", _delta(p_now, p_prev))
+    k2.metric("Bun pcs (incl. FOC)" if with_foc else "Paid bun pcs", f"{p_now:,.0f}", _delta(p_now, p_prev))
     if can_see_money():
         k3.metric("Bun sales ៛", f"{s_now:,.0f}", _delta(s_now, s_prev))
     else:
@@ -9253,17 +9309,15 @@ def _sales_insights_body():
         _si_data_check_section(issues, totals, coverage)
 
     if t_top:
-        c1, c2 = st.columns([2, 2])
-        period = c1.selectbox("Period", SI_PERIODS, key="si_period")
         rank_opts = [m for m in SI_METRICS if can_see_money() or not _is_money_col(m)]
         if st.session_state.get("si_metric") not in rank_opts:
             st.session_state["si_metric"] = rank_opts[0]
-        metric_label = c2.radio("Rank by", rank_opts, horizontal=True, key="si_metric")
+        metric_label = st.radio("Rank by", rank_opts, horizontal=True, key="si_metric")
         metric = SI_METRICS[metric_label]
         if metric == "Sales" and not daily["Sales"].sum():
             st.info("No sell prices found in the journal header; ranking by Cases instead.")
             metric, metric_label = "Cases", "Cases"
-        start, end = _si_period(period, today)
+        start, end = p_start, p_end
         top, total = _si_top(daily, start, end, metric, names, areas, 20, df, codes)
         if top.empty:
             st.info(f"No orders in this period ({start} → {end}).")
@@ -9275,12 +9329,15 @@ def _sales_insights_body():
             if len(part) and codes:
                 info = snap.get("buns", {}) or {}
                 sell = info.get("sell", {}) or {}
+                paid_part = part[~part["FOC"]] if "FOC" in part else part
                 types = pd.DataFrame([{"Code": c, "Bun": (info.get("names", {}) or {}).get(c, ""),
-                                       "Pieces": int(part[c].sum()), "Sales ៛": int(part[c].sum() * float(sell.get(c) or 0)),
+                                       "Pieces": int(part[c].sum()),
+                                       **({"FOC pcs": int(part.loc[part["FOC"], c].sum())} if with_foc and "FOC" in part else {}),
+                                       "Sales ៛": int(paid_part[c].sum() * float(sell.get(c) or 0)),
                                        "Customers": int((part.groupby("Key")[c].sum() > 0).sum())} for c in codes])
                 types = types[types["Pieces"] > 0].sort_values("Pieces", ascending=False)
                 with st.expander("🥟 Pieces by bun type (all customers, this period)"):
-                    _si_show(types, money=("Pieces", "Sales ៛"))
+                    _si_show(types, money=("Pieces", "FOC pcs", "Sales ៛"))
 
     if t_miss:
         st.markdown("Customers who normally order every X days but are **later than usual**. "
@@ -9299,11 +9356,9 @@ def _sales_insights_body():
                          money=("Usual pcs", "Avg order ៛", "Lost pcs (est.)", "Lost sales ៛ (est.)"))
 
     if t_none:
-        mode = st.radio("Month", ["This month", "Last month"], horizontal=True, key="si_month")
-        if mode == "This month":
-            m_start, m_end = this_start, today
-        else:
-            m_start, m_end = last_start, last_end
+        mode = "This month" if (p_start == this_start and p_end == today) else "period"
+        m_start, m_end = p_start, p_end
+        st.caption(f"Customers with no order in **{p_label}** — change the 📅 Period at the top to look at another month or dates.")
         table = _si_no_order(daily, names, areas, m_start, m_end, today, avgs)
         try:
             table, dup_review, n_same = _si_no_order_split(table, daily, names, m_start, m_end)
