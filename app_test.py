@@ -4344,20 +4344,32 @@ def _delivery_log():
 
 # ---------- 📌 sale notes for delivery staff (urgent / fixed pick-up time) ----------
 SALE_NOTE_COL = "📌 Sale note"
-NOTE_TIME_WORDS = ["កំណត់ម៉ោង", "ម៉ោង", "មកយក", "យកផ្ទាល់", "មុនម៉ោង", "ព្រឹក", "ថ្ងៃត្រង់", "រសៀល", "ល្ងាច",
+NOTE_TIME_WORDS = ["កំណត់ម៉ោង", "ម៉ោង", "មកយក", "យកផ្ទាល់", "មុនម៉ោង", "សុំពេល", "ឲ្យទាន់", "ឱ្យទាន់",
                    "PICK UP", "PICKUP", "AM", "PM"]
+# Part-of-day words (also common spellings) -> latest time to arrive, used when the note has no clock time
+NOTE_DAY_PARTS = [
+    (("ព្រឹក", "ព្រេក", "ព្រិក", "ពីព្រឹក", "MORNING"), 11 * 60, "ព្រឹក"),
+    (("ថ្ងៃត្រង់", "ថ្ងៃត្រង់", "NOON"), 12 * 60, "ថ្ងៃត្រង់"),
+    (("រសៀល", "AFTERNOON"), 15 * 60, "រសៀល"),
+    (("ល្ងាច", "EVENING"), 17 * 60, "ល្ងាច"),
+]
 _KM_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
+_NOTE_AM_WORDS = ("AM", "ព្រឹក", "ព្រេក", "ព្រិក")
 _NOTE_PM_WORDS = ("PM", "រសៀល", "ល្ងាច", "យប់")
 _NOTE_TIME_RES = [
-    re.compile(r"ម៉ោង\s*(\d{1,2})(?:\s*[:.h]\s*(\d{2}))?\s*(AM|PM|ព្រឹក|ថ្ងៃត្រង់|រសៀល|ល្ងាច|យប់)?"),
+    re.compile(r"ម៉ោង\s*(\d{1,2})(?:\s*[:.h]\s*(\d{2}))?\s*(AM|PM|ព្រឹក|ព្រេក|ព្រិក|ថ្ងៃត្រង់|រសៀល|ល្ងាច|យប់)?"),
     re.compile(r"(?<![\d/])(\d{1,2})\s*[:.h]\s*(\d{2})\s*(AM|PM)?(?![\d/])"),
     re.compile(r"(?<![\d/])(\d{1,2})\s*()(AM|PM)(?![A-Z])"),
 ]
 
 
+def _note_text(note):
+    return unicodedata.normalize("NFC", str(note or "")).replace("​", "").replace("‌", "").strip()
+
+
 def sale_note_time(note):
     """'មកយកម៉ោង2pm' -> 14*60 ; '10:30' -> 630 ; None when the note gives no clock time."""
-    text = str(note or "").translate(_KM_DIGITS).upper()
+    text = _note_text(note).translate(_KM_DIGITS).upper()
     for rx in _NOTE_TIME_RES:
         m = rx.search(text)
         if not m:
@@ -4365,7 +4377,7 @@ def sale_note_time(note):
         h, mins, word = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "")
         if h > 23 or mins > 59:
             continue
-        if word == "AM" or word == "ព្រឹក":
+        if word in _NOTE_AM_WORDS:
             h = 0 if h == 12 else h
         elif word in _NOTE_PM_WORDS or (word == "" and rx is _NOTE_TIME_RES[0] and 1 <= h <= 6):
             h = h + 12 if h < 12 else h                  # "ម៉ោង2" at a bakery means 2 in the afternoon
@@ -4373,26 +4385,46 @@ def sale_note_time(note):
     return None
 
 
+def sale_note_when(note):
+    """(minutes, part-of-day word): an exact clock time, else the latest time for 'ព្រឹក / រសៀល…', else (None, "")."""
+    exact = sale_note_time(note)
+    if exact is not None:
+        return exact, ""
+    up = _note_text(note).upper()
+    for words, latest, name in NOTE_DAY_PARTS:
+        if any(w in up for w in words):
+            return latest, name
+    return None, ""
+
+
 def sale_note_flags(note):
-    """(urgent, timed, minutes) for a journal remark."""
-    text = str(note or "").strip()
+    """(urgent, timed, minutes) for a journal remark. minutes = the clock time, or the latest time for a part of day."""
+    text = _note_text(note)
     if text in ("", "-"):
         return False, False, None
     up = text.upper()
     urgent = any(w.upper() in up for w in URGENT_WORDS)
-    minutes = sale_note_time(text)
+    minutes, _part = sale_note_when(text)
     timed = minutes is not None or any(w in up for w in NOTE_TIME_WORDS if not w.isascii()) \
         or any(re.search(r"\b%s\b" % w, up) for w in NOTE_TIME_WORDS if w.isascii())
     return urgent, timed, minutes
 
 
+def _note_when_text(note, minutes):
+    part = sale_note_when(note)[1]
+    if minutes is None:
+        return ""
+    return f"{part} មុន {minutes // 60:02d}:{minutes % 60:02d}" if part else f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
 def sale_note_label(note):
     """'🔥 ⏰ 14:00 · មកយកម៉ោង2pm' — empty when the sale left no note."""
-    text = str(note or "").strip()
+    text = _note_text(note)
     if text in ("", "-"):
         return ""
     urgent, timed, minutes = sale_note_flags(text)
-    head = ("🔥 " if urgent else "") + ("⏰ " if timed else "") + (f"{minutes // 60:02d}:{minutes % 60:02d} · " if minutes is not None else "")
+    when = _note_when_text(text, minutes)
+    head = ("🔥 " if urgent else "") + ("⏰ " if timed else "") + (f"{when} · " if when else "")
     return head + text
 
 
@@ -4419,7 +4451,7 @@ def _sale_notes_alert(ctx, me):
             when = ""
             if minutes is not None:
                 left = minutes - now_m
-                when = (f"⏰ **{minutes // 60:02d}:{minutes % 60:02d}**"
+                when = (f"⏰ **{_note_when_text(note, minutes)}**"
                         + (" 🚨 **ហួសម៉ោងហើយ**" if left < 0 else f" ⚠️ **នៅសល់ {left} នាទី**" if left <= 60 else ""))
             who = f"👷 {taken}" if taken else "👷 **មិនទាន់មាននរណាយក**"
             mine = " ⭐" if taken and taken == me else ""
