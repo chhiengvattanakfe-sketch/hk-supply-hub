@@ -2109,6 +2109,7 @@ def save_csv(path, df):
         _write_atomic(path, out.to_csv(index=False).encode("utf-8-sig"))
         if USE_DROPBOX:
             push(path)
+    _status_copy_kick(path)
 
 
 def _append_local_many(path, rows):
@@ -2146,6 +2147,7 @@ def append_rows(path, rows):
             raise RuntimeError("Cannot save: choose a customer for every row.")
     if not USE_DROPBOX:
         _retry(lambda: _append_local_many(path, rows))
+        _status_copy_kick(path)
         return
     last = None
     for attempt in range(6):
@@ -2154,6 +2156,7 @@ def append_rows(path, rows):
                 pull(path, force=attempt > 0, max_age=10.0)      # first try: no extra Dropbox call; a conflict forces a fresh copy
                 _append_local_many(path, rows)
                 push(path)
+            _status_copy_kick(path)
             return
         except ConflictError as e:
             last = e
@@ -13983,8 +13986,8 @@ def _make_driver_expense_csv(source, deliveries):
             continue
         day = cell_to_date(r[0], dominant)
         inv, cust = _cell_text(r[ii]), _cell_text(r[1])
-        if not day or inv in ("", "-"):
-            continue
+        if not day or inv in ("", "-") or not re.search(r"[^\W\d_]", cust):
+            continue                                        # invoice numbers typed ahead, no customer yet
         key = (inv.casefold(), cust_key(cust))
         if key in info:
             continue
@@ -14023,6 +14026,12 @@ def _make_driver_expense_csv(source, deliveries):
         g["taxi_set"] = g["taxi_set"] or taxi > 0 or str(r.get("Taxi_Station", "") or "").strip() in ("", "-")
         status = str(r.get("Expense_Status", "") or "") or expense_status(via, r.get("Taxi_Station"), r.get("Phnom_Penh_Expense"), r.get("Taxi_Expense"))
         g["done"] = g["done"] and status != "Pending"
+    for keys in by_day.values():                            # e.g. NP316463 got the cost; NP316464 same shop & day -> 0
+        done = [got[k] for k in keys if k in got and got[k]["done"]]
+        if done:
+            for k in keys:
+                if k not in got:
+                    got[k] = dict(driver=done[0]["driver"], app=0, taxi=0, app_set=True, taxi_set=True, done=True)
     out = []
     for key in order:
         row = dict(info[key])
@@ -14044,7 +14053,7 @@ def _make_driver_expense_csv(source, deliveries):
 STATUS_COPY_FOLDER = "Auto_Status"
 
 
-STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V3_EXPENSE:"
+STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V3_EXPENSE2:"
 
 
 def _journal_status_rows(journal_rows, packing, deliveries, holds):
@@ -14313,9 +14322,31 @@ def _status_copy_in_background(force=False):
         return
     if not force and time.time() - state["last_check"] < 55:
         return
-    th = threading.Thread(target=sync_journal_status_copy, kwargs={"force": force}, daemon=True, name="invoice-status")
+    th = threading.Thread(target=_status_copy_worker, kwargs={"force": force}, daemon=True, name="invoice-status")
     state["thread"] = th
     th.start()
+
+
+def _status_copy_worker(force=False):
+    """Rebuild the Excel status / delivery expense files; run again if someone saved while it was running."""
+    state = _status_copy_state()
+    for _ in range(3):
+        state["dirty"] = False
+        sync_journal_status_copy(force=force)
+        if not state.get("dirty"):
+            break
+        force = True
+
+
+def _status_copy_kick(path):
+    """Called after packing / delivery / hold data is saved by ANY user: refresh the Excel files right away
+    (before, they only refreshed while an Admin had the app open)."""
+    try:
+        if path in (PACKING_FILE, DATA_FILE, HOLD_FILE):
+            _status_copy_state()["dirty"] = True
+            _status_copy_in_background(force=True)
+    except Exception:
+        pass
 
 
 def journal_status_copy_panel():
@@ -14427,6 +14458,8 @@ if not labels:
 followup_alert_banner()
 if ROLE == "admin" or has_permission("reports"):
     journal_status_copy_panel()
+else:
+    _status_copy_in_background()                         # anyone using the app keeps the Excel files fresh
 
 # Render only the selected section. Ordinary tabs execute every section on each rerun.
 if st.session_state.get("main_section") not in labels:
