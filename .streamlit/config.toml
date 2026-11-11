@@ -1,3 +1,6 @@
-   [theme]
-   base = "light"
-   primaryColor = "#0F766E"
+[theme]
+base = "light"
+primaryColor = "#0F766E"
+
+[server]
+disconnectedSessionTTL = 43200
