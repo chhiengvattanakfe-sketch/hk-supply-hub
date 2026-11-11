@@ -2485,7 +2485,14 @@ def get_snapshot(path, mtime_ns, size):
     return load_snapshot(path, mtime_ns, size)
 
 
-_MERGED_SNAP = {}
+@st.cache_resource(show_spinner=False)
+def _shared_memo():
+    """One dict per server, shared by every visitor and every rerun: results that only change when a file changes.
+    (Plain module dicts are emptied on every rerun, because Streamlit runs this file again from the top.)"""
+    return {}
+
+
+_MERGED_SNAP = _shared_memo().setdefault("merged_snap", {})
 
 
 def _merge_journal_snapshots(main_path, main, extras):
@@ -2545,9 +2552,10 @@ def current_snapshot():
             sig.append((p, ps.st_mtime_ns, ps.st_size))
         except Exception as e:
             bot_log("warn", "Excel", f"Cannot read {os.path.basename(p)}: {str(e)[:120]}", "using this month only")
+    sig = tuple(sig)
+    _shared_memo()["snap_sig"] = sig
     if not extras:
         return data, src, path, None
-    sig = tuple(sig)
     if _MERGED_SNAP.get("sig") != sig:
         try:
             merged = _merge_journal_snapshots(path, data, extras)
@@ -2936,7 +2944,21 @@ footer {visibility: hidden;}
 .hk-nums {display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 6px; font-size: .95rem;}
 .hk-note {margin-top: 6px; font-size: .85rem;}
 .hk-group {font-weight: 700; margin: 16px 0 4px; padding-bottom: 3px; border-bottom: 2px solid rgba(128,128,128,.3);}
+.hk-board {display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 6px 0 12px;}
+.hk-tile {background: rgba(128,128,128,.07); border: 1px solid rgba(128,128,128,.22); border-radius: 14px; padding: 10px 14px;}
+.hk-tile .t {font-size: .82rem; opacity: .75;}
+.hk-tile .v {font-size: 1.75rem; font-weight: 800; line-height: 1.15;}
+.hk-tile .s {font-size: .8rem; opacity: .75;}
+.hk-areas {display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin: 0 0 12px;}
+.hk-area {border: 1px solid rgba(128,128,128,.22); border-radius: 12px; padding: 8px 12px;}
+.hk-area .h {display: flex; justify-content: space-between; font-weight: 700; font-size: .95rem;}
+.hk-bar {height: 10px; border-radius: 99px; background: rgba(128,128,128,.18); overflow: hidden; margin: 6px 0 4px; display: flex;}
+.hk-bar span {display: block; height: 100%;}
+.hk-area .s {font-size: .8rem; opacity: .8;}
+.hk-fresh {font-size: .82rem; opacity: .8; margin: -4px 0 6px;}
 @media (max-width: 640px) {
+  .hk-board {grid-template-columns: repeat(2, minmax(0, 1fr));}
+  .hk-tile .v {font-size: 1.45rem;}
   .block-container {padding-left: .7rem; padding-right: .7rem;}
   input, textarea, [data-baseweb="select"] {font-size: 16px !important;}
   .stButton > button, div[data-testid="stFormSubmitButton"] > button {min-height: 48px; width: 100%;}
@@ -3037,6 +3059,8 @@ hr {border-color: var(--line) !important;}
 /* the app's own cards and pills */
 .hk-card {background: var(--card); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);}
 .hk-pill {background: var(--card); border: 1px solid var(--line); font-weight: 600; color: var(--ink);}
+.hk-tile, .hk-area {background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow);}
+.hk-tile .t, .hk-tile .s, .hk-area .s {color: var(--muted); opacity: 1;}
 .hk-badge {font-weight: 600;}
 .hk-group {border-bottom: 2px solid var(--line); color: var(--ink);}
 .hk-sub {color: var(--muted); opacity: 1;}
@@ -4544,7 +4568,96 @@ DASH_COLUMNS = ["🔥", "Customer", "In Master", "Area", "Province", "Region", "
                 "Assigned To", "Sent Cases", "Left to send", "Sent Note", "Handled By", "Verified By", "Driver/Station", "Taxi Station", "Taxi No.", "Journal Note", "Moved/Cancel Reason", "Note", "Time", "Source", "Map status", "Map link", "Directions", "Location ID"]
 
 
+DASH_PULL_AGE = 4                 # dashboard: look for saves from other phones / app links this often (seconds)
+DASH_LATE_DAYS = 3                # an invoice delivered up to 3 days later still shows as sent on its own day
+def _dash_file_sig(path, max_age=DASH_PULL_AGE):
+    """(mtime, size) of a data file after a cheap 'did Dropbox change?' check."""
+    if USE_DROPBOX:
+        try:
+            pull(path, max_age=max_age)
+        except Exception:
+            pass
+    try:
+        s = os.stat(path)
+        return s.st_mtime_ns, s.st_size
+    except OSError:
+        return 0, 0
+
+
 def build_report(selected_date):
+    """Same result as _build_report_fresh, but built only when a journal or log file changed (else ~1 ms).
+    Shared by every visitor, so 10 phones on Live mode cost the server one build, not ten."""
+    age = DASH_PULL_AGE
+    if st.session_state.pop("_dash_force", False):        # 🔄 Refresh: ask Dropbox now, not from the 12 s list
+        _remote_listing_forget()
+        age = 0
+    snap, _src, _path, err = current_snapshot()
+    files = (PACKING_FILE, DATA_FILE, HOLD_FILE, ASSIGN_FILE, ORDERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE)
+    sig = (_shared_memo().get("snap_sig"), bool(snap), err, tuple(_dash_file_sig(f, age) for f in files))
+    memo = _shared_memo().setdefault("dash_report", {})
+    hit = memo.get(selected_date)
+    if hit is not None and hit[0] == sig:
+        df, cases_found, e = hit[1]
+        return df.copy(), cases_found, e
+    res = _build_report_fresh(selected_date)
+    memo[selected_date] = (sig, res)
+    if len(memo) > 8:
+        memo.pop(next(iter(memo)), None)
+    return res[0].copy(), res[1], res[2]
+
+
+def _dash_link(snap, df, day, scheduled_keys, names, late_days=0, other_inv=None):
+    """Rows of the packing / delivery log that count for `day`; column _key = the dashboard customer they belong to.
+    A same-day row whose name is on today's list stays on it. Any other row is linked to the journal with the same
+    rules as the expense file (invoice + name, then the shop's invoice 1-3 days earlier, shorter / longer name):
+    - linked to an invoice of `day`  -> counted for that journal customer (also when sent 1-3 days later)
+    - linked to an invoice of another day -> its own row, Source '🧾 Invoice <date>' (not 'Not in journal')."""
+    empty = df.iloc[0:0].copy()
+    empty["_key"], empty["Time"] = [], []
+    if df.empty or "_dt" not in df.columns:
+        return empty
+    d0 = pd.Timestamp(day)
+    lo, hi = d0 - pd.Timedelta(days=1 if late_days else 0), d0 + pd.Timedelta(days=late_days)
+    norm = df["_dt"].dt.normalize()
+    win = df[(norm >= lo) & (norm <= hi)].copy()
+    if win.empty:
+        return empty
+    win = win.sort_values("_dt", kind="stable")
+    win["_key"] = win["Customer"].map(cust_key)
+    same = (win["_dt"].dt.normalize() == d0).to_numpy()
+    known = win["_key"].isin(scheduled_keys).to_numpy()
+    keep = same & known
+    need = ~keep
+    if need.any():
+        jr = snap["journal"] if snap else pd.DataFrame(columns=["Date", "Customer", "Invoice"])
+        jr = jr[(jr["Date"] >= day - timedelta(days=-min(JOURNAL_MATCH_DAYS))) &
+                (jr["Date"] <= day + timedelta(days=late_days + max(JOURNAL_MATCH_DAYS)))]
+        info = {i: (d, c, inv) for i, d, c, inv in zip(jr.index, jr["Date"], jr["Customer"], jr["Invoice"])}
+        matched, _ = match_deliveries_to_journal([(i, d, c, inv) for i, (d, c, inv) in info.items()],
+                                                 win.to_dict("records"))
+        keys = win["_key"].tolist()
+        for n, k in enumerate(matched):
+            if not need[n]:
+                continue
+            if k is None:
+                keep[n] = bool(same[n])                     # not in the journal: own row (⚠️ Not in journal)
+                continue
+            jdate, jcust, jinv = info[k]
+            if jdate == day:
+                keys[n] = cust_key(jcust)
+                names.setdefault(keys[n], jcust)
+                keep[n] = True
+            elif same[n]:
+                keep[n] = True
+                if other_inv is not None:
+                    other_inv[keys[n]] = (jdate, _cell_text(jinv) or "-")
+        win["_key"] = keys
+    out = win[keep].copy()
+    out["Time"] = [t.strftime("%I:%M %p") if t.normalize() == d0 else t.strftime("%d %b %I:%M %p") for t in out["_dt"]]
+    return out
+
+
+def _build_report_fresh(selected_date):
     try:
         report_map_registry = load_map_registry()
     except Exception:
@@ -4586,15 +4699,17 @@ def build_report(selected_date):
             scheduled[cust] = {"cases": h["cases"] or None, "invoice": "-", "remark": prev}
 
     pack_info = CustomerDict()
-    df_pack = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), selected_date)
-    for key, g in df_pack.groupby(df_pack["Customer"].map(cust_key), sort=False):
+    sched_keys = set(names)
+    df_pack = _dash_link(snap, read_raw(PACKING_FILE, PACKING_COLS), selected_date, sched_keys, names)
+    for key, g in df_pack.groupby("_key", sort=False):
         cust = names.setdefault(key, g["Customer"].iloc[0])
         pack_info[cust] = {"cases": int(g["Cases_Packed"].sum()), "by": g["Prepared_By"].iloc[-1],
                            "status": str(g["Status"].iloc[-1])}
 
-    sent_info = CustomerDict()
-    df_disp = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), selected_date)
-    for key, g in df_disp.groupby(df_disp["Customer"].map(cust_key), sort=False):
+    sent_info, other_inv = CustomerDict(), {}
+    df_disp = _dash_link(snap, read_raw(DATA_FILE, DISPATCH_COLS), selected_date, sched_keys, names,
+                         late_days=DASH_LATE_DAYS, other_inv=other_inv)
+    for key, g in df_disp.groupby("_key", sort=False):
         cust = names.setdefault(key, g["Customer"].iloc[0])
         last = g.iloc[-1]
         station = str(last["Taxi_Station"]).strip()
@@ -4650,7 +4765,7 @@ def build_report(selected_date):
             "🔥": "🔥" if urgent else "", "Customer": cust,
             "In Master": "🆕 NEW" if (master_names and norm_name(cust) not in master_names and norm_name(cust) not in ignore) else "✅",
             "Area": AREA_LABEL[area], "Province": province,
-            "Region": region, "Invoice": info["invoice"] if info else "-",
+            "Region": region, "Invoice": info["invoice"] if info else (other_inv[key][1] if key in other_inv else "-"),
             "Status": status, "កេស": ordered,
             "Packed Cases": packed, "Packed Note": (f"✏️ final packed {packed} (logs total {sys_packed}) by {finp['by']}: {finp['reason']}" if finp else ""),
             "Prepared By": p["by"] if p else (finp["by"] if finp else "-"), "Assigned To": assigned.get(cust, "-"),
@@ -4665,7 +4780,8 @@ def build_report(selected_date):
             "Buns total": (info.get("buns_total", 0) if info else 0),
             "Moved/Cancel Reason": (f"{h['reason']} (by {h['by']})" if h else ""),
             "Note": s["note"] if s else "-", "Time": s["time"] if s else "-",
-            "Source": ("📝 Site order" if info.get("site_only") else "Journal") if info else "⚠️ Not in journal",
+            "Source": (("📝 Site order" if info.get("site_only") else "Journal") if info else
+                       (f"🧾 Invoice of {other_inv[key][0]:%d %b}" if key in other_inv else "⚠️ Not in journal")),
         })
     if not rows:
         return pd.DataFrame(), cases_found, err
@@ -4684,6 +4800,7 @@ def build_report(selected_date):
     return df[DASH_COLUMNS], cases_found, err
 
 
+@st.cache_data(show_spinner=False, max_entries=48)
 def summarize(df, by):
     """Customers / ordered / packed / sent per group (by = 'Area' | 'Region' | 'Province')."""
     if df.empty:
@@ -4700,6 +4817,7 @@ def summarize(df, by):
     return out.sort_values("Customers", ascending=False).reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False, max_entries=48)
 def map_data(df, metric):
     """One row per Cambodian province (all 25 + Phnom Penh) with the chosen number for the map."""
     agg = {}
@@ -4804,6 +4922,40 @@ def kpi_strip(counts, total):
     return f"<div class='hk-kpis'>{pills}<span class='hk-pill'>👥 Total <b>{total}</b></span></div>"
 
 
+DASH_WAITING = ("⏳ Pending", "🟠 Packing", "🟡 Ready for Delivery", "🔵 Part sent")
+
+
+def dash_board_html(df):
+    """Big numbers + one progress bar per area: the dashboard at one glance."""
+    st_ = df["Status"]
+    active = df[~st_.isin([ST_MOVED, ST_CANCEL])]
+    n, sent, part = len(active), int((st_ == "✅ Sent").sum()), int((st_ == "🔵 Part sent").sum())
+    wait = int(st_.isin(DASH_WAITING).sum())
+    ordered, packed, sent_c = int(active["កេស"].fillna(0).sum()), int(active["Packed Cases"].sum()), int(active["Sent Cases"].sum())
+    pct = sent * 100 // max(n, 1)
+    held = int(st_.isin([ST_MOVED, ST_CANCEL]).sum())
+    tiles = [("👥 Customers today", n, f"{held} moved / cancelled" if held else "all on the list"),
+             ("✅ Sent", sent, f"{pct}% done" + (f" · 🔵 {part} part sent" if part else "")),
+             ("⏳ Still to send", wait, f"{int((st_ == '🟡 Ready for Delivery').sum())} ready · {int((st_ == '⏳ Pending').sum())} not packed"),
+             ("📦 កេស sent", f"{sent_c}/{ordered or '-'}", f"packed {packed}")]
+    out = "<div class='hk-board'>" + "".join(
+        f"<div class='hk-tile'><div class='t'>{_e(t)}</div><div class='v'>{_e(v)}</div><div class='s'>{_e(s)}</div></div>"
+        for t, v, s in tiles) + "</div><div class='hk-areas'>"
+    for area, g in active.groupby("Area", sort=False):
+        c = g["Status"].value_counts()
+        tot = max(len(g), 1)
+        segs = [("✅ Sent", "#2e7d32"), ("🔵 Part sent", "#1565c0"), ("🟡 Ready for Delivery", "#f9a825"),
+                ("🟠 Packing", "#ef6c00")]
+        bar = "".join(f"<span style='width:{int(c.get(k, 0)) * 100 / tot:.1f}%;background:{col}'></span>" for k, col in segs)
+        done = int(c.get("✅ Sent", 0))
+        left = int(sum(c.get(k, 0) for k in DASH_WAITING))
+        out += (f"<div class='hk-area'><div class='h'><span>{_e(area)}</span><span>{done}/{len(g)} · {done * 100 // tot}%</span></div>"
+                f"<div class='hk-bar'>{bar}</div><div class='s'>🟢 sent {done} · 🔵 part {int(c.get('🔵 Part sent', 0))} · "
+                f"🟡 ready {int(c.get('🟡 Ready for Delivery', 0))} · 🟠 packing {int(c.get('🟠 Packing', 0))} · "
+                f"⏳ not packed {int(c.get('⏳ Pending', 0))} · still to send <b>{left}</b></div></div>")
+    return out + "</div>"
+
+
 def card_html(r):
     bg, fg = STATUS_STYLE.get(r["Status"], ("#757575", "#ffffff"))
     ordered = "-" if pd.isna(r["កេស"]) else int(r["កេស"])
@@ -4851,8 +5003,9 @@ def render_cards(df, editable=False, df_report=None, selected_date=None):
     d = df.copy()
     d["_a"] = d["Area"].map(AREA_RANK)
     d["_g"] = d["Region"].map(_REGION_ORDER).fillna(99)
-    d["_s"] = d["Status"].map(STATUS_RANK)
-    d = d.sort_values(["_a", "_g", "Province", "_s", "Customer"]).drop(columns=["_a", "_g", "_s"])
+    d["_c"] = d["Customer"].astype(str).str.casefold()
+    # fixed order (area, region, province, name): a card never jumps when a status changes during auto-update
+    d = d.sort_values(["_a", "_g", "Province", "_c"], kind="stable").drop(columns=["_a", "_g", "_c"])
     shown = d.head(limit)
     drawn = False
     if not editable:
@@ -4869,6 +5022,7 @@ def render_cards(df, editable=False, df_report=None, selected_date=None):
             cust = r["Customer"]
             if st.button("✏️ Check / Edit", key=f"cardedit_{cust}"):
                 st.session_state["sel_cust"] = cust
+                _dash_pause_for_edit()
             if st.session_state.get("sel_cust") == cust:
                 with st.container(border=True):
                     _update_panel(cust, df_report, selected_date)
@@ -4945,7 +5099,17 @@ def _dashboard_body():
     counts = df_scope["Status"].value_counts()
     total, n_sent = len(df_scope) - int(counts.get(ST_CANCEL, 0)), int(counts.get("✅ Sent", 0))
     total = max(total, 1)
-    st.markdown(kpi_strip(counts, total), unsafe_allow_html=True)
+    if st.session_state.get("_dash_live_on"):
+        fresh = f"🟢 Live · updated {now_kh():%H:%M:%S} · updates itself every {LIVE_REFRESH_SECONDS} s"
+    elif st.session_state.get("_dash_live_wanted") and st.session_state.get("sel_cust"):
+        fresh = f"⏸️ Auto-update paused while **{_e(st.session_state['sel_cust'])}** is open · updated {now_kh():%H:%M:%S}"
+    else:
+        fresh = f"🕒 Updated {now_kh():%H:%M:%S} · tick Live mode above to update by itself"
+    f1, f2 = st.columns([5, 1])
+    f1.markdown(f"<div class='hk-fresh'>{fresh}</div>", unsafe_allow_html=True)
+    if f2.button("🔄 Refresh", key="dash_refresh_now", help="Get the newest packing / delivery saves now"):
+        st.session_state["_dash_force"] = True
+    st.markdown(dash_board_html(df_scope), unsafe_allow_html=True)
     with st.expander("ℹ️ What do the statuses mean?"):
         st.markdown(
             "- ⏳ **Pending** - ordered in the journal, nothing packed yet\n"
@@ -4957,14 +5121,11 @@ def _dashboard_body():
             "- 📅 **Moved to tomorrow** / ❌ **Cancelled** - not delivered today\n\n"
             "🏪 If the customer collects it themselves, choose **Customer pick-up** as the driver when you save the delivery.")
     st_keys = [k for k in STATUS_RANK if int(counts.get(k, 0)) > 0]
+    if st.session_state.get("dash_status_pick") in STATUS_RANK and st.session_state["dash_status_pick"] not in st_keys:
+        st_keys.append(st.session_state["dash_status_pick"])   # keep the chosen status (now 0) instead of jumping to All
     pick_one = st.radio("👆 Click a status to see its customers in the table", ["All"] + st_keys, horizontal=True,
                         key="dash_status_pick",
                         format_func=lambda k: f"All ({total})" if k == "All" else f"{k.split(' ')[0]} {k.split(' ', 1)[1]} ({int(counts.get(k, 0))})")
-    try:
-        st.progress(n_sent / total, text=f"Delivered {n_sent} of {total} customers ({n_sent * 100 // total}%)")
-    except TypeError:
-        st.progress(n_sent / total)
-
     if can_reports:
         with st.expander("📊 Summary: Phnom Penh vs Province, regions and provinces", expanded=not mobile):
             t_area, t_region, t_prov = st.tabs(["By area", "By delivery region", "By province"])
@@ -5036,7 +5197,7 @@ def _dashboard_body():
         st.caption(f"ℹ️ No column '{JOURNAL_CASES_HEADER}' found in the journal, so ordered cases are empty. "
                    "Change JOURNAL_CASES_HEADER at the top of the file if your header is different.")
     # a different list (new filter / search / date) must not keep the row that was ticked in the old list
-    sig = (str(selected_date), view, pick_one, q.strip(), tuple(pick_region), tuple(pick_prov), verifier_filter, display, len(df_view))
+    sig = (str(selected_date), view, pick_one, q.strip(), tuple(pick_region), tuple(pick_prov), verifier_filter, display)
     if st.session_state.get("dash_sig") != sig:
         st.session_state["dash_sig"] = sig
         st.session_state["clear_sel"] = True
@@ -5066,7 +5227,9 @@ def _dashboard_body():
             "Directions": st.column_config.LinkColumn("Directions", display_text="Directions"),
         }
         cols = DASH_COLUMNS if all_cols else COMPACT_COLUMNS
+        shown_before = st.session_state.get("_dash_rows_shown", [])
         event = show_df(df_view[cols], height=430, key="dash_table", selectable=can_edit, column_config=cfg)
+        st.session_state["_dash_rows_shown"] = df_view["Customer"].tolist()
     else:
         shown_inline = render_cards(df_view, editable=can_edit, df_report=df_report, selected_date=selected_date)
 
@@ -5083,9 +5246,16 @@ def _dashboard_body():
         else:
             st.session_state.pop("sel_cust", None)
     else:
-        rows_sel = [i for i in event.selection.rows if 0 <= i < len(df_view)]   # old selection can be longer than the new list
-        if rows_sel:
-            st.session_state["sel_cust"] = df_view.iloc[rows_sel[0]]["Customer"]
+        # A tap is read against the list that was ON SCREEN when it was tapped (the list may have changed since),
+        # and only a NEW tap opens a customer - an old selection never jumps to whoever moved into that row.
+        rows_now = tuple(event.selection.rows)
+        if rows_now != st.session_state.get("_dash_sel_seen"):
+            st.session_state["_dash_sel_seen"] = rows_now
+            seen_list = shown_before or df_view["Customer"].tolist()
+            rows_sel = [i for i in rows_now if 0 <= i < len(seen_list)]
+            if rows_sel:
+                st.session_state["sel_cust"] = seen_list[rows_sel[0]]
+                _dash_pause_for_edit()
 
     selected = st.session_state.get("sel_cust")
     if selected in set(df_report["Customer"]) and not shown_inline:
@@ -5104,7 +5274,8 @@ def _update_panel(selected, df_report, selected_date):
     if h2.button("✖ Close", key=f"close_panel_{selected}"):
         st.session_state.pop("sel_cust", None)
         st.session_state["clear_sel"] = True
-        st.rerun()
+        st.session_state.pop("_dash_sel_seen", None)
+        st.rerun()                                        # full rerun: auto-update starts again
 
     if selected_date != today_kh():
         st.info("Updates can only be saved for today. Select today's date above.")
@@ -5256,6 +5427,7 @@ def bun_table_by_type(j, snap):
         tot = {"Code": "TOTAL", "Bun": "", "Sell/pcs ៛": "", "Paid pcs": int(out["Paid pcs"].sum()), "FOC pcs": int(out["FOC pcs"].sum()),
                "Total pcs": int(out["Total pcs"].sum()), "Sales ៛": int(out["Sales ៛"].sum())}
         out = pd.concat([out, pd.DataFrame([tot])], ignore_index=True)
+        out["Sell/pcs ៛"] = pd.array([None if v == "" else v for v in out["Sell/pcs ៛"]], dtype="Int64")  # no text in a number column
     return out
 
 
@@ -5788,10 +5960,21 @@ def tab_sale_order():
 
 
 
+def _dash_pause_for_edit():
+    """A customer was opened: switch from the auto-update wrapper to the still one (a full rerun picks it)."""
+    if st.session_state.get("_dash_live_on"):
+        st.rerun()
+
+
 def tab_dashboard(live):
+    """Live: the board refreshes itself every LIVE_REFRESH_SECONDS. While a customer is open (Check / Edit) the
+    auto-update pauses, so a half-filled form is never redrawn or moved; ✖ Close or saving starts it again."""
     def _run():
         safe_render(_dashboard_body, "Dashboard")
-    frag = st.fragment(run_every=LIVE_REFRESH_SECONDS)(_run) if live else st.fragment(_run)
+    on = bool(live) and not st.session_state.get("sel_cust")
+    st.session_state["_dash_live_on"] = on
+    st.session_state["_dash_live_wanted"] = bool(live)
+    frag = st.fragment(run_every=LIVE_REFRESH_SECONDS)(_run) if on else st.fragment(_run)
     frag()
 
 
@@ -14548,9 +14731,22 @@ else:
     _status_copy_in_background()                         # anyone using the app keeps the Excel files fresh
 
 # Render only the selected section. Ordinary tabs execute every section on each rerun.
+# The open section is also kept in the page link (?s=...), so a phone that wakes up / reconnects (new session)
+# opens the same section again instead of jumping back to the first one.
+_SEC_BY_LABEL = {v: k for k, v in APP_SECTION_LABEL.items()}
+_SEC_BY_LABEL[ADMIN_SECTION_LABEL] = "admin"
 if st.session_state.get("main_section") not in labels:
-    st.session_state["main_section"] = labels[0]
+    try:
+        _want = {v: k for k, v in _SEC_BY_LABEL.items()}.get(st.query_params.get("s", ""))
+    except Exception:
+        _want = None
+    st.session_state["main_section"] = _want if _want in labels else labels[0]
 _label = st.radio("Open section", labels, key="main_section", horizontal=True)
+try:
+    if st.query_params.get("s") != _SEC_BY_LABEL.get(_label, ""):
+        st.query_params["s"] = _SEC_BY_LABEL.get(_label, "")
+except Exception:
+    pass
 st.caption("Save your form before changing sections. Only the selected section loads.")
 if _label.startswith("📦"):
     tab_packing()
@@ -14559,7 +14755,8 @@ elif _label.startswith("🚚"):
 elif _label.startswith("📝"):
     tab_sale_order()
 elif _label.startswith("📊"):
-    _live = st.checkbox(f"🔄 Live mode (refresh every {LIVE_REFRESH_SECONDS}s)", value=False, key="live_mode")
+    _live = st.checkbox(f"🔄 Live mode (updates by itself every {LIVE_REFRESH_SECONDS} s, pauses while you edit a customer)",
+                        value=True, key="live_mode")
     tab_dashboard(_live)
 elif _label.startswith("📑"):
     tab_dashboard(False)
