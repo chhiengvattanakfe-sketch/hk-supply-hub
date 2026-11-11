@@ -3796,13 +3796,7 @@ def _packing_body():
             st.warning("View is turned off. Enable View to allow read-only access to the packing log, or enable Editing to work on tasks.")
             return
         st.caption("🔒 Read-only packing view — Editing is turned off for your account.")
-        df_today = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), today_kh())
-        if df_today.empty:
-            st.info("No packing progress logged today yet.")
-            return
-        show_df(df_today[PACKING_COLS])
-        st.markdown("**👷 Cases packed per staff (today)**")
-        show_df(df_today.groupby("Prepared_By")["Cases_Packed"].sum().reset_index())
+        _packing_tasks_panel()
         return
     packing_mode = st.radio("Packing method", ["📋 Quick tick list", "📤 Upload a file", "✍️ One customer"],
                             horizontal=True, key="packing_method")
@@ -3818,14 +3812,151 @@ def _packing_body():
                      label_cols=["Customer", "Cases_Packed", "Status"])
 
     st.markdown("---")
-    st.subheader("📋 Today's Packing Log")
-    df_today = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), today_kh())
-    if df_today.empty:
-        st.info("No packing progress logged today yet.")
+    _packing_tasks_panel()
+
+
+PACK_ST_DONE, PACK_ST_WIP = "Completed (រួចរាល់)", "In Progress (កំពុងធ្វើ)"
+
+
+def _packing_task_save(changes, allowed):
+    """changes = [(original row, new values)]. One safe read-change-save of the packing log."""
+    def apply(frame):
+        for original, new in changes:
+            if not allowed(original):
+                raise PermissionError(f"{original['Customer']}: you can only change your own packing.")
+            mask = pd.Series(True, index=frame.index)
+            for field in ("Date", "Customer", "Invoice"):
+                mask &= frame[field].fillna("").astype(str).eq(str(original.get(field, "") or ""))
+            for field in ("Prepared_By", "Cases_Packed", "Status"):
+                mask &= frame[field].fillna("").astype(str).eq(str(original.get(field, "") or ""))
+            if int(mask.sum()) < 1:
+                raise ValueError(f"{original['Customer']}: another staff member changed it just now. Press Refresh.")
+            idx = frame.index[mask][0]                       # identical duplicate slips: change one of them
+            for field, value in new.items():
+                frame.loc[idx, field] = value
+        return frame
+    modify_csv(PACKING_FILE, PACKING_COLS, apply)
+
+
+def _packing_tasks_panel():
+    """Packing slips of one staff member (or everyone) for any day / period; who packed, cases and status editable."""
+    st.subheader("📋 Packing log by staff")
+    flash = st.session_state.pop("pack_task_flash", None)
+    if flash:
+        st.success(flash)
+    df_all = read_raw(PACKING_FILE, PACKING_COLS)
+    recent = df_all[df_all["_dt"] >= pd.Timestamp(today_kh() - timedelta(days=62))] if not df_all.empty else df_all
+    recorded = {str(x).strip() for x in recent["Prepared_By"].dropna() if str(x).strip() not in ("", "-", "nan", "None")}
+    staff_options = [STAFF_TASK_ALL] + sorted(set(OPS_STAFF) | recorded)
+    c1, c2, c3 = st.columns([2, 1.4, 1.6])
+    staff = c1.selectbox("Packed by", staff_options, key="pack_task_staff")
+    period = c2.selectbox("📅 Date / period", STAFF_TASK_PERIODS, key="pack_task_period")
+    with c3:
+        d_from, d_to = _period_pick(period, "pack_task")
+        if period not in ("📅 Pick a day", "📅 From – to"):
+            st.caption(f"{d_from:%d %b %Y}" + ("" if d_from == d_to else f" → {d_to:%d %b %Y}"))
+    f1, f2 = st.columns([1.4, 2])
+    show = f1.radio("Show", ["All", "🟠 In progress only", "✅ Completed only"], horizontal=True, key="pack_task_show")
+    query = f2.text_input("🔎 Find customer or invoice", key="pack_task_q", max_chars=60).strip()
+
+    if df_all.empty:
+        st.info("No packing logged yet.")
         return
-    show_df(df_today[PACKING_COLS])
-    st.markdown("**👷 Cases packed per staff (today)**")
-    show_df(df_today.groupby("Prepared_By")["Cases_Packed"].sum().reset_index())
+    norm = df_all["_dt"].dt.normalize()
+    tasks = df_all[(norm >= pd.Timestamp(d_from)) & (norm <= pd.Timestamp(d_to))]
+    if staff != STAFF_TASK_ALL:
+        tasks = tasks[tasks["Prepared_By"].astype(str).str.strip() == staff]
+    if show.startswith("🟠"):
+        tasks = tasks[tasks["Status"].astype(str).str.startswith("In Progress")]
+    elif show.startswith("✅"):
+        tasks = tasks[tasks["Status"].astype(str).str.startswith("Completed")]
+    if query:
+        hay = tasks[["Customer", "Invoice"]].astype(str).agg(" ".join, axis=1)
+        tasks = tasks[hay.str.contains(query, case=False, regex=False, na=False)]
+    tasks = tasks.sort_values("_dt", kind="stable").reset_index(drop=True)
+    when = f"{d_from:%d %b}" + ("" if d_from == d_to else f" – {d_to:%d %b}")
+    if tasks.empty:
+        st.info(f"No packing for {'everyone' if staff == STAFF_TASK_ALL else staff} on {when}.")
+        return
+    k1, k2, k3, k4 = st.columns(4)
+    kpi(k1, "Packing slips", len(tasks))
+    kpi(k2, "Cases packed", int(pd.to_numeric(tasks["Cases_Packed"], errors="coerce").fillna(0).sum()))
+    kpi(k3, "Customers", int(tasks["Customer"].map(cust_key).nunique()))
+    kpi(k4, "🟠 Still in progress", int(tasks["Status"].astype(str).str.startswith("In Progress").sum()))
+    by_staff = tasks.groupby("Prepared_By").agg(Slips=("Customer", "count"), Cases=("Cases_Packed", "sum"),
+                                                Customers=("Customer", "nunique")).reset_index()
+    with st.expander(f"👷 Cases packed per staff ({when})", expanded=staff == STAFF_TASK_ALL):
+        show_df(by_staff.sort_values("Cases", ascending=False))
+    if d_from != d_to:
+        per_day = tasks.groupby(tasks["_dt"].dt.date).agg(Slips=("Customer", "count"), Cases=("Cases_Packed", "sum"))
+        with st.expander(f"📆 Per day ({len(per_day)} days)"):
+            show_df(per_day.rename_axis("Day").reset_index())
+
+    my_name = staff_name_for_user()
+    is_admin = current_role() == "admin"
+    can_edit = has_permission("edit") and has_permission("tasks")
+
+    def allowed(row):
+        return is_admin or (my_name and my_name == str(row.get("Prepared_By", "")).strip())
+
+    view = pd.DataFrame({
+        "When": [t.strftime("%I:%M %p") if d_from == d_to else t.strftime("%d %b %I:%M %p") for t in tasks["_dt"]],
+        "Customer": tasks["Customer"], "Packed by": tasks["Prepared_By"].astype(str),
+        "Cases packed": pd.to_numeric(tasks["Cases_Packed"], errors="coerce").fillna(0).astype(int),
+        "Status": tasks["Status"].astype(str), "Invoice": tasks["Invoice"]})
+    if not can_edit:
+        show_df(view)
+        return
+    st.caption("✏️ Change **Packed by**, **Cases packed** or **Status** in the table, then press Save."
+               + ("" if is_admin else " You can change only the packing saved under your own name."))
+    sig = hashlib.sha1(pd.util.hash_pandas_object(tasks[PACKING_COLS].astype(str), index=False).values.tobytes()).hexdigest()[:12]
+    sig += f"_{st.session_state.get('pack_task_undo', 0)}"
+    who_opts = sorted(set(OPS_STAFF) | set(view["Packed by"]))
+    st_opts = sorted({PACK_ST_WIP, PACK_ST_DONE} | set(view["Status"]))
+    cfg = {"When": st.column_config.TextColumn("When", disabled=True),
+           "Customer": st.column_config.TextColumn("Customer", disabled=True, width="large"),
+           "Packed by": st.column_config.SelectboxColumn("Packed by", options=who_opts, required=True),
+           "Cases packed": st.column_config.NumberColumn("Cases packed", min_value=0, max_value=MAX_CASES, step=1, format="%d"),
+           "Status": st.column_config.SelectboxColumn("Status", options=st_opts, required=True),
+           "Invoice": st.column_config.TextColumn("Invoice", disabled=True)}
+    with st.form(f"pack_task_form_{sig}"):
+        edited = st.data_editor(view, key=f"pack_task_ed_{sig}", hide_index=True, use_container_width=True,
+                                column_config=cfg, num_rows="fixed", height=min(620, 72 + 35 * len(view)))
+        b1, b2 = st.columns([2, 1])
+        save = b1.form_submit_button("💾 Save changed packing", type="primary", use_container_width=True)
+        undo = b2.form_submit_button("↩️ Undo my changes", use_container_width=True)
+    if undo:
+        st.session_state["pack_task_undo"] = st.session_state.get("pack_task_undo", 0) + 1
+        st.rerun()
+    if save:
+        changes, denied = [], []
+        originals = tasks.to_dict("records")
+        for i, row in enumerate(edited.to_dict("records")):
+            o = originals[i]
+            new = {"Prepared_By": str(row["Packed by"]), "Cases_Packed": max(0, min(_int(row["Cases packed"]), MAX_CASES)),
+                   "Status": str(row["Status"])}
+            old = {"Prepared_By": str(o["Prepared_By"]), "Cases_Packed": _int(o["Cases_Packed"]), "Status": str(o["Status"])}
+            if new == old:
+                continue
+            if not allowed(o):
+                denied.append(str(o["Customer"]))
+                continue
+            changes.append((o, new))
+        if denied:
+            st.warning("Not changed (packed by someone else): " + ", ".join(denied))
+        if not changes:
+            if not denied:
+                st.info("Nothing changed. Edit a cell first, then press Save.")
+            return
+        try:
+            _packing_task_save(changes, allowed)
+            for o, new in changes:
+                audit("packing_edit", f'{o["Customer"]} {o["Date"]}: {o["Prepared_By"]}/{o["Cases_Packed"]}/{o["Status"]} -> '
+                                      f'{new["Prepared_By"]}/{new["Cases_Packed"]}/{new["Status"]}')
+            st.session_state["pack_task_flash"] = f"✅ Saved {len(changes)} packing slip(s)"
+            st.rerun()
+        except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
+            st.error(f"Not saved: {err}")
 
 
 @st.fragment
@@ -4354,32 +4485,233 @@ def _delivery_log():
         show_df(per_staff)
 
     if can_view:
-        st.markdown("**🔎 Check completed delivery tasks by staff**")
-        recorded_staff = [str(x).strip() for x in df_today["Handled_By"].dropna().tolist()
-                          if str(x).strip() and str(x).strip() not in ("-", "nan", "None")]
-        staff_options = ["-- Select Staff --"] + sorted(set(DELIVERY_HANDLERS).union(recorded_staff))
-        selected_staff = st.selectbox(
-            "Select staff name to see their completed tasks",
-            staff_options,
-            key="dispatch_completed_staff",
-        )
-        if selected_staff == "-- Select Staff --":
-            st.caption("Choose a staff member to see the customers and cases they dispatched today.")
+        _staff_tasks_panel()
+
+
+STAFF_TASK_PERIODS = ["Today", "Yesterday", "Last 7 days", "This month", "Last month", "📅 Pick a day", "📅 From – to"]
+STAFF_TASK_ALL = "👥 Everyone"
+
+
+def _period_pick(choice, key):
+    """(from, to) dates for a period name; the two 📅 choices show a date box."""
+    t = today_kh()
+    if choice == "Yesterday":
+        return t - timedelta(days=1), t - timedelta(days=1)
+    if choice == "Last 7 days":
+        return t - timedelta(days=6), t
+    if choice == "This month":
+        return t.replace(day=1), t
+    if choice == "Last month":
+        last = t.replace(day=1) - timedelta(days=1)
+        return last.replace(day=1), last
+    if choice == "📅 Pick a day":
+        d = st.date_input("Day", value=t, max_value=t, key=key + "_day")
+        return d, d
+    if choice == "📅 From – to":
+        rng = st.date_input("From – to (tap the first day, then the last day)", value=(t - timedelta(days=6), t),
+                            max_value=t, key=key + "_rng")
+        rng = list(rng) if isinstance(rng, (list, tuple)) else [rng]
+        if not rng:
+            return t, t
+        return min(rng[0], rng[-1]), max(rng[0], rng[-1])
+    return t, t
+
+
+def _staff_task_save(changes, allowed):
+    """changes = [(original row, new values)]. One safe read-change-save of the delivery log.
+    A row is only changed when nobody else changed it since this list was loaded."""
+    def apply(frame):
+        for original, new in changes:
+            if not allowed(original):
+                raise PermissionError(f"{original['Customer']}: you can only change your own deliveries.")
+            mask = pd.Series(True, index=frame.index)
+            for field in ("Date", "Customer", "Handled_By", "Invoice"):
+                mask &= frame[field].fillna("").astype(str).eq(str(original.get(field, "") or ""))
+            if int(mask.sum()) != 1:
+                raise ValueError(f"{original['Customer']}: this delivery changed or is ambiguous. Press Refresh.")
+            idx = frame.index[mask][0]
+            for field in ("Local_Driver", "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note"):
+                if str(frame.at[idx, field]) != str(original.get(field, "")):
+                    raise ValueError(f"{original['Customer']}: another staff member changed it just now. Press Refresh.")
+            for field, value in new.items():
+                frame.loc[idx, field] = value
+        return frame
+    modify_csv(DATA_FILE, DISPATCH_COLS, apply)
+
+
+def _staff_tasks_panel():
+    """Completed delivery slips of one staff member (or everyone) for any day / period, with expenses editable."""
+    st.markdown("**🔎 Check completed delivery tasks by staff**")
+    flash = st.session_state.pop("staff_task_flash", None)
+    if flash:
+        st.success(flash)
+    df_all = read_raw(DATA_FILE, DISPATCH_COLS)
+    recent = df_all[df_all["_dt"] >= pd.Timestamp(today_kh() - timedelta(days=62))] if not df_all.empty else df_all
+    recorded = {str(x).strip() for x in recent["Handled_By"].dropna() if str(x).strip() not in ("", "-", "nan", "None")}
+    staff_options = ["-- Select Staff --", STAFF_TASK_ALL] + sorted(set(DELIVERY_HANDLERS) | recorded)
+    my_name = staff_name_for_user()
+    if "dispatch_completed_staff" not in st.session_state and my_name in staff_options:
+        st.session_state["dispatch_completed_staff"] = my_name
+    c1, c2, c3 = st.columns([2, 1.4, 1.6])
+    staff = c1.selectbox("Select staff name to see their completed tasks", staff_options, key="dispatch_completed_staff")
+    period = c2.selectbox("📅 Date / period", STAFF_TASK_PERIODS, key="staff_task_period")
+    with c3:
+        d_from, d_to = _period_pick(period, "staff_task")
+        if period not in ("📅 Pick a day", "📅 From – to"):
+            st.caption(f"{d_from:%d %b %Y}" + ("" if d_from == d_to else f" → {d_to:%d %b %Y}"))
+    if staff == "-- Select Staff --":
+        st.caption("Choose a staff member (or 👥 Everyone) to see the customers and cases they dispatched.")
+        return
+    f1, f2 = st.columns([1.4, 2])
+    show = f1.radio("Show", ["All", "⏳ Pending only", "✅ Done only"], horizontal=True, key="staff_task_show")
+    query = f2.text_input("🔎 Find customer, invoice, taxi station or note", key="staff_task_q", max_chars=60).strip()
+
+    norm = df_all["_dt"].dt.normalize()
+    tasks = df_all[(norm >= pd.Timestamp(d_from)) & (norm <= pd.Timestamp(d_to))]
+    if staff != STAFF_TASK_ALL:
+        tasks = tasks[(tasks["Handled_By"].astype(str).str.strip() == staff) |
+                      (tasks["Local_Driver"].astype(str).str.strip() == staff)]
+    if show.startswith("⏳"):
+        tasks = tasks[tasks["Expense_Status"] == "Pending"]
+    elif show.startswith("✅"):
+        tasks = tasks[tasks["Expense_Status"] != "Pending"]
+    if query:
+        hay = tasks[["Customer", "Invoice", "Taxi_Station", "Note", "Local_Driver"]].astype(str).agg(" ".join, axis=1)
+        tasks = tasks[hay.str.contains(query, case=False, regex=False, na=False)]
+    tasks = tasks.sort_values("_dt", kind="stable").reset_index(drop=True)
+    when = f"{d_from:%d %b}" + ("" if d_from == d_to else f" – {d_to:%d %b}")
+    who = "everyone" if staff == STAFF_TASK_ALL else staff
+    if tasks.empty:
+        st.info(f"No delivery tasks for {who} on {when}.")
+        return
+
+    money = can_see_money()
+    pp_sum, taxi_sum = int(tasks["Phnom_Penh_Expense"].sum()), int(tasks["Taxi_Expense"].sum())
+    k1, k2, k3, k4, k5 = st.columns(5)
+    kpi(k1, "Completed delivery slips", len(tasks))
+    kpi(k2, "Cases dispatched", int(pd.to_numeric(tasks["Cases"], errors="coerce").fillna(0).sum()))
+    kpi(k3, "Grab/TukTuk ៛", f"{pp_sum:,}")
+    kpi(k4, "Taxi ៛", f"{taxi_sum:,}")
+    kpi(k5, "Expenses still pending", int((tasks["Expense_Status"] == "Pending").sum()))
+    if d_from != d_to:
+        per_day = tasks.groupby(tasks["_dt"].dt.date).agg(Slips=("Customer", "count"), Cases=("Cases", "sum"),
+                                                           Grab_TukTuk=("Phnom_Penh_Expense", "sum"), Taxi=("Taxi_Expense", "sum"),
+                                                           Pending=("Expense_Status", lambda x: int((x == "Pending").sum())))
+        with st.expander(f"📆 Per day ({len(per_day)} days)"):
+            show_df(per_day.rename_axis("Day").reset_index())
+
+    can_edit = has_permission("edit") and has_permission("tasks") and money
+    is_admin = current_role() == "admin"
+
+    def allowed(row):
+        return is_admin or (my_name and my_name in (str(row.get("Handled_By", "")).strip(), str(row.get("Local_Driver", "")).strip()))
+
+    view = pd.DataFrame({
+        "When": [t.strftime("%I:%M %p") if d_from == d_to else t.strftime("%d %b %I:%M %p") for t in tasks["_dt"]],
+        "Customer": tasks["Customer"], "Cases": pd.to_numeric(tasks["Cases"], errors="coerce").fillna(0).astype(int),
+        "Handled by": tasks["Handled_By"],
+        "Sent with": tasks["Local_Driver"].astype(str),
+        "Taxi station": tasks["Taxi_Station"].astype(str).replace({"-": ""}),
+        "Grab/TukTuk ៛": tasks["Phnom_Penh_Expense"].map(_int), "Taxi ៛": tasks["Taxi_Expense"].map(_int),
+        "Note": tasks["Note"].astype(str).replace({"-": ""}),
+        "Status": tasks["Expense_Status"].map(lambda x: "⏳ Pending" if x == "Pending" else "✅ Done"),
+        "Verified by": tasks["Verified_By"], "Invoice": tasks["Invoice"]})
+    if not money:
+        view["Grab/TukTuk ៛"] = MONEY_LOCK
+        view["Taxi ៛"] = MONEY_LOCK
+    if staff == STAFF_TASK_ALL:
+        cols = list(view.columns)
+    else:
+        cols = [c for c in view.columns if c != "Handled by"]
+    if not can_edit:
+        show_df(view[cols])
+    else:
+        mine = [allowed(r) for r in tasks.to_dict("records")]
+        if not is_admin:
+            st.caption("✏️ You can change the expense of your own deliveries (handled or driven by you). "
+                       + ("" if all(mine) else f"{len(mine) - sum(mine)} row(s) of other staff are read-only."))
         else:
-            staff_tasks = df_today[df_today["Handled_By"].astype(str).str.strip() == selected_staff].copy()
-            if staff_tasks.empty:
-                st.info(f"No delivery tasks recorded for {selected_staff} today.")
+            st.caption("✏️ Change **Sent with**, **Taxi station**, **Grab/TukTuk ៛**, **Taxi ៛** or **Note** in the table, "
+                       "then press Save. Status turns ✅ Done by itself when the needed amount is filled.")
+        sig = hashlib.sha1(pd.util.hash_pandas_object(tasks[DISPATCH_COLS].astype(str), index=False).values.tobytes()).hexdigest()[:12]
+        choices = [PENDING_VIA] + via_options()
+        extra = sorted({v for v in view["Sent with"] if v not in choices})
+        cfg = {
+            "When": st.column_config.TextColumn("When", disabled=True),
+            "Customer": st.column_config.TextColumn("Customer", disabled=True, width="large"),
+            "Cases": st.column_config.NumberColumn("Cases", disabled=True),
+            "Handled by": st.column_config.TextColumn("Handled by", disabled=True),
+            "Sent with": st.column_config.SelectboxColumn("Sent with", options=choices + extra, required=True),
+            "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
+            "Grab/TukTuk ៛": st.column_config.NumberColumn("Grab/TukTuk ៛", min_value=0, max_value=MAX_RIEL, step=500, format="%d"),
+            "Taxi ៛": st.column_config.NumberColumn("Taxi ៛", min_value=0, max_value=MAX_RIEL, step=500, format="%d"),
+            "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT),
+            "Status": st.column_config.TextColumn("Status", disabled=True),
+            "Verified by": st.column_config.TextColumn("Verified by", disabled=True),
+            "Invoice": st.column_config.TextColumn("Invoice", disabled=True)}
+        sig += f"_{st.session_state.get('staff_task_undo', 0)}"
+        with st.form(f"staff_task_form_{sig}"):
+            edited = st.data_editor(view[cols], key=f"staff_task_ed_{sig}", hide_index=True, use_container_width=True,
+                                    column_config={c: cfg[c] for c in cols}, num_rows="fixed",
+                                    height=min(620, 72 + 35 * len(view)))
+            b1, b2 = st.columns([2, 1])
+            save = b1.form_submit_button("💾 Save changed expenses", type="primary", use_container_width=True)
+            undo = b2.form_submit_button("↩️ Undo my changes", use_container_width=True)
+        if undo:
+            st.session_state["staff_task_undo"] = st.session_state.get("staff_task_undo", 0) + 1
+            st.rerun()
+        if save:
+            changes, denied, bad = [], [], []
+            originals = tasks.to_dict("records")
+            for i, row in enumerate(edited.to_dict("records")):
+                o = originals[i]
+                via = str(row["Sent with"] or PENDING_VIA)
+                station = safe_text(row["Taxi station"] or "").strip()
+                pp, taxi = driver_pp_expense(via, row["Grab/TukTuk ៛"]), _int(row["Taxi ៛"])
+                note = safe_text(row["Note"] or "").strip()
+                new = {"Local_Driver": via, "Taxi_Station": station or "-", "Phnom_Penh_Expense": pp,
+                       "Taxi_Expense": taxi, "Note": note or "-"}
+                old = {"Local_Driver": str(o["Local_Driver"]), "Taxi_Station": str(o["Taxi_Station"]),
+                       "Phnom_Penh_Expense": _int(o["Phnom_Penh_Expense"]), "Taxi_Expense": _int(o["Taxi_Expense"]),
+                       "Note": str(o["Note"])}
+                if new == old:
+                    continue
+                if not allowed(o):
+                    denied.append(str(o["Customer"]))
+                    continue
+                if not (0 <= pp <= MAX_RIEL and 0 <= taxi <= MAX_RIEL):
+                    bad.append(str(o["Customer"]))
+                    continue
+                new["Expense_Status"] = expense_status(via, station, pp, taxi)
+                changes.append((o, new))
+            if denied:
+                st.warning("Not changed (not your delivery): " + ", ".join(denied))
+            if bad:
+                st.warning("Amount out of range: " + ", ".join(bad))
+            if not changes:
+                if not denied and not bad:
+                    st.info("Nothing changed. Edit a cell first, then press Save.")
             else:
-                cases_done = int(pd.to_numeric(staff_tasks["Cases"], errors="coerce").fillna(0).sum())
-                expense_waiting = int((staff_tasks["Expense_Status"] == "Pending").sum())
-                k1, k2, k3 = st.columns(3)
-                kpi(k1, "Completed delivery slips", len(staff_tasks))
-                kpi(k2, "Cases dispatched", cases_done)
-                kpi(k3, "Expenses still pending", expense_waiting)
-                task_cols = [c for c in ["Time", "Customer", "Cases", "Note", "Local_Driver", "Taxi_Station",
-                                         "Phnom_Penh_Expense", "Taxi_Expense", "Expense_Status", "Verified_By"]
-                             if c in staff_tasks.columns]
-                show_df(staff_tasks[task_cols])
+                try:
+                    _staff_task_save(changes, allowed)
+                    for o, new in changes:
+                        audit("expense_edit", f'{o["Customer"]} {o["Date"]}: {o["Local_Driver"]}/{o["Taxi_Station"]}/'
+                                              f'{o["Phnom_Penh_Expense"]}/{o["Taxi_Expense"]} -> {new["Local_Driver"]}/'
+                                              f'{new["Taxi_Station"]}/{new["Phnom_Penh_Expense"]}/{new["Taxi_Expense"]}')
+                    done = sum(1 for _, n in changes if n["Expense_Status"] == "Done")
+                    st.session_state["staff_task_flash"] = (f"✅ Saved {len(changes)} delivery(ies)"
+                                                            + (f" · {len(changes) - done} still ⏳ Pending (amount missing)" if done < len(changes) else ""))
+                    st.rerun()
+                except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
+                    st.error(f"Not saved: {err}")
+    if has_permission("reports"):
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            tasks[DISPATCH_COLS].to_excel(writer, index=False, sheet_name="Deliveries")
+        st.download_button(f"📥 Download this list (Excel, {len(tasks)} rows)", data=buf.getvalue(),
+                           file_name=f"Deliveries_{'All' if staff == STAFF_TASK_ALL else 'staff'}_{d_from}_{d_to}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="staff_task_dl")
+
 
 # ---------- 📌 sale notes for delivery staff (urgent / fixed pick-up time) ----------
 SALE_NOTE_COL = "📌 Sale note"
