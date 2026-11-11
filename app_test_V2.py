@@ -13963,9 +13963,11 @@ DRIVER_SHORT = {"ងិន វុទ្ធា": "VUTHEA", "អួន តួ": "T
 
 
 def _make_driver_expense_csv(source, deliveries):
-    """One row per journal invoice: who drove it and what the delivery cost (Grab/app and taxi).
-    A delivery log is matched by its invoice, else to the customer's first invoice of that day (or the day before);
-    a customer's other invoices that day get 0. Status Pending = not delivered yet, or the cost is still missing."""
+    """One row per journal invoice + customer: who drove it and what the delivery cost (Grab/TukTuk/own and taxi).
+    A delivery log counts for an invoice only when BOTH the invoice number and the customer name match the journal
+    (a row whose name was changed but kept the invoice gets nothing). A log without an invoice goes to the customer's
+    first invoice of that day (or the day before). Amounts already entered are always shown; Status Pending means
+    not delivered yet or a cost is still missing."""
     raw = _STATUS_RAW_MEMO.get("raw") if _STATUS_RAW_MEMO.get("key") == hashlib.sha1(source).digest() else None
     if raw is None:
         _make_invoice_status_csv(source, deliveries.iloc[0:0], deliveries.iloc[0:0], pd.DataFrame(columns=HOLD_COLS + ["_dt"]))
@@ -13975,55 +13977,68 @@ def _make_driver_expense_csv(source, deliveries):
         raise RuntimeError("Journal invoice column missing")
     months = Counter((r[0].year, r[0].month) for r in raw if r and isinstance(r[0], datetime))
     dominant = months.most_common(1)[0][0] if months else None
-    order, info, by_day = [], {}, {}
+    order, info, by_day, by_inv = [], {}, {}, {}
     for r in raw:
         if len(r) <= ii or not r[1]:
             continue
         day = cell_to_date(r[0], dominant)
         inv, cust = _cell_text(r[ii]), _cell_text(r[1])
-        if not day or inv in ("", "-") or inv.casefold() in info:
+        if not day or inv in ("", "-"):
             continue
-        info[inv.casefold()] = dict(Invoice=inv, Customer=cust, Date=day.isoformat())
-        order.append(inv.casefold())
-        by_day.setdefault((day, norm_name(cust)), []).append(inv.casefold())
-    got = {}
-    unmatched = 0
+        key = (inv.casefold(), cust_key(cust))
+        if key in info:
+            continue
+        info[key] = dict(Invoice=inv, Customer=cust, Date=day.isoformat())
+        order.append(key)
+        by_day.setdefault((day, cust_key(cust)), []).append(key)
+        by_inv.setdefault(inv.casefold(), []).append(key)
+    got, unmatched, mismatched = {}, 0, 0
     for r in deliveries.to_dict("records"):
         dt = r.get("_dt", parse_dt(r.get("Date")))
         if pd.isna(dt):
             continue
+        ck = cust_key(r["Customer"])
         inv = _cell_text(r.get("Invoice")).casefold()
-        if inv not in ("", "-", "nan") and inv not in info:
-            unmatched += 1                                  # its invoice is not (yet) in this journal
-            continue
-        if inv not in info:
-            day, key = dt.date(), norm_name(r["Customer"])
-            cands = by_day.get((day, key)) or by_day.get((day - timedelta(days=1), key))
-            inv = cands[0] if cands else None
-        if inv is None:
-            unmatched += 1
-            continue
-        g = got.setdefault(inv, dict(driver="", app=0, taxi=0, done=True))
+        key = (inv, ck) if inv not in ("", "-", "nan") else None
+        if key is None or key not in info:
+            if key is not None and inv not in by_inv:
+                unmatched += 1                              # invoice not (yet) in this journal
+                continue
+            if key is not None:
+                mismatched += 1                             # that invoice belongs to another customer name:
+            day = dt.date()                                 # never use it; find this customer's own invoice
+            cands = by_day.get((day, ck)) or by_day.get((day - timedelta(days=1), ck))
+            if not cands:
+                unmatched += 1
+                continue
+            key = cands[0]
+        g = got.setdefault(key, dict(driver="", app=0, taxi=0, app_set=False, taxi_set=False, done=True))
         via = str(r.get("Local_Driver", "") or "")
         if via in DRIVER_SHORT:
             g["driver"] = DRIVER_SHORT[via]
-        g["app"] += driver_pp_expense(via, r.get("Phnom_Penh_Expense"))
-        g["taxi"] += _int(r.get("Taxi_Expense"))
+        pp, taxi = driver_pp_expense(via, r.get("Phnom_Penh_Expense")), _int(r.get("Taxi_Expense"))
+        g["app"] += pp
+        g["taxi"] += taxi
+        g["app_set"] = g["app_set"] or pp > 0 or via in DRIVER_SHORT or via not in (BASE_VIA, PENDING_VIA)
+        g["taxi_set"] = g["taxi_set"] or taxi > 0 or str(r.get("Taxi_Station", "") or "").strip() in ("", "-")
         status = str(r.get("Expense_Status", "") or "") or expense_status(via, r.get("Taxi_Station"), r.get("Phnom_Penh_Expense"), r.get("Taxi_Expense"))
         g["done"] = g["done"] and status != "Pending"
     out = []
-    for inv in order:
-        row = dict(info[inv])
-        g = got.get(inv)
-        if g and g["done"]:
-            row.update(Driver=g["driver"], App_Expense=g["app"], Taxi_Expense=g["taxi"], Status="Done")
+    for key in order:
+        row = dict(info[key])
+        g = got.get(key)
+        if g:
+            row.update(Driver=g["driver"],
+                       App_Expense=g["app"] if (g["done"] or g["app"] > 0 or g["app_set"]) else "",
+                       Taxi_Expense=g["taxi"] if (g["done"] or g["taxi"] > 0 or g["taxi_set"]) else "",
+                       Status="Done" if g["done"] else "Pending")
         else:
-            row.update(Driver=g["driver"] if g else "", App_Expense="", Taxi_Expense="", Status="Pending")
+            row.update(Driver="", App_Expense="", Taxi_Expense="", Status="Pending")
         out.append(row)
     result = pd.DataFrame(out, columns=DRIVER_EXPENSE_COLS)
     return result.to_csv(index=False).encode("utf-8-sig"), {"done": int((result["Status"] == "Done").sum()),
                                                              "pending": int((result["Status"] == "Pending").sum()),
-                                                             "unmatched": unmatched}
+                                                             "unmatched": unmatched, "mismatched": mismatched}
 
 
 STATUS_COPY_FOLDER = "Auto_Status"
@@ -14281,7 +14296,8 @@ def sync_journal_status_copy(force=False):
         _write_atomic(os.path.join(os.path.dirname(local_out), exp_base), exp_data)
         state.update(fingerprint=(source_name, fingerprint), path=local_out, error=False,
                      message=f"Updated {now_kh():%d %b %H:%M} — {stats['highlighted']} invoice statuses ready for Excel; "
-                             f"delivery expense for {exp_stats['done']} invoices ({exp_stats['pending']} still pending). "
+                             f"delivery expense for {exp_stats['done']} invoices ({exp_stats['pending']} still pending, "
+                             f"{exp_stats['mismatched']} logs had another customer's invoice and were matched by name instead). "
                              f"{stats['ambiguous']} ambiguous customer/day matches skipped; {stats['unmatched']} log customer/day matches absent from this journal.")
     except Exception as e:
         state.update(error=True, message="Invoice status update pending: " + str(e)[:220])
