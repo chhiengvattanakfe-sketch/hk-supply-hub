@@ -4111,11 +4111,12 @@ JF_COLS = ["Date", "Customer", "Invoice", "ចំនួនកេស", "កេស
 
 def build_journal_fill(d_from, d_to):
     """(fill_df, unmatched_df, error) for deliveries between two dates.
-    One row per journal invoice, in journal order. A customer's expenses for one day go on its FIRST invoice
-    of that day (0 on the others) so nothing is counted twice - the same way the journal is filled by hand.
-    ចំនួនកេស = cases SENT (from the Delivery tab). When a customer has several invoices that day, the cases sent are
-    shared over the invoices by the journal's កេស, so the column adds up to exactly what was sent.
-    កេស (journal) = the cases written in the journal for that invoice (to compare)."""
+    Deliveries are linked to journal invoices with match_deliveries_to_journal (invoice + name, else the customer's
+    invoice of that day or 1-3 days before) - the same rules as the automatic DRIVER_EXPENSE file.
+    One row per journal invoice, in journal order: the invoices of the dates chosen, plus earlier invoices that were
+    delivered in these dates (e.g. invoiced 9 Nov, sent 10 Nov). A customer's expenses for one invoice day go on
+    its FIRST invoice of that day (0 on the others) so nothing is counted twice.
+    ចំនួនកេស = cases SENT, shared over that day's invoices by the journal's កេស. កេស (journal) = cases on the invoice."""
     snap, _, _, err = current_snapshot()
     if not snap:
         return None, None, err or "Journal not found"
@@ -4125,28 +4126,34 @@ def build_journal_fill(d_from, d_to):
     disp = disp[(disp["_dt"].dt.normalize() >= pd.Timestamp(d_from)) & (disp["_dt"].dt.normalize() <= pd.Timestamp(d_to))].copy()
     if disp.empty:
         return None, None, "No deliveries between these dates"
-    disp["_day"] = disp["_dt"].dt.date
-    disp["_cust"] = disp["Customer"].astype(str).map(lambda x: re.sub(r"\s+", " ", x).strip())
-    agg = {}
-    for (day, cust), g in disp.groupby(["_day", "_cust"], sort=False):
-        drv = [DRIVER_CODE.get(str(x).strip(), "") for x in g["Local_Driver"]]
-        drv = [x for x in drv if x]
-        st_ = [str(x).strip() for x in g["Taxi_Station"] if str(x).strip() not in ("", "-")]
-        notes = [str(x).strip() for x in g["Note"] if str(x).strip() not in ("", "-")]
-        agg[(day, cust)] = {"drv": drv[-1] if drv else "", "pp": int(g["Phnom_Penh_Expense"].sum()),
-                            "taxi": int(g["Taxi_Expense"].sum()), "station": " / ".join(dict.fromkeys(st_)),
-                            "note": " / ".join(dict.fromkeys(notes)), "cases": int(g["Cases"].sum())}
-    jr = snap["journal"]
-    jr = jr[(jr["Date"] >= d_from) & (jr["Date"] <= d_to)]
-    # cases sent for each journal row: the customer's sent cases shared over its invoices of that day
+    jr_all = snap["journal"]
+    lo, hi = d_from - timedelta(days=-min(JOURNAL_MATCH_DAYS)), d_to + timedelta(days=max(JOURNAL_MATCH_DAYS))
+    jr = jr_all[(jr_all["Date"] >= lo) & (jr_all["Date"] <= hi)]
+    recs = disp.to_dict("records")
+    matched, _ = match_deliveries_to_journal(
+        [(idx, r["Date"], r["Customer"], r["Invoice"]) for idx, r in jr.iterrows()], recs)
+    gkey = {idx: (r["Date"], _cust_tight(r["Customer"])) for idx, r in jr.iterrows()}
     members = {}
-    for idx, r in jr.iterrows():
-        members.setdefault((r["Date"], r["Customer"]), []).append(idx)
+    for idx in jr.index:
+        members.setdefault(gkey[idx], []).append(idx)
+    agg, miss_agg = {}, {}
+    for r, idx in zip(recs, matched):
+        k = gkey[idx] if idx is not None else (r["_dt"].date(), re.sub(r"\s+", " ", str(r["Customer"])).strip())
+        a = (agg if idx is not None else miss_agg).setdefault(
+            k, {"drv": "", "pp": 0, "taxi": 0, "station": [], "note": [], "cases": 0})
+        drv = DRIVER_CODE.get(str(r.get("Local_Driver", "")).strip(), "")
+        if drv:
+            a["drv"] = drv
+        a["pp"] += _int(r.get("Phnom_Penh_Expense"))
+        a["taxi"] += _int(r.get("Taxi_Expense"))
+        a["cases"] += _int(r.get("Cases"))
+        for f, c in (("station", "Taxi_Station"), ("note", "Note")):
+            v = str(r.get(c, "") or "").strip()
+            if v not in ("", "-", "nan") and v not in a[f]:
+                a[f].append(v)
     sent_cases = {}
-    for key, idxs in members.items():
-        a = agg.get(key)
-        if a is None:
-            continue
+    for key, a in agg.items():
+        idxs = members[key]
         w = [max(float(jr.at[i, "Cases"]), 0) if pd.notna(jr.at[i, "Cases"]) else 0 for i in idxs]
         if sum(w) == 0:
             w = [1] * len(idxs)
@@ -4155,8 +4162,10 @@ def build_journal_fill(d_from, d_to):
         sent_cases.update(zip(idxs, parts))
     rows, used = [], set()
     for idx, r in jr.iterrows():
-        key = (r["Date"], r["Customer"])
+        key = gkey[idx]
         a = agg.get(key)
+        if a is None and not (d_from <= r["Date"] <= d_to):
+            continue                                        # earlier / later invoice not delivered in these dates
         first = a is not None and key not in used
         if a is not None:
             used.add(key)
@@ -4166,13 +4175,14 @@ def build_journal_fill(d_from, d_to):
                      "អ្នកដឹក": a["drv"] if a else "",
                      "សេវាដឹក (ចំណាយ)": (a["pp"] if first else (0 if a else None)),
                      "សេវាតាក់ស៊ី (ចំណាយ)": (a["taxi"] if first else (0 if a and a["taxi"] else None)),
-                     "Taxi station": a["station"] if first else "", "Note": a["note"] if first else ""})
+                     "Taxi station": " / ".join(a["station"]) if first else "",
+                     "Note": " / ".join(a["note"]) if first else ""})
     fill = pd.DataFrame(rows, columns=JF_COLS)
     for c in ("ចំនួនកេស", "កេស (journal)"):
         fill[c] = pd.array(fill[c].tolist(), dtype="Int64")
     miss = [{"Date": k[0], "Customer": k[1], "ចំនួនកេស": v["cases"], "អ្នកដឹក": v["drv"],
-             "សេវាដឹក (ចំណាយ)": v["pp"], "សេវាតាក់ស៊ី (ចំណាយ)": v["taxi"], "Taxi station": v["station"], "Note": v["note"]}
-            for k, v in agg.items() if k not in used]
+             "សេវាដឹក (ចំណាយ)": v["pp"], "សេវាតាក់ស៊ី (ចំណាយ)": v["taxi"], "Taxi station": " / ".join(v["station"]),
+             "Note": " / ".join(v["note"])} for k, v in miss_agg.items()]
     return fill, pd.DataFrame(miss), None
 
 
@@ -4242,7 +4252,8 @@ def _journal_fill_panel():
                    | fill["សេវាតាក់ស៊ី (ចំណាយ)"].notna()]
         sent_total = int(drv.iloc[-1]["ចំនួនកេស"]) if drv is not None and not drv.empty else 0
         in_table = int(fill["ចំនួនកេស"].fillna(0).sum())
-        st.success(f"{len(has)} journal rows have delivery data (of {len(fill)} rows in range). "
+        st.success(f"{len(has)} journal rows have delivery data (of {len(fill)} rows shown). "
+                   f"Orders invoiced 1-3 days earlier are linked to their own invoice date. "
                    f"Pending expenses are 0 until you fill them in the Delivery tab.")
         st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📦 កេស sent <b>{sent_total}</b></span>"
                     f"<span class='hk-pill'>🧾 In the table below <b>{in_table}</b></span>"
@@ -4267,7 +4278,8 @@ def _journal_fill_panel():
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         show_df(has)
         if not miss.empty:
-            st.warning(f"{len(miss)} delivery(ies) were not found in the journal (name or date differs):")
+            st.warning(f"{len(miss)} delivery(ies) were not found in the journal - no invoice for that shop within "
+                       f"3 days, or the name is written differently. Fix the name / invoice in the Delivery tab:")
             show_df(miss)
 
 
@@ -13965,6 +13977,91 @@ DRIVER_EXPENSE_COLS = ["Invoice", "Customer", "Date", "Driver", "App_Expense", "
 DRIVER_SHORT = {"ងិន វុទ្ធា": "VUTHEA", "អួន តួ": "TOU"}      # names used in the journal's អ្នកដឹក column
 
 
+JOURNAL_MATCH_DAYS = (0, -1, -2, -3, 1)   # delivery day, then up to 3 days after the invoice, then invoiced next day
+
+
+def _cust_tight(name):
+    """cust_key without any spaces or punctuation: 'JAY UNG ស្ពានអាកាស 7មករា' == 'JAY UNG ស្ពានអាកាស 7 មករា'."""
+    return re.sub(r"[\s\-_.,()/]+", "", cust_key(name))
+
+
+def _names_close(a, b):
+    """Two tight names of the same shop typed shorter / longer: 'ឈាងលីដា' ~ 'ឈាងលីដាសៀមរាប', 'nisa..' ~ 'chhnisa..'."""
+    short, long_ = sorted((a, b), key=len)
+    if len(short) < 5:
+        return False
+    return long_.startswith(short) or (len(short) >= 7 and short in long_)
+
+
+def match_deliveries_to_journal(entries, deliveries):
+    """Links every delivery log row to ONE journal row. Same rules everywhere (journal fill sheet, auto expense file).
+    entries: [(key, day, customer, invoice)] in journal order. Returns ([key or None per delivery], stats).
+    1. invoice + customer name match (name may be typed shorter/longer: 'CHH NISA' vs 'NISA')
+    2. invoice typed but it is not in this journal -> not matched (stale / other month invoice)
+    3. otherwise this customer's invoice on the delivery day, or 1-3 days before (province orders invoiced earlier),
+       or the next day; exact name first, then a shorter/longer name when it points to one shop only."""
+    by_inv, by_day = {}, {}
+    for key, day, cust, inv in entries:
+        t = _cust_tight(cust)
+        if not t:
+            continue
+        inv = _cell_text(inv).casefold()
+        if inv not in ("", "-"):
+            by_inv.setdefault(inv, []).append((key, t))
+        by_day.setdefault(day, []).append((key, t))
+    deliveries = list(deliveries)
+    out, stats, later, used = [None] * len(deliveries), Counter(), [], set()
+    for i, r in enumerate(deliveries):                      # pass 1: invoice + name, or same-day exact name
+        dt = r.get("_dt", parse_dt(r.get("Date")))
+        if pd.isna(dt):
+            stats["no date"] += 1
+            continue
+        t = _cust_tight(r.get("Customer", ""))
+        inv = _cell_text(r.get("Invoice")).casefold()
+        if inv in ("nan", "-"):
+            inv = ""
+        if inv:
+            if inv not in by_inv:
+                stats["invoice not in journal"] += 1
+                continue
+            hit = [k for k, jt in by_inv[inv] if jt == t] or [k for k, jt in by_inv[inv] if _names_close(t, jt)]
+            if hit:
+                out[i] = hit[0]
+                used.add(hit[0])
+                stats["invoice"] += 1
+                continue
+            stats["invoice of another name"] += 1        # never use it; find this customer's own invoice
+        same = [k for k, jt in by_day.get(dt.date(), []) if jt == t]
+        if same:
+            out[i] = same[0]
+            used.add(same[0])
+            stats["name, same day"] += 1
+            continue
+        later.append((dt, i, t))
+    for dt, i, t in sorted(later, key=lambda x: x[0]):     # pass 2: other days / shorter-longer name
+        found, day = None, dt.date()
+        for close in (False, True):
+            for off in JOURNAL_MATCH_DAYS:
+                rows = by_day.get(day + timedelta(days=off), [])
+                cands = [(k, jt) for k, jt in rows if (_names_close(t, jt) if close else jt == t)]
+                if close and len({jt for _, jt in cands}) > 1:
+                    continue                                # shorter name fits 2 shops: do not guess
+                if off:
+                    cands = [c for c in cands if c[0] not in used]   # another day: only an invoice not yet delivered
+                if cands:
+                    found = cands[0][0]
+                    stats["name, day %+d" % off if off else "name, same day"] += 1
+                    break
+            if found is not None:
+                break
+        if found is None:
+            stats["not found"] += 1
+        else:
+            used.add(found)
+        out[i] = found
+    return out, stats
+
+
 def _make_driver_expense_csv(source, deliveries):
     """One row per journal invoice + customer: who drove it and what the delivery cost (Grab/TukTuk/own and taxi).
     A delivery log counts for an invoice only when BOTH the invoice number and the customer name match the journal
@@ -13995,26 +14092,15 @@ def _make_driver_expense_csv(source, deliveries):
         order.append(key)
         by_day.setdefault((day, cust_key(cust)), []).append(key)
         by_inv.setdefault(inv.casefold(), []).append(key)
-    got, unmatched, mismatched = {}, 0, 0
-    for r in deliveries.to_dict("records"):
-        dt = r.get("_dt", parse_dt(r.get("Date")))
-        if pd.isna(dt):
+    recs = deliveries.to_dict("records")
+    matched, mstats = match_deliveries_to_journal(
+        [(k, date.fromisoformat(v["Date"]), v["Customer"], v["Invoice"]) for k, v in info.items()], recs)
+    got = {}
+    unmatched = mstats["not found"] + mstats["invoice not in journal"]
+    mismatched = mstats["invoice of another name"]
+    for r, key in zip(recs, matched):
+        if key is None:
             continue
-        ck = cust_key(r["Customer"])
-        inv = _cell_text(r.get("Invoice")).casefold()
-        key = (inv, ck) if inv not in ("", "-", "nan") else None
-        if key is None or key not in info:
-            if key is not None and inv not in by_inv:
-                unmatched += 1                              # invoice not (yet) in this journal
-                continue
-            if key is not None:
-                mismatched += 1                             # that invoice belongs to another customer name:
-            day = dt.date()                                 # never use it; find this customer's own invoice
-            cands = by_day.get((day, ck)) or by_day.get((day - timedelta(days=1), ck))
-            if not cands:
-                unmatched += 1
-                continue
-            key = cands[0]
         g = got.setdefault(key, dict(driver="", app=0, taxi=0, app_set=False, taxi_set=False, done=True))
         via = str(r.get("Local_Driver", "") or "")
         if via in DRIVER_SHORT:
@@ -14053,7 +14139,7 @@ def _make_driver_expense_csv(source, deliveries):
 STATUS_COPY_FOLDER = "Auto_Status"
 
 
-STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V3_EXPENSE2:"
+STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V3_EXPENSE3:"
 
 
 def _journal_status_rows(journal_rows, packing, deliveries, holds):
