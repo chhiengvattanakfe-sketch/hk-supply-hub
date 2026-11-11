@@ -39,6 +39,7 @@ import json
 import html
 import unicodedata
 import hashlib
+import functools
 import math
 import logging
 import urllib.parse
@@ -105,7 +106,7 @@ CACHE_DIR = os.path.join(tempfile.gettempdir(), "hk_supply_hub_cache_" + _APP_SC
 
 # Excel journal. The bot tries EXCEL_PATTERN first; if nothing matches it switches to
 # EXCEL_FALLBACK_PATTERN by itself. To force one exact file: EXCEL_OVERRIDE = "name.xlsx"
-EXCEL_PATTERN = "*conflicted copy*.xlsx"
+EXCEL_PATTERN = "*Sale*Jou*.xlsx"
 EXCEL_FALLBACK_PATTERN = "*Sale_Journal*.xlsx"
 EXCEL_OVERRIDE = ""
 
@@ -153,7 +154,8 @@ LIVE_REFRESH_SECONDS = 20              # dashboard "Live" refresh
 # --- security ---
 REMEMBER_DAYS = 30                     # "Keep me logged in" lasts this long (renews every time the person comes back)
 COOKIE_TOKEN, COOKIE_USER = "hk_remember", "hk_user"
-LOGIN_TTL_HOURS = 12                   # automatic log-out after this many hours
+LOGIN_TTL_HOURS = 12                   # the session is re-checked after this many hours (a remembered phone logs in again by itself)
+REMEMBER_MAX_DEVICES = 40              # phones / browsers that can stay logged in per account (shared accounts need many)
 MAX_FAILS = 5                          # wrong codes before a temporary lock-out
 LOCKOUT_MIN = 5                        # lock-out length (minutes)
 MAX_CASES = 10000
@@ -169,9 +171,9 @@ VERIFY_STAFF = OPS_STAFF + SALES_STAFF
 DELIVERY_HANDLERS = OPS_STAFF + LOCAL_DRIVERS
 
 DISPATCH_COLS = ["Date", "Handled_By", "Customer", "Cases", "Local_Driver",
-                 "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By", "Expense_Status"]
+                 "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By", "Expense_Status", "Invoice"]
 DISPATCH_NUM_COLS = ["Cases", "Phnom_Penh_Expense", "Taxi_Expense"]
-PACKING_COLS = ["Date", "Prepared_By", "Customer", "Cases_Packed", "Status"]
+PACKING_COLS = ["Date", "Prepared_By", "Customer", "Cases_Packed", "Status", "Invoice"]
 ASSIGN_COLS = ["Date", "Handler", "Customer", "Action"]
 HOLD_COLS = ["Date", "Customer", "Action", "Cases", "Reason", "By"]   # Action: Tomorrow | Cancel | Restore
 HOLD_NUM_COLS = ["Cases"]
@@ -199,12 +201,13 @@ PERMISSION_LABELS = {
     "view": "View dashboard and task details",
     "edit": "Create, edit, and submit changes",
     "reports": "Reports, summaries, and report exports",
+    "money": "💵 See sales money (riel amounts, prices)",
 }
-DEFAULT_PERMISSIONS_BY_ROLE = {
-    "admin": {"tasks": True, "view": True, "edit": True, "reports": True},
-    "staff": {"tasks": True, "view": True, "edit": True, "reports": True},
-    "sales": {"tasks": False, "view": True, "edit": False, "reports": True},
-    "viewer": {"tasks": False, "view": True, "edit": False, "reports": True},
+DEFAULT_PERMISSIONS_BY_ROLE = {          # sales money is hidden from everyone except Admin unless Admin turns it on
+    "admin": {"tasks": True, "view": True, "edit": True, "reports": True, "money": True},
+    "staff": {"tasks": True, "view": True, "edit": True, "reports": True, "money": False},
+    "sales": {"tasks": False, "view": True, "edit": False, "reports": True, "money": False},
+    "viewer": {"tasks": False, "view": True, "edit": False, "reports": True, "money": False},
 }
 PERMISSION_KEYS = tuple(PERMISSION_LABELS)
 
@@ -234,6 +237,64 @@ def effective_permissions(username=None, rec=None):
     return result
 
 
+APP_SECTIONS = [                         # (id, label) in menu order; Admin's own section is not listed here
+    ("packing", "📦 1. Packing Progress (Prep)"),
+    ("delivery", "🚚 2. Log Delivery (Ops)"),
+    ("sale_order", "📝 Sale Order"),
+    ("dashboard", "📊 Live Dashboard (Sales)"),
+    ("reports", "📑 Reports"),
+    ("map", "📍 Customer Map"),
+    ("insights", "🎯 Sales Insights"),
+    ("followups", "📞 Customer Follow-ups"),
+    ("visits", "🏪 Shop Visits"),
+    ("media", "📸 Media Team"),
+]
+APP_SECTION_LABEL = dict(APP_SECTIONS)
+ADMIN_SECTION_LABEL = "🤖 4. Admin: Bot, Users & Security"
+
+
+def default_sections(role, perms):
+    """Sections a person sees when Admin has not chosen them by hand (follows their permissions)."""
+    out = []
+    if perms.get("tasks"):
+        out += ["packing", "delivery"]
+    if role in ("admin", "staff", "sales"):
+        out.append("sale_order")
+    if perms.get("view"):
+        out += ["dashboard", "map", "insights"]
+    elif perms.get("reports"):
+        out.append("reports")
+    if perms.get("view") or perms.get("reports"):
+        out.append("followups")
+    if role in ("admin", "staff", "sales") and (perms.get("edit") or perms.get("reports")):
+        out += ["visits", "media"]
+    return out
+
+
+def user_sections(username=None, rec=None):
+    """Section ids this person may open: Admin's ticks when saved, otherwise the default for their permissions.
+    A section added to the app later follows the default until Admin decides."""
+    who = username or current_user()
+    if rec is None:
+        try:
+            rec = load_users().get(who, {}) if who else {}
+        except Exception:
+            rec = {}
+    role = str((rec or {}).get("role") or (current_role() if who == current_user() else "viewer"))
+    perms = effective_permissions(who, rec)
+    if role == "admin":
+        return [sid for sid, _l in APP_SECTIONS if sid != "reports"]
+    defaults = default_sections(role, perms)
+    saved = (rec or {}).get("sections")
+    if not isinstance(saved, dict) or not saved:
+        return defaults
+    return [sid for sid, _l in APP_SECTIONS if bool(saved.get(sid, sid in defaults))]
+
+
+SECTION_NEEDS = {"packing": "tasks", "delivery": "tasks", "dashboard": "view", "map": "view", "insights": "view",
+                 "reports": "reports", "visits": "edit"}
+
+
 def has_permission(permission, username=None):
     """Check an individual capability. Unknown permissions fail closed."""
     if permission not in PERMISSION_KEYS:
@@ -256,6 +317,39 @@ def has_permission(permission, username=None):
         return bool(effective_permissions(who).get(permission, False))
     except Exception:
         return False
+
+
+MONEY_LOCK = "🔒"
+_MONEY_EXACT = {"sales", "salesactual", "amount", "price", "sell", "avg sales", "sales basis"}
+_NOT_SALES_MONEY = ("expense", "សេវា", "taxi", "phnom penh ៛")
+
+
+def can_see_money():
+    """Sales money (riel) is shown only to Admin and to users Admin gave '💵 See sales money'."""
+    try:
+        return has_permission("money")
+    except Exception:
+        return False
+
+
+def _is_money_col(col):
+    c = str(col)
+    low = c.strip().lower()
+    if any(w in low for w in _NOT_SALES_MONEY):
+        return False                                   # delivery costs are not sales money: staff enter them
+    return "៛" in c or "riel" in low or low in _MONEY_EXACT
+
+
+def hide_money(df):
+    """Same table without riel columns for people who may not see sales money."""
+    if df is None or can_see_money() or not hasattr(df, "columns"):
+        return df
+    drop = [c for c in df.columns if _is_money_col(c)]
+    return df.drop(columns=drop) if drop else df
+
+
+def money_text(value):
+    return value if can_see_money() else MONEY_LOCK
 
 
 # ==========================================
@@ -285,6 +379,17 @@ def _try_parse(s, dayfirst):
 
 
 def parse_dt(v):
+    if isinstance(v, str):
+        return _parse_dt_text(v)
+    return _parse_dt_any(v)
+
+
+@functools.lru_cache(maxsize=65536)
+def _parse_dt_text(v):
+    return _parse_dt_any(v)
+
+
+def _parse_dt_any(v):
     """Parse consistently; ambiguous text follows DAYFIRST, never today's date.
     Offset-aware timestamps are converted to Cambodia local wall time for CSV filters.
     """
@@ -867,8 +972,8 @@ def issue_remember_token(user, pw_stamp):
         for h in [h for h, r in data.items() if r.get("exp", 0) < now]:
             data.pop(h, None)                                   # forget expired phones
         mine = sorted([(r.get("created", 0), h) for h, r in data.items() if r.get("user") == user])
-        for _, h in mine[:-9]:
-            data.pop(h, None)                                   # at most 10 phones / browsers per person
+        for _, h in mine[:-(REMEMBER_MAX_DEVICES - 1)]:
+            data.pop(h, None)                                   # at most REMEMBER_MAX_DEVICES phones / browsers per person
         data[_tok_hash(token)] = {"user": user, "created": now, "exp": now + REMEMBER_DAYS * 86400, "pw": pw_stamp}
         return data
     return token if _modify_tokens(_add) else None
@@ -894,59 +999,44 @@ def _tokens_fresh(force=False):
     return _read_tokens(), True
 
 
-def _users_quick():
-    """Accounts from the local copy (instant); Dropbox only when there is no local copy yet (app just started).
-    session_ok() still checks Dropbox on the following page loads, so a removed account is still logged out."""
-    try:
-        users = _read_users_file()
-        if users:
-            return users
-    except Exception:
-        pass
-    return load_users()
-
-
-def restore_from_cookie(token=None):
+def restore_from_cookie():
     """Logs the person in again from the phone's saved token (after a screen lock, a closed tab, an app restart...).
     The phone's token is only deleted when it is surely invalid — never because Dropbox was slow."""
     url_tok = _url_token()                              # always read, so it never stays in the address
     if url_tok:
-        st.session_state["_url_tok"] = url_tok
-    token = token or st.session_state.get("_url_tok") or _request_cookie(COOKIE_TOKEN)
+        st.session_state["_url_tok"] = url_tok          # kept for the "Reconnecting…" retries below
+    token = st.session_state.get("_url_tok") or _request_cookie(COOKIE_TOKEN)
     if not token:
         return False
     h, now = _tok_hash(token), time.time()
-    rec, ok = _read_tokens().get(h), True               # FAST: local copy first, no Dropbox wait
+    tokens, ok = _tokens_fresh()
+    rec = tokens.get(h)
     if rec is None:
-        tokens, ok = _tokens_fresh(force=True)          # not here yet (saved on another server / app just restarted)
+        tokens, ok = _tokens_fresh(force=True)          # maybe saved by another session a moment ago / app just restarted
         rec = tokens.get(h)
     if rec is None:
         if ok:                                          # checked the newest list: this token really does not exist
-            st.session_state["_login_diag"] = "unknown"
             st.session_state["cookie_cmd"] = ("clear",)
             st.session_state["_rescue_off"] = True
             st.session_state.pop("_url_tok", None)
             return False
         return "retry"                                  # Dropbox not reachable: try again in a moment, keep the phone's login
     try:
-        users = _users_quick()
+        users = load_users()
     except Exception:
-        return "retry"
+        return "retry"                                  # cannot check now: keep the token, try again in a moment
     u = users.get(rec["user"])
     if rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
         _modify_tokens(lambda d: (d.pop(h, None), d)[1])
-        st.session_state["_login_diag"] = ("expired" if rec.get("exp", 0) < now else
-                                           "inactive" if not u or not u.get("active", True) else "pwchanged")
         st.session_state["cookie_cmd"] = ("clear",)
         st.session_state["_rescue_off"] = True
         st.session_state.pop("_url_tok", None)
         return False
     st.session_state.pop("_rescue_off", None)
     st.session_state.pop("_url_tok", None)
-    st.session_state.pop("_login_diag", None)
     st.session_state.update({"user": rec["user"], "role": u["role"], "login_time": now,
                              "must_change": bool(u.get("must_change"))})
-    st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # write the cookie again (iPhone Safari drops old ones)
+    st.session_state["cookie_cmd"] = ("set", token, rec["user"])    # refresh the phone's cookie (iPhone/iPad Safari drops old ones)
     st.session_state.pop("_restore_tries", None)
     audit("login", f"{u['role']} (remembered)")
     if rec.get("exp", 0) - now < (REMEMBER_DAYS - 1) * 86400:     # renew once a day
@@ -1045,52 +1135,11 @@ def _cookie_js_set_raw():
             f"W.document.cookie='{COOKIE_TOKEN}='+t+'; max-age={age}; path=/; SameSite=Lax'+s;")
 
 
-LOGIN_BRIDGE = "hk_login_bridge"
-
-
-def _login_bridge():
-    """Reads the saved login from this phone (localStorage, then cookie) and hands it to Python through a hidden
-    box — the same trick as the Shop Visits GPS check-in. No page reload, no need for the cookie to reach the server.
-    Returns the token, "none" when the phone has no saved login, or None while still waiting for the phone."""
-    n = st.session_state.get("_lb_n", 0)
-    st.markdown(f"""<style>div[data-testid="stTextInput"]:has(input[aria-label="{LOGIN_BRIDGE}"])
-        {{position:absolute;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0}}</style>""",
-                unsafe_allow_html=True)
-    raw = st.text_input(LOGIN_BRIDGE, key=f"lb_{n}", label_visibility="collapsed")
-    if raw:
-        st.session_state["_lb_n"] = n + 1               # next time a fresh, empty box
-        return raw.strip()
-    st.components.v1.html(f"""<script>
-/* try {n} */
-(function(){{
-  var W = window.parent, t = '';
-  try {{ t = W.localStorage.getItem('{COOKIE_TOKEN}') || ''; }} catch(e) {{}}
-  if (!t) {{ var m = W.document.cookie.match(/(?:^|; ){COOKIE_TOKEN}=([^;]+)/); t = m ? decodeURIComponent(m[1]) : ''; }}
-  var tries = 0;
-  function send(){{
-    var el = W.document.querySelector('input[aria-label="{LOGIN_BRIDGE}"]');
-    if (!el) {{ if (++tries < 500) setTimeout(send, 10); return; }}
-    var set = Object.getOwnPropertyDescriptor(W.HTMLInputElement.prototype, 'value').set;
-    set.call(el, t || 'none');
-    el.dispatchEvent(new Event('input', {{bubbles:true}}));
-    ['keydown','keypress','keyup'].forEach(function(k){{
-      el.dispatchEvent(new KeyboardEvent(k, {{key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true}}));
-    }});
-    el.dispatchEvent(new Event('blur', {{bubbles:true}}));
-    el.dispatchEvent(new FocusEvent('focusout', {{bubbles:true}}));
-  }}
-  send();
-}})();
-</script>""", height=0)
-    return None
-
-
 def _clear_session():
     st.session_state.pop("_table_drafts", None)
     st.session_state.pop("_task_preferences", None)
     st.session_state.pop("last_customer_upload_export", None)
-    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions", "_url_tok",
-              "_lb_done", "_lb_retry"):
+    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions", "_url_tok"):
         st.session_state.pop(k, None)
 
 
@@ -1148,7 +1197,6 @@ def _try_login(username, password, remember=False):
             for k in keys:
                 guard["fails"].pop(k, None)
         st.session_state.pop("_rescue_off", None)
-        st.session_state.pop("_login_diag", None)
         st.session_state.update({"user": uname, "role": rec["role"], "login_time": time.time(),
                                  "must_change": bool(rec.get("must_change"))})
         audit("login", rec["role"])
@@ -1156,9 +1204,6 @@ def _try_login(username, password, remember=False):
             tok = issue_remember_token(uname, rec.get("pw_changed", ""))
             if tok:
                 st.session_state["cookie_cmd"] = ("set", tok, uname)
-            else:
-                st.session_state["save_warning"] = ("⚠️ មិនអាចរក្សាទុក login លើទូរស័ព្ទនេះបានទេ (could not save 'Keep me "
-                                                    "logged in' — storage busy). Log out រួច Log in ម្តងទៀត។")
 
         def _stamp(u):
             if uname in u:
@@ -1283,8 +1328,7 @@ def _inapp_browser():
 
 def _remember_state():
     """'on' when this browser sent a valid saved login with this page, 'off' otherwise."""
-    rem = st.session_state.get("_remember")
-    tok = _request_cookie(COOKIE_TOKEN) or (rem[0] if rem else None)
+    tok = _request_cookie(COOKIE_TOKEN)
     if not tok:
         return "off"
     rec = _read_tokens().get(_tok_hash(tok))
@@ -1296,25 +1340,8 @@ LOGIN_TIPS_KM = ("បើកកម្មវិធីក្នុង **Chrome** (A
                  "ពេល Log in ត្រូវធីក ✅ Keep me logged in។")
 
 
-LOGIN_DIAG = {
-    "nophone": "ទូរស័ព្ទ/browser នេះមិនមាន login ដែលបានរក្សាទុកទេ (No saved login on this phone/browser). "
-               "Log in ម្តង ហើយធីក ✅ Keep me logged in។ បើនៅតែកើតម្តងទៀត៖ browser កំពុងលុបទិន្នន័យ "
-               "(Private tab, Telegram/Facebook browser, ឬ link ផ្សេង)។",
-    "unknown": "Server មិនស្គាល់ login ដែលបានរក្សាទុកនៅលើទូរស័ព្ទនេះ (saved login not found on the server — "
-               "the login list was lost or not saved to Dropbox). Log in ម្តងទៀត។",
-    "expired": "Login ដែលបានរក្សាទុកផុតកំណត់ហើយ (saved login expired). Log in ម្តងទៀត។",
-    "inactive": "គណនីនេះត្រូវបានបិទ ឬលុប (account disabled or removed).",
-    "pwchanged": "Password ត្រូវបានប្តូរ — login ចាស់លែងប្រើបាន (password changed). Log in ម្តងទៀត។",
-    "storage": "មិនអាចភ្ជាប់ Dropbox បាន (could not reach storage). សូមរង់ចាំបន្តិច រួចចុច Refresh។",
-}
-
-
 def render_login():
-    _diag = st.session_state.get("_login_diag")
-    if _diag in LOGIN_DIAG:
-        st.caption(f"ℹ️ ហេតុអ្វីត្រូវ Log in (why): {LOGIN_DIAG[_diag]}  [code: {_diag}]")
-    if not USE_DROPBOX:
-        st.caption("⚠️ Admin: Dropbox is not set up, so saved logins are lost every time the app restarts.")
+    _cookie_rescue()
     app = _inapp_browser()
     if app:
         st.warning(f"⚠️ អ្នកកំពុងបើកក្នុង browser របស់ {app}។ វាមិនចាំ login ទេ ដូច្នេះអ្នកត្រូវ Log in រាល់ពេល។ "
@@ -1376,52 +1403,20 @@ def render_force_change():
 def require_login():
     """Shows the login page (and stops the app) until the person is logged in. Returns the role."""
     if not session_ok():
-        got = restore_from_cookie()                    # cookie reached the server: log in at once
+        got = restore_from_cookie()                        # phone was locked / tab closed / app restarted: use the saved token
         if got == "retry":
             tries = st.session_state.get("_restore_tries", 0) + 1
             st.session_state["_restore_tries"] = tries
-            if tries <= 4:                             # storage busy right after an app restart: short wait, try again
+            if tries <= 4:                                 # storage busy right after an app restart: wait instead of logging out
                 st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
-                time.sleep(0.3)
+                time.sleep(1.5 * tries)
                 st.rerun()
-
-    # The cookie did not reach the server (common after a screen lock on phones):
-    # ask the phone itself for its saved login, then continue in the SAME run (no extra page reload).
-    if (not st.session_state.get("user") and not st.session_state.get("_lb_done")
-            and not st.session_state.get("_rescue_off")):
-        box = st.empty()
-        with box.container():
-            st.info("🔄 កំពុងភ្ជាប់ឡើងវិញ… (Reconnecting, please wait)")
-            tok = _login_bridge()
-            if tok is None:                            # waiting for the phone's answer
-                if st.button("🔐 Log in with password", key="lb_skip"):
-                    st.session_state["_lb_done"] = True
-                    st.rerun()
-                st.stop()
-        st.session_state["_lb_done"] = True
-        if tok == "none":
-            st.session_state["_login_diag"] = "nophone"
-        else:
-            got = restore_from_cookie(tok)
-            if got == "retry":
-                n = st.session_state.get("_lb_retry", 0) + 1
-                st.session_state["_lb_retry"] = n
-                if n <= 3:                             # Dropbox slow right after waking: ask again
-                    st.session_state["_lb_done"] = False
-                    time.sleep(0.3)
-                    st.rerun()
-                st.session_state["_login_diag"] = "storage"
-        box.empty()                                    # remove the "Reconnecting" note and the hidden box
-
     _emit_cookie_cmd()
     if session_ok():
-        st.session_state.pop("_restore_tries", None)
         if st.session_state.get("must_change"):
             render_force_change()
             st.stop()
         return st.session_state["role"]
-
-    st.session_state.pop("_restore_tries", None)
     render_login()
     st.stop()
 
@@ -1599,6 +1594,23 @@ def pull(path, force=False, max_age=30.0):
     if not USE_DROPBOX:
         return
     S, name = _sync_state(), os.path.basename(path)
+    if not force:
+        if time.time() - S["last_pull"].get(path, 0) < max_age:
+            return
+        try:
+            entry = _remote_listing().get(name.lower())
+        except Exception:
+            entry = None
+        if entry is not None:
+            with S["lock"]:
+                if S["rev"].get(path) == entry["rev"] and os.path.exists(path):
+                    S["last_pull"][path] = time.time()
+                    return
+                downloaded, res = _dbx().files_download(_rpath(name))
+                _write_atomic(path, res.content)
+                S["rev"][path] = downloaded.rev
+                S["last_pull"][path] = time.time()
+            return
     with S["lock"]:
         if not force and time.time() - S["last_pull"].get(path, 0) < max_age:
             return
@@ -1639,6 +1651,14 @@ def push(path):
             raise
         S["rev"][path] = md.rev
         S["last_pull"][path] = time.time()
+    try:                                       # our own save: the folder list now knows the new version
+        state = _remote_list_state()
+        with state["lock"]:
+            e = state["entries"].get(name.lower())
+            state["entries"][name.lower()] = {**(e or {"name": name, "mtime": time.time()}), "rev": md.rev,
+                                              "hash": getattr(md, "content_hash", None) or md.rev}
+    except Exception:
+        pass
 
 
 def _log_pull_once(path):
@@ -1679,33 +1699,91 @@ def _schedule_log_push(path):
         t.start()
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _list_remote_folder(_token=0):
-    dbx, out = _dbx(), []
+REMOTE_LIST_EVERY_S = 12         # the Dropbox folder list is refreshed in the background this often
+REMOTE_LIST_MAX_AGE_S = 60       # an older list is never trusted: the page then asks Dropbox directly
+
+
+@st.cache_resource(show_spinner=False)
+def _remote_list_state():
+    return {"entries": {}, "t": 0.0, "lock": threading.Lock(), "thread": None, "used": 0.0}
+
+
+def _fetch_remote_folder(dbx):
+    out = {}
     res = dbx.files_list_folder(DROPBOX_FOLDER)
     while True:
         for e in res.entries:
             if hasattr(e, "rev"):
-                out.append({"name": e.name, "rev": e.rev,
-                            "hash": getattr(e, "content_hash", None) or e.rev,
-                            "mtime": e.server_modified.replace(tzinfo=timezone.utc).timestamp()})
+                out[e.name.lower()] = {"name": e.name, "rev": e.rev,
+                                       "hash": getattr(e, "content_hash", None) or e.rev,
+                                       "mtime": e.server_modified.replace(tzinfo=timezone.utc).timestamp()}
         if not res.has_more:
             break
         res = dbx.files_list_folder_continue(res.cursor)
     return out
 
 
+def _remote_list_worker(state, dbx):
+    """One background thread per server: keeps the folder list fresh so page clicks never wait for Dropbox."""
+    while time.time() - state["used"] < 900:            # stop after 15 min without visitors
+        time.sleep(REMOTE_LIST_EVERY_S)
+        try:
+            entries = _fetch_remote_folder(dbx)
+            with state["lock"]:
+                state["entries"], state["t"] = entries, time.time()
+        except Exception:
+            pass
+    with state["lock"]:
+        state["thread"] = None
+
+
+def _remote_listing():
+    """{lower-case file name: info} for the Dropbox folder. Instant after the first call."""
+    state = _remote_list_state()
+    state["used"] = time.time()
+    with state["lock"]:
+        fresh = time.time() - state["t"] < REMOTE_LIST_MAX_AGE_S
+        alive = state["thread"] is not None and state["thread"].is_alive()
+    if not fresh:
+        entries = _fetch_remote_folder(_dbx())
+        with state["lock"]:
+            state["entries"], state["t"] = entries, time.time()
+    if not alive:
+        with state["lock"]:
+            if state["thread"] is None or not state["thread"].is_alive():
+                th = threading.Thread(target=_remote_list_worker, args=(state, _dbx()), daemon=True, name="dropbox-list")
+                state["thread"] = th
+                th.start()
+    return state["entries"]
+
+
+def _remote_listing_forget():
+    state = _remote_list_state()
+    with state["lock"]:
+        state["t"] = 0.0
+
+
+def _remote_entry(name):
+    return _remote_listing().get(str(name).lower())
+
+
+def _list_remote_folder(_token=0):
+    return list(_remote_listing().values())
+
+
 def _remote_excel_names():
     try:
         return [x for x in _list_remote_folder()
-                if x["name"].lower().endswith(".xlsx") and not x["name"].startswith("~$")]
+                if x["name"].lower().endswith(".xlsx") and not x["name"].startswith("~$")
+                and ("conflicted copy" not in x["name"].lower() or x["name"].lower() == EXCEL_OVERRIDE.lower())
+                and not x["name"].lower().endswith("__status.xlsx")]
     except Exception:
         return []
 
 
 def _pick_remote(names, pattern):
     ms = [x for x in names if fnmatch.fnmatchcase(x["name"].lower(), pattern.lower())]
-    return max(ms, key=lambda x: x["mtime"]) if ms else None
+    return _pick_by_month(ms, lambda x: x["name"], lambda x: x["mtime"]) if ms else None
 
 
 def excel_pattern_matches():
@@ -1720,30 +1798,27 @@ def _dropbox_excel():
     S = _sync_state()
     try:
         names = [x for x in _list_remote_folder()
-                 if x["name"].lower().endswith(".xlsx") and not x["name"].startswith("~$")]
+                 if x["name"].lower().endswith(".xlsx") and not x["name"].startswith("~$")
+                and ("conflicted copy" not in x["name"].lower() or x["name"].lower() == EXCEL_OVERRIDE.lower())
+                and not x["name"].lower().endswith("__status.xlsx")]
         chosen = None
         if EXCEL_OVERRIDE:
             chosen = next((x for x in names if x["name"].lower() == EXCEL_OVERRIDE.lower()), None)
         chosen = chosen or _pick_remote(names, EXCEL_PATTERN) or _pick_remote(names, EXCEL_FALLBACK_PATTERN)
         if not chosen:
             return None
-        local = os.path.join(DATA_DIR, chosen["name"])
-        with S["lock"]:
-            if (not os.path.exists(local)) or S["xl_hash"].get(chosen["name"]) != chosen["hash"]:
-                _, res = _dbx().files_download(_rpath(chosen["name"]))
-                _write_atomic(local, res.content)
-                S["xl_hash"][chosen["name"]] = chosen["hash"]
-        return local
+        return _dropbox_fetch_journal(chosen)
     except Exception as e:
         bot_log("warn", "Dropbox", f"Cannot fetch the journal: {str(e)[:120]}", "using the saved copy")
         old = [f for f in glob.glob(os.path.join(DATA_DIR, "*.xlsx")) if not os.path.basename(f).startswith("~$")]
-        return max(old, key=os.path.getmtime) if old else None
+        return _pick_by_month(old, os.path.basename, os.path.getmtime) if old else None
 
 
 def resync_now():
     """Forget everything we know about Dropbox so the next read downloads fresh copies."""
     st.cache_data.clear()
     if USE_DROPBOX:
+        _remote_listing_forget()
         S = _sync_state()
         with S["lock"]:
             S["last_pull"].clear()
@@ -1798,14 +1873,15 @@ def latest_good_backup(path):
     return max(files, key=os.path.getmtime) if files else None
 
 
-def prune_backups():
+def prune_backups(dbx=None):
     removed = 0
     try:
         if USE_DROPBOX:
-            res = _dbx().files_list_folder(_remote_backup_dir())
+            dbx = dbx or _dbx()
+            res = dbx.files_list_folder(_remote_backup_dir())
             ents = list(res.entries)
             while res.has_more:
-                res = _dbx().files_list_folder_continue(res.cursor)
+                res = dbx.files_list_folder_continue(res.cursor)
                 ents += list(res.entries)
             now = datetime.now(timezone.utc).timestamp()
             for e in ents:
@@ -1814,7 +1890,7 @@ def prune_backups():
                 age_days = (now - e.server_modified.replace(tzinfo=timezone.utc).timestamp()) / 86400
                 extra = re.match(r"^\d{4}-\d{2}-\d{2}_\d{6}_", e.name)
                 if age_days > 30 or (extra and age_days > 7):
-                    _dbx().files_delete_v2(f"{_remote_backup_dir()}/{e.name}")
+                    dbx.files_delete_v2(f"{_remote_backup_dir()}/{e.name}")
                     removed += 1
             return removed
         now = time.time()
@@ -1829,51 +1905,105 @@ def prune_backups():
     return removed
 
 
+_BACKUP_FILES = lambda: (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE,
+                         MAP_REGISTRY_FILE, CALLS_FILE, SI_ALIAS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
+                         os.path.join(DATA_DIR, "media_shoots.csv"), os.path.join(DATA_DIR, "media_status.csv"),
+                         os.path.join(DATA_DIR, "visit_settings.json"))
+
+
 def daily_backup_once(day_str):
-    """Retry failed backups, cache only success, and protect accounts/locations too."""
+    """Retry failed backups, cache only success, and protect accounts/locations too.
+    Dropbox mode: runs in the background (about 30 Dropbox requests) so the first click of the day never waits."""
     state = _sync_state()
+    if not USE_DROPBOX:
+        return _daily_backup_local(state, day_str)
+    with state["lock"]:
+        if state.get("backup_day") != day_str:
+            state["backup_day"] = day_str
+            state["backup_done"] = set()
+            state["backup_failures"] = []
+            state["backup_try"] = 0.0
+        done_all = state.get("backup_ok_day") == day_str
+        running = state.get("backup_running", False)
+        recent = time.time() - state.get("backup_try", 0.0) < 600           # failed ones are retried every 10 min
+        if done_all or running or recent:
+            return list(state.get("backup_failures", []))
+        state["backup_running"], state["backup_try"] = True, time.time()
+    try:
+        dbx = _dbx()
+        names = {k: v for k, v in _remote_listing().items()}
+    except Exception as e:
+        with state["lock"]:
+            state["backup_running"] = False
+            state["backup_failures"] = [f"Cannot access backup folder: {str(e)[:120]}"]
+        return list(state["backup_failures"])
+    threading.Thread(target=_daily_backup_dropbox, args=(state, dbx, names, day_str), daemon=True,
+                     name="daily-backup").start()
+    return list(state.get("backup_failures", []))
+
+
+def _daily_backup_dropbox(state, dbx, remote_names, day_str):
+    failures = []
+    try:
+        try:
+            dbx.files_create_folder_v2(_remote_backup_dir())
+        except Exception as e:
+            if not _is_conflict(e):
+                raise
+        for path in _BACKUP_FILES():
+            base = os.path.basename(path)
+            with state["lock"]:
+                if path in state.setdefault("backup_done", set()):
+                    continue
+            if base.lower() not in remote_names:
+                continue
+            dest = f"{_remote_backup_dir()}/{day_str}_{base}"
+            try:
+                try:
+                    dbx.files_get_metadata(dest)
+                except Exception as e:
+                    if not _is_not_found(e):
+                        raise
+                    dbx.files_copy_v2(_rpath(base), dest)
+                with state["lock"]:
+                    state["backup_done"].add(path)
+            except Exception as e:
+                failures.append(f"{base}: {str(e)[:160]}")
+        if not failures and state.get("pruned_day") != day_str:
+            prune_backups(dbx)
+            state["pruned_day"] = day_str
+    except Exception as e:
+        failures.append(f"Cannot access backup folder: {str(e)[:120]}")
+    with state["lock"]:
+        state["backup_failures"] = failures
+        state["backup_running"] = False
+        if not failures:
+            state["backup_ok_day"] = day_str
+
+
+def _daily_backup_local(state, day_str):
     failures = []
     with state["lock"]:
         if state.get("backup_day") != day_str:
             state["backup_day"] = day_str
             state["backup_done"] = set()
         done = state.setdefault("backup_done", set())
-        files = (DATA_FILE, PACKING_FILE, ASSIGN_FILE, HOLD_FILE, ORDERS_FILE, USERS_FILE, LOCATIONS_FILE, MAP_REGISTRY_FILE, CALLS_FILE, SI_ALIAS_FILE, VISITS_FILE, VISIT_ZONE_FILE, VISIT_PIN_FILE, LEADS_FILE,
-                 os.path.join(DATA_DIR, "visit_settings.json"))
-        if USE_DROPBOX:
-            try:
-                _dbx().files_create_folder_v2(_remote_backup_dir())
-            except Exception as e:
-                if not _is_conflict(e):
-                    return [f"Cannot access backup folder: {str(e)[:120]}"]
-        else:
-            try:
-                os.makedirs(BACKUP_DIR, exist_ok=True)
-            except OSError as e:
-                return [f"Cannot access backup folder: {str(e)[:120]}"]
-        for path in files:
+        try:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+        except OSError as e:
+            return [f"Cannot access backup folder: {str(e)[:120]}"]
+        for path in _BACKUP_FILES():
             if path in done:
                 continue
             base = os.path.basename(path)
             try:
-                if USE_DROPBOX:
-                    if remote_meta(base) is None:
-                        continue
-                    dest = f"{_remote_backup_dir()}/{day_str}_{base}"
-                    try:
-                        _dbx().files_get_metadata(dest)
-                    except Exception as e:
-                        if not _is_not_found(e):
-                            raise
-                        _dbx().files_copy_v2(_rpath(base), dest)
-                else:
-                    if not os.path.exists(path):
-                        continue
-                    dest = os.path.join(BACKUP_DIR, f"{day_str}_{base}")
-                    if not os.path.exists(dest):
-                        with file_lock(path):
-                            with open(path, "rb") as f:
-                                _write_atomic(dest, f.read())
+                if not os.path.exists(path):
+                    continue
+                dest = os.path.join(BACKUP_DIR, f"{day_str}_{base}")
+                if not os.path.exists(dest):
+                    with file_lock(path):
+                        with open(path, "rb") as f:
+                            _write_atomic(dest, f.read())
                 done.add(path)
             except Exception as e:
                 failures.append(f"{base}: {str(e)[:160]}")
@@ -1979,6 +2109,7 @@ def save_csv(path, df):
         _write_atomic(path, out.to_csv(index=False).encode("utf-8-sig"))
         if USE_DROPBOX:
             push(path)
+    _status_copy_kick(path)
 
 
 def _append_local_many(path, rows):
@@ -1998,6 +2129,9 @@ def append_rows(path, rows):
     rows = [{k: (v if k == "Date" or not isinstance(v, str) else safe_text(v)) for k, v in r.items()} for r in rows]
     if not rows:
         return
+    if path in (PACKING_FILE, DATA_FILE):                 # link the journal invoice when there is exactly one
+        for row in rows:
+            row["Invoice"] = _resolve_record_invoice(row)
     spec = next((spec for spec in FILES.values() if spec[0] == path), None)
     if spec:
         raw = pd.DataFrame(rows)
@@ -2013,6 +2147,7 @@ def append_rows(path, rows):
             raise RuntimeError("Cannot save: choose a customer for every row.")
     if not USE_DROPBOX:
         _retry(lambda: _append_local_many(path, rows))
+        _status_copy_kick(path)
         return
     last = None
     for attempt in range(6):
@@ -2021,6 +2156,7 @@ def append_rows(path, rows):
                 pull(path, force=attempt > 0, max_age=10.0)      # first try: no extra Dropbox call; a conflict forces a fresh copy
                 _append_local_many(path, rows)
                 push(path)
+            _status_copy_kick(path)
             return
         except ConflictError as e:
             last = e
@@ -2061,13 +2197,74 @@ def rows_for_day(df, target_date):
 # ==========================================
 # EXCEL JOURNAL SNAPSHOT (fast read-only parse + memory cache + disk cache)
 # ==========================================
+def _dropbox_fetch_journal(chosen):
+    """Local copy of one journal listed in Dropbox (downloaded only when it changed)."""
+    S = _sync_state()
+    local = os.path.join(DATA_DIR, chosen["name"])
+    with S["lock"]:
+        if (not os.path.exists(local)) or S["xl_hash"].get(chosen["name"]) != chosen["hash"]:
+            _, res = _dbx().files_download(_rpath(chosen["name"]))
+            _write_atomic(local, res.content)
+            S["xl_hash"][chosen["name"]] = chosen["hash"]
+    return local
+
+
+JOURNAL_PREV_MONTH_DAYS = 7      # in the first days of a month the previous month's journal is read as well
+
+
+def _ym_add(ym, n):
+    y, m = ym[0], ym[1] + n
+    while m > 12:
+        y, m = y + 1, m - 12
+    while m < 1:
+        y, m = y - 1, m + 12
+    return (y, m)
+
+
+def find_excel_files():
+    """[main journal, neighbour month journals...].
+    Next month's journal is read too as soon as it exists (orders for the 1st are typed on the last day of the
+    month), and in the first days of a month also last month's journal (late entries, reports of last week)."""
+    main = find_excel_file()
+    if not main:
+        return []
+    ym = _journal_ym(os.path.basename(main))
+    if not ym or EXCEL_OVERRIDE:
+        return [main]
+    want = [_ym_add(ym, 1)]
+    t = today_kh()
+    if (t.year, t.month) == ym and t.day <= JOURNAL_PREV_MONTH_DAYS:
+        want.append(_ym_add(ym, -1))
+    out = [main]
+    try:
+        if USE_DROPBOX:
+            names = [x for x in _remote_excel_names() if fnmatch.fnmatchcase(x["name"].lower(), EXCEL_PATTERN.lower())]
+            for w in want:
+                ms = [x for x in names if _journal_ym(x["name"]) == w and x["name"] != os.path.basename(main)]
+                if ms:
+                    out.append(_dropbox_fetch_journal(max(ms, key=lambda x: x["mtime"])))
+        else:
+            fs = [f for f in glob.glob(os.path.join(CURRENT_DIR, EXCEL_PATTERN))
+                  if not os.path.basename(f).startswith("~$") and "conflicted copy" not in os.path.basename(f).lower()
+                  and not os.path.basename(f).lower().endswith("__status.xlsx") and os.path.abspath(f) != os.path.abspath(main)]
+            for w in want:
+                ms = [f for f in fs if _journal_ym(os.path.basename(f)) == w]
+                if ms:
+                    out.append(max(ms, key=os.path.getmtime))
+    except Exception as e:
+        bot_log("warn", "Excel", f"Next / last month journal not read: {str(e)[:120]}", "using this month only")
+    return out
+
+
 def find_excel_file():
     if USE_DROPBOX:
         return _dropbox_excel()
 
     def _files(pattern):
         fs = glob.glob(os.path.join(CURRENT_DIR, pattern))
-        return [f for f in fs if not os.path.basename(f).startswith("~$")]
+        return [f for f in fs if not os.path.basename(f).startswith("~$")
+                and "conflicted copy" not in os.path.basename(f).lower()
+                and not os.path.basename(f).lower().endswith("__status.xlsx")]
 
     if EXCEL_OVERRIDE:
         p = os.path.join(CURRENT_DIR, EXCEL_OVERRIDE)
@@ -2076,7 +2273,7 @@ def find_excel_file():
     for pat in (EXCEL_PATTERN, EXCEL_FALLBACK_PATTERN):
         fs = _files(pat)
         if fs:
-            return max(fs, key=os.path.getmtime)
+            return _pick_by_month(fs, os.path.basename, os.path.getmtime)
     return None
 
 
@@ -2288,17 +2485,77 @@ def get_snapshot(path, mtime_ns, size):
     return load_snapshot(path, mtime_ns, size)
 
 
+_MERGED_SNAP = {}
+
+
+def _merge_journal_snapshots(main_path, main, extras):
+    """Main journal + the rows of next / last month's journal that belong to that file's own month.
+    Rows already in the main journal (same day, customer and invoice) are not added twice."""
+    j = main["journal"].copy()
+    j["JournalFile"] = os.path.basename(main_path)
+    have = set(zip(j["Date"], j["Customer"].map(norm_name), j["Invoice"].astype(str)))
+    parts, customers, areas = [j], list(main["customers"]), {}
+    seen = {norm_name(c) for c in customers}
+    for path, snap in extras:
+        ym = _journal_ym(os.path.basename(path))
+        x = snap["journal"]
+        if x.empty or not ym:
+            continue
+        d = pd.to_datetime(x["Date"], errors="coerce")
+        x = x[(d.dt.year == ym[0]) & (d.dt.month == ym[1])]
+        keys = list(zip(x["Date"], x["Customer"].map(norm_name), x["Invoice"].astype(str)))
+        x = x[[k not in have for k in keys]].copy()
+        if x.empty:
+            continue
+        x["JournalFile"] = os.path.basename(path)
+        parts.append(x)
+        for c in snap["customers"]:
+            if norm_name(c) not in seen:
+                customers.append(c)
+                seen.add(norm_name(c))
+        areas.update(snap.get("areas", {}))
+    merged = pd.concat(parts, ignore_index=True, sort=False) if len(parts) > 1 else j
+    for c in merged.columns:
+        if re.fullmatch(r"N\d+", str(c)):
+            merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
+    merged = merged.sort_values("Date", kind="stable").reset_index(drop=True)
+    areas.update(main.get("areas", {}))                        # this month's Master List wins
+    return dict(main, journal=merged, customers=customers, areas=areas,
+                skipped=list(main.get("skipped", [])),
+                journal_files=[os.path.basename(main_path)] + [os.path.basename(p) for p, _ in extras])
+
+
 def current_snapshot():
-    """(snapshot | None, source, path, error text | None). Never raises."""
-    path = find_excel_file()
+    """(snapshot | None, source, path, error text | None). Never raises.
+    path = this month's journal; next month's journal (and last month's in the first days) is merged in."""
+    paths = find_excel_files()
+    path = paths[0] if paths else None
     if not path or not os.path.exists(path):
         return None, None, path, f"No journal file found in {where_text()}"
     try:
         stt = os.stat(path)
         data, src = get_snapshot(path, stt.st_mtime_ns, stt.st_size)
-        return data, src, path, None
     except Exception as e:
         return None, None, path, str(e)
+    extras, sig = [], [(path, stt.st_mtime_ns, stt.st_size)]
+    for p in paths[1:]:
+        try:
+            ps = os.stat(p)
+            extras.append((p, get_snapshot(p, ps.st_mtime_ns, ps.st_size)[0]))
+            sig.append((p, ps.st_mtime_ns, ps.st_size))
+        except Exception as e:
+            bot_log("warn", "Excel", f"Cannot read {os.path.basename(p)}: {str(e)[:120]}", "using this month only")
+    if not extras:
+        return data, src, path, None
+    sig = tuple(sig)
+    if _MERGED_SNAP.get("sig") != sig:
+        try:
+            merged = _merge_journal_snapshots(path, data, extras)
+        except Exception as e:
+            bot_log("warn", "Excel", f"Could not add next / last month journal: {str(e)[:120]}", "using this month only")
+            return data, src, path, None
+        _MERGED_SNAP.update(sig=sig, val=merged)
+    return _MERGED_SNAP["val"], src, path, None
 
 
 def get_customer_list():
@@ -2335,7 +2592,7 @@ def _check_csv(add, key, master, auto_fix):
     suggestions = []
     if USE_DROPBOX:
         try:
-            pull(path, force=True)
+            pull(path)                       # uses the background folder list: no wait unless the file changed
         except Exception as e:
             add("error", label, f"Cannot refresh {base}: {str(e)[:100]}", "retry when storage is available; no repair attempted")
             return suggestions
@@ -2366,13 +2623,9 @@ def _check_csv(add, key, master, auto_fix):
     notes = []
     if missing:
         notes.append("added optional columns: " + ", ".join(missing))
-    if master:
-        canon = canonical_map(master)
-        corrected = fixed["Customer"].map(lambda n: canon.get(norm_name(n), n))
-        count = int((corrected != fixed["Customer"]).sum())
-        fixed["Customer"] = corrected
-        if count:
-            notes.append(f"normalized spacing/capitalization for {count} customer names")
+    # Customer names are NOT rewritten any more: renaming them to the Master List spelling made saved
+    # packing/delivery rows stop matching the journal spelling, so customers stayed "Pending".
+    # The dashboard matches names ignoring capitals/spaces (cust_key), so no rename is needed.
     duplicate_count = int(raw.duplicated(subset=[c for c in cols if c in raw]).sum())
     if duplicate_count:
         add("warn", label, f"{base}: {duplicate_count} exact repeated records", "review possible duplicates; all records retained")
@@ -2433,7 +2686,7 @@ def run_health_check(auto_fix=True):
     # --- storage ---
     if USE_DROPBOX:
         try:
-            _dbx().files_get_metadata(DROPBOX_FOLDER)
+            _remote_listing()
             add("info", "Dropbox", f"Connected - data folder {DROPBOX_FOLDER}", "-")
         except Exception as e:
             add("error", "Dropbox", f"Cannot open folder '{DROPBOX_FOLDER}': {str(e)[:120]}",
@@ -2685,6 +2938,11 @@ footer {visibility: hidden;}
 .hk-group {font-weight: 700; margin: 16px 0 4px; padding-bottom: 3px; border-bottom: 2px solid rgba(128,128,128,.3);}
 @media (max-width: 640px) {
   .block-container {padding-left: .7rem; padding-right: .7rem;}
+  input, textarea, [data-baseweb="select"] {font-size: 16px !important;}
+  .stButton > button, div[data-testid="stFormSubmitButton"] > button {min-height: 48px; width: 100%;}
+  .hk-top {flex-wrap: wrap;}
+  [data-testid="stHorizontalBlock"] {flex-wrap: wrap;}
+  [data-testid="stColumn"] {min-width: min(100%, 280px);}
   h1 {font-size: 1.45rem !important;}
   h3 {font-size: 1.15rem !important;}
   .hk-pill {font-size: .85rem; padding: 3px 9px;}
@@ -2793,7 +3051,11 @@ hr {border-color: var(--line) !important;}
 
 
 def show_df(df, height=None, key=None, selectable=False, column_config=None):
-    """Shows a table. Returns the selection event when row-click is available (else None)."""
+    """Shows a table. Returns the selection event when row-click is available (else None). Riel columns are hidden
+    from people without the 'See sales money' permission."""
+    df = hide_money(df)
+    if column_config:
+        column_config = {k: v for k, v in column_config.items() if not (_is_money_col(k) and not can_see_money())}
     base = {"hide_index": True}
     if height:
         base["height"] = height
@@ -2810,6 +3072,8 @@ def show_df(df, height=None, key=None, selectable=False, column_config=None):
 
 
 def kpi(container, label, value):
+    if _is_money_col(label) and not can_see_money():
+        value = MONEY_LOCK
     try:
         container.metric(label, value, border=True)
     except TypeError:
@@ -2839,6 +3103,8 @@ def via_options():
 
 def expense_status(via, station, pp, taxi):
     """'Pending' while a needed expense (Grab/TukTuk or a taxi station) has no amount yet, otherwise 'Done'."""
+    if via == PENDING_VIA:
+        return "Pending"
     station = (station or "").strip()
     need_pp = via == BASE_VIA
     need_taxi = station not in ("", "-")
@@ -2848,7 +3114,7 @@ def expense_status(via, station, pp, taxi):
 def current_assignments(day=None):
     """{customer: handler} for a day (the last Assign / Release of each customer wins)."""
     df = rows_for_day(read_raw(ASSIGN_FILE, ASSIGN_COLS), day or today_kh())
-    out = {}
+    out = CustomerDict()
     for r in df.to_dict("records"):
         if r["Action"] == "Assign":
             out[r["Customer"]] = r["Handler"]
@@ -2872,6 +3138,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
         else:
             customer_name = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
+        invoice_number = ""  # Invoice linking is automatic; staff save by customer.
         d_cases = max(0, min(int(default_cases), MAX_CASES))
         cases = st.number_input("ចំនួនកេស (Number of Cases):", min_value=0, max_value=MAX_CASES, step=1,
                                 value=d_cases, key=f"{k}_cases_{d_cases}")
@@ -2886,13 +3153,13 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
         local_driver = st.selectbox(
             "Delivery method - choose My own delivery if the selected staff member delivers it themselves:",
             ["None (Grab/TukTuk)", SELF_DELIVERY] + LOCAL_DRIVERS + [PICKUP_VIA], key=f"{k}_drv")
-        taxi_station = st.text_input("Taxi Station Name (Leave blank if purely local Phnom Penh delivery):",
+        taxi_station = st.text_input("Taxi station (only if using a paid taxi; otherwise leave blank, including Ta Khmau):",
                                      max_chars=MAX_TEXT, key=f"{k}_taxi")
         delivery_note = st.text_input("📝 Note (Optional: Taxi phone number, plate, or instructions):",
                                       max_chars=MAX_TEXT, key=f"{k}_note")
 
         st.markdown("#### Expenses (៛ Riel) - optional now, you can fill them later in the Delivery tab")
-        st.caption("For My own delivery or a named local driver, leave Phnom Penh transport expense at 0 unless you actually paid a transport fee.")
+        st.caption("តួ and វុទ្ធា: Phnom Penh expense is automatically saved as 0. Enter taxi expense only when a paid taxi is used. Phnom Penh, Ta Khmau and other direct deliveries can have 0 taxi expense.")
         pp_expense = st.number_input("1. Phnom Penh Expense (៛) - Enter 0 if using own delivery / local driver:",
                                      min_value=0, max_value=MAX_RIEL, step=500, key=f"{k}_pp")
         taxi_expense = st.number_input("2. Taxi Expense (៛) - Enter 0 if local delivery:",
@@ -2912,10 +3179,12 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
             else:
                 try:
                     handler_local = local_driver if local_driver != "None (Grab/TukTuk)" else BASE_VIA
+                    pp_expense = driver_pp_expense(handler_local, pp_expense)
                     append_row(DATA_FILE, {
                         "Date": now_str(),
                         "Handled_By": dispatched_by,
                         "Customer": customer_name.strip(),
+                        "Invoice": invoice_number.strip(),
                         "Cases": cases,
                         "Local_Driver": handler_local,
                         "Taxi_Station": taxi_station.strip() or "-",
@@ -2946,6 +3215,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
         else:
             customer = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
+        invoice_number = ""  # Invoice linking is automatic; staff save by customer.
         prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
 
         col1, col2 = st.columns(2)
@@ -2970,6 +3240,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
                         "Date": now_str(),
                         "Prepared_By": prepared_by,
                         "Customer": customer.strip(),
+                        "Invoice": invoice_number.strip(),
                         "Cases_Packed": cases_packed,
                         "Status": pack_status,
                     })
@@ -3320,6 +3591,10 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
         return
     if check_col != "Save?":
         d = d.rename(columns={"Save?": check_col})
+    if "Invoice" not in d.columns:
+        d["Invoice"] = ""
+    if column_order is not None and "Invoice" not in column_order:
+        column_order = list(column_order) + ["Invoice"]
     opts = sorted(set(ctx["today"]) | {c for c in d["Customer"] if c})
     st.caption("Tick several customers and edit their cases, then save once. Ticks and typing stay on this screen until you save.")
     preferences = _form_preferences("packing_staff")
@@ -3330,8 +3605,8 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
             index=staff_options.index(linked) if linked in staff_options else 0, key=f"{key}_by")
         include_all = st.checkbox("Include every customer shown when saving", key=editor_key + "_all",
             help="Applies to the whole list below when you press Save. Otherwise, tick individual rows.")
-        editable = (check_col, "Cases") if key == "tick" else (check_col, "Customer", "Status", "Cases")
-        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+        editable = (check_col, "Cases", "Invoice") if key == "tick" else (check_col, "Customer", "Status", "Cases", "Invoice")
+        edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
             disabled=[c for c in d.columns if c not in editable], column_order=column_order,
             column_config={check_col: st.column_config.CheckboxColumn(check_col),
                 "Customer": st.column_config.SelectboxColumn("Customer", options=opts),
@@ -3350,13 +3625,17 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
         if not (include_all or r[check_col]) or r["Status"] == "Skip" or cust not in valid or cases <= 0 or cases > MAX_CASES:
             continue
         if _int(ctx["packed"].get(cust, 0)) != _int(r.get("Already packed", 0)):
-            changed.append(cust)
-        recs.append({"Date": now_str(), "Prepared_By": prepared_by, "Customer": cust, "Cases_Packed": cases,
+            changed.append(cust)        # someone else packed this customer meanwhile: skip it, save the rest
+            continue
+        recs.append({"Date": now_str(), "Prepared_By": prepared_by, "Customer": cust, "Invoice": str(r.get("Invoice", "")), "Cases_Packed": cases,
                      "Status": "Completed (រួចរាល់)" if r["Status"] == "Done" else "In Progress (កំពុងធ្វើ)"})
         total += cases
-    if changed:
-        st.error("Packing totals changed for: " + ", ".join(changed[:5]) + ". Reload this list before saving; your current selections are still here.")
+    if changed and not recs:
+        st.error("Not saved — packing totals changed for: " + ", ".join(changed[:5]) + ". Press ↻ Reload this list.")
         return
+    if changed:
+        st.session_state["save_warning"] = ("Saved the others, but SKIPPED (someone else packed them meanwhile - reload and check): "
+                                            + ", ".join(changed[:8]))
     if not recs:
         st.warning("Tick at least one customer with cases above 0, or choose Include every customer shown.")
         return
@@ -3487,6 +3766,7 @@ def _upload_tab():
 
 def _packing_body():
     st.markdown("### 📦 Bun Preparation & Packing")
+    task_view_selector("packing")
     if not has_permission("edit"):
         if not has_permission("view"):
             st.warning("View is turned off. Enable View to allow read-only access to the packing log, or enable Editing to work on tasks.")
@@ -3539,11 +3819,52 @@ def _sorted_records(recs):
     return sorted(recs, key=lambda r: (AREA_RANK.get(r["Area"], 9), _REGION_ORDER.get(r["Region"], 99), r["Province"], r["Customer"]))
 
 
+DEL_ZONE_PROVINCE = "🌄 ខេត្ត (Province)"
+DEL_ZONE_ALL = "📍 គ្រប់តំបន់ (All)"
+
+
+def _delivery_zone_of(recs):
+    """{customer: group}: Phnom Penh customers get the same zone as in Shop Visits / Media Team
+    (Admin's choice, else the shop's map pin, else the name); province customers are one group."""
+    pp = {norm_name(r["Customer"]): r["Customer"] for r in recs if r.get("Area") == AREA_LABEL[PP]}
+    try:
+        zmap = _visit_zone_map(pp) if pp else {}
+    except Exception:
+        zmap = {}
+    out = {}
+    for r in recs:
+        if r.get("Area") == AREA_LABEL[PP]:
+            z = zmap.get(norm_name(r["Customer"]), VISIT_ZONE_NOT_SET)
+            out[r["Customer"]] = VISIT_ZONE_NOT_SET if str(z).startswith("🚫") else z
+        else:
+            out[r["Customer"]] = DEL_ZONE_PROVINCE
+    return out
+
+
+def _delivery_zone_rank(z):
+    order = list(VISIT_ZONES) + [VISIT_ZONE_NOT_SET, DEL_ZONE_PROVINCE]
+    return order.index(z) if z in order else len(order)
+
+
 def delivery_context():
     ctx = packing_context()
-    ctx["recs"] = _sorted_records(ctx["df"].to_dict("records")) if not ctx["df"].empty else []
+    recs = _sorted_records(ctx["df"].to_dict("records")) if not ctx["df"].empty else []
+    zones = _delivery_zone_of(recs)
+    for r in recs:
+        r["Zone"] = zones.get(r["Customer"], DEL_ZONE_PROVINCE)
+    ctx["recs"] = sorted(recs, key=lambda r: (_delivery_zone_rank(r["Zone"]), str(r.get("Province", "")), r["Customer"]))
     ctx["assigned"] = current_assignments()
     return ctx
+
+
+def _delivery_zone_picker(recs, key):
+    """Group filter: all, one Phnom Penh zone, or province customers. Remembered while the app is open."""
+    counts = Counter(r["Zone"] for r in recs)
+    options = [DEL_ZONE_ALL] + sorted(counts, key=_delivery_zone_rank)
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = DEL_ZONE_ALL
+    return st.selectbox("📍 ក្រុម / តំបន់ (Group)", options, key=key,
+                        format_func=lambda z: f"{z}  ({len(recs)})" if z == DEL_ZONE_ALL else f"{_km(z)}  ({counts.get(z, 0)})")
 
 
 def _claim_tab(me, ctx):
@@ -3553,21 +3874,25 @@ def _claim_tab(me, ctx):
     st.caption("Choose the customers **you** will deliver today, before you start. Other staff will see they are taken. "
                "You can release a customer again if you cannot go.")
     recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND]
+    zone = _delivery_zone_picker(recs, "claim_zone")
+    if zone != st.session_state.get("_claim_zone_prev", zone):
+        _reset_draft("claim", me)                           # new group: start a fresh tick list
+    st.session_state["_claim_zone_prev"] = zone
     with st.form("claim_filters"):
-        f1, f2 = st.columns(2)
-        area = f1.radio("Show", ["All", AREA_LABEL[PP], AREA_LABEL["Province"]], horizontal=True, key="claim_area")
-        q = f2.text_input("🔎 Search customer", key="claim_q", max_chars=60)
+        q = st.text_input("🔎 Search customer", key="claim_q", max_chars=60)
         if st.form_submit_button("Apply customer filter"):
             _reset_draft("claim", me)
-    if area != "All":
-        recs = [r for r in recs if r["Area"] == area]
+    if zone != DEL_ZONE_ALL:
+        recs = [r for r in recs if r["Zone"] == zone]
     if q.strip():
         recs = [r for r in recs if q.strip().lower() in r["Customer"].lower()]
     if not recs and not _has_editor_draft("claim", me):
         st.info("No customers to choose right now.")
     else:
         assigned = ctx["assigned"]
-        rows = [{"Take ✅": False, "Customer": r["Customer"], "Province": r["Province"], "Status": r["Status"],
+        rows = [{"Take ✅": False, "Customer": r["Customer"], SALE_NOTE_COL: sale_note_label(r.get("Journal Note")),
+                 "Zone": _km(r["Zone"]) if r["Zone"] != DEL_ZONE_PROVINCE else r["Province"],
+                 "Province": r["Province"], "Status": r["Status"],
                  "Packed": int(r["Packed Cases"]), "Ordered": None if pd.isna(r["កេស"]) else int(r["កេស"]),
                  "Taken by": assigned.get(r["Customer"], "-")} for r in recs]
         _reload_draft_button("claim", me)
@@ -3575,9 +3900,10 @@ def _claim_tab(me, ctx):
         st.caption("Choose all the customers you need, then save once. Ticks do not refresh the page.")
         with st.form("batch_" + editor_key, clear_on_submit=False):
             select_all = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
-            edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+            edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
                 disabled=[c for c in d.columns if c != "Take ✅"],
-                column_config={"Take ✅": st.column_config.CheckboxColumn("Take ✅")})
+                column_config={"Take ✅": st.column_config.CheckboxColumn("Take ✅"),
+                               SALE_NOTE_COL: st.column_config.TextColumn(SALE_NOTE_COL, width="medium")})
             submitted = st.form_submit_button("✅ Save selected delivery customers", type="primary")
         if submitted:
             new, blocked = [], []
@@ -3606,7 +3932,7 @@ def _claim_tab(me, ctx):
                     st.error(f"⚠️ Could not save: {err}")
 
     mine = [r["Customer"] for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
-    pool = mine if current_role() != "admin" else [c for c in ctx["assigned"] if c in {r["Customer"] for r in ctx["recs"]}]
+    pool = mine if current_role() != "admin" else [r["Customer"] for r in ctx["recs"] if r["Customer"] in ctx["assigned"]]
     with st.expander(f"↩️ Release customers ({len(mine)} are mine)"):
         with st.form("release_customers", clear_on_submit=False):
             rel = st.multiselect("Customers I will NOT deliver after all", pool, key="claim_release")
@@ -3624,7 +3950,7 @@ def _send_tab(me, ctx):
     if not has_permission("edit") or not has_permission("tasks"):
         st.warning("Editing delivery tasks is disabled for your account.")
         return
-    st.caption("Tick the customers whose buns you have **sent**. Choose **My own delivery** when you deliver it yourself; no transport expense is required unless a taxi station is also recorded. Expenses can be filled later in step 3.")
+    st.caption("Tick customers and check the cases, then save as sent. Driver, taxi and expenses can be completed later in step 3. No case checker is required.")
     with st.form("send_list_options"):
         include_free = st.checkbox("Also show customers nobody has taken yet", key="send_free")
         search_send = st.text_input("🔎 Find customer to send", key="send_customer_search", max_chars=60)
@@ -3633,6 +3959,12 @@ def _send_tab(me, ctx):
     assigned = ctx["assigned"]
     recs = [r for r in ctx["recs"] if r["Status"] not in NOT_TO_SEND
             and (assigned.get(r["Customer"]) == me or (include_free and r["Customer"] not in assigned))]
+    zone = _delivery_zone_picker(recs, "send_zone")
+    if zone != st.session_state.get("_send_zone_prev", zone):
+        _reset_draft("send", me)
+    st.session_state["_send_zone_prev"] = zone
+    if zone != DEL_ZONE_ALL:
+        recs = [r for r in recs if r["Zone"] == zone]
     if search_send.strip():
         q_send = search_send.strip().casefold()
         recs = [r for r in recs if q_send in str(r["Customer"]).casefold()
@@ -3645,57 +3977,56 @@ def _send_tab(me, ctx):
         ordered = None if pd.isna(r["កេស"]) else int(r["កេស"])
         packed, sent = int(r["Packed Cases"]), int(r["Sent Cases"])
         left = (packed - sent) if packed > sent else ((ordered - sent) if (ordered and ordered > sent) else 1)
-        rows.append({"Sent ✅": False, "Customer": r["Customer"], "Cases": int(left), "Via": "Use default", "Taxi station": "",
+        rows.append({"Sent ✅": False, "Customer": r["Customer"], SALE_NOTE_COL: sale_note_label(r.get("Journal Note")),
+                     "Zone": _km(r["Zone"]) if r["Zone"] != DEL_ZONE_PROVINCE else r["Province"],
+                     "Invoice": "", "Cases": int(left), "Via": "Use default", "Taxi station": "",
                      "Note": "", "Status": r["Status"], "Province": r["Province"],
                      "Saved sent cases": sent, "Saved packed cases": packed, "Saved order cases": ordered if ordered is not None else -1})
     _reload_draft_button("send", me)
     d, editor_key = _task_editor_frame("send", pd.DataFrame(rows), me)
-    st.caption("Tick several deliveries, edit cases and notes, then save once.")
-    preferences = _form_preferences("send_defaults", me)
-    via_values = via_options()
-    verifier_values = ["-- Select Staff --"] + VERIFY_STAFF
+    if "Invoice" not in d.columns:
+        d["Invoice"] = ""
+    st.caption("Save the total cases for this customer. No invoice entry is needed.")
     with st.form("batch_" + editor_key, clear_on_submit=False):
-        c1, c2 = st.columns(2)
-        default_via = c1.selectbox("Sent with (default)", via_values,
-            index=via_values.index(preferences.get("via")) if preferences.get("via") in via_values else 0, key="send_via")
-        verified_by = c2.selectbox("✅ Cases checked by", verifier_values,
-            index=verifier_values.index(preferences.get("verifier")) if preferences.get("verifier") in verifier_values else 0, key="send_vby")
+        default_via = PENDING_VIA
         select_all_send = st.checkbox("Include every customer shown when saving", key=editor_key + "_all")
-        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
-            column_order=["Sent ✅", "Customer", "Cases", "Via", "Taxi station", "Note", "Status"],
-            disabled=["Customer", "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
+        edited = phone_task_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
+            column_order=["Sent ✅", "Customer", SALE_NOTE_COL, "Cases", "Invoice", "Note", "Zone", "Status"],
+            disabled=["Customer", SALE_NOTE_COL, "Zone", "Status", "Province", "Saved sent cases", "Saved packed cases", "Saved order cases"],
             column_config={"Sent ✅": st.column_config.CheckboxColumn("Sent ✅"),
                 "Cases": st.column_config.NumberColumn("Cases", min_value=0, max_value=MAX_CASES, step=1),
-                "Via": st.column_config.SelectboxColumn("Via", options=["Use default"] + via_options()),
+                "Via": st.column_config.SelectboxColumn("Via", options=["Use default", PENDING_VIA] + via_options()),
                 "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
-                "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT)})
+                "Note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT),
+                SALE_NOTE_COL: st.column_config.TextColumn(SALE_NOTE_COL, width="medium")})
         submitted = st.form_submit_button("🚚 Save selected deliveries", type="primary")
     if submitted:
-        if verified_by == "-- Select Staff --":
-            st.error("❌ Please choose who checked the number of cases.")
-            return
-        preferences.update({"via": default_via, "verifier": verified_by})
         selected_rows = [r for r in edited.to_dict("records") if select_all_send or r["Sent ✅"]]
-        fresh = {r["Customer"]: r for r in ctx["recs"]}
-        blocked = [r["Customer"] for r in selected_rows if r["Customer"] not in fresh
+        fresh = CustomerDict()
+        for _r in ctx["recs"]:
+            fresh[_r["Customer"]] = _r
+        # Only skip a customer when saving it could double-count: someone else already sent it (or part of it),
+        # it was moved/cancelled, or another staff member took it. Packing changes are NOT a reason to block.
+        blocked = {r["Customer"] for r in selected_rows if r["Customer"] not in fresh
                    or fresh[r["Customer"]]["Status"] in NOT_TO_SEND
                    or _int(fresh[r["Customer"]]["Sent Cases"]) != _int(r["Saved sent cases"])
-                   or _int(fresh[r["Customer"]]["Packed Cases"]) != _int(r["Saved packed cases"])
-                   or _int(fresh[r["Customer"]]["កេស"], -1) != _int(r["Saved order cases"], -1)
-                   or (assigned.get(r["Customer"]) not in (None, me) and current_role() != "admin")]
-        if blocked:
-            st.error("These deliveries changed while you were selecting: " + ", ".join(blocked[:5]) + ". Reload this list before saving.")
+                   or (assigned.get(r["Customer"]) not in (None, me) and current_role() != "admin")}
+        if blocked and len(blocked) == len(selected_rows):
+            st.error("Not saved — these customers were already sent / changed by someone else: "
+                     + ", ".join(sorted(blocked)[:5]) + ". Press ↻ Reload this list.")
             return
         out, take, total = [], [], 0
         for r in edited.to_dict("records"):
             cust, cases, via = r["Customer"], _int(r["Cases"]), r["Via"]
             via = default_via if via == "Use default" else via
-            if not (select_all_send or r["Sent ✅"]) or cases <= 0 or cases > MAX_CASES or via not in via_options():
+            if cust in blocked:
+                continue
+            if not (select_all_send or r["Sent ✅"]) or cases <= 0 or cases > MAX_CASES or via not in [PENDING_VIA] + via_options():
                 continue
             station = safe_text(r["Taxi station"] or "")
-            out.append({"Date": now_str(), "Handled_By": me, "Customer": cust, "Cases": cases, "Local_Driver": via,
+            out.append({"Date": now_str(), "Handled_By": me, "Customer": cust, "Invoice": str(r.get("Invoice", "")), "Cases": cases, "Local_Driver": via,
                         "Taxi_Station": station or "-", "Phnom_Penh_Expense": 0, "Taxi_Expense": 0,
-                        "Note": safe_text(r["Note"] or "") or "-", "Verified_By": verified_by,
+                        "Note": safe_text(r["Note"] or "") or "-", "Verified_By": "-",
                         "Expense_Status": expense_status(via, station, 0, 0)})
             total += cases
             if cust not in assigned:
@@ -3713,20 +4044,24 @@ def _send_tab(me, ctx):
                             "deliveries saved successfully; assignments need review")
                     st.session_state["assignment_warning"] = "Deliveries were saved. Assignment updates failed; ask Admin to review. Do not resend these deliveries."
             waiting = sum(1 for o in out if o["Expense_Status"] == "Pending")
+            if blocked:
+                st.session_state["save_warning"] = ("Saved the others, but SKIPPED (already sent or changed by someone else): "
+                                                    + ", ".join(sorted(blocked)[:8]))
             audit("dispatch_bulk", f"{len(out)} customers, {total} cases, by {me}")
             _reset_draft("send", me)
-            flash_and_refresh(f"Saved {len(out)} deliveries ({total} cases). {waiting} need expenses - fill them in step 3")
+            flash_and_refresh(f"Saved {len(out)} deliveries ({total} cases). {waiting} need delivery details - complete them in step 3")
         except (RuntimeError, ConflictError, PermissionError) as err:
             bot_log("error", "Save dispatch (bulk)", str(err), "-")
             st.error(f"⚠️ Could not save: {err}")
 
 
-def pending_expense_df(who, scope):
+def pending_expense_df(who, scope, include_done=False):
     """Deliveries still waiting for expenses. who = staff name or None (everyone); scope = Today | Last 7 days | All waiting."""
     df = read_raw(DATA_FILE, DISPATCH_COLS)
-    df = df[df["Expense_Status"] == "Pending"]
+    if not include_done:
+        df = df[df["Expense_Status"] == "Pending"]
     if who:
-        df = df[df["Handled_By"] == who]
+        df = df[(df["Handled_By"] == who) | (df["Local_Driver"] == who)]
     if scope == "Today":
         df = df[df["_dt"].dt.normalize() == pd.Timestamp(today_kh())]
     elif scope == "Last 7 days":
@@ -3736,81 +4071,36 @@ def pending_expense_df(who, scope):
 
 def _expense_tab(me):
     if not has_permission("edit") or not has_permission("tasks"):
-        st.warning("Editing delivery expenses is disabled for your account.")
+        st.warning("Editing delivery details is disabled for your account.")
         return
-    is_admin = current_role() == "admin"
-    st.caption("Fill in expenses for deliveries you already sent. Self-delivered orders need no transport expense unless a taxi station is recorded. Tick **Done** for each row you finish, then save.")
-    with st.form("expense_filters"):
-        c1, c2 = st.columns(2)
-        scope = c1.radio("Show", ["Today", "Last 7 days", "All waiting"], horizontal=True, key="exp_scope")
-        who = me
-        if is_admin:
-            pick = c2.selectbox("Handler", ["(everyone)"] + DELIVERY_HANDLERS, key="exp_who")
-            who = None if pick == "(everyone)" else pick
-        if st.form_submit_button("Apply expense filter"):
-            _reset_draft("expenses", str((who, scope)))
-    if not is_admin and me == "-- Select Staff --":
-        st.info("Choose your name at the top first.")
+    if me == "-- Select Staff --":
+        st.info("Choose your name first.")
         return
-    df = pending_expense_df(who, scope)
-    if df.empty and not _has_editor_draft("expenses", str((who, scope))):
-        st.success("Nothing is waiting for expenses. 🎉")
+    if st.session_state.get("_task_view_preference", "Cards") == "Cards":
+        st.caption("Complete one customer card and Save. Choose the driver before entering expenses. Other cards stay open.")
+    who = me
+    if current_role() == "admin":
+        pick = st.selectbox("Staff", ["My deliveries", "Everyone"] + DELIVERY_HANDLERS, key="phone_exp_staff")
+        who = None if pick == "Everyone" else me if pick == "My deliveries" else pick
+    query = st.text_input("🔎 Find customer or invoice", key="phone_exp_search").strip().casefold()
+    df = pending_expense_df(who, "All waiting")
+    if query and not df.empty:
+        df = df[df["Customer"].astype(str).str.casefold().str.contains(query, regex=False) |
+                df["Invoice"].astype(str).str.casefold().str.contains(query, regex=False)]
+    st.caption(f"{len(df)} deliveries waiting")
+    if st.button("↻ Refresh completed list", key="phone_exp_refresh", use_container_width=True):
+        st.rerun()
+    if df.empty:
+        st.success("All delivery details completed ✅")
         return
-    st.info(f"⏳ {len(df)} deliveries are waiting for expenses.")
-    rows = [{"Done ✅": False, "Customer": r["Customer"], "When": str(r["Date"])[5:16], "Via": r["Local_Driver"],
-             "Taxi station": "" if r["Taxi_Station"] in ("-", "") else r["Taxi_Station"],
-             "Phnom Penh ៛": int(r["Phnom_Penh_Expense"]), "Taxi ៛": int(r["Taxi_Expense"]),
-             "By": r["Handled_By"], "Date": r["Date"]} for r in df.to_dict("records")]
-    draft_scope = str((who, scope))
-    _reload_draft_button("expenses", draft_scope)
-    d, editor_key = _task_editor_frame("expenses", pd.DataFrame(rows), draft_scope)
-    order = ["Done ✅", "Customer", "When", "Via", "Taxi station", "Phnom Penh ៛", "Taxi ៛"] + (["By"] if who is None else [])
-    with st.form("batch_" + editor_key, clear_on_submit=False):
-        edited = st.data_editor(d, hide_index=True, height=min(560, 60 + 36 * len(d)), key=editor_key,
-            column_order=order, disabled=["Customer", "When", "Via", "By", "Date"],
-            column_config={"Done ✅": st.column_config.CheckboxColumn("Done ✅"),
-                "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
-                "Phnom Penh ៛": st.column_config.NumberColumn("Phnom Penh ៛", min_value=0, max_value=MAX_RIEL, step=500),
-                "Taxi ៛": st.column_config.NumberColumn("Taxi ៛", min_value=0, max_value=MAX_RIEL, step=500)})
-        submitted = st.form_submit_button("💾 Save selected expenses", type="primary")
-    if submitted:
-        updates, problems, total = {}, [], 0
-        for r in edited.to_dict("records"):
-            if not r["Done ✅"]:
-                continue
-            station, pp, tx = safe_text(r["Taxi station"] or ""), _int(r["Phnom Penh ៛"]), _int(r["Taxi ៛"])
-            if r["Via"] == BASE_VIA and pp <= 0:
-                problems.append(f"{r['Customer']}: enter the Phnom Penh ៛ (Grab/TukTuk)")
-            elif station and tx <= 0:
-                problems.append(f"{r['Customer']}: enter the Taxi ៛ for {station}")
-            else:
-                updates[(str(r["Date"]), r["Customer"], r["By"])] = (station or "-", pp, tx)
-                total += pp + tx
-        if problems:
-            st.error("❌ Not saved yet:\n\n" + "\n".join(f"- {p}" for p in problems[:8]))
-            return
-        if not updates:
-            st.warning("Tick **Done** on the rows you have finished first.")
-            return
-
-        def _apply(frame):
-            for (dt, cust, by), (station, pp, tx) in updates.items():
-                m = (frame["Date"].astype(str) == dt) & (frame["Customer"] == cust) & (frame["Handled_By"] == by) & (frame["Expense_Status"] == "Pending")
-                if not m.any():
-                    raise ValueError(f"The delivery of {cust} was changed by someone else. Reload and try again.")
-                i = frame.index[m][0]
-                frame.loc[i, "Taxi_Station"] = station
-                frame.loc[i, "Phnom_Penh_Expense"] = pp
-                frame.loc[i, "Taxi_Expense"] = tx
-                frame.loc[i, "Expense_Status"] = "Done"
-            return frame
-        try:
-            modify_csv(DATA_FILE, DISPATCH_COLS, _apply)
-            audit("expenses_filled", f"{len(updates)} deliveries, {total} riel, by {me}")
-            _reset_draft("expenses", draft_scope)
-            flash_and_refresh(f"Saved expenses for {len(updates)} deliveries (៛{total:,})")
-        except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
-            st.error(f"❌ {err}")
+    if st.session_state.get("_task_view_preference", "Cards") == "Table":
+        _expense_table(df, me, str((who, query)))
+        return
+    records = df.to_dict("records")
+    pages = (len(records) + 7) // 8
+    page = st.selectbox("Page (8 customers each)", list(range(1, pages + 1)), key="phone_exp_page")
+    for record in records[(page - 1) * 8:page * 8]:
+        _expense_phone_card(record, me)
 
 
 # ---- Journal fill sheet: expenses/driver in the same order as the Sale Journal ----
@@ -4055,11 +4345,134 @@ def _delivery_log():
                              if c in staff_tasks.columns]
                 show_df(staff_tasks[task_cols])
 
+# ---------- 📌 sale notes for delivery staff (urgent / fixed pick-up time) ----------
+SALE_NOTE_COL = "📌 Sale note"
+NOTE_TIME_WORDS = ["កំណត់ម៉ោង", "ម៉ោង", "មកយក", "យកផ្ទាល់", "មុនម៉ោង", "សុំពេល", "ឲ្យទាន់", "ឱ្យទាន់",
+                   "PICK UP", "PICKUP", "AM", "PM"]
+# Part-of-day words (also common spellings) -> latest time to arrive, used when the note has no clock time
+NOTE_DAY_PARTS = [
+    (("ព្រឹក", "ព្រេក", "ព្រិក", "ពីព្រឹក", "MORNING"), 11 * 60, "ព្រឹក"),
+    (("ថ្ងៃត្រង់", "ថ្ងៃត្រង់", "NOON"), 12 * 60, "ថ្ងៃត្រង់"),
+    (("រសៀល", "AFTERNOON"), 15 * 60, "រសៀល"),
+    (("ល្ងាច", "EVENING"), 17 * 60, "ល្ងាច"),
+]
+_KM_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
+_NOTE_AM_WORDS = ("AM", "ព្រឹក", "ព្រេក", "ព្រិក")
+_NOTE_PM_WORDS = ("PM", "រសៀល", "ល្ងាច", "យប់")
+_NOTE_TIME_RES = [
+    re.compile(r"ម៉ោង\s*(\d{1,2})(?:\s*[:.h]\s*(\d{2}))?\s*(AM|PM|ព្រឹក|ព្រេក|ព្រិក|ថ្ងៃត្រង់|រសៀល|ល្ងាច|យប់)?"),
+    re.compile(r"(?<![\d/])(\d{1,2})\s*[:.h]\s*(\d{2})\s*(AM|PM)?(?![\d/])"),
+    re.compile(r"(?<![\d/])(\d{1,2})\s*()(AM|PM)(?![A-Z])"),
+]
+
+
+def _note_text(note):
+    return unicodedata.normalize("NFC", str(note or "")).replace("​", "").replace("‌", "").strip()
+
+
+def sale_note_time(note):
+    """'មកយកម៉ោង2pm' -> 14*60 ; '10:30' -> 630 ; None when the note gives no clock time."""
+    text = _note_text(note).translate(_KM_DIGITS).upper()
+    for rx in _NOTE_TIME_RES:
+        m = rx.search(text)
+        if not m:
+            continue
+        h, mins, word = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "")
+        if h > 23 or mins > 59:
+            continue
+        if word in _NOTE_AM_WORDS:
+            h = 0 if h == 12 else h
+        elif word in _NOTE_PM_WORDS or (word == "" and rx is _NOTE_TIME_RES[0] and 1 <= h <= 6):
+            h = h + 12 if h < 12 else h                  # "ម៉ោង2" at a bakery means 2 in the afternoon
+        return h * 60 + mins
+    return None
+
+
+def sale_note_when(note):
+    """(minutes, part-of-day word): an exact clock time, else the latest time for 'ព្រឹក / រសៀល…', else (None, "")."""
+    exact = sale_note_time(note)
+    if exact is not None:
+        return exact, ""
+    up = _note_text(note).upper()
+    for words, latest, name in NOTE_DAY_PARTS:
+        if any(w in up for w in words):
+            return latest, name
+    return None, ""
+
+
+def sale_note_flags(note):
+    """(urgent, timed, minutes) for a journal remark. minutes = the clock time, or the latest time for a part of day."""
+    text = _note_text(note)
+    if text in ("", "-"):
+        return False, False, None
+    up = text.upper()
+    urgent = any(w.upper() in up for w in URGENT_WORDS)
+    minutes, _part = sale_note_when(text)
+    timed = minutes is not None or any(w in up for w in NOTE_TIME_WORDS if not w.isascii()) \
+        or any(re.search(r"\b%s\b" % w, up) for w in NOTE_TIME_WORDS if w.isascii())
+    return urgent, timed, minutes
+
+
+def _note_when_text(note, minutes):
+    part = sale_note_when(note)[1]
+    if minutes is None:
+        return ""
+    return f"{part} មុន {minutes // 60:02d}:{minutes % 60:02d}" if part else f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def sale_note_label(note):
+    """'🔥 ⏰ 14:00 · មកយកម៉ោង2pm' — empty when the sale left no note."""
+    text = _note_text(note)
+    if text in ("", "-"):
+        return ""
+    urgent, timed, minutes = sale_note_flags(text)
+    when = _note_when_text(text, minutes)
+    head = ("🔥 " if urgent else "") + ("⏰ " if timed else "") + (f"{when} · " if when else "")
+    return head + text
+
+
+def _sale_notes_alert(ctx, me):
+    """Top of Log Delivery: customers not sent yet whose sale note says urgent or a pick-up time, earliest first."""
+    now_m = now_kh().hour * 60 + now_kh().minute
+    flagged, other = [], []
+    for r in ctx["recs"]:
+        note = str(r.get("Journal Note", "") or "").strip()
+        if note in ("", "-") or r["Status"] in NOT_TO_SEND:
+            continue
+        urgent, timed, minutes = sale_note_flags(note)
+        taken = ctx["assigned"].get(r["Customer"], "")
+        zone = r.get("Zone", "")
+        status = f'{r["Status"]} · 📍 {_km(zone) if zone != DEL_ZONE_PROVINCE else r.get("Province", "")}' if zone else r["Status"]
+        row = (minutes if minutes is not None else 24 * 60, 0 if urgent else 1, r["Customer"], note, status, taken, minutes, urgent)
+        (flagged if (urgent or timed) else other).append(row)
+    if not flagged and not other:
+        return
+    flagged.sort()
+    if flagged:
+        lines = []
+        for _sort, _u, cust, note, status, taken, minutes, urgent in flagged:
+            when = ""
+            if minutes is not None:
+                left = minutes - now_m
+                when = (f"⏰ **{_note_when_text(note, minutes)}**"
+                        + (" 🚨 **ហួសម៉ោងហើយ**" if left < 0 else f" ⚠️ **នៅសល់ {left} នាទី**" if left <= 60 else ""))
+            who = f"👷 {taken}" if taken else "👷 **មិនទាន់មាននរណាយក**"
+            mine = " ⭐" if taken and taken == me else ""
+            lines.append(f"- {'🔥 ' if urgent else ''}{when} **{cust}**{mine} — 📌 {note}  \n  {status} · {who}")
+        st.error(f"**📌 ចំណាំពីផ្នែកលក់ — ប្រញាប់ / កំណត់ម៉ោងយក ({len(flagged)})** · សូមដឹកឱ្យទាន់ ដើម្បីកុំឱ្យអតិថិជនបោះបង់\n\n"
+                 + "\n".join(lines))
+    if other:
+        with st.expander(f"📝 ចំណាំផ្សេងទៀតពីផ្នែកលក់ ({len(other)})"):
+            for *_x, cust, note, status, taken, _m, _u in sorted(other, key=lambda x: x[2]):
+                st.markdown(f"- **{cust}** — {note} <small>· {status}{' · 👷 ' + taken if taken else ''}</small>", unsafe_allow_html=True)
+
+
 def _dispatch_body():
     if not has_permission("tasks") or not has_permission("edit"):
         st.warning("Delivery task editing is disabled for your account.")
         return
     st.markdown("### 🚚 Delivery")
+    task_view_selector("delivery")
     linked_staff = staff_name_for_user()
     default_staff_index = DELIVERY_HANDLERS.index(linked_staff) + 1 if linked_staff in DELIVERY_HANDLERS else 0
     me = st.selectbox("👷 I am (choose your name once — office staff or delivery driver)",
@@ -4070,20 +4483,19 @@ def _dispatch_body():
     n_wait = len(pending_expense_df(me, "All waiting")) if me != "-- Select Staff --" else 0
     if me != "-- Select Staff --":
         st.markdown(f"<div class='hk-kpis'><span class='hk-pill'>📌 To send <b>{len(mine)}</b></span>"
-                    f"<span class='hk-pill'>⏳ Expenses to fill <b>{n_wait}</b></span></div>", unsafe_allow_html=True)
-    step = st.radio("Delivery step", ["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Fill my expenses",
-                                    "✍️ One customer", "📊 Today's log"], horizontal=True, key="delivery_step")
-    need_name = me == "-- Select Staff --"
-    if step.startswith(("1️⃣", "2️⃣")) and need_name:
+                    f"<span class='hk-pill'>⏳ Details to complete <b>{n_wait}</b></span></div>", unsafe_allow_html=True)
+    _sale_notes_alert(ctx, me)
+    step = st.selectbox("Delivery step", ["1️⃣ Choose my customers", "2️⃣ Send", "3️⃣ Complete delivery details", "✍️ One customer", "📊 Today's log"], key="phone_delivery_step")
+    if me == "-- Select Staff --" and not step.startswith("📊"):
         st.info("Choose your name at the top first.")
-    elif step.startswith("1️⃣"):
+        return
+    if step.startswith("1"):
         _claim_tab(me, ctx)
-    elif step.startswith("2️⃣"):
+    elif step.startswith("2"):
         _send_tab(me, ctx)
-    elif step.startswith("3️⃣"):
+    elif step.startswith("3"):
         _expense_tab(me)
-    elif step.startswith("✍️"):
-        st.caption("Expenses are optional now. Save this form before changing steps.")
+    elif step.startswith("✍"):
         dispatch_form("expense_form")
     else:
         _delivery_log()
@@ -4126,12 +4538,15 @@ def build_report(selected_date):
     except Exception:
         report_map_registry = None
     snap, _, _, err = current_snapshot()
-    scheduled, cases_found = {}, False
+    scheduled, cases_found = CustomerDict(), False
+    names = {}      # matching key -> name shown on screen (the journal spelling wins)
     if snap:
         cases_found = snap["cases_col_found"]
         sub = journal_plus_orders(snap, selected_date)
         _bc = bun_codes(snap)
-        for name, g in sub.groupby("Customer", sort=False):
+        for key, g in sub.groupby(sub["Customer"].map(cust_key), sort=False):
+            name = g["Customer"].iloc[0]
+            names[key] = name
             tot = g["Cases"].sum(min_count=1)
             _bsum = g[_bc].sum() if _bc else None
             scheduled[name] = {"cases": int(tot) if pd.notna(tot) else None,
@@ -4145,9 +4560,11 @@ def build_report(selected_date):
     holds = current_holds(selected_date)
     finals = current_final(selected_date)
     finals_p = current_final(selected_date, "Packed")
-    for cust, h in current_holds(selected_date - timedelta(days=1)).items():
+    for _key, h in current_holds(selected_date - timedelta(days=1)).items():
         if h["action"] != "Tomorrow":
             continue
+        cust = h["name"]
+        names.setdefault(cust_key(cust), cust)
         prev = f"📅 Moved from {selected_date - timedelta(days=1)}" + (f" ({h['reason']})" if h["reason"] not in ("", "-") else "")
         if cust in scheduled:
             scheduled[cust]["remark"] = _join_unique([scheduled[cust]["remark"], prev], sep=" / ")
@@ -4156,15 +4573,17 @@ def build_report(selected_date):
         else:
             scheduled[cust] = {"cases": h["cases"] or None, "invoice": "-", "remark": prev}
 
-    pack_info = {}
+    pack_info = CustomerDict()
     df_pack = rows_for_day(read_raw(PACKING_FILE, PACKING_COLS), selected_date)
-    for cust, g in df_pack.groupby("Customer", sort=False):
+    for key, g in df_pack.groupby(df_pack["Customer"].map(cust_key), sort=False):
+        cust = names.setdefault(key, g["Customer"].iloc[0])
         pack_info[cust] = {"cases": int(g["Cases_Packed"].sum()), "by": g["Prepared_By"].iloc[-1],
                            "status": str(g["Status"].iloc[-1])}
 
-    sent_info = {}
+    sent_info = CustomerDict()
     df_disp = rows_for_day(read_raw(DATA_FILE, DISPATCH_COLS), selected_date)
-    for cust, g in df_disp.groupby("Customer", sort=False):
+    for key, g in df_disp.groupby(df_disp["Customer"].map(cust_key), sort=False):
+        cust = names.setdefault(key, g["Customer"].iloc[0])
         last = g.iloc[-1]
         station = str(last["Taxi_Station"]).strip()
         driver = f"{last['Local_Driver']} ➡️ {station}" if station not in ("-", "") else str(last["Local_Driver"])
@@ -4183,7 +4602,11 @@ def build_report(selected_date):
     master_names = {norm_name(n) for n in snap["customers"]} if snap else set()
     ignore = {norm_name(n) for n in IGNORE_NEW}
     rows = []
-    for cust in set(scheduled) | set(pack_info) | set(sent_info) | set(finals) | set(finals_p):
+    for fd in (finals, finals_p):
+        for key, v in fd.items():
+            names.setdefault(key, v["name"])
+    for key in set(scheduled) | set(pack_info) | set(sent_info) | set(finals) | set(finals_p):
+        cust = names.get(key, key)
         p, s, info = pack_info.get(cust), sent_info.get(cust), scheduled.get(cust)
         area, province, region, _how = resolve_location(cust, areas.get(norm_name(cust)), overrides.get(norm_name(cust)))
         if province in ("Unknown", "Unknown province") and report_map_registry is not None:
@@ -4319,10 +4742,11 @@ def current_final(day, kind="Sent"):
     """{customer: {"cases","reason","by"}} - the FINAL number of កេស sent (kind="Sent") or packed (kind="Packed"),
     set by hand. The last Final<kind> / Final<kind>Reset of each customer wins."""
     df = rows_for_day(read_raw(HOLD_FILE, HOLD_COLS), day)
-    out = {}
+    out = CustomerDict()
     for r in df.to_dict("records"):
         if r["Action"] == f"Final{kind}":
-            out[r["Customer"]] = {"cases": max(_int(r["Cases"]), 0), "reason": str(r["Reason"]), "by": str(r["By"])}
+            out[r["Customer"]] = {"cases": max(_int(r["Cases"]), 0), "reason": str(r["Reason"]), "by": str(r["By"]),
+                                  "name": r["Customer"]}
         elif r["Action"] == ("FinalReset" if kind == "Sent" else f"Final{kind}Reset"):
             out.pop(r["Customer"], None)
     return out
@@ -4331,10 +4755,11 @@ def current_final(day, kind="Sent"):
 def current_holds(day):
     """{customer: {"action","cases","reason","by"}} for a day. The last Tomorrow / Cancel / Restore of each customer wins."""
     df = rows_for_day(read_raw(HOLD_FILE, HOLD_COLS), day)
-    out = {}
+    out = CustomerDict()
     for r in df.to_dict("records"):
         if r["Action"] in ("Tomorrow", "Cancel"):
-            out[r["Customer"]] = {"action": r["Action"], "cases": _int(r["Cases"]), "reason": str(r["Reason"]), "by": str(r["By"])}
+            out[r["Customer"]] = {"action": r["Action"], "cases": _int(r["Cases"]), "reason": str(r["Reason"]), "by": str(r["By"]),
+                                  "name": r["Customer"]}
         elif r["Action"] == "Restore":
             out.pop(r["Customer"], None)
     return out
@@ -4870,7 +5295,7 @@ def _bun_panel(df_scope, selected_date, mobile=False):
         show_df(g, height=420)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            by_type.to_excel(w, index=False, sheet_name="By bun type")
+            hide_money(by_type).to_excel(w, index=False, sheet_name="By bun type")
             g.to_excel(w, index=False, sheet_name="By customer")
         st.download_button("📥 Download bun sales (Excel)", data=buf.getvalue(), file_name=f"Bun_Sales_{selected_date}.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="bun_dl")
@@ -5187,7 +5612,7 @@ def tab_sale_order():
     qty = {}
     cols = st.columns(4)
     for i, c in enumerate(ORDER_BUNS):
-        label = f"{c} {names.get(c, '')}" + (f" · ៛{int(sell[c]):,}" if sell.get(c) else "")
+        label = f"{c} {names.get(c, '')}" + (f" · ៛{int(sell[c]):,}" if sell.get(c) and can_see_money() else "")
         qty[c] = cols[i % 4].number_input(label, min_value=0, max_value=1_000_000, step=1, value=0, key=k("q_" + c))
     pcs = sum(qty.values())
     amount = sum(qty[c] * (sell.get(c) or 0) for c in ORDER_BUNS)
@@ -5241,8 +5666,8 @@ def tab_sale_order():
                 append_row(ORDERS_FILE, row)
                 audit("sale_order", f"{customer} | {order_date} | {pcs} pcs")
                 st.session_state["order_gen"] = gen + 1
-                st.session_state["flash"] = f"Order saved: {customer} | {pcs:,} pcs | ៛{int(amount):,} (synced to Dropbox)" if USE_DROPBOX else \
-                    f"Order saved: {customer} | {pcs:,} pcs | ៛{int(amount):,}"
+                _amt = f" | ៛{int(amount):,}" if can_see_money() else ""
+                st.session_state["flash"] = f"Order saved: {customer} | {pcs:,} pcs{_amt}" + (" (synced to Dropbox)" if USE_DROPBOX else "")
                 st.rerun()
             except (RuntimeError, ConflictError) as e:
                 st.error(f"❌ {e}")
@@ -5559,6 +5984,9 @@ def _users_panel():
         "View": "ON" if effective_permissions(u, r).get("view") else "OFF",
         "Edit": "ON" if effective_permissions(u, r).get("edit") else "OFF",
         "Reports": "ON" if effective_permissions(u, r).get("reports") else "OFF",
+        "💵 Money": "ON" if effective_permissions(u, r).get("money") else "OFF",
+        "Sections": ("Auto · " if not (isinstance(r.get("sections"), dict) and r.get("sections")) else "Custom · ")
+                    + ", ".join(APP_SECTION_LABEL[sid].split(" ", 1)[0] for sid in user_sections(u, r)),
         "Starter password": "yes" if r.get("must_change") else "",
         "Last login": r.get("last_login", ""), "Password changed": r.get("pw_changed", "")}
         for u, r in sorted(users.items())]))
@@ -5576,23 +6004,53 @@ def _users_panel():
             p_view = st.checkbox(PERMISSION_LABELS["view"], value=perm_values["view"], key=f"perm_view_{perm_user}", disabled=is_admin_target)
             p_edit = st.checkbox(PERMISSION_LABELS["edit"], value=perm_values["edit"], key=f"perm_edit_{perm_user}", disabled=is_admin_target)
             p_reports = st.checkbox(PERMISSION_LABELS["reports"], value=perm_values["reports"], key=f"perm_reports_{perm_user}", disabled=is_admin_target)
-            save_perms = st.form_submit_button("💾 Save permissions", type="primary")
+            p_money = st.checkbox(PERMISSION_LABELS["money"], value=perm_values["money"], key=f"perm_money_{perm_user}", disabled=is_admin_target,
+                                  help="OFF = riel amounts, prices and sales money are hidden (🔒). Bun pieces stay visible.")
+            st.markdown("**👁️ Sections this user can open** (Open section menu)")
+            saved_secs = perm_rec.get("sections") if isinstance(perm_rec.get("sections"), dict) and perm_rec.get("sections") else None
+            use_default = st.checkbox("Automatic — follow the permissions above", value=saved_secs is None,
+                                      key=f"perm_secdef_{perm_user}", disabled=is_admin_target,
+                                      help="Untick to choose the sections by hand below.")
+            now_secs = set(user_sections(perm_user, perm_rec))
+            grid = st.columns(2)
+            sec_ticks = {sid: grid[i % 2].checkbox(label, value=sid in now_secs, key=f"perm_sec_{perm_user}_{sid}",
+                                                   disabled=is_admin_target)
+                         for i, (sid, label) in enumerate(APP_SECTIONS)}
+            st.caption("Automatic ticked = the boxes are ignored and sections follow Tasks / View / Edit / Reports. "
+                       "Untick Automatic to show exactly the ticked sections.")
+            save_perms = st.form_submit_button("💾 Save permissions & sections", type="primary")
         if save_perms:
             if is_admin_target:
                 st.info("Admin access remains fully enabled.")
             else:
-                new_perms = {"tasks": p_tasks, "view": p_view, "edit": p_edit, "reports": p_reports}
+                new_perms = {"tasks": p_tasks, "view": p_view, "edit": p_edit, "reports": p_reports, "money": p_money}
+                new_secs = None if use_default else {sid: bool(v) for sid, v in sec_ticks.items()}
+                if new_secs is not None and not any(new_secs.values()):
+                    new_secs = None
+                    st.session_state["save_warning"] = "No section was ticked, so this user stays on Automatic sections."
+                missing = [f"{APP_SECTION_LABEL[sid]} needs “{PERMISSION_LABELS[SECTION_NEEDS[sid]]}”"
+                           for sid, on in (new_secs or {}).items() if on and sid in SECTION_NEEDS and not new_perms[SECTION_NEEDS[sid]]]
+
                 def _save_perms(u):
                     if perm_user not in u:
                         raise ValueError("That user no longer exists. Refresh and try again.")
                     if u[perm_user].get("role") == "admin":
                         u[perm_user]["permissions"] = {k: True for k in PERMISSION_KEYS}
+                        u[perm_user].pop("sections", None)
                     else:
                         u[perm_user]["permissions"] = dict(new_perms)
+                        if new_secs is None:
+                            u[perm_user].pop("sections", None)
+                        else:
+                            u[perm_user]["sections"] = dict(new_secs)
                     return u
                 try:
                     modify_users(_save_perms)
-                    audit("user_permissions_changed", f"{perm_user}: " + ", ".join(f"{k}={'ON' if v else 'OFF'}" for k, v in new_perms.items()))
+                    if missing:
+                        st.session_state["save_warning"] = ("Saved. These sections will open but stay read-only / locked until you also turn on: "
+                                                            + "; ".join(missing))
+                    audit("user_permissions_changed", f"{perm_user}: " + ", ".join(f"{k}={'ON' if v else 'OFF'}" for k, v in new_perms.items())
+                          + " | sections: " + ("automatic" if new_secs is None else ", ".join(k for k, v in new_secs.items() if v)))
                     flash_and_refresh(f"Permissions saved for {perm_user}")
                 except (ValueError, RuntimeError, ConflictError) as err:
                     st.error(f"❌ Could not save permissions: {err}")
@@ -6427,8 +6885,13 @@ def modify_map_registry(fn):
             time.sleep(0.2 * (attempt + 1))
 
 
+@functools.lru_cache(maxsize=8192)
+def _analyse_map_link_cached(url):
+    return analyse_map_link(url)
+
+
 def map_record_analysis(record):
-    analysis = analyse_map_link(record.get("resolved_url") or record.get("url", ""))
+    analysis = dict(_analyse_map_link_cached(record.get("resolved_url") or record.get("url", "")))
     if (analysis["Map status"] == "Needs link expansion"
             and "no usable destination coordinates" in record.get("resolution_note", "")):
         analysis["Map status"] = "Needs full pin link"
@@ -6449,6 +6912,17 @@ def map_registry_frame(registry=None):
     return frame
 
 
+def _map_name_index(registry):
+    """{normalised name: [records]} — built once per loaded registry (kept on the registry dict itself)."""
+    idx = registry.get("_name_index")
+    if idx is None or registry.get("_name_index_n") != len(registry.get("records", {})):
+        idx = {}
+        for rec in registry.get("records", {}).values():
+            idx.setdefault(norm_name(rec["customer"]), []).append(rec)
+        registry["_name_index"], registry["_name_index_n"] = idx, len(registry.get("records", {}))
+    return idx
+
+
 def customer_map_match(customer, registry):
     """No fuzzy identity matching and no merging separate leads with the same name."""
     key = norm_name(customer)
@@ -6459,7 +6933,7 @@ def customer_map_match(customer, registry):
             return {"Map status": "Saved match needs review", "Map link": "", "Directions": "", "Location ID": ""}
         candidates = [rec]
     else:
-        candidates = [rec for rec in registry["records"].values() if norm_name(rec["customer"]) == key]
+        candidates = _map_name_index(registry).get(key, [])
     if not candidates:
         return {"Map status": "No location match", "Map link": "", "Directions": "", "Location ID": ""}
     # Any duplicate identity requires Admin's explicit choice, even when a pin is shared.
@@ -6829,7 +7303,8 @@ def tab_customer_map():
 SI_HIST_DAILY_FILE = os.path.join(DATA_DIR, "sales_history_daily.csv")      # older months, one row per invoice line
 SI_HIST_MONTHLY_FILE = os.path.join(DATA_DIR, "sales_history_monthly.csv")  # older months, bun pieces per customer per month
 SI_IGNORE_NAMES = {x.upper() for x in IGNORE_NEW} | {"STAF"}          # staff / general sales are not customers
-SI_PERIODS = ["This month", "Last month", "Last 30 days", "Last 90 days", "All time"]
+SI_PERIODS = ["This month", "Last month", "Last 30 days", "Last 90 days", "This year", "All time",
+              "📅 Pick a month", "📅 Custom dates"]
 SI_METRICS = {"Sales ៛": "Sales", "Bun pcs": "Pcs", "Cases": "Cases", "Orders (days)": "Orders"}
 
 
@@ -6844,7 +7319,35 @@ def _si_period(choice, today):
         return today - timedelta(days=29), today
     if choice == "Last 90 days":
         return today - timedelta(days=89), today
+    if choice == "This year":
+        return today.replace(month=1, day=1), today
     return date(2000, 1, 1), today
+
+
+def _si_period_picker(daily, today):
+    """One period for the whole Sales Insights page: preset, any month, or any dates. -> (start, end, label)."""
+    c1, c2 = st.columns([2, 3])
+    choice = c1.selectbox("📅 Period", SI_PERIODS, key="si_period")
+    if choice == "📅 Pick a month":
+        first = (daily["D"].min() if len(daily) else pd.Timestamp(today)).to_period("M")
+        months = list(pd.period_range(first, pd.Timestamp(today).to_period("M"), freq="M"))[::-1]
+        m = c2.selectbox("Month", months, key="si_period_month", format_func=lambda p: p.strftime("%B %Y"))
+        start = m.start_time.date()
+        end = min(m.end_time.date(), today)
+        return start, end, m.strftime("%B %Y")
+    if choice == "📅 Custom dates":
+        lo = daily["D"].min().date() if len(daily) else today - timedelta(days=30)
+        picked = c2.date_input("From → To", value=(max(lo, today - timedelta(days=13)), today), min_value=lo,
+                               max_value=today, key="si_period_dates")
+        if isinstance(picked, (list, tuple)) and len(picked) == 2:
+            start, end = picked
+        else:                                              # only the first day picked so far
+            start = end = picked[0] if isinstance(picked, (list, tuple)) and picked else today
+        return start, end, f"{start:%d %b %Y} → {end:%d %b %Y}"
+    start, end = _si_period(choice, today)
+    if choice == "All time" and len(daily):
+        return start, end, f"All time ({daily['D'].min():%d %b %Y} → {end:%d %b %Y})"
+    return start, end, f"{choice} · {start:%d %b} → {end:%d %b %Y}"
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -6985,9 +7488,9 @@ def _si_collect_journals(snap):
         else:
             candidates=[{'name':os.path.basename(p),'mtime':os.path.getmtime(p),'path':p} for p in glob.glob(os.path.join(CURRENT_DIR,'*.xlsx')) if _si_is_journal_name(os.path.basename(p))]
         current=find_excel_file()
-        current_name=os.path.basename(current) if current else ''
+        in_live=set(snap.get('journal_files') or [os.path.basename(current) if current else ''])
         for item in sorted(candidates,key=lambda r:(r['mtime'],r['name'])):
-            if item['name']==current_name:continue
+            if item['name'] in in_live:continue
             try:
                 if USE_DROPBOX:
                     local=os.path.join(CACHE_DIR,'analysis_journals',item['name'])
@@ -7019,13 +7522,53 @@ def _si_collect_journals(snap):
     return combined,codes
 
 
-def _si_prepare(snap):
-    """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows."""
+@st.cache_resource(show_spinner=False)
+def _si_prepare_memo():
+    return {}
+
+
+_SI_PREP_STATE_KEYS = ("si_journal_coverage", "si_journal_warnings", "si_skipped", "si_combined")
+
+
+def _si_prepare_sig():
+    """Changes only when a journal, a history file or the site orders change (or the day changes)."""
+    files = (SI_JOURNAL_HISTORY_FILE, SI_HIST_DAILY_FILE, SI_HIST_MONTHLY_FILE, ORDERS_FILE)
+    if USE_DROPBOX:
+        for p in files:
+            try:
+                pull(p)
+            except Exception:
+                pass
+        journals = tuple(sorted((r["name"], r["rev"]) for r in _list_remote_folder() if _si_is_journal_name(r["name"])))
+    else:
+        journals = tuple(sorted((os.path.basename(p), _file_sig(p)) for p in glob.glob(os.path.join(CURRENT_DIR, "*.xlsx"))
+                                if _si_is_journal_name(os.path.basename(p))))
+    cur = find_excel_file()
+    return (str(cur), _file_sig(cur) if cur else (0, 0), journals, tuple(_file_sig(p) for p in files), str(today_kh()))
+
+
+def _si_prepare(snap, full=False):
+    """One row per customer per day: (Key, D, Customer, Cases, Sales, Pcs) + the bun-level rows.
+    Reused by every page and every person until a journal / history / order file changes (was rebuilt on each click)."""
+    try:
+        sig = _si_prepare_sig()
+    except Exception:
+        sig = None
+    memo = _si_prepare_memo()
+    hit = memo.get("v")
+    # The memo lives across app updates (no restart): a result saved by an older version has another shape.
+    if sig is not None and hit and hit[0] == sig and isinstance(hit[1], tuple) and len(hit[1]) == 5:
+        for k, v in hit[2].items():
+            st.session_state[k] = v
+        return hit[1][:3] if not full else hit[1]
     j, codes = _si_collect_journals(snap)
     history_daily = _si_read_hist(SI_HIST_DAILY_FILE)
     history_monthly = _si_read_hist(SI_HIST_MONTHLY_FILE)
     sell = (snap.get("buns", {}) or {}).get("sell", {}) or {}
-    return _si_prepare_cached(j, codes, history_daily, history_monthly, sell, today_kh())
+    out = _si_prepare_cached(j, codes, history_daily, history_monthly, sell, today_kh())
+    if sig is not None:
+        memo["v"] = (sig, out, {k: st.session_state.get(k) for k in _SI_PREP_STATE_KEYS})
+    return out[:3] if not full else out
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -7033,11 +7576,11 @@ def _si_prepare_cached(j, codes, history_daily, history_monthly, sell, as_of):
     """Inputs include current orders, both history sources, product codes and prices."""
     j, codes, _n_hist = _si_add_history(j, codes, history_daily, history_monthly)
     if j is None or j.empty:
-        return pd.DataFrame(), pd.DataFrame(), codes
+        return pd.DataFrame(), pd.DataFrame(), codes, pd.DataFrame(), pd.DataFrame()
     df = j.copy()
     df["Customer"] = df["Customer"].astype(str).str.strip()
     df = df[df["Customer"].ne("") & ~df["Customer"].str.upper().isin(SI_IGNORE_NAMES)]
-    df = df[~df["FOC"].fillna(False).astype(bool)]                       # free buns are not orders
+    df["FOC"] = df["FOC"].fillna(False).astype(bool) if "FOC" in df else False     # free buns: kept, flagged
     df["D"] = pd.to_datetime(df["Date"], errors="coerce").dt.normalize()
     df = df.dropna(subset=["D"]).copy()
     df["Key"] = df["Customer"].map(norm_name)
@@ -7059,9 +7602,15 @@ def _si_prepare_cached(j, codes, history_daily, history_monthly, sell, as_of):
     # deposit...) are not bun orders: they would add riel and a fake "order day". Data check lists them.
     df = df[(df["D"] <= pd.Timestamp(as_of)) & (df["Pcs"] > 0)].copy()
     df["Cases"] = pd.to_numeric(df["Cases"], errors="coerce").fillna(0.0)
-    daily = df.groupby(["Key", "D"], as_index=False).agg(
-        Customer=("Customer", "first"), Cases=("Cases", "sum"), Sales=("Sales", "sum"), Pcs=("Pcs", "sum"))
-    return daily, df, codes
+    df.loc[df["FOC"], "Sales"] = 0.0                                     # a free gift brings no riel
+    df["FOC pcs"] = df["Pcs"].where(df["FOC"], 0.0)
+
+    def _daily(frame):
+        return frame.groupby(["Key", "D"], as_index=False).agg(
+            Customer=("Customer", "first"), Cases=("Cases", "sum"), Sales=("Sales", "sum"), Pcs=("Pcs", "sum"),
+            **{"FOC pcs": ("FOC pcs", "sum")})
+    paid = df[~df["FOC"]]
+    return _daily(paid), paid, codes, _daily(df), df
 
 
 def _si_names_areas(snap, daily):
@@ -7113,38 +7662,58 @@ def _si_top(daily, start, end, metric, names, areas, top_n=20, df=None, codes=()
 
 
 def _si_habits(daily, today, min_orders=4, lookback=180, factor=1.5, dormant_factor=4.0, names=None, areas=None):
-    """Usual ordering rhythm of each customer and whether they are late. Status: On track | Missing | Dormant."""
+    """Usual ordering rhythm of each customer and whether they are late. Status: On track | Missing | Dormant.
+    Works on plain number arrays per customer (about 10x faster than pandas per group)."""
+    import numpy as np
     names, areas = names or {}, areas or {}
     t = pd.Timestamp(today)
-    d = daily[daily["D"] >= t - pd.Timedelta(days=lookback)]
+    d = daily[daily["D"] >= t - pd.Timedelta(days=lookback)].sort_values(["Key", "D"], kind="mergesort")
     rows = []
-    for key, g in d.groupby("Key"):
-        dates = g["D"].sort_values().reset_index(drop=True)
-        if len(dates) < min_orders:
-            continue
-        gaps = dates.diff().dt.days.dropna()
-        gap = max(1.0, float(gaps.median()))
-        cv = float(gaps.std() / gaps.mean()) if len(gaps) > 1 and gaps.mean() > 0 else 0.0
-        last = dates.iloc[-1]
-        since = int((t - last).days)
-        late_at = max(gap * factor, gap + 1)
-        dormant_at = max(min(gap * dormant_factor, 90), late_at + 1)
-        status = "Dormant" if since > dormant_at else ("Missing" if since >= late_at else "On track")
-        wd = dates.dt.dayofweek.value_counts()
-        wd_name = ("Mon Tue Wed Thu Fri Sat Sun".split()[int(wd.index[0])]) if wd.iloc[0] / len(dates) >= 0.5 else "-"
-        avg_order = float(g["Sales"].mean())
-        avg_pcs = float(g["Pcs"].mean())
-        cycles = max(1, int(since // gap)) if status != "On track" else 0
-        rows.append({
-            "Key": key, "Customer": names.get(key, g["Customer"].iloc[0]), "Area": areas.get(key, AREA_LABEL["Unknown"]),
-            "Orders in period": len(dates), "Usual gap (days)": round(gap, 1), "Usual day": wd_name,
-            "Pattern": "🟢 Regular" if cv <= 0.6 else "🟡 Irregular",
-            "Last order": last.strftime("%Y-%m-%d"), "Days since": since,
-            "Expected by": (last + pd.Timedelta(days=gap)).strftime("%Y-%m-%d"),
-            "Days late": max(0, int(round(since - gap))), "Usual cases": round(float(g["Cases"].median()), 1),
-            "Usual pcs": int(round(float(g["Pcs"].median()))), "Avg order ៛": int(round(avg_order)),
-            "Missed orders (est.)": cycles, "Lost pcs (est.)": int(round(cycles * avg_pcs)),
-            "Lost sales ៛ (est.)": int(round(cycles * avg_order)), "Status": status})
+    if not d.empty:
+        keys = d["Key"].to_numpy()
+        days = d["D"].to_numpy().astype("datetime64[D]").astype("int64")
+        sales = d["Sales"].to_numpy(dtype="float64")
+        pcs = d["Pcs"].to_numpy(dtype="float64")
+        cases = pd.to_numeric(d["Cases"], errors="coerce").to_numpy(dtype="float64")
+        custs = d["Customer"].to_numpy()
+        t_day = int(np.datetime64(t.normalize(), "D").astype("int64"))
+        starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]])
+        ends = np.r_[starts[1:], len(keys)]
+        day_names = "Mon Tue Wed Thu Fri Sat Sun".split()
+        for s0, e0 in zip(starts, ends):
+            n = e0 - s0
+            if n < min_orders:
+                continue
+            key = keys[s0]
+            dts = days[s0:e0]
+            gaps = np.diff(dts).astype("float64")
+            gap = max(1.0, float(np.median(gaps))) if len(gaps) else 1.0
+            gm = gaps.mean() if len(gaps) else 0.0
+            cv = float(gaps.std(ddof=1) / gm) if len(gaps) > 1 and gm > 0 else 0.0
+            last_i = int(dts[-1])
+            last = pd.Timestamp(np.datetime64(last_i, "D"))
+            since = int(t_day - last_i)
+            late_at = max(gap * factor, gap + 1)
+            dormant_at = max(min(gap * dormant_factor, 90), late_at + 1)
+            status = "Dormant" if since > dormant_at else ("Missing" if since >= late_at else "On track")
+            wd = np.bincount(((dts + 3) % 7).astype("int64"), minlength=7)      # 1970-01-01 was a Thursday
+            wd_name = day_names[int(wd.argmax())] if wd.max() / n >= 0.5 else "-"
+            avg_order = float(sales[s0:e0].mean())
+            avg_pcs = float(pcs[s0:e0].mean())
+            cs = cases[s0:e0]
+            cs = cs[~np.isnan(cs)]
+            usual_cases = round(float(np.median(cs)), 1) if len(cs) else float("nan")
+            cycles = max(1, int(since // gap)) if status != "On track" else 0
+            rows.append({
+                "Key": key, "Customer": names.get(key, custs[s0]), "Area": areas.get(key, AREA_LABEL["Unknown"]),
+                "Orders in period": int(n), "Usual gap (days)": round(gap, 1), "Usual day": wd_name,
+                "Pattern": "🟢 Regular" if cv <= 0.6 else "🟡 Irregular",
+                "Last order": last.strftime("%Y-%m-%d"), "Days since": since,
+                "Expected by": (last + pd.Timedelta(days=gap)).strftime("%Y-%m-%d"),
+                "Days late": max(0, int(round(since - gap))), "Usual cases": usual_cases,
+                "Usual pcs": int(round(float(np.median(pcs[s0:e0])))), "Avg order ៛": int(round(avg_order)),
+                "Missed orders (est.)": cycles, "Lost pcs (est.)": int(round(cycles * avg_pcs)),
+                "Lost sales ៛ (est.)": int(round(cycles * avg_order)), "Status": status})
     cols = ["Key", "Customer", "Area", "Orders in period", "Usual gap (days)", "Usual day", "Pattern", "Last order",
             "Days since", "Expected by", "Days late", "Usual cases", "Usual pcs", "Avg order ៛",
             "Missed orders (est.)", "Lost pcs (est.)", "Lost sales ៛ (est.)", "Status"]
@@ -7274,11 +7843,13 @@ def _si_dup_scan(missing_items, ordered_items, all_names):
     for n in set(all_names):
         word_count.update(set(_si_name_tokens(n)))
     okeys = [(k, n, _visit_match_key(n)) for k, n in ordered_items]
+    gidx = _gram_index([o[2] for o in okeys])
     out = {}
     for k, n in missing_items:
         mk = _visit_match_key(n)
         best = None
-        for ok, on, omk in okeys:
+        for j in _gram_shortlist(mk, gidx, 0.3):
+            ok, on, omk = okeys[j]
             if ok == k or not mk or not omk:
                 continue
             if mk != omk:
@@ -7329,10 +7900,27 @@ def _si_alias_save(name, same_as, decision):
 
 
 def _si_no_order_split(table, daily, names, month_start, month_end):
-    """Remove customers who DID order under another spelling.
+    """Remove customers who DID order under another spelling (remembered until the data or a decision changes).
     -> (table without them, review table of look-alikes, number hidden because Admin confirmed / same spelling)."""
     if table is None or table.empty or daily.empty:
         return table, pd.DataFrame(), 0
+    try:
+        _si_alias_read()                                    # refresh the decisions file first
+        key = (_si_frame_sig(table), _si_frame_sig(daily), str(month_start), str(month_end), _file_sig(SI_ALIAS_FILE))
+    except Exception:
+        key = None
+    memo = st.session_state.setdefault("_si_split_memo", {})
+    if key is not None and key in memo:
+        return memo[key]
+    out = _si_no_order_split_calc(table, daily, names, month_start, month_end)
+    if key is not None:
+        if len(memo) > 6:
+            memo.clear()
+        memo[key] = out
+    return out
+
+
+def _si_no_order_split_calc(table, daily, names, month_start, month_end):
     s, e = pd.Timestamp(month_start), pd.Timestamp(month_end)
     month = daily[(daily["D"] >= s) & (daily["D"] <= e)]
     if month.empty:
@@ -7475,32 +8063,98 @@ def _si_no_order_contact_table(frame, history, month_start, key, height=420):
         st.rerun()
 
 
-def _si_dup_review(review, key="si_dup"):
-    """Look-alike names: one did not order, the other did. Admin decides once; the answer is remembered."""
-    if review.empty:
-        return
+def _si_dup_review(review, key="si_dup", all_names=()):
+    """Table of look-alike names (one did not order, the other did). Choose ✅ Same / ❌ Different per row, then Save."""
     st.markdown(f"**🔁 ប្រហែលជាអតិថិជនដដែល — បានបញ្ជាទិញក្រោមឈ្មោះផ្សេង ({len(review)})**")
-    st.caption("ឈ្មោះទាំងនេះមិនបង្ហាញក្នុងតារាង 'មិនបញ្ជាទិញ' ខាងក្រោមទេ រហូតដល់អ្នកសម្រេច។ "
-               "✅ ដូចគ្នា = លុបចេញពីបញ្ជីមិនបញ្ជាទិញជារៀងរហូត · ❌ ផ្សេងគ្នា = បង្ហាញវិញ ហើយមិនសួរទៀត។")
     can = has_permission("edit")
-    for i, r in enumerate(review.head(25).to_dict("records")):
-        c1, c2, c3 = st.columns([6, 1.3, 1.3])
-        c1.markdown(f"**{r['Customer']}** ↔ បានបញ្ជាទិញជា **{r['Ordered as']}**  \n"
-                    f"<small>{r['Pcs this month']:,} pcs ខែនេះ · ចុងក្រោយ {r['Last order (other name)']} · ស្រដៀង {r['Likeness %']}%</small>",
-                    unsafe_allow_html=True)
-        tag = hashlib.sha256(f"{r['Customer']}|{r['Ordered as']}".encode()).hexdigest()[:16]
-        for col, label, dec in ((c2, "✅ ដូចគ្នា", "Same"), (c3, "❌ ផ្សេងគ្នា", "Different")):
-            if col.button(label, key=f"{key}_{dec}_{tag}", disabled=not can, use_container_width=True):
+    if not review.empty:
+        st.caption("ឈ្មោះទាំងនេះមិនបង្ហាញក្នុងតារាង 'មិនបញ្ជាទិញ' ខាងក្រោមទេ រហូតដល់អ្នកសម្រេច។ ជ្រើស ✅ ដូចគ្នា ឬ ❌ ផ្សេងគ្នា "
+                   "ក្នុងជួរ 'សម្រេច' (ឬប្រើប៊ូតុងជ្រើសទាំងអស់) ហើយចុច 💾 រក្សាទុក។ "
+                   "✅ ដូចគ្នា = ចាត់ទុកជាអតិថិជនតែមួយ · ❌ ផ្សេងគ្នា = បង្ហាញវិញ ហើយមិនសួរទៀត។")
+        CHOICES = ["—", "✅ ដូចគ្នា", "❌ ផ្សេងគ្នា"]
+        ver = st.session_state.get(f"{key}_ver", 0)
+        preset = st.session_state.get(f"{key}_preset", "—")
+        b1, b2, b3, _sp = st.columns([1.4, 1.4, 1.6, 3])
+        if b1.button("✅ ជ្រើស ≥95% ជាដូចគ្នា", key=f"{key}_p95", disabled=not can, use_container_width=True):
+            st.session_state[f"{key}_preset"] = "95"
+            st.session_state[f"{key}_ver"] = ver + 1
+            st.rerun()
+        if b2.button("✅ ជ្រើសទាំងអស់ ដូចគ្នា", key=f"{key}_pall", disabled=not can, use_container_width=True):
+            st.session_state[f"{key}_preset"] = "all"
+            st.session_state[f"{key}_ver"] = ver + 1
+            st.rerun()
+        if b3.button("↩️ សម្អាតការជ្រើស", key=f"{key}_pclr", disabled=not can, use_container_width=True):
+            st.session_state[f"{key}_preset"] = "—"
+            st.session_state[f"{key}_ver"] = ver + 1
+            st.rerun()
+        view = review.copy()
+        view.insert(0, "សម្រេច", ["✅ ដូចគ្នា" if preset == "all" or (preset == "95" and p >= 95) else "—"
+                                  for p in view["Likeness %"]])
+        edited = st.data_editor(
+            view, hide_index=True, use_container_width=True, key=f"{key}_ed_{ver}",
+            height=min(520, 38 + 35 * (len(view) + 1)),
+            disabled=[c for c in view.columns if c != "សម្រេច"] if can else True,
+            column_config={
+                "សម្រេច": st.column_config.SelectboxColumn("សម្រេច", options=CHOICES, required=True, width="small"),
+                "Customer": st.column_config.TextColumn("ឈ្មោះមិនបញ្ជាទិញ"),
+                "Ordered as": st.column_config.TextColumn("បានបញ្ជាទិញជា"),
+                "Pcs this month": st.column_config.NumberColumn("Pcs ខែនេះ", format="%d"),
+                "Last order (other name)": st.column_config.TextColumn("បញ្ជាទិញចុងក្រោយ"),
+                "Likeness %": st.column_config.ProgressColumn("ស្រដៀង", min_value=0, max_value=100, format="%d%%"),
+            })
+        picked = edited[edited["សម្រេច"] != "—"] if can else edited.iloc[0:0]
+        n_same = int((picked["សម្រេច"] == "✅ ដូចគ្នា").sum())
+        n_diff = len(picked) - n_same
+        if st.button(f"💾 រក្សាទុក ({n_same} ដូចគ្នា · {n_diff} ផ្សេងគ្នា)", key=f"{key}_save", type="primary",
+                     disabled=picked.empty):
+            done, errs = 0, []
+            for r in picked.to_dict("records"):
                 try:
-                    _si_alias_save(r["Customer"], r["Ordered as"], dec)
-                    st.session_state["flash"] = f"បានរក្សាទុក: {r['Customer']} = {'ដូចគ្នា' if dec == 'Same' else 'ផ្សេងគ្នា'}"
+                    _si_alias_save(r["Customer"], r["Ordered as"], "Same" if r["សម្រេច"].startswith("✅") else "Different")
+                    done += 1
+                except Exception as e:
+                    errs.append(f"{r['Customer']}: {str(e)[:60]}")
+            st.session_state[f"{key}_preset"] = "—"
+            st.session_state[f"{key}_ver"] = ver + 1
+            if errs:
+                st.warning("មិនបានរក្សាទុក: " + "; ".join(errs[:5]))
+            st.session_state["flash"] = f"✅ បានរក្សាទុក {done} ការសម្រេច ({n_same} ដូចគ្នា · {n_diff} ផ្សេងគ្នា)"
+            st.rerun()
+    else:
+        st.caption("រកមិនឃើញឈ្មោះស្រដៀងគ្នាទេ។")
+    with st.expander("🔗 ភ្ជាប់ឈ្មោះ 2 ដោយខ្លួនឯង (ឈ្មោះដែលកម្មវិធីរកមិនឃើញ)"):
+        opts = sorted(set(all_names), key=str.casefold)
+        if not opts or not can:
+            st.caption("មិនមានឈ្មោះ ឬគណនីរបស់អ្នកមិនអាចកែបាន។")
+        else:
+            c1, c2 = st.columns(2)
+            n1 = c1.selectbox("ឈ្មោះទី 1", opts, index=None, key=f"{key}_m1", placeholder="វាយឈ្មោះ…")
+            n2 = c2.selectbox("ឈ្មោះទី 2 (អតិថិជនតែមួយ)", opts, index=None, key=f"{key}_m2", placeholder="វាយឈ្មោះ…")
+            ok = bool(n1 and n2 and n1 != n2)
+            if st.button("✅ ចាត់ទុកជាអតិថិជនតែមួយ", key=f"{key}_mset", disabled=not ok) and ok:
+                try:
+                    _si_alias_save(n1, n2, "Same")
+                    st.session_state["flash"] = f"✅ {n1} = {n2}"
                     st.rerun()
                 except Exception as e:
                     st.error(str(e)[:150])
-    if len(review) > 25:
-        with st.expander(f"មើលទាំងអស់ ({len(review)})"):
-            _si_show(review)
-
+        same, _diff = _si_alias_decisions()
+        saved = _si_alias_read()
+        if not saved.empty:
+            st.markdown("**ការសម្រេចដែលបានរក្សាទុក**")
+            last = saved.assign(_p=[frozenset((norm_name(a), norm_name(b))) for a, b in zip(saved["Customer"], saved["Same as"])])
+            last = last.drop_duplicates("_p", keep="last").drop(columns=["_p", "_dt"], errors="ignore").iloc[::-1]
+            st.dataframe(last, hide_index=True, use_container_width=True, height=min(300, 38 + 35 * (len(last) + 1)))
+            undo = st.selectbox("ដកការសម្រេចចេញ (សួរម្តងទៀត)", [f"{a} ↔ {b}" for a, b in zip(last["Customer"], last["Same as"])],
+                                index=None, key=f"{key}_undo", placeholder="ជ្រើសដើម្បីដកចេញ…")
+            if undo and st.button("↩️ ដកចេញ", key=f"{key}_undo_btn", disabled=not can):
+                a, b = undo.split(" ↔ ", 1)
+                try:
+                    _si_alias_save(a, b, "Undecided")
+                    st.session_state["flash"] = "↩️ បានដកការសម្រេចចេញ"
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e)[:150])
 
 def _si_care(daily, df, codes, habits, names, areas, today, month_start, avgs=None, measure="Pcs"):
     """Rule-based customer-care list: who to contact, why, and what to say / offer."""
@@ -7750,16 +8404,34 @@ CALL_PLATFORMS = ["📞 Phone call", "✈️ Telegram", "💬 Messenger / Facebo
                   "📱 SMS", "🚶 Visit shop", "🗨️ Other"]
 
 
+_PLAT_MEMO = {}
+
+
+def _si_platform_map(history):
+    """{customer key: (last platform used, last phone text)} — built once per loaded call history."""
+    hit = _PLAT_MEMO.get("v")
+    if hit is not None and hit[0] is history:
+        return hit[1]
+    out = {}
+    if history is not None and not history.empty:
+        plats = history["Platform"].astype(str) if "Platform" in history else pd.Series("", index=history.index)
+        phones = history["Phone"].astype(str) if "Phone" in history else pd.Series("", index=history.index)
+        for k, pl, ph in zip(history["Customer"].map(norm_name), plats, phones):
+            prev = out.get(k, ("", ""))
+            out[k] = (pl if pl in CALL_PLATFORMS else prev[0], ph)
+    _PLAT_MEMO["v"] = (history, out)
+    return out
+
+
 def _si_platform_guess(history, customer, phone=""):
     """Platform to pre-select: the one used last time with this customer, else a guess from the phone / Telegram field."""
     try:
-        if history is not None and not history.empty and "Platform" in history:
-            mine = history[history["Customer"].map(norm_name).eq(norm_name(customer))]
-            used = [p for p in mine["Platform"].astype(str) if p in CALL_PLATFORMS]
+        if history is not None and not history.empty:
+            used, last_phone = _si_platform_map(history).get(norm_name(customer), ("", ""))
             if used:
-                return used[-1]
-            if not phone and not mine.empty:
-                phone = str(mine.iloc[-1].get("Phone", ""))
+                return used
+            if not phone:
+                phone = last_phone
     except Exception:
         pass
     ph = str(phone or "").strip().lower()
@@ -7853,13 +8525,12 @@ def _followup_sales_context():
             return names,pd.DataFrame(),False
         # Confirm order storage is readable rather than silently assuming it is empty.
         if USE_DROPBOX:
-            metadata = remote_meta(os.path.basename(journal_path))
-            if metadata is None:
+            entry = _remote_entry(os.path.basename(journal_path))
+            if entry is None:
                 return names,pd.DataFrame(),False
-            expected_hash = getattr(metadata, 'content_hash', None) or metadata.rev
-            if _sync_state()["xl_hash"].get(os.path.basename(journal_path)) != expected_hash:
+            if _sync_state()["xl_hash"].get(os.path.basename(journal_path)) != entry["hash"]:
                 return names,pd.DataFrame(),False
-            pull(ORDERS_FILE, force=True)
+            pull(ORDERS_FILE)
         read_raw(ORDERS_FILE, ORDER_COLS)
         orders=journal_plus_orders(snap)
         if 'FOC' in orders:orders=orders[~orders['FOC'].fillna(False).astype(bool)]
@@ -7896,23 +8567,39 @@ def _followup_review_panel(history):
     if view.empty:st.info('No follow-ups match these filters. Clear the filters to see all records.')
     st.caption('Order received is detected only from an order dated after the latest call. A same-day order needs manual confirmation. Receipt of an order does not prove a complaint was resolved. Save Resolved with a result after checking.')
     if has_permission('reports'):
-        by_reason=report.groupby(['Reason','Alert'],dropna=False).size().reset_index(name='Customers')
-        by_owner=report.assign(**{'Assigned to':report['Assigned to'].replace('','Unassigned')}).groupby(['Assigned to','Alert']).size().reset_index(name='Customers')
-        buf=_report_excel_bytes(dict([('Current follow-ups',report),('Filtered review',view),('Reasons',by_reason),('Staff results',by_owner),('Call history',history[[c for c in CALL_COLS if c in history]])]))
-        st.download_button('Download follow-up review report',buf,file_name=f'Followup_Review_{today_kh()}.xlsx',mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',key='fu_review_download')
+        def _fu_frames():
+            by_reason=report.groupby(['Reason','Alert'],dropna=False).size().reset_index(name='Customers')
+            by_owner=report.assign(**{'Assigned to':report['Assigned to'].replace('','Unassigned')}).groupby(['Assigned to','Alert']).size().reset_index(name='Customers')
+            return dict([('Current follow-ups',report),('Filtered review',view),('Reasons',by_reason),('Staff results',by_owner),('Call history',history[[c for c in CALL_COLS if c in history]])])
+        _lazy_excel_download('Download follow-up review report', _fu_frames, f'Followup_Review_{today_kh()}.xlsx', 'fu_review_download')
     return report
 
 
 @st.fragment(run_every=300)
+def _file_sig(path):
+    try:
+        stt = os.stat(path)
+        return (stt.st_mtime_ns, stt.st_size)
+    except OSError:
+        return (0, 0)
+
+
 def followup_alert_banner():
     if not (has_permission('view') or has_permission('reports')):return
     try:
-        history=read_raw(CALLS_FILE,CALL_COLS)
+        history=read_raw(CALLS_FILE,CALL_COLS,max_age=120)
         if history.empty:return
-        _,orders,available=_followup_sales_context()
-        report=_followup_review_data(history,orders,today_kh(),sales_available=available)
-        due=int(report['Alert'].isin(['Overdue','Due today']).sum())
-        setup=int(report['Alert'].eq('Needs setup').sum())
+        sig=(_file_sig(CALLS_FILE),_file_sig(ORDERS_FILE),str(find_excel_file() if not USE_DROPBOX else _sync_state()["xl_hash"]),
+             str(today_kh()),int(time.time()//300))
+        hit=st.session_state.get('_fu_banner')
+        if hit and hit[0]==sig:
+            due,setup,available=hit[1]
+        else:
+            _,orders,available=_followup_sales_context()
+            report=_followup_review_data(history,orders,today_kh(),sales_available=available)
+            due=int(report['Alert'].isin(['Overdue','Due today']).sum())
+            setup=int(report['Alert'].eq('Needs setup').sum())
+            st.session_state['_fu_banner']=(sig,(due,setup,available))
         if due or setup:
             st.warning(f'Customer follow-ups: {due} due/overdue · {setup} need a date, owner or next action. Open Customer Follow-ups to review.')
         if not available:st.caption('Follow-up alerts: order confirmation is unavailable until sales data is accessible.')
@@ -7943,14 +8630,15 @@ def _si_contact_context(frame, history, daily, today):
     for customer in result.get("Customer", pd.Series(dtype=str)):
         key = norm_name(customer)
         call = contacts.get(key, {})
-        called = pd.to_datetime(call.get("Date", ""), errors="coerce")
-        order = pd.to_datetime(last_orders.get(key), errors="coerce")
+        called = parse_dt(call.get("Date", ""))
+        order = last_orders.get(key)
+        order = pd.Timestamp(order) if order is not None and pd.notna(order) else pd.NaT
         called_today = pd.notna(called) and called.date() == today
         ordered_today = pd.notna(order) and order.date() == today
         days_ago = (today - called.date()).days if pd.notna(called) else None
         recent = days_ago is not None and 0 <= days_ago <= CALL_RECENT_DAYS
         ordered_after = pd.notna(order) and pd.notna(called) and order.normalize() > called.normalize()
-        due = pd.to_datetime(call.get("Follow-up date", ""), errors="coerce")
+        due = parse_dt(call.get("Follow-up date", ""))
         scheduled = pd.notna(due) and due.date() > today and call.get("Follow-up state") in ("Open", "Awaiting order")
         plat = _si_platform_of(call) if call else ""
         when = (f"{called:%d %b}" + (" (today)" if days_ago == 0 else f" ({days_ago} d ago)")) if pd.notna(called) else ""
@@ -8180,8 +8868,27 @@ def _followup_export_frame():
         return pd.DataFrame([{"Report unavailable": str(error)[:200]}])
 
 
+def _lazy_excel_download(label, frames_fn, file_name, key):
+    """Build the Excel file only when someone asks for it (building it on every click made pages slow)."""
+    if not st.session_state.get(f"{key}_ready"):
+        if st.button(f"📄 Prepare: {label}", key=f"{key}_prep"):
+            st.session_state[f"{key}_ready"] = True
+            st.rerun()
+        return
+    try:
+        st.download_button(label, _report_excel_bytes(frames_fn()), file_name=file_name, mime=XLSX_MIME, key=key,
+                           on_click=lambda: st.session_state.pop(f"{key}_ready", None))
+    except Exception as e:
+        st.warning(f"Could not build Excel file: {e}")
+
+
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
 def _report_excel_bytes(frames):
-    """Export reports with the same Excel dependency used to read journals."""
+    """Export reports with the same Excel dependency used to read journals. Riel columns are left out for people
+    without the 'See sales money' permission."""
+    frames = {name: hide_money(frame) for name, frame in frames.items()}
     from openpyxl.utils import get_column_letter
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -8267,10 +8974,29 @@ SI_DC_SPECS = [
 SI_DC_SEV = {"fix": ("❗", "Needs fixing"), "review": ("⚠️", "Please review"), "info": ("ℹ️", "For your information")}
 
 
+_SI_SIG_MEMO = {}
+
+
 def _si_frame_sig(frame):
-    """Cheap fingerprint of a DataFrame, used to cache heavy calculations until the data really changes."""
+    """Cheap fingerprint of a DataFrame, used to cache heavy calculations until the data really changes.
+    The same (shared, unchanged) table object is fingerprinted only once."""
     if frame is None or len(frame) == 0:
         return "empty"
+    hit = _SI_SIG_MEMO.get(id(frame))
+    if hit is not None and hit[0] is frame:
+        return hit[1]
+    sig = _si_frame_sig_calc(frame)
+    if len(_SI_SIG_MEMO) > 32:
+        _SI_SIG_MEMO.clear()
+    _SI_SIG_MEMO[id(frame)] = (frame, sig)
+    return sig
+
+
+def _si_frame_sig_calc(frame):
+    try:
+        return f"{len(frame)}-{int(pd.util.hash_pandas_object(frame, index=False).sum())}"
+    except Exception:
+        pass
     try:
         return f"{len(frame)}-{int(pd.util.hash_pandas_object(frame.astype(str), index=False).sum())}"
     except Exception:
@@ -8436,9 +9162,7 @@ def _si_data_check_section(issues, totals, coverage):
             for k, t, sev, *_ in SI_DC_SPECS:
                 if len(issues.get(k, ())):
                     frames[t[:31]] = issues[k]
-            st.download_button("📥 Download data check (Excel)", data=_report_excel_bytes(frames),
-                               file_name=f"Data_Check_{today_kh()}.xlsx", key="si_dc_dl",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            _lazy_excel_download("📥 Download data check (Excel)", lambda: frames, f"Data_Check_{today_kh()}.xlsx", "si_dc_dl")
         except Exception as e:
             st.warning(f"Could not build the Excel file: {e}")
 
@@ -8516,7 +9240,8 @@ def _si_active_map_section(daily, names, areas, today):
         mx = max(1.0, float(m["Pcs"].max()))
         m["radius"] = (60 + 340 * (m["Pcs"] / mx) ** 0.5).round(0)
         m["label"] = [f"{'🟡 #' + str(r) + ' ' if g == 'top' else ''}{c}" for r, g, c in zip(m["Rank"], m["Group"], m["Customer"])]
-        m["info"] = [f"{int(p):,} pcs · ៛{int(s):,} · {o} ដង · ចុងក្រោយ {l:%d %b}"
+        _money = can_see_money()
+        m["info"] = [f"{int(p):,} pcs" + (f" · ៛{int(s):,}" if _money else "") + f" · {o} ដង · ចុងក្រោយ {l:%d %b}"
                      for p, s, o, l in zip(m["Pcs"], m["Sales"], m["Orders"], m["Last"])]
         m["nav"] = [f"https://www.google.com/maps/dir/?api=1&destination={a},{b}" for a, b in zip(m["Lat"], m["Lon"])]
         try:
@@ -8549,6 +9274,7 @@ def _si_active_map_section(daily, names, areas, today):
     tbl = tbl[["Rank", "ក្រុម", "Customer", "Area", "Pcs", "Sales", "Orders", "ចុងក្រោយ", "Days since", "ទីតាំង", "ផ្លូវ"]].rename(
         columns={"Rank": "លេខ", "Customer": "អតិថិជន", "Area": "តំបន់", "Pcs": "នំ (pcs)", "Sales": "លក់ ៛", "Orders": "ចំនួនដង",
                  "Days since": "ថ្ងៃមុន"})
+    tbl = hide_money(tbl)
     try:
         st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(520, 60 + 35 * len(tbl)),
                      column_config={"លក់ ៛": st.column_config.NumberColumn(format="localized"),
@@ -8569,7 +9295,7 @@ def _sales_insights_body():
                  help="Read the newest journal and orders from Dropbox"):
         try:
             if USE_DROPBOX:
-                _list_remote_folder.clear()
+                _remote_listing_forget()
                 pull(ORDERS_FILE, force=True)
                 pull(CALLS_FILE, force=True)
             get_snapshot.clear()
@@ -8584,7 +9310,11 @@ def _sales_insights_body():
     if _src == "stale":
         st.warning("The journal could not be read. These figures use the last readable copy; today's orders may be missing.")
     with st.spinner("Reading journals…"):
-        daily, df, codes = _si_prepare(snap)
+        daily_paid, df_paid, codes, daily_all, df_all = _si_prepare(snap, full=True)
+    with_foc = st.toggle("🎁 Count FOC (free) buns too", value=True, key="si_with_foc",
+                         help="On: every bun that left the shop, free ones included (free buns count as 0 ៛). "
+                              "Off: paid buns only.")
+    daily, df = (daily_all, df_all) if with_foc else (daily_paid, df_paid)
     combined = st.session_state.get("si_combined", pd.DataFrame())
     coverage = st.session_state.get("si_journal_coverage", pd.DataFrame())
     skipped = st.session_state.get("si_skipped", pd.DataFrame())
@@ -8625,11 +9355,26 @@ def _sales_insights_body():
     sig = _si_frame_sig(daily) + "|" + _si_frame_sig(mon)
     habits, avgs, no_month = _si_derived(sig, today, lookback, min_orders, factor, dormant_factor, daily, mon, names, areas)
     this_start = today.replace(day=1)
-    d_mtd = daily[(daily["D"] >= pd.Timestamp(this_start)) & (daily["D"] <= pd.Timestamp(today))]
     last_end = this_start - timedelta(days=1)
     last_start = last_end.replace(day=1)
-    same_end = min(last_start + timedelta(days=today.day - 1), last_end)
-    d_prev = daily[(daily["D"] >= pd.Timestamp(last_start)) & (daily["D"] <= pd.Timestamp(same_end))]
+    p_start, p_end, p_label = _si_period_picker(daily, today)
+    if p_start > p_end:
+        p_start, p_end = p_end, p_start
+    if p_start == this_start and p_end == today:             # this month: compare with the same days last month
+        prev_s, prev_e, vs = last_start, min(last_start + timedelta(days=today.day - 1), last_end), "same days last month"
+    elif p_start.year > 2001:
+        length = (p_end - p_start).days + 1
+        prev_e = p_start - timedelta(days=1)
+        prev_s = prev_e - timedelta(days=length - 1)
+        if p_start.day == 1 and (p_end + timedelta(days=1)).day == 1:          # a whole month: the month before
+            prev_s = prev_e.replace(day=1)
+        vs = f"{prev_s:%d %b} → {prev_e:%d %b}"
+    else:
+        prev_s = prev_e = None
+        vs = ""
+    d_mtd = daily[(daily["D"] >= pd.Timestamp(p_start)) & (daily["D"] <= pd.Timestamp(p_end))]
+    d_prev = (daily[(daily["D"] >= pd.Timestamp(prev_s)) & (daily["D"] <= pd.Timestamp(prev_e))]
+              if prev_s else daily.iloc[0:0])
     try:
         no_month, _dups_m, _n_same_m = _si_no_order_split(no_month, daily, names, today.replace(day=1), today)
     except Exception:
@@ -8638,22 +9383,27 @@ def _sales_insights_body():
     missing = habits[habits["Status"] == "Missing"] if not habits.empty else habits
 
     def _delta(now, prev):
-        return f"{(now - prev) / prev * 100:+.0f}% vs same days last month" if prev > 0 else None
+        return f"{(now - prev) / prev * 100:+.0f}% vs {vs}" if (vs and prev > 0) else None
 
     s_now, s_prev = d_mtd["Sales"].sum(), d_prev["Sales"].sum()
     p_now, p_prev = d_mtd["Pcs"].sum(), d_prev["Pcs"].sum()
-    st.markdown(f"**This month so far** · {this_start:%d %b} → {today:%d %b}")
+    foc_now = d_mtd["FOC pcs"].sum() if "FOC pcs" in d_mtd else 0
+    st.markdown(f"**{p_label}**" + (f" · 🎁 includes {foc_now:,.0f} free (FOC) pcs" if with_foc and foc_now else
+                                     " · paid buns only" if not with_foc else ""))
     k1, k2, k3 = st.columns(3)
     k1.metric("Customers who ordered", f"{d_mtd['Key'].nunique():,}", _delta(d_mtd["Key"].nunique(), d_prev["Key"].nunique()))
-    k2.metric("Paid bun pcs", f"{p_now:,.0f}", _delta(p_now, p_prev))
-    k3.metric("Bun sales ៛", f"{s_now:,.0f}", _delta(s_now, s_prev))
+    k2.metric("Bun pcs (incl. FOC)" if with_foc else "Paid bun pcs", f"{p_now:,.0f}", _delta(p_now, p_prev))
+    if can_see_money():
+        k3.metric("Bun sales ៛", f"{s_now:,.0f}", _delta(s_now, s_prev))
+    else:
+        k3.metric("Bun sales ៛", MONEY_LOCK)
     st.markdown("**Customers to watch**")
     k4, k5, k6 = st.columns(3)
     k4.metric("Late vs their habit", f"{len(missing):,}")
     k5.metric("Bought last month, not yet now", f"{len(lost_month):,}")
-    k6.metric("Sales at risk ៛ (est.)", f"{int(missing['Lost sales ៛ (est.)'].sum()) if len(missing) else 0:,}")
+    k6.metric("Sales at risk ៛ (est.)", money_text(f"{int(missing['Lost sales ៛ (est.)'].sum()) if len(missing) else 0:,}"))
 
-    care_measure = "Sales" if str(st.session_state.get("si_care_measure", "")).startswith("💵") else "Pcs"
+    care_measure = "Sales" if (str(st.session_state.get("si_care_measure", "")).startswith("💵") and can_see_money()) else "Pcs"
     care = _si_care_cached(sig + "|" + _si_frame_sig(habits), today, care_measure, daily, df, codes, habits, names, areas, avgs)
     care_unit = "pcs" if care_measure == "Pcs" else "៛"
     top = pd.DataFrame()
@@ -8683,31 +9433,35 @@ def _sales_insights_body():
         _si_data_check_section(issues, totals, coverage)
 
     if t_top:
-        c1, c2 = st.columns([2, 2])
-        period = c1.selectbox("Period", SI_PERIODS, key="si_period")
-        metric_label = c2.radio("Rank by", list(SI_METRICS), horizontal=True, key="si_metric")
+        rank_opts = [m for m in SI_METRICS if can_see_money() or not _is_money_col(m)]
+        if st.session_state.get("si_metric") not in rank_opts:
+            st.session_state["si_metric"] = rank_opts[0]
+        metric_label = st.radio("Rank by", rank_opts, horizontal=True, key="si_metric")
         metric = SI_METRICS[metric_label]
         if metric == "Sales" and not daily["Sales"].sum():
             st.info("No sell prices found in the journal header; ranking by Cases instead.")
             metric, metric_label = "Cases", "Cases"
-        start, end = _si_period(period, today)
+        start, end = p_start, p_end
         top, total = _si_top(daily, start, end, metric, names, areas, 20, df, codes)
         if top.empty:
             st.info(f"No orders in this period ({start} → {end}).")
         else:
             st.caption(f"{start} → {end} · Top 20 hold {top['Share %'].sum():.0f}% of all {metric_label} in this period.")
-            _si_bar(top, "Customer", metric_label if metric_label in top.columns else "Sales ៛")
+            _si_bar(top, "Customer", metric_label if metric_label in top.columns else ("Sales ៛" if can_see_money() else "Bun pcs"))
             _si_show(top, money=("Sales ៛", "Avg order ៛", "Bun pcs"), pct=("Share %",), height=760)
             part = df[(df["D"] >= pd.Timestamp(start)) & (df["D"] <= pd.Timestamp(end))]
             if len(part) and codes:
                 info = snap.get("buns", {}) or {}
                 sell = info.get("sell", {}) or {}
+                paid_part = part[~part["FOC"]] if "FOC" in part else part
                 types = pd.DataFrame([{"Code": c, "Bun": (info.get("names", {}) or {}).get(c, ""),
-                                       "Pieces": int(part[c].sum()), "Sales ៛": int(part[c].sum() * float(sell.get(c) or 0)),
+                                       "Pieces": int(part[c].sum()),
+                                       **({"FOC pcs": int(part.loc[part["FOC"], c].sum())} if with_foc and "FOC" in part else {}),
+                                       "Sales ៛": int(paid_part[c].sum() * float(sell.get(c) or 0)),
                                        "Customers": int((part.groupby("Key")[c].sum() > 0).sum())} for c in codes])
                 types = types[types["Pieces"] > 0].sort_values("Pieces", ascending=False)
                 with st.expander("🥟 Pieces by bun type (all customers, this period)"):
-                    _si_show(types, money=("Pieces", "Sales ៛"))
+                    _si_show(types, money=("Pieces", "FOC pcs", "Sales ៛"))
 
     if t_miss:
         st.markdown("Customers who normally order every X days but are **later than usual**. "
@@ -8726,11 +9480,9 @@ def _sales_insights_body():
                          money=("Usual pcs", "Avg order ៛", "Lost pcs (est.)", "Lost sales ៛ (est.)"))
 
     if t_none:
-        mode = st.radio("Month", ["This month", "Last month"], horizontal=True, key="si_month")
-        if mode == "This month":
-            m_start, m_end = this_start, today
-        else:
-            m_start, m_end = last_start, last_end
+        mode = "This month" if (p_start == this_start and p_end == today) else "period"
+        m_start, m_end = p_start, p_end
+        st.caption(f"Customers with no order in **{p_label}** — change the 📅 Period at the top to look at another month or dates.")
         table = _si_no_order(daily, names, areas, m_start, m_end, today, avgs)
         try:
             table, dup_review, n_same = _si_no_order_split(table, daily, names, m_start, m_end)
@@ -8741,7 +9493,7 @@ def _sales_insights_body():
             hist_calls = read_raw(CALLS_FILE, CALL_COLS)
         except Exception:
             hist_calls = pd.DataFrame(columns=CALL_COLS)
-        _si_dup_review(dup_review)
+        _si_dup_review(dup_review, all_names=list(names.values()))
         if table.empty:
             st.success("Every customer ordered in this month. 🎉")
         else:
@@ -8772,7 +9524,8 @@ def _sales_insights_body():
             sel = st.session_state.get("si_seg_sel")
             if sel not in segs:
                 sel = None
-            st.radio("Measure customers by", ["🥟 Bun pcs", "💵 Sales ៛"], horizontal=True, key="si_care_measure")
+            if can_see_money():
+                st.radio("Measure customers by", ["🥟 Bun pcs", "💵 Sales ៛"], horizontal=True, key="si_care_measure")
             st.caption("👆 Click a card to filter the lists below. Click it again (or 📋 All) to clear.")
             cards = [(None, f"📋 All · {len(care)}")] + [(sg, f"{sg} · {cnt[sg]}") for sg in segs]
             for i in range(0, len(cards), 4):
@@ -9407,7 +10160,7 @@ def _visit_zone_from_gps(lat, lon):
     return zone, khan
 
 
-def _visit_zone_info(names):
+def _visit_zone_info(names, cache_key="_visit_zone_cache"):
     """{key: (zone, where it came from)} — Admin's choice, else the real location, else the name. Reused for 2 minutes."""
     try:
         sig = (len(names), hash(tuple(sorted(names))), os.path.getmtime(VISIT_PIN_FILE) if os.path.exists(VISIT_PIN_FILE) else 0,
@@ -9415,7 +10168,7 @@ def _visit_zone_info(names):
                len(st.session_state.get("_visit_new", {}) or {}))
     except Exception:
         sig = None
-    hit = st.session_state.get("_visit_zone_cache")
+    hit = st.session_state.get(cache_key)
     if sig is not None and hit and hit[0] == sig:
         return hit[1]
     over = _visit_zone_overrides()
@@ -9444,7 +10197,7 @@ def _visit_zone_info(names):
             out[k] = (z, "🔤⚠️ ឈ្មោះមាន 2 តំបន់ — សូមពិនិត្យ")
         else:
             out[k] = (z, "🔤 តាមឈ្មោះ")
-    st.session_state["_visit_zone_cache"] = (sig, out)
+    st.session_state[cache_key] = (sig, out)
     return out
 
 
@@ -9467,18 +10220,31 @@ def _visit_progress(visits, user):
                 text=f"ថ្ងៃនេះ: បានចុះ {done} / {VISIT_DAILY_TARGET} ហាង" + (" 🎉 ដល់គោលដៅហើយ" if not left else f" · នៅសល់ {left}"))
 
 
-def _visit_zone_picker(zone_map, key, due=None):
-    """Zone selector, remembered for the day so staff pick it once. due = Counter(zone -> shops due now)."""
+VISIT_ALL_ZONES = "🗺️ គ្រប់តំបន់ (ទាំងអស់)"
+
+
+def _visit_zone_picker(zone_map, key, due=None, allow_all=False):
+    """Zone selector, remembered for the day so staff pick it once. due = Counter(zone -> shops due now).
+    allow_all=True adds 'all zones' (returns VISIT_ALL_ZONES)."""
     counts = Counter(zone_map.values())
     due = due or Counter()
     options = [z for z in VISIT_ZONE_NAMES if counts.get(z) and not z.startswith("🚫")]
     if not options:
         return None
+    if allow_all:
+        options = [VISIT_ALL_ZONES] + options
     mem = st.session_state.get("visit_zone_today")
     if st.session_state.get(key) not in options:
-        st.session_state[key] = mem if mem in options else options[0]
-    zone = st.selectbox("🗺️ តំបន់របស់ខ្ញុំថ្ងៃនេះ", options, key=key, format_func=lambda z: f"{_km(z)}  ({counts.get(z, 0)} ហាង" + (f" · ត្រូវចុះ {due[z]}" if due.get(z) else "") + ")")
-    st.session_state["visit_zone_today"] = zone
+        st.session_state[key] = mem if mem in options else options[1 if allow_all else 0]
+    n_all, due_all = sum(counts.get(z, 0) for z in options[1:] if allow_all), sum(due.values())
+
+    def _fmt(z):
+        if z == VISIT_ALL_ZONES:
+            return f"{z}  ({n_all} ហាង" + (f" · ត្រូវចុះ {due_all}" if due_all else "") + ")"
+        return f"{_km(z)}  ({counts.get(z, 0)} ហាង" + (f" · ត្រូវចុះ {due[z]}" if due.get(z) else "") + ")"
+    zone = st.selectbox("🗺️ តំបន់របស់ខ្ញុំថ្ងៃនេះ", options, key=key, format_func=_fmt)
+    if zone != VISIT_ALL_ZONES:
+        st.session_state["visit_zone_today"] = zone        # the New visit form starts in this zone
     return zone
 
 
@@ -9782,19 +10548,48 @@ def _visit_registry_pins(registry):
     return out
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
+def _grams(key):
+    k = f"  {key} "
+    return {k[i:i + 3] for i in range(len(k) - 2)}
+
+
+def _gram_index(keys):
+    """3-letter piece -> set of positions. Lets fuzzy matching skip names that share almost nothing."""
+    idx = {}
+    for i, k in enumerate(keys):
+        for g in _grams(k):
+            idx.setdefault(g, set()).add(i)
+    return idx
+
+
+def _gram_shortlist(key, idx, min_share=0.3):
+    """Positions sharing at least min_share of key's 3-letter pieces (the only ones worth a full comparison)."""
+    gs = _grams(key)
+    if not gs:
+        return []
+    hits = Counter()
+    for g in gs:
+        for i in idx.get(g, ()):
+            hits[i] += 1
+    need = max(1, int(len(gs) * min_share))
+    return [i for i, c in hits.items() if c >= need]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
 def _visit_pin_candidates(name_items, pin_items):
     """{key: [(score, location id, map name, lat, lon), ...best 3]} and {key: candidate} for the safe automatic links.
     Safe = same name after cleaning, or ≥ 90% alike and clearly better than the next pin."""
     import difflib
     pins = [(pid, pname, lat, lon, _visit_match_key(pname)) for pid, pname, lat, lon, _p in pin_items]
+    gidx = _gram_index([p[4] for p in pins])
     cands, auto, claimed = {}, {}, Counter()
     for k, name in name_items:
         nk = _visit_match_key(name)
         if len(nk) < 3:
             continue
         scored = []
-        for pid, pname, lat, lon, pk in pins:
+        for j in _gram_shortlist(nk, gidx, 0.25):
+            pid, pname, lat, lon, pk = pins[j]
             sm = difflib.SequenceMatcher(None, nk, pk)
             if sm.real_quick_ratio() < 0.5 or sm.quick_ratio() < 0.5:
                 continue
@@ -9818,8 +10613,22 @@ def _visit_pin_candidates(name_items, pin_items):
 
 
 def _visit_candidates_for(names, registry):
-    pins = tuple(_visit_registry_pins(registry))
-    return _visit_pin_candidates(tuple(sorted(names.items())), pins)
+    """Fuzzy pin suggestions. Remembered on the registry object, so repeated clicks cost nothing."""
+    items = tuple(sorted(names.items()))
+    memo = registry.setdefault("_cand_memo", {}) if isinstance(registry, dict) else {}
+    key = (hash(items), len(registry.get("records", {})) if isinstance(registry, dict) else 0)
+    if key in memo:
+        return memo[key]
+    pins = registry.get("_pins_tuple") if isinstance(registry, dict) else None
+    if pins is None:
+        pins = tuple(_visit_registry_pins(registry))
+        if isinstance(registry, dict):
+            registry["_pins_tuple"] = pins
+    out = _visit_pin_candidates(items, pins)
+    if len(memo) > 16:
+        memo.clear()
+    memo[key] = out
+    return out
 
 
 def _visit_pin_info(customer, registry=None, store=None, auto=None):
@@ -10139,6 +10948,10 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
     if zone:
         keys = {k for k in keys if (zone_map or {}).get(k) == zone}
     new = st.session_state.get("_visit_new", {}) or {}
+    try:
+        sticker = _sticker_latest(visits=visits)
+    except Exception:
+        sticker = {}
     rows = []
     for k in keys:
         s = stats.loc[k] if (not stats.empty and k in stats.index) else None
@@ -10175,6 +10988,9 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
             gap = s["Usual gap"]
             if pd.notna(gap) and gap > 0 and s["Days since order"] > 2 * gap and s["Order days"] >= 3:
                 score += 2; why.append(f"⏰ មិនបញ្ជាទិញ {int(s['Days since order'])} ថ្ងៃ (ធម្មតា {gap:.0f})")
+        sk = sticker.get(k)
+        if _sticker_needs(sk):
+            score += 2; why.append(f"🏷️ ត្រូវការស្ទីគ័រ ({sk['src']} {sk['date']:%d %b}) — យកស្ទីគ័រទៅ")
         if size.startswith("🟢"):
             score += 1
         if due_in is not None and due_in > 0 and not why:
@@ -10190,11 +11006,71 @@ def _visit_route(visits, stats, names, areas, zone_map=None, zone=None, cfg=None
     return out.sort_values(["Priority", "Pcs 28 days"], ascending=False).reset_index(drop=True)
 
 
+def _visit_unpick(customer):
+    st.session_state["visit_picked"] = [c for c in st.session_state.get("visit_picked", []) if c != customer]
+
+
+def _visit_plan_card(row, key, star, registry, pin_store, auto_pins, zone_src, all_zones=False, removable=False):
+    link, exact = _visit_map_link(row["Customer"], registry, pin_store, auto_pins)
+    with st.container(border=True):
+        if _visit_phone_mode():
+            c1 = st.container()
+            c2, c3 = st.columns(2)
+        else:
+            c1, c2, c3 = st.columns([4, 1, 1])
+        zone_txt = f" · {_km(row['Area'])}" if all_zones else ""
+        c1.markdown(f"**{'⭐ ' if star else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
+                    f"<span style='color:#6B7280'>{_km(row['Size'])} · ចុះហាងចុងក្រោយ {_km_days(row['Last visit'])} · {row['Pcs 28 days']:,} pcs ក្នុង ២៨ ថ្ងៃ"
+                    f"{zone_txt} · {zone_src.get(norm_name(row['Customer']), '')}</span>",
+                    unsafe_allow_html=True)
+        c2.link_button("🧭 ទៅ" if exact else "⚠️ គ្មានទីតាំង", link, use_container_width=True,
+                       help="ផ្លូវទៅទីតាំងហាងដែលបានរក្សាទុក" if exact
+                       else "No saved location yet: this searches the name on Google Maps. Save the real location at the shop.")
+        c3.button("ចាប់ផ្តើម ▶", key=key, use_container_width=True, on_click=_visit_start, args=(row["Customer"],))
+        if removable:
+            c1.button("✖ ដកចេញ", key=f"{key}_rm", on_click=_visit_unpick, args=(row["Customer"],))
+
+
+def _visit_map_pick(route, done_today, registry, store, auto):
+    """Map of the plan's shops (same as the Media Team map). Tap a pin to pick the shops for today's trip."""
+    rows = []
+    for r in route.to_dict("records"):
+        pin = _visit_pin(r["Customer"], registry, store, auto)
+        if not pin:
+            continue
+        why, due = str(r["Why visit"]), r["Due in (days)"]
+        if norm_name(r["Customer"]) in done_today:
+            kind, why = "dark", "✅ បានចុះរួចថ្ងៃនេះ"
+        elif "🔴" in why:
+            kind = "red"
+        elif "🆕 អតិថិជនថ្មី" in why:
+            kind = "blue"
+        elif "🏷️ ត្រូវការស្ទីគ័រ" in why:
+            kind = "purple"
+        elif pd.isna(due) or due <= 0:
+            kind = "orange"
+        else:
+            kind = "grey"
+        rows.append({"Lat": pin[0], "Lon": pin[1], "Customer": r["Customer"], "label": r["Customer"],
+                     "info": f"{why}\n{r['Pcs 28 days']:,} pcs / 28 ថ្ងៃ", "color": PICK_PIN_COLORS[kind],
+                     "radius": 130 if kind in ("red", "blue", "purple") else 100 if kind == "orange" else 60})
+    show_map = st.toggle("🗺️ បង្ហាញផែនទី — ចុចលើចំណុចដើម្បីជ្រើសហាង", value=True, key="visit_show_map")
+    st.caption("🔴 បញ្ហាមិនទាន់ដោះស្រាយ · 🔵 អតិថិជនថ្មី · 🟣 ត្រូវការស្ទីគ័រ · 🟠 ដល់ពេលចុះ · ⚪ មិនទាន់ដល់ពេល · ⚫ ចុះរួចថ្ងៃនេះ · 🟢 បានជ្រើស"
+               + (f" · {len(route) - len(rows)} ហាងមិនទាន់មានទីតាំង" if len(rows) < len(route) else ""))
+    if show_map:
+        picked = _pick_map(rows, "visit_picked", "visit_shops", 320 if _visit_phone_mode() else 430)
+    else:
+        picked = list(st.session_state.get("visit_picked", []))
+    if picked:
+        st.button("↩️ សម្អាតការជ្រើស", key="visit_pick_clear", on_click=lambda: st.session_state.pop("visit_picked", None))
+    return picked
+
+
 def _visit_is_due(route):
     """Rows that need a visit now: due/late, never visited, or with an open problem."""
     if route.empty:
         return route.iloc[0:0]
-    return route[route["Due in (days)"].fillna(0).le(0) | route["Why visit"].str.contains("🔴")]
+    return route[route["Due in (days)"].fillna(0).le(0) | route["Why visit"].str.contains("🔴|🏷️ ត្រូវការស្ទីគ័រ")]
 
 
 def _visit_new_form(visits, stats, names):
@@ -10513,6 +11389,10 @@ def _vf_check(d, ctx, phone):
     fifo = cols[1].radio("🥟 ការតាំង / នំចាស់នៅខាងមុខ (FIFO)", VF_FIFO, format_func=_km, index=_vf_idx(VF_FIFO, d.get("fifo")), horizontal=True, key="vf_fifo")
     old_pcs = cols[2].number_input("នំចាស់ / ខូច ដែលរកឃើញ (pcs)", 0, 5000, int(d.get("old_pcs", 0)), 1, key="vf_old")
     sticker = cols[3].radio("🏷️ ស្ទីគ័រ", VF_STICKER, format_func=_km, index=_vf_idx(VF_STICKER, d.get("sticker")), horizontal=True, key="vf_sticker")
+    try:
+        cols[3].caption(_sticker_text(_sticker_latest().get(ctx.get("key"))))
+    except Exception:
+        pass
     changed = cols[4].number_input("ស្ទីគ័របានប្តូរថ្ងៃនេះ", 0, 100, int(d.get("changed", 0)), 1, key="vf_changed")
     fridge_fixed = st.checkbox("🧽 ខ្ញុំបានសម្អាត / រៀបទូទឹកកក ឬកន្លែងតាំងថ្ងៃនេះ", value=bool(d.get("fridge_fixed")), key="vf_ffix")
     st.caption(f"គូសធីកអ្វីដែលល្អនៅ {_km(ctx['shop_type'])}:")
@@ -10620,6 +11500,7 @@ def _vf_save(a, ctx):
         st.error("មិនអាចរក្សាទុករបាយការណ៍បានទេ: " + str(e)[:160] + "។ ចម្លើយរបស់អ្នកនៅដដែល សូមចុចរក្សាទុកម្តងទៀត។")
         return
     audit("shop visit" + (" (TEST)" if _visit_test_mode() else ""), f"{customer} | {label} | {row['Problems']}")
+    _visit_unpick(customer)                              # done: off the map picks
     _vf_draft_delete()
     for k in [k for k in list(st.session_state) if str(k).startswith(("visit_gps", "visit_customer", "visit_cam", "visit_files",
                                                                      "visit_before", "visit_after", "vf_", "visit_draft", "visit_ctx"))]:
@@ -10906,9 +11787,8 @@ def _visit_report_body(visits):
         _visit_show_photos(r["Photos"], "vr")
     if has_permission("reports"):
         try:
-            st.download_button("📥 Download visits (Excel)", data=_report_excel_bytes({"Visits": v.drop(columns=["_dt"]), "By staff": per}),
-                               file_name=f"Shop_Visits_{start}_{end}.xlsx", key="vr_dl",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            _lazy_excel_download("📥 Download visits (Excel)", lambda: {"Visits": v.drop(columns=["_dt"]), "By staff": per},
+                                 f"Shop_Visits_{start}_{end}.xlsx", "vr_dl")
         except Exception as e:
             st.warning(f"Could not build the Excel file: {e}")
 
@@ -11769,9 +12649,10 @@ def _shop_visits_body():
         zone_src = {k: v[1] for k, v in _visit_zone_info(names).items()}
         all_route = _visit_route(visits, stats, names, areas, zone_map)
         due_all = _visit_is_due(all_route)
-        zone = _visit_zone_picker(zone_map, "visit_zone_plan", Counter(due_all["Area"]))
-        route = all_route[all_route["Area"].eq(zone)].reset_index(drop=True) if zone else all_route
-        st.caption(f"📅 ហាងនៅភ្នំពេញ {len(due_all)} ត្រូវចុះឥឡូវ · ក្នុងតំបន់នេះ {len(_visit_is_due(route))}។")
+        zone = _visit_zone_picker(zone_map, "visit_zone_plan", Counter(due_all["Area"]), allow_all=True)
+        all_zones = zone == VISIT_ALL_ZONES
+        route = all_route if (all_zones or not zone) else all_route[all_route["Area"].eq(zone)].reset_index(drop=True)
+        st.caption(f"📅 ហាងនៅភ្នំពេញ {len(due_all)} ត្រូវចុះឥឡូវ" + ("" if all_zones else f" · ក្នុងតំបន់នេះ {len(_visit_is_due(route))}") + "។")
         if route.empty:
             st.info("មិនទាន់មានហាងក្នុងតំបន់នេះទេ។")
             return
@@ -11783,24 +12664,23 @@ def _shop_visits_body():
             auto_pins = {}
         done_today = set(visits.loc[visits["_dt"].dt.date == today_kh(), "Customer"].map(norm_name)) if not visits.empty else set()
         todo = route[~route["Customer"].map(norm_name).isin(done_today)]
-        st.markdown(f"**⭐ ហាងណែនាំ {VISIT_DAILY_TARGET} សម្រាប់ថ្ងៃនេះ** — ហាងសំខាន់បំផុតក្នុងតំបន់នេះ")
-        q = st.text_input("🔎 ស្វែងរកហាងក្នុងតំបន់នេះ", key="vroute_q", max_chars=60)
+        card = dict(registry=registry, pin_store=pin_store, auto_pins=auto_pins, zone_src=zone_src, all_zones=all_zones)
+        picked = _visit_map_pick(route, done_today, registry, pin_store, auto_pins)
+        if picked:
+            st.markdown(f"**✅ ហាងដែលបានជ្រើសលើផែនទី ({len(picked)})** — តាមលំដាប់ដែលបានចុច")
+            by_name = {r["Customer"]: r for r in route.to_dict("records")}
+            for n, c in enumerate(picked):
+                if c in by_name:
+                    _visit_plan_card(by_name[c], f"vpk_{n}", star=False, removable=True, **card)
+            st.divider()
+        where = "គ្រប់តំបន់" if all_zones else "ក្នុងតំបន់នេះ"
+        st.markdown(f"**⭐ ហាងណែនាំ {VISIT_DAILY_TARGET} សម្រាប់ថ្ងៃនេះ** — ហាងសំខាន់បំផុត{where}")
+        q = st.text_input(f"🔎 ស្វែងរកហាង{where}", key="vroute_q", max_chars=60)
         r = todo if not q.strip() else todo[todo["Customer"].str.contains(q.strip(), case=False, regex=False)]
         for n, (i, row) in enumerate(r.head(VISIT_DAILY_TARGET + 12).iterrows()):
             if n == VISIT_DAILY_TARGET and not q.strip():
-                st.markdown("**ហាងផ្សេងទៀតក្នុងតំបន់នេះ**")
-            link, exact = _visit_map_link(row["Customer"], registry, pin_store, auto_pins)
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([4, 1, 1])
-                c1.markdown(f"**{'⭐ ' if n < VISIT_DAILY_TARGET and not q.strip() else ''}{row['Customer']}**  \n{row['Why visit']}  \n"
-                            f"<span style='color:#6B7280'>{_km(row['Size'])} · ចុះហាងចុងក្រោយ {_km_days(row['Last visit'])} · {row['Pcs 28 days']:,} pcs ក្នុង ២៨ ថ្ងៃ"
-                            f" · {zone_src.get(norm_name(row['Customer']), '')}</span>",
-                            unsafe_allow_html=True)
-                c2.link_button("🧭 ទៅ" if exact else "⚠️ គ្មានទីតាំង", link, use_container_width=True,
-                               help="ផ្លូវទៅទីតាំងហាងដែលបានរក្សាទុក" if exact
-                               else "No saved location yet: this searches the name on Google Maps. Save the real location at the shop.")
-                c3.button("ចាប់ផ្តើម ▶", key=f"vstart_{i}", use_container_width=True,
-                          on_click=_visit_start, args=(row["Customer"],))
+                st.markdown(f"**ហាងផ្សេងទៀត{where}**")
+            _visit_plan_card(row, f"vstart_{i}", star=n < VISIT_DAILY_TARGET and not q.strip(), **card)
         if done_today & set(route["Customer"].map(norm_name)):
             st.caption("✅ បានចុះរួចថ្ងៃនេះ (ដោយអ្នកណាម្នាក់): " + ", ".join(route.loc[route["Customer"].map(norm_name).isin(done_today), "Customer"]))
     elif view == "⚙️ Shops & zones":
@@ -11833,6 +12713,1658 @@ def _shop_visits_body():
         _visit_problems_body(visits)
 
 
+# ==========================================
+# 📸 MEDIA TEAM — photos & videos of Phnom Penh shops every Friday and Saturday
+# ==========================================
+MEDIA_FILE = os.path.join(DATA_DIR, "media_shoots.csv")
+MEDIA_COLS = ["Date", "Customer", "ShootID", "Zone", "By", "Photos", "Videos", "Sticker", "Menu", "Banner",
+              "Why", "Note", "Shoot day"]
+MEDIA_DIR = "media"
+MEDIA_DAYS = (4, 5)                       # Friday, Saturday (Monday = 0)
+MEDIA_ITEMS = ["Sticker", "Menu", "Banner"]
+MEDIA_STATES = ["✅ Put up a new one today", "👍 Has one, still good", "⚠️ Old — needs a new one", "❌ None — needs one",
+                "➖ Not for this shop"]
+MEDIA_NEED = ("⚠️ Old — needs a new one", "❌ None — needs one")
+MEDIA_KM = {"Sticker": "ស្ទីគ័រ", "Menu": "ម៉ឺនុយ", "Banner": "បដា / Banner",
+            "✅ Put up a new one today": "✅ បានដាក់ថ្មីថ្ងៃនេះ", "👍 Has one, still good": "👍 មានហើយ នៅល្អ",
+            "⚠️ Old — needs a new one": "⚠️ ចាស់ — ត្រូវការថ្មី", "❌ None — needs one": "❌ មិនមាន — ត្រូវការ",
+            "➖ Not for this shop": "➖ មិនត្រូវការសម្រាប់ហាងនេះ"}
+MEDIA_PHOTO_MAX = 12
+MEDIA_VIDEO_MAX_MB = 200
+MEDIA_RECENT_DAYS = 45                    # journal events this recent put a shop on the media list
+MEDIA_REFRESH_DAYS = 90                   # photos older than this are "old"
+# journal remark words -> why the media team should go
+MEDIA_EVENT_RULES = [
+    ("fridge", 10, "🧊 ទូថ្មី", re.compile(r"ទូរ?\s*ថ្មី|NEW\s*FRIDGE", re.I)),
+    ("display", 5, "🪧 ឧបករណ៍តាំងថ្មី", re.compile(r"X[\s\-]*STAND|រ៉េស៊ីស្តង់|ឆ័ត្រ|ឆ៍ត្រ|UMBRELLA|STICKER|ស្ទីគ័រ|BANNER|ផ្ទាំង|MENU|ម៉ឺនុយ", re.I)),
+]
+
+
+def _mkm(v):
+    return MEDIA_KM.get(v, v)
+
+
+# Filmed / refused status per shop. Seed = the MEDIA colours of REPORT_UPDATED_ALL.xlsx (TOTAL sheet, 30 Oct 2026):
+# green = Filmed, red = Refused (customer does not allow filming), yellow = Yellow (meaning not given), blank = not yet.
+MEDIA_STATUS_FILE = os.path.join(DATA_DIR, "media_status.csv")
+MEDIA_STATUS_COLS = ["Date", "Customer", "Status", "By", "Source"]
+MEDIA_STATUS_SEED_DATE = "2026-10-30 16:40:00"
+_MEDIA_STATUS_SEED = json.loads(r"""[["VUTHEA SOY ផ្លូវលេខ6A ចំការដូង","Filmed"],["STAF","Refused"],["SUGEK CHIN អ៊ីអន2","Filmed"],["SAIFONG HENG កប់ស្រូវ","Refused"],["MOUYGUECH KONG ផ្លូវកម្ពជាក្រោម","Filmed"],["LIM NGEAN ទឹកល្អក់2 ទួលគោក","Filmed"],["មរតកកាហ្វេ អង្គតាសោម","Filmed"],["CHUU MI បុរីវិមានភ្នំពេញថ្មី","Filmed"],["សឿន ប៊ុនឆៃ បុរីសូនី","Filmed"],["សែបកាហ្វេ​ Station","Filmed"],["Conextion កោះពេជ្រ","Filmed"],["LIM LONG សំរោងធំ","Filmed"],["VUTHEA SOY ទួលគោក","Filmed"],["OUN VY ផ្សារតាប៉ាង ផ្លូវ 49","Filmed"],["AH HORNG OVER វាលស្បូវ","Filmed"],["NHET ROM ប៉េងហួតបឹងស្នោរ","Filmed"],["សារិកា កាហ្វេ","Filmed"],["SENG SOCHEATA ឈូកវ៉ា2","Filmed"],["KANG VUTHY កំពង់ចម្លងព្រែកលាប","Filmed"],["ក្រសួងការពារជាតិ","Refused"],["នំបុ័ងភ្នំពេញ ចោមចៅ","Refused"],["SOU SARITH បឹងកេងកង3","Refused"],["ឥន្រ្ទី បូព៌ា ព្រៃជីសាក់ ចោមចៅ3 ពោធិ៍សែនជ័យ","Filmed"],["BELLA SMITT តាខ្មៅ","Filmed"],["TANGIM COSMETIC ផ្សារស្លាបលែង","Filmed"],["FRIEND COFFEE ជ្រោយចង្វារ","Filmed"],["NHET ROM ស្ទឹងមានជ័យ","Filmed"],["VUTHEA SOY ចំការដូង","Filmed"],["RAK បុរីអ័រគីដេ","Filmed"],["SOK RA បឹងកក់ 2","Filmed"],["THYDA SET","Filmed"],["ជឹម ជ័យសេរីមុនិន្ទ កោះពេជ្រ","Filmed"],["PHAL LA មន្ទីរពេទ្យកុមារជាតិ","Refused"],["AGRO CAFE សាលាកសិកម្មចំការដូង","Filmed"],["VIN MART ទួលគោក","Filmed"],["RAKSMEY NANO ច្បាអំពៅ","Filmed"],["CHIN HOK ទល់មុខឡានទឹក","Filmed"],["KOEM SREYRATH ទួលស្វាយព្រៃ","Filmed"],["នំបុ័ងភ្នំពេញ បូរីសូនី","Refused"],["CHHIM SANDALIN","Filmed"],["ប៊ុនធេង កាហ្វេ ឈូកមាស","Filmed"],["JOLYTA ផ្សារឯករាជ្យ 2","Filmed"],["CHEA MOLIVANN ស្តុបបឹងកក់","Filmed"],["ONE OLYMAPIC MALL អូឡាំព្យា","Refused"],["AEON MAXVALU SUPERMARKET BEONG KAK 51 (EDEN)","Filmed"],["THAISOR NA ជាសុផារ៉ា","Filmed"],["SOKHEA NEANG ទំនប់កប់ស្រូវ","Filmed"],["SOPHAL FREEMAN ផ្សារត្រពាំងឈូក","Refused"],["CHEA SHATAPANA សំណង់12","Filmed"],["SOUPHEA POV កប់ស្រូវ","Filmed"],["SREY POV ស្ទឹងមានជ័យ","Filmed"],["LA BELLA COFFEE ព្រៃទទឹង","Yellow"],["SEAVMEY តាខ្មៅ","Filmed"],["MIE XIANG សែនសុខ","Filmed"],["MI NEA អរិក្សយត្រ","Filmed"],["UTH SIEMHONG ច្បារអំពៅ","Yellow"],["H LYHACH ទួលទំពូង","Filmed"],["ម៉ែ កុលាប បុរីសន្ដិភាព2( Jaunary mis)","Filmed"],["P RESTAURANT","Filmed"],["ដើមកាហ្វេ​ ដេអិន","Filmed"],["ផ្ទះនំបញ្ខុក ឈូកមាស","Filmed"],["SO MALY អូពីរ កំពង់សោម","Filmed"],["VUTHEA SOY CHIP MONG 271","Filmed"],["ជា ទិត្យ សូម៉ាតឿន(ABC ព្រៃ ស )","Refused"],["CHAN THA ផ្សារបឹងត្របែក","Filmed"],["ភឿន ចរិយា ផ្សារដីហ៊ុយ","Filmed"],["X CAFÉ ចំកាដូង","Filmed"],["RISOU COFFEE ( YANO )","Filmed"],["SAMNEANG LUN ទួលកី","Filmed"],["LIM LONG ព្រែកតាទែន","Filmed"],["JEE DA ផ្លូវ60ម៉ែត្រ ចាក់អង្រែក្រោម","Filmed"],["នំបុ័ងភ្នំពេញ ចម្រើនផល","Refused"],["BO KAKNIKA ព្រែកព្នៅ","Yellow"],["OUN POV ចោមចៅ","Refused"],["MR.DAD COFFEE យុគន្ធរ","Filmed"],["AEON MAXVALU EXPRESS BENG KANG 51","Refused"],["SOENG LINGLING បុរីលឹមឈាងហាក់ ចំការដូង","Filmed"],["SORIYA ដួងនៀប 2004","Filmed"],["តេលាម៉ាក់លុច","Filmed"],["សារី ផ្លូវសឡា","Filmed"],["AEON MAXVALU TOUL KORK 337 (3021) MV TK337","Filmed"],["AEON MAXVALU TOUL KORK 315","Filmed"],["TIK TOK CAFÉ សែនសុខ","Filmed"],["កោះកាហ្វេ","Filmed"],["ស្រីឡៃ សម្រស់ធម្មជាតិ លូ 5","Filmed"],["ក្រសួងការងារ","Refused"],["NANFA វត្ដអង្គពោធិ៍ញ្ញាណ","Filmed"],["ទឹម លីហេង ចំការដូង","Filmed"],["KIM CHHENGHONG ជម្ពូវន្ត","Filmed"],["AH RAVY ផ្លូវ 2004","Filmed"],["AEON MAXVALU​ CHROY CHONG VA 3014","Filmed"],["SREYROTH JIMMY កំបូល","Refused"],["EUNG PANHA ទួលគោក","Filmed"],["ណារិន ចន្ធធារ៉ា ឫស្សីកែវ","Filmed"],["កែវ ចាន់សាវីន ពេទ្យរុស្សី","Filmed"],["នំបុ័ងភ្នំពេញ 271","Refused"],["SREY KHOUCH ព្រែកព្នៅ","Yellow"],["VIE VIE តាខ្មៅ","Filmed"],["VIN MART អូឬស្សី","Filmed"],["THE Snow ផ្សារសាំងហាន់ ផ្លូវ 907","Filmed"],["VY DA ឃួនសុធុន","Refused"],["SUN POVNEARY ក្រាំងធ្នង់","Filmed"],["RAKSMEY ROMDOUL","Filmed"],["RATHA UNG ចាក់អង្រែក្រោម","Filmed"],["L RESIDENCEបុរីកីឡា","Filmed"],["BLUEBIRD INTERNATIONL EDUCATION","Refused"],["KHAM CHISOPHEAK ស្តុបដេផន","Filmed"],["NOK NOI COFFEE តាខ្មៅ","Filmed"],["ម៉ែ ម៉េងលី (សាវីមិច ផ្សារទូកមាស)","Filmed"],["CALTEX អង្គតាសោម","Refused"],["ដើមកាហ្វេ បឹងកក់","Filmed"],["AEON MAXVALU TONLE BASSAC MONIVONG  3018","Filmed"],["ចណ្ណាកាហ្វេ","Filmed"],["ចុងភៅមានហេង (កប់ស្រូវ)","Refused"],["នំបុ័ងភ្នំពេញ ជ្រោយចង្វា","Refused"],["PHO MONICA ពេទ្យរុស្សី","Filmed"],["CHIN HOK កោះនរា","Filmed"],["BEE ត្រពាំងថ្លឹង","Refused"],["RADET JASPER ឈូកវ៉ា 2","Filmed"],["THIDA LUCKY ច្បារអំពៅ","Filmed"],["TELA RITHY CAMCO","Filmed"],["Paradise Coffee បឹងកេងកង","Filmed"],["The Station coffee ភ្នំពេញថ្មី","Filmed"],["GALLERY COFFE ជ្រោយចង្វារ","Filmed"],["VUTHEA SOY ជម្ពូវន្ត","Filmed"],["បៀលប្រាយសែនសុខ","Filmed"],["AEON MAXVALU EXPRESS TOUL TOMPUNG","Refused"],["AEON MAXVALU BOEUNG KAK","Refused"],["JUER ODEM","Filmed"],["អ៊ីកាហ្វេ ផ្សារថ្មី","Filmed"],["ហេង សៀវម៉ី កំពង់ចាម","Filmed"],["DARA PICH ព្រែកតាកូវ ក្រុងអរិយក្សត្រ","Filmed"],["Poch Rady បុរីលឹមឆេងហាក់ អូឌឹម","Filmed"],["ម៉ាក់ កូនវិ បែកចាន","Filmed"],["TON CHANNY ស្រែអំបិល កោះកុង","Filmed"],["MAICHEU សៀមរាប","Refused"],["KIM SUN ចំការដូង","Filmed"],["THE FRESH វិមានឯករាជ្យ","Filmed"],["CHIN HOK ភូមិខ្មែរជោគជ័យ អ៊ីអន 3","Filmed"],["YU MI បុរីពិភពថ្មី 1","Filmed"],["PISETH POUV បឹងទំពុន","Refused"],["OLE CAFE ទួលពង្រ","Filmed"],["HAK NYTA ពោធិ៍ចិនតុង","Filmed"],["RASY HR គួរស្រូវ","Yellow"],["VUTHEA SOY ទួលសង្កែ","Filmed"],["ឡឹង បញ្ញា ផ្សារបែកចាន","Filmed"],["SOPHORS VETH ឈូកវ៉ា 1","Filmed"],["ដេប៉ូតេលាគីឡូម៉ែត្រ65 ផ្លូវជាតិលេខ5","Filmed"],["SOPHEAROM MEN ទឹកល្អក់២","Filmed"],["AEON MAXVALU CHAK ANGRE LEU","Filmed"],["AEON MAXVALU CHAKTUMUK51","Filmed"],["THY CHOURY បុរីឡេងណាវ៉ាត់ត្រា","Yellow"],["MOLII COFFEE ដីហុយ","Filmed"],["PTT កំពង់ឆ្នាំង","Refused"],["AEON MAXVALU EXPRESS BENG KANG 51","Refused"],["DIAMOND BICYCLE ឬស្សីកែវ","Filmed"],["PHON SIHOUR ឫស្សីកែវ","Filmed"],["PHAN NA វត្តអង្គតាមិញ","Yellow"],["TOTAL មោងឬស្សី","Refused"],["LEAK KHENA","Refused"],["AEON MAXVALU SUPERMARKET TOUL SANGKE 105","Refused"],["MART វិមានភ្នំពេញ","Refused"],["LY TA MAC COFFEE កាល់ម៉ែត្រ","Filmed"],["HEN SREYROTH ទឹកថ្លា","Filmed"],["ចែ គីមកាហ្វេ អ្នកលឿង","Filmed"],["JOHN MENGHAK វត្ដភ្នំ","Filmed"],["AEON MAXVALU EXPRESS KENG KANG 57","Refused"],["PRAK PHIRUN ទឹកថ្លា","Filmed"],["SN79 MART & TOYS បឹងស្នោរ","Filmed"],["HORN SOTHEA ព្រែកក្ដី","Filmed"],["PHAI VITA ត្រពាំងថ្លឹង","Filmed"],["JUER JUER ចោមចៅ","Filmed"],["CHHUN SOVANN ស្រែអំបិល","Filmed"],["CREAM COFFEE ទួលគោក","Filmed"],["CHEA THEARA រង្វង់មូលមច្ឆា","Filmed"],["SENG WANDEAN ឬស្សីកែវ","Filmed"],["SREYLEAP SENG កំបូល","Yellow"],["L MENG ផ្លូវជាសុផារា","Refused"],["MONYNEATH ទូលគោក","Filmed"],["សៀក នី ស្លាបលែង","Filmed"],["PANHCHAKRITHD ស៊ីសុវត្ដ","Filmed"],["LIMEY HAY ទួលគោក","Filmed"],["AEON MAXVALU STENG MEAN CHEY","Filmed"],["VUTHEA SOY K MALL","Filmed"],["លាង សារ៉ាន ភ្នំពេញថ្មី","Refused"],["វណ្ណ​ នី វេងស្រេង","Filmed"],["SENG KAVEN OCIC","Filmed"],["Melia coffee ក្រាំងធ្នុង","Refused"],["QM SERVICES ទួលទំពូង","Filmed"],["លុយ ផារី ស្ទឹងមានជ័យ","Filmed"],["LITTLE CAFÉ បុរីពិភពថ្មី ត្រពាំងថ្លឹង","Filmed"],["EAN MENGLONG បុរីអង្គភ្នំពេញ","Filmed"],["កង់ទីនសាលា BRIGHT LINE ចំការដូង","Refused"],["VUOCHLY បឹងស្នោរ","Filmed"],["PISEY KO ស្រុកបន្ទាយមាស ជិតផ្សាទូកមាស កំពត","Filmed"],["PTT កប់ស្រូវ","Refused"],["TONG BOREY អូរឡាំពិក","Filmed"],["អ៊ីពៅ ចំការដូង","Filmed"],["CHHAY EANG បឹងសាឡាង ផ្សារដើមគរ","Yellow"],["សំរេច ប្ដូរប្រាក់ ទឹកថ្លា","Refused"],["RY បុរីសុខសាន្ដ","Filmed"],["AEON MAXVALU REOUSSEY KEO 598","Refused"],["SN Coffee 2002","Yellow"],["NK NK បឹងកេងកង","Filmed"],["VANN YAPENG ទួលពង្រ","Refused"],["VIN MART ទួលទំពូង","Filmed"],["HEANG SREY NUOCH បុរីអ័គីដេ","Filmed"],["LY Ly ផ្សារថ្មី","Filmed"],["JAY UNG ស្ពានអាកាស 7 មករា","Filmed"],["SUM CHANNY ក្រាំងធ្នុង","Filmed"],["នំបុ័ងភ្នំពេញ តាំងក្រសាំង","Refused"],["សោ ភា ទួលគោក","Filmed"],["MIE XIANGបឹងបៃតង","Filmed"],["នំបុ័ងភ្នំពេញ ទួលពង្រ","Refused"],["អ៊ឹង ផិចហ័ង GRAND PHNOM PENH","Refused"],["MINI COFFEE ច្បារអំពៅ","Filmed"],["MEN CHAMNAN កប់ស្រូវ","Filmed"],["LAY KONG RETAIL ចំការដូង","Refused"],["SOPHEAP Y វិមានឯករាជ្យ","Refused"],["MINI COFFEE ABA","Filmed"],["35 COFFEE NOKAI 271","Filmed"],["PTT ត្រពាំងអណ្ដើក","Refused"],["CHAN LAKENA CHIP MONG","Filmed"],["កាហ្វេ 21","Filmed"],["នំបុ័ងភ្នំពេញ ឬស្សីកែវ","Refused"],["LV COFFEE បាក់ទូក","Filmed"],["MINI COFFEE បឹងកេងកង1","Filmed"],["KIM CHHENGHONG សែនសុខ","Filmed"],["SY LAUREN តាខ្មៅ","Filmed"],["ស៊ុន រតនៈ បាក់ទូក","Filmed"],["ធារី កប់ស្រូវ","Filmed"],["KANNITHA សាលាពេទ្យ","Filmed"],["SOVAN PANHA ព្រៃស","Filmed"],["SREY NUCH ច្បារអំពៅ","Filmed"],["H LYHACH បឹងត្របែក","Filmed"],["X COFFEE (SOPHORN KOY)","Filmed"],["LAY KONG COFFEE CC2 ចោមចៅ","Refused"],["RAINBO បឹងស្នោរ","Filmed"],["35 COFFEE ស្ពានដែក","Filmed"],["CROIS CAFÉ 271","Filmed"],["PICH COFFEE អគ្គស្នងការនគរបាល ស្ពានក្បាលថ្នល់","Refused"],["AEON MAXVALU SUPERMARKET TUEK THLA","Filmed"],["CHHING GERRA បឹងត្របែក","Refused"],["KIMSOUR SENG បុរីលឺមឈាងហាក់ ចំការដូង","Filmed"],["RAKSMEY NHAN MC PARK ស្ទឹងមានជ័យ","Filmed"],["AEON MAXVALU EXPRESS TOUL TOMPUNG","Refused"],["HENG THIDA សាលាឥន្រ្ដិយ៍ទេវី","Filmed"],["ឥទ្ធិពលកាហ្វេ ​កម្ពុជាក្រោម","Filmed"],["ONNIK COFFEE ទួលទំពូង","Filmed"],["EANG BORA បាវិត","Refused"],["ONNIK COFFEE សាលាយុគន្ធ","Filmed"],["LEANG BUNRUN ទួលគោក","Refused"],["KAFE SOYA HOUSE អង្គតាមិញ","Filmed"],["HAY ផ្លូវឧស្យានអារ៉ាតា","Filmed"],["FLOWER បឹងកក់","Filmed"],["AEON MAXVALU CHERNG EK 50","Refused"],["B MART បឹងកេងកង","Refused"],["MORIKO KREE សាលាចតុមុខ","Filmed"],["ROATH ROMNEA ស្ទឹងមានជ័យ(Reach Reach)","Refused"],["CHHAY BORY តាខ្មៅ","Filmed"],["SENGHEEANG SEAN ព្រៃទា","Filmed"],["KIM SEU LY ត្នោតជ្រុំ","Refused"],["NOREAK 168 SHOP តាំងក្រសាំង","Filmed"],["ហួត លៀងទុយ ស្រែអំបិល","Filmed"],["SUGEK CAFÉ សំរោងអណ្ដែត","Filmed"],["AH THOEUN សំរោងអណ្ដែត","Filmed"],["THE BLUE សាន់សាញ បឹងកក់","Filmed"],["THEARY សាលាកសិកម្មចំការដូង","Refused"],["LT (CN)","Refused"],["MUY SOCHENDA សែនសុខ","Filmed"],["AH HOUY ឧដុង្គ","Filmed"],["SAK COFFEE ភូមិឬស្សី","Filmed"],["SOUN SREYNICH ទួលពង្រ","Filmed"],["AH GECH CORNER ព្រែកលាភ","Refused"],["BONG BEE ចាក់អង្រែ","Refused"],["BORA MEY ព្រៃទា","Filmed"],["BTA WATCH ទួលពង្រ","Refused"],["CHANKHOEUN ផ្សារត្រពាំងឈួក","Filmed"],["HENG CHHUNIM វេងស្រេង","Filmed"],["KRU LAOKRU បុរីអ័រគីដេ","Refused"],["NA RAKSMEY វិទ្យាល័យជម្ពូវន្ត","Filmed"],["NA RY កោះរ៉ុង កំពង់សោម","Filmed"],["PANHCHAKRITHD ក្រោយវាំង","Filmed"],["QM SERVICES ព្រៃស","Filmed"],["CHIN HOK ជ្រោយចង្វារ","Filmed"],["DY DARA ឬស្សីកែវ","Filmed"],["ING KIMLEANG ឬស្សីកែវ","Filmed"],["SIVLANG LIM ឈូកមាស","Filmed"],["SOK SOPHAL ច្បារអំពៅ","Yellow"]]""")
+MEDIA_STATUS_LABEL = {"Filmed": "✅ ថតរួច", "Refused": "🚫 មិនឱ្យថត", "Not yet": "⏳ មិនទាន់ថត", "Yellow": "🟡 ពណ៌លឿង (ក្នុង Excel)"}
+
+
+def _media_status_read():
+    try:
+        return read_raw(MEDIA_STATUS_FILE, MEDIA_STATUS_COLS, max_age=60)
+    except Exception:
+        return pd.DataFrame(columns=MEDIA_STATUS_COLS + ["_dt"])
+
+
+def _media_status_map(names, shoots):
+    """{key: (status, timestamp)} — newest of: Excel seed, saved status changes, and real shoots (a shoot = Filmed)."""
+    seed_t = pd.Timestamp(MEDIA_STATUS_SEED_DATE)
+    by_mk = {_visit_match_key(n): k for k, n in names.items()}
+    def key_of(name):
+        k = norm_name(name)
+        return k if k in names else by_mk.get(_visit_match_key(name), k)
+    out = {}
+    def put(k, status, t):
+        if k not in out or t >= out[k][1]:
+            out[k] = (status, t)
+    for name, status in _MEDIA_STATUS_SEED:
+        put(key_of(name), status, seed_t)
+    st_df = _media_status_read()
+    for r in st_df.to_dict("records"):
+        t = pd.to_datetime(r.get("_dt"), errors="coerce")
+        if pd.notna(t) and r.get("Status") in MEDIA_STATUS_LABEL:
+            put(key_of(r["Customer"]), r["Status"], t)
+    if shoots is not None and not shoots.empty:
+        for name, t in zip(shoots["Customer"], shoots["_dt"]):
+            if pd.notna(t):
+                put(key_of(name), "Filmed", pd.Timestamp(t))
+    return out
+
+
+def _media_status_set(customer, status, source="app"):
+    if not has_permission("edit"):
+        raise PermissionError("Your account needs Create, edit, and submit changes permission.")
+    append_row(MEDIA_STATUS_FILE, {"Date": now_str(), "Customer": customer, "Status": status,
+                                   "By": current_user() or "-", "Source": source})
+    audit("media status", f"{customer} | {status} | {source}")
+
+
+def _media_read():
+    try:
+        return read_raw(MEDIA_FILE, MEDIA_COLS, max_age=60)
+    except Exception:
+        return pd.DataFrame(columns=MEDIA_COLS + ["_dt"])
+
+
+def _media_next_shoot_day(today):
+    """Today when it is Friday / Saturday, else the coming Friday."""
+    if today.weekday() in MEDIA_DAYS:
+        return today
+    return today + timedelta(days=(4 - today.weekday()) % 7)
+
+
+def _media_rel(name):
+    month = name[1:7] if name[:1] == "M" and name[1:7].isdigit() else "misc"
+    return f"{MEDIA_DIR}/{month[:4]}-{month[4:6]}/{name}"
+
+
+def _media_save_file(name, data):
+    """Photos and videos go to <Dropbox folder>/media/YYYY-MM/. Big videos are sent in 8 MB pieces."""
+    rel = _media_rel(name)
+    if not USE_DROPBOX:
+        full = os.path.join(DATA_DIR, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        _write_atomic(full, data)
+        return
+    import dropbox
+    dbx, path, chunk = _dbx(), f"{DROPBOX_FOLDER}/{rel}", 8 * 1024 * 1024
+    if len(data) <= 4 * chunk:
+        dbx.files_upload(data, path, mode=dropbox.files.WriteMode.overwrite, mute=True)
+        return
+    start = dbx.files_upload_session_start(data[:chunk])
+    cursor = dropbox.files.UploadSessionCursor(session_id=start.session_id, offset=chunk)
+    while cursor.offset + chunk < len(data):
+        dbx.files_upload_session_append_v2(data[cursor.offset:cursor.offset + chunk], cursor)
+        cursor.offset += chunk
+    dbx.files_upload_session_finish(data[cursor.offset:], cursor,
+                                    dropbox.files.CommitInfo(path=path, mode=dropbox.files.WriteMode.overwrite, mute=True))
+
+
+@st.cache_data(show_spinner=False, max_entries=120, ttl=3600)
+def _media_load_photo(name):
+    return _media_load(name)
+
+
+def _media_load(name):
+    rel = _media_rel(name)
+    if USE_DROPBOX:
+        _md, res = _dbx().files_download(f"{DROPBOX_FOLDER}/{rel}")
+        return res.content
+    with open(os.path.join(DATA_DIR, rel), "rb") as f:
+        return f.read()
+
+
+# ---------- 🏷️ sticker status shared by Shop Visits and the Media Team ----------
+# A Shop Visit says Good / Old / Missing (+ how many stickers were changed); the Media Team says the same with
+# MEDIA_STATES. The newest report from either team is the shop's sticker status, and both teams see it.
+STICKER_FROM_VISIT = {"Good": "👍 Has one, still good", "Old / faded": "⚠️ Old — needs a new one",
+                      "Missing": "❌ None — needs one"}
+STICKER_TO_VISIT = {"✅ Put up a new one today": "Good", "👍 Has one, still good": "Good",
+                    "⚠️ Old — needs a new one": "Old / faded", "❌ None — needs one": "Missing"}
+STICKER_SRC_VISIT, STICKER_SRC_MEDIA = "🏪 Shop Visit", "📸 Media"
+_STICKER_MEMO = {}
+
+
+def _sticker_latest(visits=None, shoots=None):
+    """{customer key: {"state", "date", "src", "by"}} = newest sticker report of Shop Visits and Media Team."""
+    if visits is None:
+        visits = _visit_read()
+    if shoots is None:
+        shoots = _media_read()
+
+    def _sig(df):
+        return (len(df), str(df["_dt"].max()) if len(df) and "_dt" in df.columns else "")
+    sig = (_sig(visits), _sig(shoots))
+    if _STICKER_MEMO.get("sig") == sig:
+        return _STICKER_MEMO["val"]
+    found = []
+    if len(visits) and {"Customer", "Sticker", "_dt"} <= set(visits.columns):
+        v = visits[visits["Sticker"].isin(list(STICKER_FROM_VISIT))]
+        changed = pd.to_numeric(v.get("Stickers changed", 0), errors="coerce").fillna(0)
+        state = v["Sticker"].map(STICKER_FROM_VISIT).where(changed <= 0, "✅ Put up a new one today")
+        found.append(pd.DataFrame({"k": v["Customer"].map(norm_name), "state": state, "date": v["_dt"],
+                                   "src": STICKER_SRC_VISIT, "by": v.get("Staff", "-")}))
+    if len(shoots) and {"Customer", "Sticker", "_dt"} <= set(shoots.columns):
+        m = shoots[shoots["Sticker"].isin(MEDIA_STATES)]
+        found.append(pd.DataFrame({"k": m["Customer"].map(norm_name), "state": m["Sticker"], "date": m["_dt"],
+                                   "src": STICKER_SRC_MEDIA, "by": m.get("By", "-")}))
+    out = {}
+    if found:
+        allr = pd.concat(found, ignore_index=True).dropna(subset=["date"]).sort_values("date")
+        for r in allr.drop_duplicates("k", keep="last").to_dict("records"):
+            out[r["k"]] = {"state": r["state"], "date": pd.Timestamp(r["date"]), "src": r["src"], "by": str(r["by"])}
+    _STICKER_MEMO.update(sig=sig, val=out)
+    return out
+
+
+def _sticker_needs(info):
+    return bool(info) and info.get("state") in MEDIA_NEED
+
+
+def _sticker_text(info):
+    """'🏷️ ស្ទីគ័រចុងក្រោយ: ⚠️ ចាស់ — ត្រូវការថ្មី · 📸 Media 25 Oct (dara)'"""
+    if not info:
+        return "🏷️ ស្ទីគ័រ: មិនទាន់មានព័ត៌មាន"
+    return f"🏷️ ស្ទីគ័រចុងក្រោយ: {_mkm(info['state'])} · {info['src']} {info['date']:%d %b} ({info['by']})"
+
+
+PICK_PIN_COLORS = {"red": [220, 40, 40, 230], "blue": [30, 110, 220, 230], "orange": [240, 150, 0, 230],
+                   "purple": [150, 60, 200, 220], "grey": [150, 150, 150, 170], "dark": [70, 70, 70, 150],
+                   "picked": [20, 160, 70, 255]}
+
+
+def _pick_map(rows, state_key, layer_id, height):
+    """Map with tap-to-pick: rows = [{Lat, Lon, Customer, label, info, color, radius}].
+    A tap adds the shop to st.session_state[state_key] (tap again removes it). Returns the picked names."""
+    picked = list(st.session_state.get(state_key, []))
+    if not rows:
+        return picked
+    try:
+        import pydeck as pdk
+        for r in rows:
+            if r["Customer"] in picked:
+                r["color"], r["radius"] = PICK_PIN_COLORS["picked"], 130
+        layer = pdk.Layer("ScatterplotLayer", data=rows, id=layer_id, get_position="[Lon, Lat]",
+                          get_fill_color="color", get_radius="radius", radius_min_pixels=6, radius_max_pixels=16,
+                          stroked=True, get_line_color=[255, 255, 255], line_width_min_pixels=1, pickable=True)
+        lat = sum(r["Lat"] for r in rows) / len(rows)
+        lon = sum(r["Lon"] for r in rows) / len(rows)
+        deck = pdk.Deck(layers=[layer], map_provider="carto", map_style="light",
+                        initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=12 if len(rows) < 60 else 11),
+                        tooltip={"text": "{label}\n{info}"})
+        ver_key = state_key + "_ver"
+        ver = st.session_state.get(ver_key, 0)
+        try:
+            event = st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", key=f"{layer_id}_{ver}",
+                                    height=height)
+        except TypeError:                                    # older Streamlit: map without tapping
+            st.pydeck_chart(deck)
+            event = None
+        try:
+            objs = (event.selection.get("objects", {}) or {}).get(layer_id, []) if event is not None else []
+        except Exception:
+            objs = []
+        if objs:
+            name = objs[0].get("Customer")
+            if name:
+                picked = [c for c in picked if c != name] if name in picked else picked + [name]
+                st.session_state[state_key] = picked
+                st.session_state[ver_key] = ver + 1           # clear the tap so the next tap counts again
+                st.rerun(scope="fragment") if _fragment_rerun_ok() else st.rerun()
+    except Exception as e:
+        st.caption("ផែនទីមិនអាចបង្ហាញបានទេ: " + str(e)[:120])
+    return picked
+
+
+def _media_last_shoot(shoots):
+    """{customer key: newest shoot row}."""
+    if shoots.empty:
+        return {}
+    s = shoots.sort_values("_dt")
+    return {norm_name(r["Customer"]): r for r in s.to_dict("records")}
+
+
+def _media_events(names, today):
+    """{key: [(date, kind, score, label, remark)]} from the journal remarks + first orders + new leads."""
+    out = {}
+    start = pd.Timestamp(today) - pd.Timedelta(days=MEDIA_RECENT_DAYS)
+    comb = st.session_state.get("si_combined", pd.DataFrame())
+    if comb is not None and not comb.empty and {"Date", "Customer", "Remark"} <= set(comb.columns):
+        c = comb[["Date", "Customer", "Remark"]].copy()
+        c["D"] = pd.to_datetime(c["Date"], errors="coerce")
+        c = c[(c["D"] >= start) & c["Remark"].astype(str).str.strip().ne("-")]
+        for d, cust, rem in zip(c["D"], c["Customer"], c["Remark"].astype(str)):
+            k = norm_name(cust)
+            if k not in names:
+                continue
+            for kind, score, label, rx in MEDIA_EVENT_RULES:
+                if rx.search(rem):
+                    out.setdefault(k, []).append((d.normalize(), kind, score, label, rem))
+                    break
+    daily = st.session_state.get("_visit_daily", pd.DataFrame())
+    if daily is not None and not daily.empty:
+        first = daily.groupby("Key")["D"].min()
+        older = set()                                       # bought in months before the daily journal starts = not new
+        try:
+            hm = _si_read_hist(SI_HIST_MONTHLY_FILE)
+            if not hm.empty and {"Customer", "Month"} <= set(hm.columns):
+                start_m = pd.Timestamp(daily["D"].min()).strftime("%Y-%m")
+                pcs = pd.to_numeric(hm["Pcs"], errors="coerce").fillna(0) if "Pcs" in hm.columns else 1
+                older = set(hm.loc[(hm["Month"].astype(str) < start_m) & (pcs > 0), "Customer"].map(norm_name))
+        except Exception:
+            older = set()
+        for k, d in first.items():
+            if k in names and k not in older and d >= pd.Timestamp(today) - pd.Timedelta(days=30):
+                out.setdefault(k, []).append((pd.Timestamp(d).normalize(), "new", 8, "🆕 អតិថិជនថ្មី", f"បញ្ជាទិញលើកដំបូង {d:%d %b}"))
+    for k, v in (st.session_state.get("_visit_new", {}) or {}).items():
+        if k in names and v.get("date") is not None and not any(e[1] == "new" for e in out.get(k, [])):
+            out.setdefault(k, []).append((pd.Timestamp(v["date"]).normalize(), "new", 8, "🆕 អតិថិជនថ្មី", "ពី Leads report"))
+    return out
+
+
+def _media_priority(stats, names, zone_map, shoots, today):
+    """Shops for the media team, most urgent first. A journal event counts until the shop is filmed after it."""
+    events = _media_events(names, today)
+    last = _media_last_shoot(shoots)
+    status = _media_status_map(names, shoots)
+    sticker = _sticker_latest(shoots=shoots)
+    t = pd.Timestamp(today)
+    rows = []
+    for k, name in names.items():
+        zone = zone_map.get(k, VISIT_ZONE_NOT_SET)
+        if str(zone).startswith("🚫"):
+            continue
+        stt = status.get(k, ("Not yet", None))
+        if stt[0] == "Refused":
+            continue                                           # customer does not allow filming
+        ls = last.get(k)
+        shot = pd.to_datetime(ls["_dt"]) if ls is not None else None
+        shot_day = shot.normalize() if shot is not None and pd.notna(shot) else None
+        filmed_before = shot_day is None and stt[0] == "Filmed"     # green in the Excel file, date unknown
+        score, why, open_events = 0, [], []
+        cut = shot_day if shot_day is not None else (stt[1].normalize() if stt[0] == "Filmed" and stt[1] is not None else None)
+        for d, kind, sc, label, rem in sorted(events.get(k, []), key=lambda e: -e[2]):
+            if cut is not None and cut >= d:
+                continue                                   # already filmed after this happened (green = filmed by that date)
+            if any(e[1] == kind for e in open_events):
+                continue
+            open_events.append((d, kind))
+            score += sc
+            why.append(f"{label} ({d:%d %b})")
+        s = stats.loc[k] if (not stats.empty and k in stats.index) else None
+        pcs28 = float(s["Pcs 28d"]) if s is not None and pd.notna(s["Pcs 28d"]) else 0.0
+        if shot_day is None and not filmed_before:
+            if pcs28 > 0:
+                score += 3
+                why.append("📷 មិនទាន់មានរូប")
+        elif shot_day is not None and (t - shot_day).days > MEDIA_REFRESH_DAYS and pcs28 > 0:
+            score += 2
+            why.append(f"📷 រូបចាស់ ({(t - shot_day).days} ថ្ងៃ)")
+        need = [MEDIA_KM[i] for i in MEDIA_ITEMS if i != "Sticker" and ls is not None and str(ls.get(i, "")) in MEDIA_NEED]
+        sk = sticker.get(k)
+        if _sticker_needs(sk):                             # newest sticker report of Shop Visits or Media Team
+            need.insert(0, MEDIA_KM["Sticker"] + (f" ({sk['src']} {sk['date']:%d %b})" if sk["src"] == STICKER_SRC_VISIT else ""))
+        if need:
+            score += 4
+            why.append("🖨️ ត្រូវការ " + ", ".join(need))
+        if score <= 0:
+            continue
+        if pcs28 >= 1000:
+            score += 1
+        rows.append({"Priority": score, "Customer": name, "Zone": zone, "Why": " · ".join(why),
+                     "Last photo": (f"{shot_day:%d %b %Y}" if shot_day is not None
+                                    else "✅ ថតរួច (មុន · Excel)" if filmed_before else "មិនទាន់"),
+                     "Pcs 28 days": int(pcs28), "_new": any(e[1] in ("fridge", "new") for e in open_events),
+                     "_reshoot": False})
+    rows += _media_reshoot_rows(rows, stats, names, zone_map, status, last, t)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["Priority", "Pcs 28 days"], ascending=False).reset_index(drop=True)
+
+
+MEDIA_RESHOOT_TOP = 20            # top-selling Phnom Penh shops (pcs, last 28 days): highest re-shoot priority
+MEDIA_RESHOOT_TOP2 = 50           # next group
+MEDIA_RESHOOT_NEAR_KM = 1.5       # filmed shops this close to a new shop / new fridge are filmed again on the same trip
+MEDIA_RESHOOT_MIN_DAYS = 30       # never film the same shop again sooner than this
+
+
+def _media_reshoot_rows(rows, stats, names, zone_map, status, last, t):
+    """🔁 Every customer already filmed can be filmed again (not sooner than 30 days after the last shoot).
+    Order: top sellers first, then shops near a new shop / new fridge (same trip), then the rest by sales."""
+    on_list = {norm_name(r["Customer"]) for r in rows}
+    pcs = {}
+    for k in names:
+        if not str(zone_map.get(k, "")).startswith("🚫") and not stats.empty and k in stats.index and pd.notna(stats.at[k, "Pcs 28d"]):
+            pcs[k] = float(stats.at[k, "Pcs 28d"])
+    rank = {k: i + 1 for i, (k, v) in enumerate(sorted(pcs.items(), key=lambda kv: -kv[1])) if v > 0}
+    try:
+        registry, store = _visit_registry(), _visit_pin_store()
+        auto = _visit_candidates_for(names, registry)[1]
+    except Exception:
+        registry, store, auto = {"records": {}, "bindings": {}}, {}, {}
+    anchors = []
+    for r in rows:
+        if r.get("_new"):
+            pin = _visit_pin(r["Customer"], registry, store, auto)
+            if pin:
+                anchors.append((r["Customer"], pin))
+    out = []
+    for k, name in names.items():
+        if k in on_list or str(zone_map.get(k, "")).startswith("🚫"):
+            continue
+        stt = status.get(k, ("Not yet", None))
+        ls = last.get(k)
+        shot = pd.to_datetime(ls["_dt"]).normalize() if ls is not None and pd.notna(ls.get("_dt")) else None
+        if stt[0] != "Filmed" and shot is None:
+            continue                                     # never filmed: handled by the main list
+        if stt[0] == "Refused":
+            continue
+        if shot is not None and (t - shot).days < MEDIA_RESHOOT_MIN_DAYS:
+            continue
+        score, why = 1, []                               # every filmed customer can be filmed again
+        rk = rank.get(k)
+        if rk and rk <= MEDIA_RESHOOT_TOP:
+            score += 3
+            why.append(f"⭐ Top sale #{rk}")
+        elif rk and rk <= MEDIA_RESHOOT_TOP2:
+            score += 2
+            why.append(f"⭐ Top {MEDIA_RESHOOT_TOP2} (#{rk})")
+        elif rk:
+            why.append(f"លក់ #{rk}")
+        else:
+            score -= 0.5
+            why.append("មិនបានបញ្ជាទិញ 28 ថ្ងៃ")
+        if anchors:
+            pin = _visit_pin(name, registry, store, auto)
+            if pin:
+                d, near = min((_haversine_m(pin[0], pin[1], a[0], a[1]), an) for an, a in anchors)
+                if d <= MEDIA_RESHOOT_NEAR_KM * 1000:
+                    score += 2
+                    why.append(f"📍 ជិត {near[:28]} ({d / 1000:.1f} km)")
+        if shot is not None and (t - shot).days > MEDIA_REFRESH_DAYS:
+            score += 1
+            why.append(f"📷 រូបចាស់ {(t - shot).days} ថ្ងៃ")
+        out.append({"Priority": score, "Customer": name, "Zone": zone_map.get(k, VISIT_ZONE_NOT_SET),
+                    "Why": "🔁 ថតម្តងទៀត · " + " · ".join(why),
+                    "Last photo": f"{shot:%d %b %Y}" if shot is not None else "✅ ថតរួច (មុន · Excel)",
+                    "Pcs 28 days": int(pcs.get(k, 0)), "_new": False, "_reshoot": True})
+    return out
+
+
+def _media_start(customer):
+    st.session_state["media_view"] = "📸 ថតហាង"
+    st.session_state["media_customer"] = customer
+
+
+def _media_plan_body(stats, names, zone_map, shoots, today):
+    day = _media_next_shoot_day(today)
+    is_day = today.weekday() in MEDIA_DAYS
+    st.markdown(f"#### 📅 ថ្ងៃថត: **{'ថ្ងៃនេះ' if is_day else 'ថ្ងៃសុក្រ'} {day:%d %b}** " +
+                ("· ថ្ងៃសៅរ៍បន្ទាប់" if day.weekday() == 4 and is_day else ""))
+    plan = _media_priority(stats, names, zone_map, shoots, today)
+    st.session_state["media_why"] = dict(zip(plan["Customer"].map(norm_name), plan["Why"])) if not plan.empty else {}
+    if plan.empty:
+        st.success("គ្មានហាងត្រូវថតទេ — ហាងទាំងអស់មានរូបថ្មីហើយ។ 🎉")
+        return
+    week_start = pd.Timestamp(today - timedelta(days=today.weekday()))
+    done_week = shoots[shoots["_dt"] >= week_start] if not shoots.empty else shoots
+    stmap = _media_status_map(names, shoots)
+    active = [k for k in names if not str(zone_map.get(k, "")).startswith("🚫")]
+    n_f = sum(stmap.get(k, ("",))[0] == "Filmed" for k in active)
+    n_r = sum(stmap.get(k, ("",))[0] == "Refused" for k in active)
+    st.caption(f"ហាងភ្នំពេញ {len(active)}: ✅ ថតរួច {n_f} · 🚫 មិនឱ្យថត {n_r} (មិនបង្ហាញក្នុងបញ្ជី) · "
+               f"⏳ មិនទាន់ថត {len(active) - n_f - n_r}")
+    if _media_phone():
+        r1, r2 = st.columns(2), st.columns(2)
+        c1, c2, c3, c4 = r1[0], r1[1], r2[0], r2[1]
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ហាងត្រូវថត", f"{len(plan)}")
+    c2.metric("🆕 ទូថ្មី / អតិថិជនថ្មី", f"{int(plan['_new'].sum())}")
+    c3.metric("ថតរួចសប្តាហ៍នេះ", f"{done_week['Customer'].map(norm_name).nunique() if not done_week.empty else 0}")
+    c4.metric("រូប / វីដេអូ សប្តាហ៍នេះ",
+              f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Photos', []))} / "
+              f"{sum(len([x for x in str(p).split(';') if x and x != '-']) for p in done_week.get('Videos', []))}")
+    t1, t2 = (st.container(), st.container()) if _media_phone() else st.columns(2)
+    only_new = t1.toggle("🆕 បង្ហាញតែ ទូថ្មី និង អតិថិជនថ្មី", key="media_only_new")
+    with_re = t2.toggle(f"🔁 ថតម្តងទៀត: ហាងថតរួចទាំងអស់ ({int(plan['_reshoot'].sum())}) — Top sale និងជិតហាងថ្មីមុន",
+                        value=True, key="media_with_reshoot")
+    view = plan[plan["_new"]] if only_new else plan
+    if not with_re:
+        view = view[~view["_reshoot"]]
+    zone = _media_zone_picker(view)
+    if zone != MEDIA_ALL_ZONES:
+        view = view[view["Zone"] == zone]
+    registry, store = _visit_registry(), _visit_pin_store()
+    try:
+        auto = _visit_candidates_for({norm_name(c): c for c in view["Customer"]}, registry)[1]
+    except Exception:
+        auto = {}
+    picked = _media_map_pick(view, registry, store, auto)
+    if picked:
+        st.markdown(f"**✅ ហាងដែលបានជ្រើសលើផែនទី ({len(picked)})**")
+        order = {c: i for i, c in enumerate(picked)}
+        chosen = view[view["Customer"].isin(picked)].copy()
+        chosen["_o"] = chosen["Customer"].map(order)
+        _media_cards(chosen.sort_values("_o"), registry, store, auto, "mp", removable=True)
+        st.divider()
+    show_n = st.session_state.get("media_show_n", 40)
+    st.caption(f"{len(view)} ហាង · ចុច ▶ ដើម្បីថត និងបញ្ចូលរូប។ ហាងបាត់ពីបញ្ជីវិញ ពេលថតរួច។")
+    _media_cards(view.head(show_n), registry, store, auto, "mg")
+    if len(view) > show_n:
+        st.button(f"⬇️ បង្ហាញបន្ថែម ({len(view) - show_n} ទៀត)", key="media_more", use_container_width=True,
+                  on_click=lambda: st.session_state.update(media_show_n=show_n + 40))
+
+
+MEDIA_ALL_ZONES = "🗺️ គ្រប់តំបន់ (ទាំងអស់)"
+
+
+def _media_zone_picker(view):
+    """Zone filter with one more choice: all zones on one map."""
+    counts = Counter(view["Zone"])
+    options = [MEDIA_ALL_ZONES] + [z for z in VISIT_ZONE_NAMES if counts.get(z) and not z.startswith("🚫")]
+    if st.session_state.get("media_zone") not in options:
+        st.session_state["media_zone"] = MEDIA_ALL_ZONES
+    return st.selectbox("🗺️ តំបន់", options, key="media_zone",
+                        format_func=lambda z: f"{z}  ({len(view)} ហាង)" if z == MEDIA_ALL_ZONES else f"{_km(z)}  ({counts.get(z, 0)} ហាង)")
+
+
+MEDIA_PIN_COLORS = {"fridge": [220, 40, 40, 230], "new": [30, 110, 220, 230], "print": [240, 150, 0, 230],
+                    "reshoot": [150, 60, 200, 220],
+                    "other": [120, 120, 120, 200], "picked": [20, 160, 70, 255]}
+
+
+def _media_unpick(customer):
+    st.session_state["media_picked"] = [c for c in st.session_state.get("media_picked", []) if c != customer]
+
+
+def _media_map_pick(view, registry, store, auto):
+    """Map of the shops on the list. Tap a pin to add the shop to today's picks (tap again to remove)."""
+    rows = []
+    for r in view.to_dict("records"):
+        pin = _visit_pin(r["Customer"], registry, store, auto)
+        if not pin:
+            continue
+        why = r["Why"]
+        kind = ("fridge" if "🧊" in why else "new" if "🆕" in why
+                else "print" if "🖨️" in why else "reshoot" if "🔁" in why else "other")
+        rows.append({"Lat": pin[0], "Lon": pin[1], "Customer": r["Customer"], "label": r["Customer"],
+                     "info": why, "color": MEDIA_PIN_COLORS[kind], "radius": 130 if kind in ("fridge", "new") else 80})
+    show_map = st.toggle("🗺️ បង្ហាញផែនទី — ចុចលើចំណុចដើម្បីជ្រើសហាង", value=True, key="media_show_map")
+    st.caption("🔴 ទូថ្មី · 🔵 អតិថិជនថ្មី · 🟠 ត្រូវការ ស្ទីគ័រ/ម៉ឺនុយ/បដា · 🟣 ថតម្តងទៀត · ⚪ ផ្សេងៗ · 🟢 បានជ្រើស"
+               + (f" · {len(view) - len(rows)} ហាងមិនទាន់មានទីតាំង (មើលក្នុងបញ្ជីខាងក្រោម)" if len(rows) < len(view) else ""))
+    if show_map:
+        picked = _pick_map(rows, "media_picked", "media_shops", 320 if _media_phone() else 430)
+    else:
+        picked = list(st.session_state.get("media_picked", []))
+    if picked:
+        st.button("↩️ សម្អាតការជ្រើស", key="media_pick_clear", on_click=lambda: st.session_state.pop("media_picked", None))
+    return picked
+
+
+def _fragment_rerun_ok():
+    try:
+        import inspect
+        return "scope" in inspect.signature(st.rerun).parameters
+    except Exception:
+        return False
+
+
+def _media_cards(view, registry, store, auto, prefix, removable=False):
+    phone = _media_phone()
+    for i, r in enumerate(view.to_dict("records")):
+        with st.container(border=True):
+            if phone:                                   # text on top, two big buttons side by side under it
+                a = st.container()
+                b, c = st.columns(2)
+            else:
+                a, b, c = st.columns([5, 1.2, 1.2])
+            a.markdown(f"**{r['Customer']}**  \n<small>{r['Why']}<br>📷 រូបចុងក្រោយ: {r['Last photo']} · {r['Pcs 28 days']:,} pcs/28 ថ្ងៃ</small>",
+                       unsafe_allow_html=True)
+            link, exact = _visit_map_link(r["Customer"], registry, store, auto)
+            b.link_button("🧭 ទៅ" if exact else "🔎 រក", link, use_container_width=True)
+            c.button("ថត ▶", key=f"media_go_{prefix}_{i}", use_container_width=True, on_click=_media_start, args=(r["Customer"],))
+            if removable:
+                a.button("✖ ដកចេញ", key=f"media_rm_{prefix}_{i}", on_click=_media_unpick, args=(r["Customer"],))
+            with a.popover("🚫 មិនឱ្យថត"):
+                st.caption("ម្ចាស់ហាងមិនអនុញ្ញាតឱ្យថត? ហាងនឹងចេញពីបញ្ជី។ អាចដាក់វិញក្នុង 📊 របាយការណ៍។")
+                if st.button("✔ បញ្ជាក់", key=f"media_ref_{prefix}_{i}"):
+                    try:
+                        _media_status_set(r["Customer"], "Refused")
+                        _media_unpick(r["Customer"])
+                        st.session_state["flash"] = f"🚫 {r['Customer']}: មិនឱ្យថត"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e)[:120])
+
+
+def _media_form_body(names, zone_map, today):
+    customers = sorted(set(names.values()), key=str.casefold)
+    pre = st.session_state.get("media_customer")
+    idx = customers.index(pre) if pre in customers else None
+    customer = st.selectbox("1️⃣ ហាង (ភ្នំពេញ)", customers, index=idx, key="media_customer_box", placeholder="វាយឈ្មោះហាង…")
+    if not customer:
+        st.info("ជ្រើសហាង ឬចុច ▶ ពីផែនការ។")
+        return
+    st.session_state["media_customer"] = customer
+    if today.weekday() not in MEDIA_DAYS:
+        st.caption("ℹ️ ថ្ងៃនេះមិនមែនថ្ងៃសុក្រ/សៅរ៍ទេ — នៅតែអាចបញ្ចូលបាន។")
+    sk = _sticker_latest().get(norm_name(customer))
+    (st.warning if _sticker_needs(sk) else st.caption)(_sticker_text(sk) + (" — សូមយកស្ទីគ័រថ្មីទៅជាមួយ" if _sticker_needs(sk) else ""))
+    with st.form("media_form", clear_on_submit=True):
+        photos = st.file_uploader(f"2️⃣ រូបថតហាង (រហូតដល់ {MEDIA_PHOTO_MAX})", type=["jpg", "jpeg", "png", "heic", "webp"],
+                                  accept_multiple_files=True)
+        videos = st.file_uploader(f"3️⃣ វីដេអូ (mp4 / mov, ≤ {MEDIA_VIDEO_MAX_MB} MB នីមួយៗ)", type=["mp4", "mov", "m4v"],
+                                  accept_multiple_files=True)
+        st.markdown("**4️⃣ ស្ទីគ័រ · ម៉ឺនុយ · បដា**")
+        if _media_phone():                               # big tap targets, one item under the other
+            states = {item: st.radio(f"{MEDIA_KM[item]}", MEDIA_STATES, index=None, format_func=_mkm,
+                                     key=f"media_{item}") for item in MEDIA_ITEMS}
+        else:
+            cols = st.columns(3)
+            states = {item: cols[n].selectbox(MEDIA_KM[item], MEDIA_STATES, index=None, format_func=_mkm,
+                                              placeholder="ជ្រើស…", key=f"media_{item}")
+                      for n, item in enumerate(MEDIA_ITEMS)}
+        note = st.text_area("5️⃣ កំណត់ចំណាំ (ជម្រើស)", max_chars=1000, placeholder="ឧ. ទូដាក់ខាងក្នុង ពន្លឺតិច…")
+        saved = st.form_submit_button("💾 រក្សាទុក", type="primary", use_container_width=True)
+    if not saved:
+        return
+    errs = []
+    if not photos and not videos:
+        errs.append("សូមបញ្ចូលរូប ឬវីដេអូយ៉ាងហោចណាស់ 1")
+    if photos and len(photos) > MEDIA_PHOTO_MAX:
+        errs.append(f"រូបច្រើនពេក (អតិបរមា {MEDIA_PHOTO_MAX})")
+    if any(v.size > MEDIA_VIDEO_MAX_MB * 1024 * 1024 for v in (videos or [])):
+        errs.append(f"វីដេអូធំពេក (អតិបរមា {MEDIA_VIDEO_MAX_MB} MB)")
+    missing = [MEDIA_KM[i] for i, v in states.items() if not v]
+    if missing:
+        errs.append("សូមជ្រើស: " + ", ".join(missing))
+    if errs:
+        st.error(" · ".join(errs))
+        return
+    sid = f"M{now_kh():%Y%m%d-%H%M%S}-{pysecrets.token_hex(2)}"
+    who = current_user() or "-"
+    p_names, v_names = [], []
+    prog = st.progress(0.0, text="កំពុងបញ្ចូល…")
+    total = len(photos or []) + len(videos or [])
+    try:
+        for n, f in enumerate(photos or [], 1):
+            data = _visit_photo_prepare(f.getvalue(), [customer[:40], f"{now_kh():%d/%m/%Y %H:%M} · {who}"])
+            name = f"{sid}_p{n}.jpg"
+            _media_save_file(name, data)
+            p_names.append(name)
+            prog.progress(len(p_names) / total, text=f"រូប {n}/{len(photos)}")
+        for n, f in enumerate(videos or [], 1):
+            ext = os.path.splitext(f.name)[1].lower() or ".mp4"
+            name = f"{sid}_v{n}{ext if ext in ('.mp4', '.mov', '.m4v') else '.mp4'}"
+            _media_save_file(name, f.getvalue())
+            v_names.append(name)
+            prog.progress((len(p_names) + len(v_names)) / total, text=f"វីដេអូ {n}/{len(videos)}")
+        k = norm_name(customer)
+        append_row(MEDIA_FILE, {"Date": now_str(), "Customer": customer, "ShootID": sid,
+                                "Zone": zone_map.get(k, VISIT_ZONE_NOT_SET), "By": who,
+                                "Photos": ";".join(p_names) or "-", "Videos": ";".join(v_names) or "-",
+                                **{i: states[i] for i in MEDIA_ITEMS},
+                                "Why": st.session_state.get("media_why", {}).get(k, "-"), "Note": note.strip() or "-",
+                                "Shoot day": "Yes" if today.weekday() in MEDIA_DAYS else "No"})
+        audit("media shoot saved", f"{customer} | {len(p_names)} photos | {len(v_names)} videos")
+    except Exception as e:
+        prog.empty()
+        st.error("មិនអាចរក្សាទុកបានទេ: " + str(e)[:200] + (" — រូបដែលបានបញ្ចូលរួច: " + str(len(p_names)) if p_names else ""))
+        return
+    prog.empty()
+    st.session_state.pop("media_customer", None)
+    _media_unpick(customer)
+    st.session_state["flash"] = f"📸 បានរក្សាទុក {customer}: {len(p_names)} រូប · {len(v_names)} វីដេអូ"
+    st.session_state["media_view"] = "📋 ផែនការ ថ្ងៃសុក្រ-សៅរ៍"
+    st.rerun()
+
+
+def _media_show_shoot(r, key):
+    st.markdown(f"**{r['Customer']}** · {str(r['Date'])[:16]} · {r['By']}")
+    st.caption(" · ".join(f"{MEDIA_KM[i]}: {_mkm(str(r.get(i, '-')))}" for i in MEDIA_ITEMS)
+               + (f" · 📝 {r['Note']}" if str(r.get("Note", "-")) not in ("-", "") else ""))
+    photos = [p for p in str(r.get("Photos", "")).split(";") if p and p != "-"]
+    if photos:
+        cols = st.columns(min(2 if _media_phone() else 3, len(photos)))
+        for i, name in enumerate(photos):
+            try:
+                cols[i % len(cols)].image(_media_load_photo(name), use_container_width=True)
+            except Exception as e:
+                cols[i % len(cols)].warning(f"{name}: {str(e)[:60]}")
+    videos = [v for v in str(r.get("Videos", "")).split(";") if v and v != "-"]
+    for i, name in enumerate(videos):
+        vk = f"{key}_v{i}"
+        if st.session_state.get(vk):
+            try:
+                st.video(_media_load(name))
+            except Exception as e:
+                st.warning(f"{name}: {str(e)[:80]}")
+        elif st.button(f"▶️ បើកវីដេអូ {i + 1}", key=vk + "_btn"):
+            st.session_state[vk] = True
+            st.rerun()
+
+
+def _media_gallery_body(shoots, names):
+    if shoots.empty:
+        st.info("មិនទាន់មានរូបថតទេ។")
+        return
+    options = sorted(set(shoots["Customer"]), key=str.casefold)
+    pick = st.selectbox("ហាង", options, index=None, key="media_gal_shop", placeholder="ជ្រើសហាង ដើម្បីមើលរូបទាំងអស់…")
+    if pick:
+        rows = shoots[shoots["Customer"].map(norm_name).eq(norm_name(pick))].sort_values("_dt", ascending=False)
+        for n, r in enumerate(rows.to_dict("records")):
+            with st.container(border=True):
+                _media_show_shoot(r, f"mg_{n}")
+        return
+    st.caption("ថតចុងក្រោយ (10 ចុងក្រោយ)")
+    for n, r in enumerate(shoots.sort_values("_dt", ascending=False).head(10).to_dict("records")):
+        with st.container(border=True):
+            _media_show_shoot(r, f"ml_{n}")
+
+
+def _media_report_body(shoots, today):
+    if shoots.empty:
+        st.info("មិនទាន់មានទិន្នន័យ។")
+        return
+    s = shoots.copy()
+    s["Week"] = (s["_dt"] - pd.to_timedelta(s["_dt"].dt.weekday, unit="D")).dt.strftime("%d %b")
+    s["n_photo"] = s["Photos"].map(lambda p: len([x for x in str(p).split(";") if x and x != "-"]))
+    s["n_video"] = s["Videos"].map(lambda p: len([x for x in str(p).split(";") if x and x != "-"]))
+    s["_wk"] = s["_dt"] - pd.to_timedelta(s["_dt"].dt.weekday, unit="D")
+    wk = (s.groupby(["_wk", "Week"]).agg(ហាង=("Customer", "nunique"), រូប=("n_photo", "sum"), វីដេអូ=("n_video", "sum"),
+                                       ថ្ងៃសុក្រសៅរ៍=("Shoot day", lambda x: int((x == "Yes").sum())))
+          .reset_index().sort_values("_wk", ascending=False).drop(columns="_wk").head(10))
+    st.markdown("**📊 តាមសប្តាហ៍**")
+    show_df(wk.rename(columns={"Week": "សប្តាហ៍ចាប់ពី"}))
+    st.markdown("**👤 តាមបុគ្គលិក (30 ថ្ងៃ)**")
+    recent = s[s["_dt"] >= pd.Timestamp(today) - pd.Timedelta(days=30)]
+    show_df(recent.groupby("By").agg(ហាង=("Customer", "nunique"), រូប=("n_photo", "sum"), វីដេអូ=("n_video", "sum")).reset_index())
+    last = pd.DataFrame(list(_media_last_shoot(s).values()))
+    need = last[last[MEDIA_ITEMS].isin(MEDIA_NEED).any(axis=1)] if not last.empty else last
+    st.markdown(f"**🖨️ ហាងត្រូវការ ស្ទីគ័រ / ម៉ឺនុយ / បដា ថ្មី ({len(need)})**")
+    if need.empty:
+        st.caption("គ្មាន")
+    else:
+        t = need[["Customer", "Date"] + MEDIA_ITEMS].copy()
+        for i in MEDIA_ITEMS:
+            t[i] = t[i].map(lambda v: "🖨️ ត្រូវការ" if v in MEDIA_NEED else _mkm(v))
+        show_df(t.rename(columns={"Date": "ថតចុងក្រោយ", **{i: MEDIA_KM[i] for i in MEDIA_ITEMS}}))
+    if has_permission("reports"):
+        _lazy_excel_download("📥 Download media report (Excel)",
+                             lambda: {"Shoots": s.drop(columns=["_dt", "_wk"], errors="ignore"), "By week": wk,
+                                      "Needs print": need.drop(columns=["_dt"], errors="ignore") if not need.empty else need},
+                             f"Media_{today}.xlsx", "media_dl")
+
+
+def _media_parse_report_xlsx(data):
+    """[(customer name, status)] from the MEDIA column colours of REPORT_UPDATED_ALL.xlsx (sheet TOTAL)."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data), data_only=True)
+    sheets = (["TOTAL"] if "TOTAL" in wb.sheetnames else []) + [n for n in wb.sheetnames if n != "TOTAL"]
+    for sn in sheets:
+        ws = wb[sn]
+        for r in range(1, min(ws.max_row, 30) + 1):
+            vals = [str(ws.cell(r, c).value or "").strip() for c in range(1, min(ws.max_column, 40) + 1)]
+            if "MEDIA" in [v.upper() for v in vals] and any("ឈ្មោះ" in v for v in vals):
+                mcol = [v.upper() for v in vals].index("MEDIA") + 1
+                ncol = next(i for i, v in enumerate(vals, 1) if "ឈ្មោះ" in v)
+                out = []
+                for rr in range(r + 1, ws.max_row + 1):
+                    name = ws.cell(rr, ncol).value
+                    if not name or not str(name).strip():
+                        continue
+                    f = ws.cell(rr, mcol).fill
+                    rgb = (f.fgColor.rgb if f is not None and f.fill_type == "solid" and f.fgColor is not None
+                           and f.fgColor.type == "rgb" else "")
+                    status = {"FF00B050": "Filmed", "FF92D050": "Filmed", "FF00FF00": "Filmed",
+                              "FFC00000": "Refused", "FFFF0000": "Refused", "FFFFFF00": "Yellow"}.get(str(rgb).upper(), "Not yet")
+                    out.append((re.sub(r"\s+", " ", str(name)).strip(), status))
+                return out, sn
+    raise ValueError("No sheet with a MEDIA column and a customer-name column (ឈ្មោះ…) was found.")
+
+
+def _media_status_body(names, zone_map, shoots):
+    stmap = _media_status_map(names, shoots)
+    rows = []
+    for k, n in names.items():
+        z = zone_map.get(k, VISIT_ZONE_NOT_SET)
+        if str(z).startswith("🚫"):
+            continue
+        s_, t_ = stmap.get(k, ("Not yet", None))
+        rows.append({"Customer": n, "Zone": _km(z), "Status": MEDIA_STATUS_LABEL.get(s_, s_),
+                     "Since": f"{t_:%d %b %Y}" if t_ is not None else ""})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("គ្មានហាង។")
+        return
+    st.markdown("**🎨 ស្ថានភាពថត តាមតំបន់**")
+    show_df(pd.crosstab(df["Zone"], df["Status"], margins=True, margins_name="សរុប").reset_index())
+    f1, f2 = st.columns([2, 3])
+    pick = f1.selectbox("បង្ហាញ", ["ទាំងអស់"] + list(MEDIA_STATUS_LABEL.values()), key="media_st_filter")
+    q = f2.text_input("ស្វែងរកឈ្មោះ", key="media_st_q")
+    view = df if pick == "ទាំងអស់" else df[df["Status"] == pick]
+    if q.strip():
+        view = view[view["Customer"].str.contains(q.strip(), case=False, regex=False)]
+    show_df(view.sort_values(["Status", "Zone", "Customer"]), height=380)
+    if has_permission("edit"):
+        with st.expander("✏️ ប្តូរស្ថានភាពហាង (ឧ. ម្ចាស់ហាងអនុញ្ញាតវិញ)"):
+            c1, c2, c3 = st.columns([3, 2, 1.2])
+            who = c1.selectbox("ហាង", sorted(df["Customer"], key=str.casefold), index=None, key="media_st_shop",
+                               placeholder="វាយឈ្មោះ…")
+            new = c2.selectbox("ស្ថានភាពថ្មី", ["Filmed", "Refused", "Not yet"], format_func=lambda v: MEDIA_STATUS_LABEL[v],
+                               key="media_st_new")
+            if c3.button("💾 រក្សាទុក", key="media_st_save", disabled=not who) and who:
+                try:
+                    _media_status_set(who, new)
+                    st.session_state["flash"] = f"{who}: {MEDIA_STATUS_LABEL[new]}"
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e)[:150])
+        with st.expander("📥 យកស្ថានភាពពី REPORT_UPDATED_ALL.xlsx (ពណ៌ក្នុងជួរ MEDIA)"):
+            st.caption("🟩 បៃតង = ថតរួច · 🟥 ក្រហម = មិនឱ្យថត · ក្រឡាទទេ = មិនទាន់ថត (មិនប្តូរហាងដែលបានថតក្នុង app រួច)។")
+            up = st.file_uploader("ឯកសារ Excel", type=["xlsx"], key="media_st_xl")
+            if up is not None:
+                try:
+                    parsed, sheet = _media_parse_report_xlsx(up.getvalue())
+                except Exception as e:
+                    st.error(str(e)[:200])
+                    parsed, sheet = [], ""
+                if parsed:
+                    by_mk = {_visit_match_key(n): n for n in names.values()}
+                    changes, unknown = [], []
+                    for name, s_ in parsed:
+                        if s_ in ("Not yet", "Yellow"):
+                            continue
+                        app_name = names.get(norm_name(name)) or by_mk.get(_visit_match_key(name))
+                        if not app_name:
+                            unknown.append(name)
+                            continue
+                        cur = stmap.get(norm_name(app_name), ("Not yet", None))[0]
+                        if cur != s_:
+                            changes.append({"Customer": app_name, "From": MEDIA_STATUS_LABEL.get(cur, cur), "To": MEDIA_STATUS_LABEL[s_], "_s": s_})
+                    st.write(f"Sheet **{sheet}**: {len(parsed)} ហាង · ប្តូរ {len(changes)} · មិនស្គាល់ឈ្មោះ {len(unknown)}")
+                    if changes:
+                        show_df(pd.DataFrame(changes).drop(columns="_s"), height=260)
+                        if st.button(f"💾 រក្សាទុក {len(changes)} ការប្តូរ", key="media_st_import", type="primary"):
+                            try:
+                                append_rows(MEDIA_STATUS_FILE, [{"Date": now_str(), "Customer": c["Customer"], "Status": c["_s"],
+                                                                 "By": current_user() or "-", "Source": "Excel " + sheet} for c in changes])
+                                st.session_state["flash"] = f"✅ បានយក {len(changes)} ស្ថានភាពពី Excel"
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e)[:150])
+                    if unknown:
+                        with st.expander(f"ឈ្មោះមិនស្គាល់ ({len(unknown)})"):
+                            st.write(", ".join(unknown[:200]))
+
+
+MEDIA_VIEWS = ["📋 ផែនការ ថ្ងៃសុក្រ-សៅរ៍", "📸 ថតហាង", "🎨 ស្ថានភាពថត", "🖼️ រូបភាពហាង", "📊 របាយការណ៍"]
+
+
+def _media_phone():
+    if "media_phone" not in st.session_state:
+        st.session_state["media_phone"] = is_mobile()
+    return bool(st.session_state.get("media_phone"))
+
+
+def _media_body():
+    today = today_kh()
+    h1, h2 = st.columns([4, 1.3])
+    h1.subheader("📸 Media Team — ថតរូប និងវីដេអូ ហាងភ្នំពេញ (ថ្ងៃសុក្រ · សៅរ៍)")
+    _media_phone()
+    h2.toggle("📱 Phone mode", key="media_phone", help="ប៊ូតុងធំ ផែនទីតូច ទម្រង់ងាយស្រួលលើទូរស័ព្ទ។ បើកដោយស្វ័យប្រវត្តិលើទូរស័ព្ទ។")
+    if _media_phone():
+        st.markdown(VISIT_PHONE_CSS, unsafe_allow_html=True)
+    if st.session_state.get("media_view") not in MEDIA_VIEWS:
+        st.session_state["media_view"] = MEDIA_VIEWS[0]
+    view = st.radio("Media", MEDIA_VIEWS, key="media_view", horizontal=True, label_visibility="collapsed")
+    shoots = _media_read()
+    if view == "🖼️ រូបភាពហាង":
+        _media_gallery_body(shoots, {})
+        return
+    if view == "📊 របាយការណ៍":
+        _media_report_body(shoots, today)
+        return
+    snap, _src, _path, err = current_snapshot()
+    if snap:
+        try:
+            _si_prepare(snap)                       # journal remarks (ទូថ្មី, X STAND…) for the priority list
+        except Exception:
+            pass
+    stats, names, _areas = _visit_customer_stats()
+    if not names:
+        st.warning("រកមិនឃើញអតិថិជននៅភ្នំពេញទេ។ " + (err or ""))
+        return
+    zone_map = _visit_zone_map(names)
+    if view == "🎨 ស្ថានភាពថត":
+        _media_status_body(names, zone_map, shoots)
+    elif view == "📸 ថតហាង":
+        _media_form_body(names, zone_map, today)
+    else:
+        _media_plan_body(stats, names, zone_map, shoots, today)
+
+
+@st.fragment
+def _media_fragment():
+    _media_body()
+
+
+def tab_media():
+    """Runs as a fragment: taps inside redraw only this section."""
+    try:
+        _media_fragment()
+    except Exception as e:
+        if "fragment" in str(e).lower():
+            _media_body()
+        else:
+            raise
+
+
+
+
+# ==========================================
+# MERGED FROM THE OLDER BRANCH (app_test (5).py, 31 Oct 2026): customer matching ignoring spelling,
+# invoice link on packing / delivery rows, journal of the current month, phone cards for tasks and expenses,
+# 'Fill in later' delivery details, invoice status CSV for the journal.
+# ==========================================
+def cust_key(name):
+    """Matching key for a customer: ignores capital letters, extra spaces and Khmer spelling variants.
+    The journal, packing log, delivery log, holds and assignments are all joined with this key."""
+    return norm_name(_kh(name))
+
+
+class CustomerDict(dict):
+    """A dict whose keys are customer names compared with cust_key (so 'LY MEY' == 'Ly  Mey')."""
+    def __setitem__(self, k, v):
+        super().__setitem__(cust_key(k), v)
+
+    def __getitem__(self, k):
+        return super().__getitem__(cust_key(k))
+
+    def __contains__(self, k):
+        return super().__contains__(cust_key(k))
+
+    def get(self, k, default=None):
+        return super().get(cust_key(k), default)
+
+    def pop(self, k, *default):
+        return super().pop(cust_key(k), *default)
+
+
+_JOURNAL_MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                   "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
+_JOURNAL_YM_RE = re.compile(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\u200b_\-.]*(20\d\d)")
+
+
+def _journal_ym(name):
+    m = _JOURNAL_YM_RE.search(str(name).lower())
+    return (int(m.group(2)), _JOURNAL_MONTHS[m.group(1)]) if m else None
+
+
+def _pick_by_month(items, name_of, mtime_of):
+    """Current month's journal; else the latest earlier month; never a future month."""
+    if not items:
+        return None
+    t = today_kh()
+    now_ym = (t.year, t.month)
+    dated = [(it, _journal_ym(name_of(it))) for it in items]
+    dated = [(it, ym) for it, ym in dated if ym]
+    cur = [it for it, ym in dated if ym == now_ym]
+    if cur:
+        return max(cur, key=mtime_of)
+    past = [(ym, it) for it, ym in dated if ym < now_ym]
+    if past:
+        best = max(ym for ym, _ in past)
+        return max((it for ym, it in past if ym == best), key=mtime_of)
+    undated = [it for it in items if not _journal_ym(name_of(it))]
+    return max(undated or items, key=mtime_of)
+
+
+PENDING_VIA = "Fill in later"
+
+
+def driver_pp_expense(via, amount):
+    """Company drivers never incur a Phnom Penh transport charge."""
+    return 0 if via in LOCAL_DRIVERS else _int(amount)
+
+
+def task_view_selector(section):
+    options = ["Cards", "Table"]
+    preference = st.session_state.get("_task_view_preference") or ("Cards" if is_mobile() else "Table")
+    selected = st.radio("View", options, index=options.index(preference),
+                        horizontal=True, key="task_view_" + section)
+    st.session_state["_task_view_preference"] = selected
+    st.caption("Cards: easy on phones. Table: compact for tablets and computers. Save your edits before switching views.")
+    return selected
+
+
+def phone_task_editor(frame, **kwargs):
+    """Native vertical inputs inside the caller's form: no rerun while typing."""
+    key = kwargs["key"]
+    disabled = set(kwargs.get("disabled", []))
+    columns = [c for c in (kwargs.get("column_order") or list(frame.columns)) if c != "Invoice"]
+    if st.session_state.get("_task_view_preference", "Cards") == "Table":
+        table = frame.copy(deep=True)
+        if "Invoice" in table:
+            table["Invoice"] = ""
+        options = dict(kwargs)
+        options["key"] = key + "_table"
+        options["column_order"] = columns
+        config = dict(options.get("column_config", {}))
+        for hidden in set(table.columns) - set(columns):
+            config[hidden] = None
+        options["column_config"] = config
+        options["use_container_width"] = True
+        return st.data_editor(table, **options)
+    out = []
+    for pos, original in enumerate(frame.to_dict("records")):
+        row = dict(original)
+        if "Invoice" in row:
+            row["Invoice"] = ""
+        with st.container(border=True):
+            st.write("**" + str(row.get("Customer", "Customer")) + "**")
+            details = [str(row.get(c, "")) for c in ("Zone", "Status", "Taken by") if c in row and row.get(c) not in ("", None)]
+            if "Zone" not in row and "Province" in row:
+                details.insert(0, str(row.get("Province", "")))
+            if details:
+                st.caption(" · ".join(details))
+            note = str(row.get(SALE_NOTE_COL, "") or "")
+            if note:
+                (st.error if note.startswith(("🔥", "⏰")) else st.caption)("📌 " + note)
+            for col in columns:
+                if col in disabled or col not in row:
+                    continue
+                widget_key = f"{key}_card_{pos}_{col}"
+                if col in ("Take ✅", "Sent ✅", "Save?", "Done ✅"):
+                    row[col] = st.checkbox(col, value=bool(row[col]), key=widget_key)
+                elif col == "Cases":
+                    row[col] = st.number_input("Cases / ចំនួនកេស", min_value=0, max_value=MAX_CASES,
+                        value=max(0, min(MAX_CASES, _int(row[col]))), step=1, key=widget_key)
+                elif col == "Status":
+                    options = ["Done", "Not yet", "Skip"]
+                    row[col] = st.selectbox(col, options, index=options.index(row[col]) if row[col] in options else 0, key=widget_key)
+                elif col == "Customer":
+                    opts, _, _ = customer_choices()
+                    choices = list(dict.fromkeys([str(row[col])] + list(opts)))
+                    row[col] = st.selectbox("Customer", choices, key=widget_key)
+                else:
+                    row[col] = st.text_input(col, value=str(row[col] or ""), key=widget_key)
+        out.append(row)
+    return pd.DataFrame(out, columns=frame.columns)
+
+
+def _save_expense_card(original, via, station, pp, taxi, note, _frame=None):
+    """Update exactly one delivery; reject edits made since this card was loaded."""
+    station = safe_text(station or "").strip()
+    station = "" if station == "-" else station
+    if via not in via_options():
+        raise ValueError("Choose who delivered first.")
+    pp, taxi = driver_pp_expense(via, pp), _int(taxi)
+    if not (0 <= pp <= MAX_RIEL and 0 <= taxi <= MAX_RIEL):
+        raise ValueError("Expense amount is outside the allowed range.")
+    if expense_status(via, station, pp, taxi) != "Done":
+        raise ValueError("Enter the paid transport expense. If no taxi was used, leave taxi station blank and taxi expense 0.")
+    def apply(frame):
+        mask = pd.Series(True, index=frame.index)
+        for field in ("Date", "Customer", "Handled_By", "Invoice"):
+            mask &= frame[field].fillna("").astype(str).eq(str(original.get(field, "") or ""))
+        if int(mask.sum()) != 1:
+            raise ValueError("This delivery changed or is ambiguous. Refresh the list.")
+        idx = frame.index[mask][0]
+        for field in ("Local_Driver", "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Expense_Status"):
+            if str(frame.at[idx, field]) != str(original.get(field, "")):
+                raise ValueError("Another staff member updated this delivery. Refresh before saving.")
+        for field, value in {"Local_Driver": via, "Taxi_Station": station or "-",
+                             "Phnom_Penh_Expense": pp, "Taxi_Expense": taxi,
+                             "Note": safe_text(note or "") or "-", "Expense_Status": "Done"}.items():
+            frame.loc[idx, field] = value
+        return frame
+    if _frame is not None:
+        return apply(_frame)
+    modify_csv(DATA_FILE, DISPATCH_COLS, apply)
+
+
+@st.fragment
+def _expense_phone_card(record, me):
+    token = _draft_id("expense_card", "|".join(str(record.get(c, "")) for c in ("Date", "Customer", "Handled_By", "Invoice")))
+    if st.session_state.get(token + "_saved"):
+        st.success(str(record["Customer"]) + " — saved ✅")
+        return
+    with st.container(border=True):
+        st.write("**" + str(record["Customer"]) + "**")
+        st.caption(f'{record["Date"]} · {record.get("Cases", 0)} cases · Invoice {record.get("Invoice", "")}')
+        choices = [PENDING_VIA] + via_options()
+        previous = str(record.get("Local_Driver", ""))
+        default = previous if previous in choices else PENDING_VIA
+        if default == PENDING_VIA and me in LOCAL_DRIVERS:
+            default = me
+        via = st.selectbox("🚚 Sent with / អ្នកដឹក", choices, index=choices.index(default), key=token + "_via")
+        with st.form(token + "_form"):
+            if via in LOCAL_DRIVERS:
+                pp = 0
+                st.caption("Phnom Penh expense: 0៛ automatically")
+            else:
+                pp = st.number_input("Phnom Penh expense ៛", min_value=0, max_value=MAX_RIEL,
+                                     value=_int(record.get("Phnom_Penh_Expense")), step=500, key=token + "_pp")
+            station = st.text_input("Taxi station — blank if no taxi", value="" if record.get("Taxi_Station") in ("", "-") else str(record.get("Taxi_Station", "")), max_chars=MAX_TEXT, key=token + "_station")
+            taxi = st.number_input("Taxi expense ៛ — 0 if no taxi", min_value=0, max_value=MAX_RIEL,
+                                   value=_int(record.get("Taxi_Expense")), step=500, key=token + "_taxi")
+            st.caption("Phnom Penh / តាខ្មៅ / direct delivery: no taxi needed? Leave station blank and taxi 0.")
+            note = st.text_input("Note / កំណត់ចំណាំ", value="" if record.get("Note") == "-" else str(record.get("Note", "")), max_chars=MAX_TEXT, key=token + "_note")
+            save = st.form_submit_button("💾 Save this customer", type="primary", use_container_width=True)
+        if save:
+            try:
+                _save_expense_card(record, via, station, pp, taxi, note)
+                audit("expenses_filled", f'Card: {record["Customer"]}, by {me}')
+                st.session_state[token + "_saved"] = True
+                st.rerun(scope="fragment")
+            except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
+                st.error(str(err))
+
+
+def _expense_table(df, me, scope):
+    st.caption("Edit several rows, tick Save, then save once. Phnom Penh expense is automatically 0 for តួ and វុទ្ធា.")
+    rows = []
+    for original in df.to_dict("records"):
+        row = {c: original.get(c, "") for c in DISPATCH_COLS}
+        via = row["Local_Driver"]
+        if via == PENDING_VIA and me in LOCAL_DRIVERS:
+            via = me
+        row.update({"Save": False, "Sent with": via,
+                    "Taxi station": "" if row["Taxi_Station"] == "-" else row["Taxi_Station"],
+                    "Phnom Penh ៛": driver_pp_expense(via, row["Phnom_Penh_Expense"]),
+                    "Taxi ៛": _int(row["Taxi_Expense"]),
+                    "Delivery note": "" if row["Note"] == "-" else row["Note"]})
+        rows.append(row)
+    _reload_draft_button("expense_table", scope)
+    frame, key = _task_editor_frame("expense_table", pd.DataFrame(rows), scope)
+    visible = ["Save", "Customer", "Date", "Cases", "Sent with", "Taxi station", "Phnom Penh ៛", "Taxi ៛", "Delivery note"]
+    config = {c: None for c in frame.columns if c not in visible}
+    config.update({
+        "Save": st.column_config.CheckboxColumn("Save"),
+        "Sent with": st.column_config.SelectboxColumn("Sent with", options=[PENDING_VIA] + via_options()),
+        "Phnom Penh ៛": st.column_config.NumberColumn("Phnom Penh ៛", min_value=0, max_value=MAX_RIEL, step=500),
+        "Taxi ៛": st.column_config.NumberColumn("Taxi ៛", min_value=0, max_value=MAX_RIEL, step=500),
+        "Taxi station": st.column_config.TextColumn("Taxi station", max_chars=MAX_TEXT),
+        "Delivery note": st.column_config.TextColumn("Note", max_chars=MAX_TEXT)})
+    with st.form("form_" + key):
+        edited = st.data_editor(frame, key=key, hide_index=True, use_container_width=True,
+            column_order=visible, column_config=config, disabled=DISPATCH_COLS,
+            height=min(600, 70 + 36 * len(frame)))
+        save = st.form_submit_button("💾 Save selected expenses", type="primary", use_container_width=True)
+    if save:
+        selected = [r for r in edited.to_dict("records") if r["Save"]]
+        if not selected:
+            st.warning("Tick Save for the rows you finished.")
+            return
+        def apply(latest):
+            result = latest.copy(deep=True)
+            for row in selected:
+                original = {c: row[c] for c in DISPATCH_COLS}
+                result = _save_expense_card(original, row["Sent with"], row["Taxi station"],
+                    row["Phnom Penh ៛"], row["Taxi ៛"], row["Delivery note"], _frame=result)
+            return result
+        try:
+            modify_csv(DATA_FILE, DISPATCH_COLS, apply)
+            audit("expenses_filled", f"Table: {len(selected)} deliveries, by {me}")
+            _reset_draft("expense_table", scope)
+            flash_and_refresh(f"Saved expenses for {len(selected)} deliveries")
+        except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
+            st.error(f"Not saved: {err}. Your edits are kept.")
+
+
+def _invoice_choices(customer, day=None):
+    snap, src, _, error = current_snapshot()
+    if error or not snap or src == "stale":
+        raise RuntimeError("Journal unavailable; retry before saving invoice-linked records")
+    sub = snap["journal"]
+    sub = sub[(sub["Date"] == (day or today_kh())) & (sub["Customer"].map(norm_name) == norm_name(customer))]
+    return sorted({str(v).strip() for v in sub["Invoice"] if str(v).strip() not in ("", "-", "nan")})
+
+
+def _resolve_record_invoice(row):
+    # Staff save customer totals. Link only an unambiguous invoice.
+    supplied = str(row.get("Invoice", "")).strip()
+    day = parse_dt(row["Date"])
+    try:
+        choices = _invoice_choices(row["Customer"], day.date())
+    except RuntimeError:
+        if supplied in ("", "-", "nan"):
+            return "-"
+        raise
+    if supplied in ("", "-", "nan"):
+        return choices[0] if len(choices) == 1 else "-"
+    matches = [v for v in choices if v.casefold() == supplied.casefold()]
+    if len(matches) != 1:
+        raise RuntimeError(f"{row['Customer']}: invoice {supplied} does not match this customer and date in the journal")
+    return matches[0]
+
+
+_STATUS_RAW_MEMO = {}
+
+
+def _make_invoice_status_csv(source, packing, deliveries, holds):
+    """Export exact invoice status, conservatively skipping ambiguous legacy rows."""
+    key = hashlib.sha1(source).digest()
+    if _STATUS_RAW_MEMO.get("key") == key:
+        raw = _STATUS_RAW_MEMO["raw"]                    # journal unchanged: only packing / delivery changed
+    else:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(source), read_only=True, data_only=True)
+        try:
+            ws = wb[JOURNAL_SHEET]; ws.reset_dimensions()
+            raw = list(ws.iter_rows(values_only=True))
+        finally:
+            wb.close()
+        _STATUS_RAW_MEMO.update(key=key, raw=raw)
+    ci = next((i for row in raw[:15] for i,v in enumerate(row) if v is not None and JOURNAL_CASES_HEADER in str(v)), None)
+    ii = next((i for row in raw[:15] for i,v in enumerate(row) if v is not None and JOURNAL_INVOICE_HEADER in str(v)), None)
+    if ci is None or ii is None:
+        raise RuntimeError("Journal invoice/cases column missing")
+    months = Counter((r[0].year,r[0].month) for r in raw if r and isinstance(r[0],datetime))
+    dominant = months.most_common(1)[0][0] if months else None
+    groups, by_day = {}, {}
+    for r in raw:
+        if len(r) <= max(ci,ii) or not r[1]:continue
+        day = cell_to_date(r[0], dominant)
+        inv, cust = _cell_text(r[ii]), _cell_text(r[1])
+        if not day or inv in ("", "-"):continue
+        key = (norm_name(cust), inv.casefold())
+        g = groups.setdefault(key, dict(Customer=cust,Invoice=inv,ordered=0.,days=set(),ids=set(),packed=0.,sent=0.,completed=False))
+        qty = pd.to_numeric(r[ci],errors="coerce")
+        if pd.notna(qty):g['ordered'] += max(float(qty),0)
+        g['days'].add(day)
+        if len(r)>2 and _cell_text(r[2]):g['ids'].add(_cell_text(r[2]))
+        by_day.setdefault((day,norm_name(cust)),set()).add(key)
+    skipped=0
+    for frame,kind,field in ((packing,'packed','Cases_Packed'),(deliveries,'sent','Cases')):
+        for r in frame.to_dict('records'):
+            dt=r.get('_dt',parse_dt(r.get('Date')))
+            if pd.isna(dt): skipped+=1;continue
+            possibilities=by_day.get((dt.date(),norm_name(r['Customer'])),set())
+            inv=_cell_text(r.get('Invoice'))
+            if inv not in ('','-','nan'):
+                possibilities={k for k in possibilities if k[1]==inv.casefold()}
+            if len(possibilities)!=1:
+                for candidate in possibilities:
+                    groups[candidate]['customer_total_only'] = True
+                skipped+=1
+                continue
+            key=next(iter(possibilities));g=groups[key]
+            g[kind]+=max(float(r[field]),0)
+            if kind=='packed':g['completed']=str(r.get('Status','')).startswith('Completed')
+    # Customer-level corrections cannot be divided across several invoices.
+    correction={}
+    for r in holds.to_dict('records'):
+        dt=r.get('_dt',parse_dt(r.get('Date')))
+        if pd.isna(dt):continue
+        k=(dt.date(),norm_name(r['Customer']));a=correction.setdefault(k,{})
+        action=r['Action']
+        if action in ('FinalSent','FinalPacked'):a[action]=max(float(r['Cases']),0)
+        elif action in ('FinalReset','FinalPackedReset'):a.pop('FinalSent' if action=='FinalReset' else 'FinalPacked',None)
+        elif action in ('Tomorrow','Cancel'):a['hold']=True
+        elif action=='Restore':a.pop('hold',None)
+    out=[]
+    for key,g in groups.items():
+        status='Pending'
+        if len(g['days'])!=1 or len(g['ids'])>1 or g.get('customer_total_only'):status='Review'
+        else:
+            day=next(iter(g['days']));ck=(day,key[0]);o=correction.get(ck,{})
+            if o.get('hold'):status='Hold'
+            elif o and len(by_day[ck])>1:status='Review'
+            else:
+                g['packed']=o.get('FinalPacked',g['packed']);g['sent']=o.get('FinalSent',g['sent'])
+                target=max(g['ordered'],g['packed'])
+                if g['sent']>0:status='Sent' if target>0 and g['sent']>=target else 'Part sent'
+                elif g['packed']>0 and (g['completed'] or 'FinalPacked' in o) and g['packed']>=g['ordered']:status='Packed'
+        out.append(dict(Customer=g['Customer'],Invoice=g['Invoice'],Status=status,Packed_Cases=g['packed'],Sent_Cases=g['sent'],Ordered_Cases=g['ordered']))
+    result=pd.DataFrame(out,columns=['Customer','Invoice','Status','Packed_Cases','Sent_Cases','Ordered_Cases'])
+    return result.to_csv(index=False).encode('utf-8-sig'), {'highlighted':int(result.Status.isin(['Sent','Packed','Part sent']).sum()),'ambiguous':int((result.Status=='Review').sum()),'unmatched':skipped}
+
+
+# ---------- 🚚 delivery expense per invoice, for the sale journal's អ្នកដឹក / សេវាដឹក / សេវាតាក់ស៊ី columns ----------
+DRIVER_EXPENSE_COLS = ["Invoice", "Customer", "Date", "Driver", "App_Expense", "Taxi_Expense", "Status"]
+DRIVER_SHORT = {"ងិន វុទ្ធា": "VUTHEA", "អួន តួ": "TOU"}      # names used in the journal's អ្នកដឹក column
+
+
+def _make_driver_expense_csv(source, deliveries):
+    """One row per journal invoice + customer: who drove it and what the delivery cost (Grab/TukTuk/own and taxi).
+    A delivery log counts for an invoice only when BOTH the invoice number and the customer name match the journal
+    (a row whose name was changed but kept the invoice gets nothing). A log without an invoice goes to the customer's
+    first invoice of that day (or the day before). Amounts already entered are always shown; Status Pending means
+    not delivered yet or a cost is still missing."""
+    raw = _STATUS_RAW_MEMO.get("raw") if _STATUS_RAW_MEMO.get("key") == hashlib.sha1(source).digest() else None
+    if raw is None:
+        _make_invoice_status_csv(source, deliveries.iloc[0:0], deliveries.iloc[0:0], pd.DataFrame(columns=HOLD_COLS + ["_dt"]))
+        raw = _STATUS_RAW_MEMO["raw"]
+    ii = next((i for row in raw[:15] for i, v in enumerate(row) if v is not None and JOURNAL_INVOICE_HEADER in str(v)), None)
+    if ii is None:
+        raise RuntimeError("Journal invoice column missing")
+    months = Counter((r[0].year, r[0].month) for r in raw if r and isinstance(r[0], datetime))
+    dominant = months.most_common(1)[0][0] if months else None
+    order, info, by_day, by_inv = [], {}, {}, {}
+    for r in raw:
+        if len(r) <= ii or not r[1]:
+            continue
+        day = cell_to_date(r[0], dominant)
+        inv, cust = _cell_text(r[ii]), _cell_text(r[1])
+        if not day or inv in ("", "-") or not re.search(r"[^\W\d_]", cust):
+            continue                                        # invoice numbers typed ahead, no customer yet
+        key = (inv.casefold(), cust_key(cust))
+        if key in info:
+            continue
+        info[key] = dict(Invoice=inv, Customer=cust, Date=day.isoformat())
+        order.append(key)
+        by_day.setdefault((day, cust_key(cust)), []).append(key)
+        by_inv.setdefault(inv.casefold(), []).append(key)
+    got, unmatched, mismatched = {}, 0, 0
+    for r in deliveries.to_dict("records"):
+        dt = r.get("_dt", parse_dt(r.get("Date")))
+        if pd.isna(dt):
+            continue
+        ck = cust_key(r["Customer"])
+        inv = _cell_text(r.get("Invoice")).casefold()
+        key = (inv, ck) if inv not in ("", "-", "nan") else None
+        if key is None or key not in info:
+            if key is not None and inv not in by_inv:
+                unmatched += 1                              # invoice not (yet) in this journal
+                continue
+            if key is not None:
+                mismatched += 1                             # that invoice belongs to another customer name:
+            day = dt.date()                                 # never use it; find this customer's own invoice
+            cands = by_day.get((day, ck)) or by_day.get((day - timedelta(days=1), ck))
+            if not cands:
+                unmatched += 1
+                continue
+            key = cands[0]
+        g = got.setdefault(key, dict(driver="", app=0, taxi=0, app_set=False, taxi_set=False, done=True))
+        via = str(r.get("Local_Driver", "") or "")
+        if via in DRIVER_SHORT:
+            g["driver"] = DRIVER_SHORT[via]
+        pp, taxi = driver_pp_expense(via, r.get("Phnom_Penh_Expense")), _int(r.get("Taxi_Expense"))
+        g["app"] += pp
+        g["taxi"] += taxi
+        g["app_set"] = g["app_set"] or pp > 0 or via in DRIVER_SHORT or via not in (BASE_VIA, PENDING_VIA)
+        g["taxi_set"] = g["taxi_set"] or taxi > 0 or str(r.get("Taxi_Station", "") or "").strip() in ("", "-")
+        status = str(r.get("Expense_Status", "") or "") or expense_status(via, r.get("Taxi_Station"), r.get("Phnom_Penh_Expense"), r.get("Taxi_Expense"))
+        g["done"] = g["done"] and status != "Pending"
+    for keys in by_day.values():                            # e.g. NP316463 got the cost; NP316464 same shop & day -> 0
+        done = [got[k] for k in keys if k in got and got[k]["done"]]
+        if done:
+            for k in keys:
+                if k not in got:
+                    got[k] = dict(driver=done[0]["driver"], app=0, taxi=0, app_set=True, taxi_set=True, done=True)
+    out = []
+    for key in order:
+        row = dict(info[key])
+        g = got.get(key)
+        if g:
+            row.update(Driver=g["driver"],
+                       App_Expense=g["app"] if (g["done"] or g["app"] > 0 or g["app_set"]) else "",
+                       Taxi_Expense=g["taxi"] if (g["done"] or g["taxi"] > 0 or g["taxi_set"]) else "",
+                       Status="Done" if g["done"] else "Pending")
+        else:
+            row.update(Driver="", App_Expense="", Taxi_Expense="", Status="Pending")
+        out.append(row)
+    result = pd.DataFrame(out, columns=DRIVER_EXPENSE_COLS)
+    return result.to_csv(index=False).encode("utf-8-sig"), {"done": int((result["Status"] == "Done").sum()),
+                                                             "pending": int((result["Status"] == "Pending").sum()),
+                                                             "unmatched": unmatched, "mismatched": mismatched}
+
+
+STATUS_COPY_FOLDER = "Auto_Status"
+
+
+STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V3_EXPENSE2:"
+
+
+def _journal_status_rows(journal_rows, packing, deliveries, holds):
+    """Exact date/name matching; a repeated name with different IDs is ambiguous.
+    All invoices for a customer/day share one aggregate status, not an invoice status.
+    """
+    groups = {}
+    for row_no, day, name, customer_id, cases in journal_rows:
+        key = (day, norm_name(name))
+        g = groups.setdefault(key, {"rows": [], "ids": set(), "ordered": 0.0})
+        g["rows"].append(row_no)
+        if customer_id:
+            g["ids"].add(customer_id)
+        if cases is not None and not pd.isna(cases):
+            g["ordered"] += max(float(cases), 0)
+    activity = {}
+    for frame, kind, field in ((packing, "packed", "Cases_Packed"), (deliveries, "sent", "Cases")):
+        for r in frame.to_dict("records"):
+            dt = r.get("_dt", parse_dt(r.get("Date")))
+            if pd.isna(dt):
+                continue
+            key = (dt.date(), norm_name(r["Customer"]))
+            a = activity.setdefault(key, {})
+            a[kind] = a.get(kind, 0) + max(float(r[field]), 0)
+            if kind == "packed":
+                a["completed"] = str(r.get("Status", "")).startswith("Completed")
+    overrides = {}
+    for r in holds.to_dict("records"):
+        dt = r.get("_dt", parse_dt(r.get("Date")))
+        if pd.isna(dt):
+            continue
+        a = overrides.setdefault((dt.date(), norm_name(r["Customer"])), {})
+        action = r["Action"]
+        if action in ("FinalSent", "FinalPacked"):
+            a[action] = max(float(r["Cases"]), 0)
+        elif action in ("FinalReset", "FinalPackedReset"):
+            a.pop("FinalSent" if action == "FinalReset" else "FinalPacked", None)
+        elif action in ("Tomorrow", "Cancel"):
+            a["hold"] = action
+        elif action == "Restore":
+            a.pop("hold", None)
+    marked, ambiguous = {}, 0
+    for key, g in groups.items():
+        if len(g["ids"]) > 1:
+            ambiguous += 1
+            continue
+        a, o = activity.get(key, {}), overrides.get(key, {})
+        if o.get("hold"):
+            continue
+        packed = o.get("FinalPacked", a.get("packed", 0))
+        sent = o.get("FinalSent", a.get("sent", 0))
+        target = max(g["ordered"], packed)
+        status = None
+        if sent > 0:
+            # Without any known target, sending cannot prove full completion.
+            status = "sent" if target > 0 and sent >= target else "part"
+        elif packed > 0 and ("FinalPacked" in o or a.get("completed")):
+            if g["ordered"] <= 0 or packed >= g["ordered"]:
+                status = "packed"
+        if status:
+            marked.update({n: status for n in g["rows"]})
+    unmatched = sum(1 for k in activity if k not in groups)
+    return marked, {"highlighted": len(marked), "ambiguous": ambiguous, "unmatched": unmatched}
+
+
+def _make_status_workbook(source, packing, deliveries, holds):
+    """Patch B-cell fills in the XLSX ZIP; preserve formulas, cached values and all other parts."""
+    import zipfile
+    import posixpath
+    import xml.etree.ElementTree as ET
+    from openpyxl import load_workbook
+    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    wb = load_workbook(io.BytesIO(source), read_only=True, data_only=True)
+    try:
+        ws = wb[JOURNAL_SHEET]
+        ws.reset_dimensions()
+        raw = list(ws.iter_rows(values_only=True))
+        cases_col = next((i for row in raw[:15] for i, v in enumerate(row)
+                          if v is not None and JOURNAL_CASES_HEADER in str(v)), None)
+        if cases_col is None:
+            raise ValueError("Journal cases column was not found; status copy postponed.")
+        months = Counter((r[0].year, r[0].month) for r in raw if r and isinstance(r[0], datetime))
+        dominant = months.most_common(1)[0][0] if months else None
+        rows = []
+        for n, r in enumerate(raw, 1):
+            if len(r) < 2 or not r[1] or str(r[1]).strip() == JOURNAL_HEADER_TEXT:
+                continue
+            day = cell_to_date(r[0], dominant)
+            if day:
+                qty = pd.to_numeric(r[cases_col] if cases_col < len(r) else None, errors="coerce")
+                rows.append((n, day, str(r[1]), _cell_text(r[2]) if len(r) > 2 else "", qty))
+    finally:
+        wb.close()
+    marks, stats = _journal_status_rows(rows, packing, deliveries, holds)
+    with zipfile.ZipFile(io.BytesIO(source)) as zin:
+        book = ET.fromstring(zin.read("xl/workbook.xml"))
+        sheet = next(s for s in book.find(ns + "sheets") if s.get("name") == JOURNAL_SHEET)
+        rid = sheet.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        rels = ET.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
+        target = next(r.get("Target") for r in rels if r.get("Id") == rid)
+        part = target.lstrip("/") if target.startswith("/") else posixpath.normpath("xl/" + target)
+        styles = zin.read("xl/styles.xml").decode("utf-8")
+        root = ET.fromstring(styles)
+        fills, xfs = root.find(ns + "fills"), root.find(ns + "cellXfs")
+        if fills is None or xfs is None:
+            raise ValueError("Unsupported Excel style table")
+        colors = {"packed": "FFFFE699", "sent": "FFC6EFCE", "part": "FFBDD7EE"}
+        extra_fills = "".join('<fill><patternFill patternType="solid"><fgColor rgb="%s"/><bgColor indexed="64"/></patternFill></fill>' % c for c in colors.values())
+        fill_ids = {k: len(fills) + i for i, k in enumerate(colors)}
+        # Copy raw style XML so unsupported style extensions remain intact.
+        block = re.search(r'<cellXfs\b[^>]*>(.*?)</cellXfs>', styles, re.S)
+        if not block:
+            raise ValueError("Unsupported prefixed Excel styles")
+        originals = re.findall(r'<xf\b[^>]*?/>|<xf\b[^>]*>.*?</xf>', block.group(1), re.S)
+        if len(originals) != len(xfs):
+            raise ValueError("Cannot safely preserve Excel styles")
+        added, style_ids = [], {}
+        sheet_xml = zin.read(part).decode("utf-8")
+        def patch_cell(match):
+            tag = match.group(0)
+            ref = re.search(r'\br="B(\d+)"', tag)
+            status = marks.get(int(ref.group(1))) if ref else None
+            if not status:
+                return tag
+            existing = re.search(r'\bs="(\d+)"', tag)
+            old = int(existing.group(1)) if existing else 0
+            key = (old, status)
+            if key not in style_ids:
+                xf = originals[old]
+                end = xf.index(">")
+                head, tail = xf[:end], xf[end:]
+                for attr, value in (("fillId", fill_ids[status]), ("applyFill", 1)):
+                    head = re.sub(r'\s' + attr + r'="[^"]*"', '', head)
+                    where = len(head) - 1 if head.endswith("/") else len(head)
+                    head = head[:where] + f' {attr}="{value}"' + head[where:]
+                style_ids[key] = len(xfs) + len(added)
+                added.append(head + tail)
+            tag = re.sub(r'\ss="[^"]*"', '', tag)
+            return tag[:-1] + f' s="{style_ids[key]}">' if not tag.endswith('/>') else tag[:-2] + f' s="{style_ids[key]}"/>'
+        sheet_xml = re.sub(r'<c\b[^>]*>', patch_cell, sheet_xml)
+        for name, count, extra in (("fills", len(fills) + 3, extra_fills), ("cellXfs", len(xfs) + len(added), "".join(added))):
+            styles = re.sub(r'<' + name + r'\b[^>]*>', f'<{name} count="{count}">', styles, count=1)
+            styles = styles.replace('</' + name + '>', extra + '</' + name + '>', 1)
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for entry in zin.infolist():
+                data = sheet_xml.encode("utf-8") if entry.filename == part else styles.encode("utf-8") if entry.filename == "xl/styles.xml" else zin.read(entry.filename)
+                zout.writestr(entry, data)
+        return out.getvalue(), stats
+
+
+@st.cache_resource(show_spinner=False)
+def _status_copy_state():
+    return {"lock": threading.Lock(), "last_check": 0, "fingerprint": None,
+            "message": "Waiting for first automatic update", "path": None, "error": False}
+
+
+def sync_journal_status_copy(force=False):
+    """Rebuild only on changed input. Fail closed on stale reads; never upload to source path."""
+    import zipfile
+    state = _status_copy_state()
+    if not state["lock"].acquire(blocking=False):
+        return
+    try:
+        if not force and time.time() - state["last_check"] < 55:
+            return
+        state["last_check"] = time.time()
+        # Capture destination revision BEFORE reading inputs, so competing app writers cannot win stale.
+        if USE_DROPBOX:
+            names = _remote_excel_names()
+            chosen = next((x for x in names if x["name"].lower() == EXCEL_OVERRIDE.lower()), None) if EXCEL_OVERRIDE else None
+            chosen = chosen or _pick_remote(names, EXCEL_PATTERN) or _pick_remote(names, EXCEL_FALLBACK_PATTERN)
+            if not chosen:
+                raise ValueError("No source journal found; check the journal filename settings")
+            base = os.path.splitext(chosen["name"])[0] + "__INVOICE_STATUS.csv"
+            remote_out = _rpath(STATUS_COPY_FOLDER + "/" + base)
+            try:
+                output_md = _dbx().files_get_metadata(remote_out)
+            except Exception as e:
+                if not _is_not_found(e):
+                    raise
+                output_md = None
+            cached = state.get("src_cache")                 # re-download the journal only when its revision changed
+            if cached and cached[0] == chosen["name"] and cached[1] == chosen["rev"]:
+                source_md, source = cached[2], cached[3]
+            else:
+                source_md, response = _dbx().files_download(_rpath(chosen["name"]))
+                source = response.content
+                state["src_cache"] = (chosen["name"], source_md.rev, source_md, source)
+            source_name = chosen["name"]
+        else:
+            source_path = find_excel_file()
+            if not source_path:
+                raise ValueError("No source journal found")
+            source_name = os.path.basename(source_path)
+            with open(source_path, "rb") as f:
+                source = f.read()
+            base = os.path.splitext(source_name)[0] + "__INVOICE_STATUS.csv"
+        # Downloads happen outside the shared lock (pull only downloads a file that changed, using the folder
+        # listing kept fresh in the background), so taps in the app never wait for this job.
+        inputs = ((PACKING_FILE, PACKING_COLS), (DATA_FILE, DISPATCH_COLS), (HOLD_FILE, HOLD_COLS))
+        for path, _cols in inputs:
+            pull(path, max_age=0)
+        def _ver(p):
+            return _sync_state()["rev"].get(p) if USE_DROPBOX else str(_file_sig(p))
+        versions = {p: _ver(p) for p, _c in inputs}
+        src_ver = source_md.rev if USE_DROPBOX else hashlib.sha1(source).hexdigest()
+        fingerprint = hashlib.sha256((STATUS_COPY_VERSION + src_ver + "|" + "|".join(str(versions[p]) for p, _c in inputs)).encode()).hexdigest()
+        local_out = os.path.join(DATA_DIR, STATUS_COPY_FOLDER, base)
+        if state["fingerprint"] == (source_name, fingerprint) and os.path.exists(local_out):
+            return                                           # nothing changed: no reading, no rebuilding
+        # Strict reads: no cached/offline fallback is allowed for publishing highlights.
+        frames = []
+        with _sync_state()["lock"]:                          # local reads only (fast)
+            for path, cols in inputs:
+                if path in (PACKING_FILE, DATA_FILE) and not os.path.exists(path):
+                    raise ValueError(os.path.basename(path) + " is missing; status copy postponed")
+                frame = _csv_read(path, cols)
+                if frame["_dt"].isna().any():
+                    raise ValueError(os.path.basename(path) + " has invalid dates; correct them before highlighting")
+                frames.append(frame)
+            if any(_ver(p) != versions[p] for p, _c in inputs):
+                raise ConflictError("Packing/delivery data changed while reading; retrying next minute")
+        data, stats = _make_invoice_status_csv(source, *frames)
+        exp_base = base.replace("__INVOICE_STATUS.csv", "__DRIVER_EXPENSE.csv")
+        exp_data, exp_stats = _make_driver_expense_csv(source, frames[1])
+        if USE_DROPBOX:
+            import dropbox
+            if remote_meta(source_name).rev != source_md.rev:
+                raise ConflictError("Sales journal changed during update; retrying next minute")
+            for path, rev in versions.items():
+                md = remote_meta(os.path.basename(path))
+                if (md.rev if md else None) != rev:
+                    raise ConflictError("Packing/delivery data changed; retrying next minute")
+            try:
+                _dbx().files_create_folder_v2(_rpath(STATUS_COPY_FOLDER))
+            except Exception as e:
+                if not _is_conflict(e):
+                    raise
+            mode = dropbox.files.WriteMode.update(output_md.rev) if output_md else dropbox.files.WriteMode.add
+            _dbx().files_upload(data, remote_out, mode=mode, autorename=False, mute=True, strict_conflict=True)
+            # The expense copy is written only by this job, so it can simply be replaced.
+            _dbx().files_upload(exp_data, _rpath(STATUS_COPY_FOLDER + "/" + exp_base),
+                                mode=dropbox.files.WriteMode.overwrite, autorename=False, mute=True)
+        else:
+            if os.path.exists(os.path.join(os.path.dirname(local_out), "~$" + base)):
+                raise RuntimeError("Close the status copy in Excel to let it refresh")
+        _write_atomic(local_out, data)
+        _write_atomic(os.path.join(os.path.dirname(local_out), exp_base), exp_data)
+        state.update(fingerprint=(source_name, fingerprint), path=local_out, error=False,
+                     message=f"Updated {now_kh():%d %b %H:%M} — {stats['highlighted']} invoice statuses ready for Excel; "
+                             f"delivery expense for {exp_stats['done']} invoices ({exp_stats['pending']} still pending, "
+                             f"{exp_stats['mismatched']} logs had another customer's invoice and were matched by name instead). "
+                             f"{stats['ambiguous']} ambiguous customer/day matches skipped; {stats['unmatched']} log customer/day matches absent from this journal.")
+    except Exception as e:
+        state.update(error=True, message="Invoice status update pending: " + str(e)[:220])
+    finally:
+        state["lock"].release()
+
+
+@st.fragment(run_every=60)
+def _status_copy_in_background(force=False):
+    state = _status_copy_state()
+    th = state.get("thread")
+    if th is not None and th.is_alive():
+        return
+    if not force and time.time() - state["last_check"] < 55:
+        return
+    th = threading.Thread(target=_status_copy_worker, kwargs={"force": force}, daemon=True, name="invoice-status")
+    state["thread"] = th
+    th.start()
+
+
+def _status_copy_worker(force=False):
+    """Rebuild the Excel status / delivery expense files; run again if someone saved while it was running."""
+    state = _status_copy_state()
+    for _ in range(3):
+        state["dirty"] = False
+        sync_journal_status_copy(force=force)
+        if not state.get("dirty"):
+            break
+        force = True
+
+
+def _status_copy_kick(path):
+    """Called after packing / delivery / hold data is saved by ANY user: refresh the Excel files right away
+    (before, they only refreshed while an Admin had the app open)."""
+    try:
+        if path in (PACKING_FILE, DATA_FILE, HOLD_FILE):
+            _status_copy_state()["dirty"] = True
+            _status_copy_in_background(force=True)
+    except Exception:
+        pass
+
+
+def journal_status_copy_panel():
+    _status_copy_in_background()
+    state = _status_copy_state()
+    with st.expander("🟨🟩 Original journal: invoice conditional formatting"):
+        st.caption("The app publishes Auto_Status / <journal>__INVOICE_STATUS.csv. Connect this CSV once to the original journal’s App_Status sheet. Excel conditional formatting colors customer names using customer + invoice; the app never saves the sales workbook.")
+        st.caption("Yellow = fully packed · Green = fully sent · Blue = partly sent. Status is matched by customer + invoice. Old records without invoices are used only when there is exactly one matching invoice that day. Existing product and remark colors stay intact.")
+        st.caption("Updates within about 60 seconds while an authorized app session is open. In Excel, refresh the App_Status query (or enable refresh every minute). No update runs when the app is asleep or closed.")
+        if st.button("Refresh invoice status CSV now", key="journal_highlight_refresh"):
+            sync_journal_status_copy(force=True)          # pressed by hand: wait for it
+        (st.warning if state["error"] else st.caption)(state["message"])
+        if state.get("path") and os.path.exists(state["path"]):
+            with open(state["path"], "rb") as f:
+                st.download_button("Download invoice status CSV", f.read(), file_name=os.path.basename(state["path"]),
+                                   mime="text/csv", key="journal_highlight_download")
+
+
 ROLE = require_login()                     # nothing below runs until the person is logged in
 _visit_read_gps_params()                   # a shop check-in comes back in the address bar
 if "main_section" not in st.session_state:  # new session (phone woke up / reconnected) with an unfinished visit
@@ -11856,7 +14388,14 @@ if _assignment_warning:
 USER = current_user()
 with st.sidebar:
     st.markdown(f"### 👤 {USER}")
-    st.caption(f"{ROLE_LABEL.get(ROLE, ROLE)} | auto log-out after {LOGIN_TTL_HOURS} h")
+    st.caption(f"{ROLE_LABEL.get(ROLE, ROLE)}")
+    if _remember_state() == "on":
+        st.caption("🔐 Auto-login: ✅ ចាំលើឧបករណ៍នេះ")
+    else:
+        st.caption("🔐 Auto-login: ⚠️ មិនទាន់ចាំលើ browser នេះ — ចុច Refresh ម្តង។ បើនៅតែត្រូវ Log in រាល់ពេល៖ " + LOGIN_TIPS_KM)
+        _app = _inapp_browser()
+        if _app:
+            st.warning(f"អ្នកកំពុងប្រើ browser ក្នុង {_app} — វាលុប login។ សូមបើកក្នុង Chrome / Safari។")
     with st.expander("🔑 Change my password"):
         with st.form("chg_pw_form", clear_on_submit=True):
             _c = st.text_input("Current password", type="password", max_chars=100)
@@ -11906,28 +14445,21 @@ st.caption(_chips)
 if ROLE in ("staff", "admin"):
     health_status()
 
-_perms = effective_permissions(current_user())
-labels = []
-if _perms.get("tasks"):
-    labels.extend(["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)"])
-if ROLE in ("admin", "staff", "sales"):
-    labels.append("📝 Sale Order")
-if _perms.get("view"):
-    labels.append("📊 Live Dashboard (Sales)")
-    labels.append("📍 Customer Map")
-    labels.append("🎯 Sales Insights")
-elif _perms.get("reports"):
-    labels.append("📑 Reports")
-if _perms.get("view") or _perms.get("reports"):
-    labels.append("📞 Customer Follow-ups")
-if ROLE in ("admin", "staff", "sales") and (_perms.get("edit") or _perms.get("reports")):
-    labels.append("🏪 Shop Visits")
+try:
+    _my_rec = load_users().get(current_user(), {})
+except Exception:
+    _my_rec = None
+labels = [APP_SECTION_LABEL[sid] for sid in user_sections(current_user(), _my_rec)]
 if ROLE == "admin":
-    labels.append("🤖 4. Admin: Bot, Users & Security")
+    labels.append(ADMIN_SECTION_LABEL)
 if not labels:
-    st.warning("No app sections are enabled for your account. Ask Admin to turn on Tasks, View, or Reports.")
+    st.warning("No app sections are open for your account yet. Ask Admin to choose your sections (🤖 Admin → 👁️ Sections).")
     st.stop()
 followup_alert_banner()
+if ROLE == "admin" or has_permission("reports"):
+    journal_status_copy_panel()
+else:
+    _status_copy_in_background()                         # anyone using the app keeps the Excel files fresh
 
 # Render only the selected section. Ordinary tabs execute every section on each rerun.
 if st.session_state.get("main_section") not in labels:
@@ -11953,5 +14485,7 @@ elif _label.startswith("📞"):
     tab_followups()
 elif _label.startswith("🏪"):
     tab_shop_visits()
+elif _label.startswith("📸"):
+    tab_media()
 else:
     tab_bot()
