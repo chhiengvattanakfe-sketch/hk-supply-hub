@@ -237,6 +237,64 @@ def effective_permissions(username=None, rec=None):
     return result
 
 
+APP_SECTIONS = [                         # (id, label) in menu order; Admin's own section is not listed here
+    ("packing", "📦 1. Packing Progress (Prep)"),
+    ("delivery", "🚚 2. Log Delivery (Ops)"),
+    ("sale_order", "📝 Sale Order"),
+    ("dashboard", "📊 Live Dashboard (Sales)"),
+    ("reports", "📑 Reports"),
+    ("map", "📍 Customer Map"),
+    ("insights", "🎯 Sales Insights"),
+    ("followups", "📞 Customer Follow-ups"),
+    ("visits", "🏪 Shop Visits"),
+    ("media", "📸 Media Team"),
+]
+APP_SECTION_LABEL = dict(APP_SECTIONS)
+ADMIN_SECTION_LABEL = "🤖 4. Admin: Bot, Users & Security"
+
+
+def default_sections(role, perms):
+    """Sections a person sees when Admin has not chosen them by hand (follows their permissions)."""
+    out = []
+    if perms.get("tasks"):
+        out += ["packing", "delivery"]
+    if role in ("admin", "staff", "sales"):
+        out.append("sale_order")
+    if perms.get("view"):
+        out += ["dashboard", "map", "insights"]
+    elif perms.get("reports"):
+        out.append("reports")
+    if perms.get("view") or perms.get("reports"):
+        out.append("followups")
+    if role in ("admin", "staff", "sales") and (perms.get("edit") or perms.get("reports")):
+        out += ["visits", "media"]
+    return out
+
+
+def user_sections(username=None, rec=None):
+    """Section ids this person may open: Admin's ticks when saved, otherwise the default for their permissions.
+    A section added to the app later follows the default until Admin decides."""
+    who = username or current_user()
+    if rec is None:
+        try:
+            rec = load_users().get(who, {}) if who else {}
+        except Exception:
+            rec = {}
+    role = str((rec or {}).get("role") or (current_role() if who == current_user() else "viewer"))
+    perms = effective_permissions(who, rec)
+    if role == "admin":
+        return [sid for sid, _l in APP_SECTIONS if sid != "reports"]
+    defaults = default_sections(role, perms)
+    saved = (rec or {}).get("sections")
+    if not isinstance(saved, dict) or not saved:
+        return defaults
+    return [sid for sid, _l in APP_SECTIONS if bool(saved.get(sid, sid in defaults))]
+
+
+SECTION_NEEDS = {"packing": "tasks", "delivery": "tasks", "dashboard": "view", "map": "view", "insights": "view",
+                 "reports": "reports", "visits": "edit"}
+
+
 def has_permission(permission, username=None):
     """Check an individual capability. Unknown permissions fail closed."""
     if permission not in PERMISSION_KEYS:
@@ -4286,20 +4344,32 @@ def _delivery_log():
 
 # ---------- 📌 sale notes for delivery staff (urgent / fixed pick-up time) ----------
 SALE_NOTE_COL = "📌 Sale note"
-NOTE_TIME_WORDS = ["កំណត់ម៉ោង", "ម៉ោង", "មកយក", "យកផ្ទាល់", "មុនម៉ោង", "ព្រឹក", "ថ្ងៃត្រង់", "រសៀល", "ល្ងាច",
+NOTE_TIME_WORDS = ["កំណត់ម៉ោង", "ម៉ោង", "មកយក", "យកផ្ទាល់", "មុនម៉ោង", "សុំពេល", "ឲ្យទាន់", "ឱ្យទាន់",
                    "PICK UP", "PICKUP", "AM", "PM"]
+# Part-of-day words (also common spellings) -> latest time to arrive, used when the note has no clock time
+NOTE_DAY_PARTS = [
+    (("ព្រឹក", "ព្រេក", "ព្រិក", "ពីព្រឹក", "MORNING"), 11 * 60, "ព្រឹក"),
+    (("ថ្ងៃត្រង់", "ថ្ងៃត្រង់", "NOON"), 12 * 60, "ថ្ងៃត្រង់"),
+    (("រសៀល", "AFTERNOON"), 15 * 60, "រសៀល"),
+    (("ល្ងាច", "EVENING"), 17 * 60, "ល្ងាច"),
+]
 _KM_DIGITS = str.maketrans("០១២៣៤៥៦៧៨៩", "0123456789")
+_NOTE_AM_WORDS = ("AM", "ព្រឹក", "ព្រេក", "ព្រិក")
 _NOTE_PM_WORDS = ("PM", "រសៀល", "ល្ងាច", "យប់")
 _NOTE_TIME_RES = [
-    re.compile(r"ម៉ោង\s*(\d{1,2})(?:\s*[:.h]\s*(\d{2}))?\s*(AM|PM|ព្រឹក|ថ្ងៃត្រង់|រសៀល|ល្ងាច|យប់)?"),
+    re.compile(r"ម៉ោង\s*(\d{1,2})(?:\s*[:.h]\s*(\d{2}))?\s*(AM|PM|ព្រឹក|ព្រេក|ព្រិក|ថ្ងៃត្រង់|រសៀល|ល្ងាច|យប់)?"),
     re.compile(r"(?<![\d/])(\d{1,2})\s*[:.h]\s*(\d{2})\s*(AM|PM)?(?![\d/])"),
     re.compile(r"(?<![\d/])(\d{1,2})\s*()(AM|PM)(?![A-Z])"),
 ]
 
 
+def _note_text(note):
+    return unicodedata.normalize("NFC", str(note or "")).replace("​", "").replace("‌", "").strip()
+
+
 def sale_note_time(note):
     """'មកយកម៉ោង2pm' -> 14*60 ; '10:30' -> 630 ; None when the note gives no clock time."""
-    text = str(note or "").translate(_KM_DIGITS).upper()
+    text = _note_text(note).translate(_KM_DIGITS).upper()
     for rx in _NOTE_TIME_RES:
         m = rx.search(text)
         if not m:
@@ -4307,7 +4377,7 @@ def sale_note_time(note):
         h, mins, word = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "")
         if h > 23 or mins > 59:
             continue
-        if word == "AM" or word == "ព្រឹក":
+        if word in _NOTE_AM_WORDS:
             h = 0 if h == 12 else h
         elif word in _NOTE_PM_WORDS or (word == "" and rx is _NOTE_TIME_RES[0] and 1 <= h <= 6):
             h = h + 12 if h < 12 else h                  # "ម៉ោង2" at a bakery means 2 in the afternoon
@@ -4315,26 +4385,46 @@ def sale_note_time(note):
     return None
 
 
+def sale_note_when(note):
+    """(minutes, part-of-day word): an exact clock time, else the latest time for 'ព្រឹក / រសៀល…', else (None, "")."""
+    exact = sale_note_time(note)
+    if exact is not None:
+        return exact, ""
+    up = _note_text(note).upper()
+    for words, latest, name in NOTE_DAY_PARTS:
+        if any(w in up for w in words):
+            return latest, name
+    return None, ""
+
+
 def sale_note_flags(note):
-    """(urgent, timed, minutes) for a journal remark."""
-    text = str(note or "").strip()
+    """(urgent, timed, minutes) for a journal remark. minutes = the clock time, or the latest time for a part of day."""
+    text = _note_text(note)
     if text in ("", "-"):
         return False, False, None
     up = text.upper()
     urgent = any(w.upper() in up for w in URGENT_WORDS)
-    minutes = sale_note_time(text)
+    minutes, _part = sale_note_when(text)
     timed = minutes is not None or any(w in up for w in NOTE_TIME_WORDS if not w.isascii()) \
         or any(re.search(r"\b%s\b" % w, up) for w in NOTE_TIME_WORDS if w.isascii())
     return urgent, timed, minutes
 
 
+def _note_when_text(note, minutes):
+    part = sale_note_when(note)[1]
+    if minutes is None:
+        return ""
+    return f"{part} មុន {minutes // 60:02d}:{minutes % 60:02d}" if part else f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
 def sale_note_label(note):
     """'🔥 ⏰ 14:00 · មកយកម៉ោង2pm' — empty when the sale left no note."""
-    text = str(note or "").strip()
+    text = _note_text(note)
     if text in ("", "-"):
         return ""
     urgent, timed, minutes = sale_note_flags(text)
-    head = ("🔥 " if urgent else "") + ("⏰ " if timed else "") + (f"{minutes // 60:02d}:{minutes % 60:02d} · " if minutes is not None else "")
+    when = _note_when_text(text, minutes)
+    head = ("🔥 " if urgent else "") + ("⏰ " if timed else "") + (f"{when} · " if when else "")
     return head + text
 
 
@@ -4361,7 +4451,7 @@ def _sale_notes_alert(ctx, me):
             when = ""
             if minutes is not None:
                 left = minutes - now_m
-                when = (f"⏰ **{minutes // 60:02d}:{minutes % 60:02d}**"
+                when = (f"⏰ **{_note_when_text(note, minutes)}**"
                         + (" 🚨 **ហួសម៉ោងហើយ**" if left < 0 else f" ⚠️ **នៅសល់ {left} នាទី**" if left <= 60 else ""))
             who = f"👷 {taken}" if taken else "👷 **មិនទាន់មាននរណាយក**"
             mine = " ⭐" if taken and taken == me else ""
@@ -5892,6 +5982,8 @@ def _users_panel():
         "Edit": "ON" if effective_permissions(u, r).get("edit") else "OFF",
         "Reports": "ON" if effective_permissions(u, r).get("reports") else "OFF",
         "💵 Money": "ON" if effective_permissions(u, r).get("money") else "OFF",
+        "Sections": ("Auto · " if not (isinstance(r.get("sections"), dict) and r.get("sections")) else "Custom · ")
+                    + ", ".join(APP_SECTION_LABEL[sid].split(" ", 1)[0] for sid in user_sections(u, r)),
         "Starter password": "yes" if r.get("must_change") else "",
         "Last login": r.get("last_login", ""), "Password changed": r.get("pw_changed", "")}
         for u, r in sorted(users.items())]))
@@ -5911,23 +6003,51 @@ def _users_panel():
             p_reports = st.checkbox(PERMISSION_LABELS["reports"], value=perm_values["reports"], key=f"perm_reports_{perm_user}", disabled=is_admin_target)
             p_money = st.checkbox(PERMISSION_LABELS["money"], value=perm_values["money"], key=f"perm_money_{perm_user}", disabled=is_admin_target,
                                   help="OFF = riel amounts, prices and sales money are hidden (🔒). Bun pieces stay visible.")
-            save_perms = st.form_submit_button("💾 Save permissions", type="primary")
+            st.markdown("**👁️ Sections this user can open** (Open section menu)")
+            saved_secs = perm_rec.get("sections") if isinstance(perm_rec.get("sections"), dict) and perm_rec.get("sections") else None
+            use_default = st.checkbox("Automatic — follow the permissions above", value=saved_secs is None,
+                                      key=f"perm_secdef_{perm_user}", disabled=is_admin_target,
+                                      help="Untick to choose the sections by hand below.")
+            now_secs = set(user_sections(perm_user, perm_rec))
+            grid = st.columns(2)
+            sec_ticks = {sid: grid[i % 2].checkbox(label, value=sid in now_secs, key=f"perm_sec_{perm_user}_{sid}",
+                                                   disabled=is_admin_target)
+                         for i, (sid, label) in enumerate(APP_SECTIONS)}
+            st.caption("Automatic ticked = the boxes are ignored and sections follow Tasks / View / Edit / Reports. "
+                       "Untick Automatic to show exactly the ticked sections.")
+            save_perms = st.form_submit_button("💾 Save permissions & sections", type="primary")
         if save_perms:
             if is_admin_target:
                 st.info("Admin access remains fully enabled.")
             else:
                 new_perms = {"tasks": p_tasks, "view": p_view, "edit": p_edit, "reports": p_reports, "money": p_money}
+                new_secs = None if use_default else {sid: bool(v) for sid, v in sec_ticks.items()}
+                if new_secs is not None and not any(new_secs.values()):
+                    new_secs = None
+                    st.session_state["save_warning"] = "No section was ticked, so this user stays on Automatic sections."
+                missing = [f"{APP_SECTION_LABEL[sid]} needs “{PERMISSION_LABELS[SECTION_NEEDS[sid]]}”"
+                           for sid, on in (new_secs or {}).items() if on and sid in SECTION_NEEDS and not new_perms[SECTION_NEEDS[sid]]]
+
                 def _save_perms(u):
                     if perm_user not in u:
                         raise ValueError("That user no longer exists. Refresh and try again.")
                     if u[perm_user].get("role") == "admin":
                         u[perm_user]["permissions"] = {k: True for k in PERMISSION_KEYS}
+                        u[perm_user].pop("sections", None)
                     else:
                         u[perm_user]["permissions"] = dict(new_perms)
+                        if new_secs is None:
+                            u[perm_user].pop("sections", None)
+                        else:
+                            u[perm_user]["sections"] = dict(new_secs)
                     return u
                 try:
                     modify_users(_save_perms)
-                    audit("user_permissions_changed", f"{perm_user}: " + ", ".join(f"{k}={'ON' if v else 'OFF'}" for k, v in new_perms.items()))
+                    if missing:
+                        st.session_state["save_warning"] = ("Saved. These sections will open but stay read-only / locked until you also turn on: "
+                                                            + "; ".join(missing))
+                    audit("user_permissions_changed", f"{perm_user}: " + ", ".join(f"{k}={'ON' if v else 'OFF'}" for k, v in new_perms.items())
+                          + " | sections: " + ("automatic" if new_secs is None else ", ".join(k for k, v in new_secs.items() if v)))
                     flash_and_refresh(f"Permissions saved for {perm_user}")
                 except (ValueError, RuntimeError, ConflictError) as err:
                     st.error(f"❌ Could not save permissions: {err}")
@@ -13837,10 +13957,79 @@ def _make_invoice_status_csv(source, packing, deliveries, holds):
     return result.to_csv(index=False).encode('utf-8-sig'), {'highlighted':int(result.Status.isin(['Sent','Packed','Part sent']).sum()),'ambiguous':int((result.Status=='Review').sum()),'unmatched':skipped}
 
 
+# ---------- 🚚 delivery expense per invoice, for the sale journal's អ្នកដឹក / សេវាដឹក / សេវាតាក់ស៊ី columns ----------
+DRIVER_EXPENSE_COLS = ["Invoice", "Customer", "Date", "Driver", "App_Expense", "Taxi_Expense", "Status"]
+DRIVER_SHORT = {"ងិន វុទ្ធា": "VUTHEA", "អួន តួ": "TOU"}      # names used in the journal's អ្នកដឹក column
+
+
+def _make_driver_expense_csv(source, deliveries):
+    """One row per journal invoice: who drove it and what the delivery cost (Grab/app and taxi).
+    A delivery log is matched by its invoice, else to the customer's first invoice of that day (or the day before);
+    a customer's other invoices that day get 0. Status Pending = not delivered yet, or the cost is still missing."""
+    raw = _STATUS_RAW_MEMO.get("raw") if _STATUS_RAW_MEMO.get("key") == hashlib.sha1(source).digest() else None
+    if raw is None:
+        _make_invoice_status_csv(source, deliveries.iloc[0:0], deliveries.iloc[0:0], pd.DataFrame(columns=HOLD_COLS + ["_dt"]))
+        raw = _STATUS_RAW_MEMO["raw"]
+    ii = next((i for row in raw[:15] for i, v in enumerate(row) if v is not None and JOURNAL_INVOICE_HEADER in str(v)), None)
+    if ii is None:
+        raise RuntimeError("Journal invoice column missing")
+    months = Counter((r[0].year, r[0].month) for r in raw if r and isinstance(r[0], datetime))
+    dominant = months.most_common(1)[0][0] if months else None
+    order, info, by_day = [], {}, {}
+    for r in raw:
+        if len(r) <= ii or not r[1]:
+            continue
+        day = cell_to_date(r[0], dominant)
+        inv, cust = _cell_text(r[ii]), _cell_text(r[1])
+        if not day or inv in ("", "-") or inv.casefold() in info:
+            continue
+        info[inv.casefold()] = dict(Invoice=inv, Customer=cust, Date=day.isoformat())
+        order.append(inv.casefold())
+        by_day.setdefault((day, norm_name(cust)), []).append(inv.casefold())
+    got = {}
+    unmatched = 0
+    for r in deliveries.to_dict("records"):
+        dt = r.get("_dt", parse_dt(r.get("Date")))
+        if pd.isna(dt):
+            continue
+        inv = _cell_text(r.get("Invoice")).casefold()
+        if inv not in ("", "-", "nan") and inv not in info:
+            unmatched += 1                                  # its invoice is not (yet) in this journal
+            continue
+        if inv not in info:
+            day, key = dt.date(), norm_name(r["Customer"])
+            cands = by_day.get((day, key)) or by_day.get((day - timedelta(days=1), key))
+            inv = cands[0] if cands else None
+        if inv is None:
+            unmatched += 1
+            continue
+        g = got.setdefault(inv, dict(driver="", app=0, taxi=0, done=True))
+        via = str(r.get("Local_Driver", "") or "")
+        if via in DRIVER_SHORT:
+            g["driver"] = DRIVER_SHORT[via]
+        g["app"] += driver_pp_expense(via, r.get("Phnom_Penh_Expense"))
+        g["taxi"] += _int(r.get("Taxi_Expense"))
+        status = str(r.get("Expense_Status", "") or "") or expense_status(via, r.get("Taxi_Station"), r.get("Phnom_Penh_Expense"), r.get("Taxi_Expense"))
+        g["done"] = g["done"] and status != "Pending"
+    out = []
+    for inv in order:
+        row = dict(info[inv])
+        g = got.get(inv)
+        if g and g["done"]:
+            row.update(Driver=g["driver"], App_Expense=g["app"], Taxi_Expense=g["taxi"], Status="Done")
+        else:
+            row.update(Driver=g["driver"] if g else "", App_Expense="", Taxi_Expense="", Status="Pending")
+        out.append(row)
+    result = pd.DataFrame(out, columns=DRIVER_EXPENSE_COLS)
+    return result.to_csv(index=False).encode("utf-8-sig"), {"done": int((result["Status"] == "Done").sum()),
+                                                             "pending": int((result["Status"] == "Pending").sum()),
+                                                             "unmatched": unmatched}
+
+
 STATUS_COPY_FOLDER = "Auto_Status"
 
 
-STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V2:"
+STATUS_COPY_VERSION = "HK_INVOICE_STATUS_V3_EXPENSE:"
 
 
 def _journal_status_rows(journal_rows, packing, deliveries, holds):
@@ -14065,6 +14254,8 @@ def sync_journal_status_copy(force=False):
             if any(_ver(p) != versions[p] for p, _c in inputs):
                 raise ConflictError("Packing/delivery data changed while reading; retrying next minute")
         data, stats = _make_invoice_status_csv(source, *frames)
+        exp_base = base.replace("__INVOICE_STATUS.csv", "__DRIVER_EXPENSE.csv")
+        exp_data, exp_stats = _make_driver_expense_csv(source, frames[1])
         if USE_DROPBOX:
             import dropbox
             if remote_meta(source_name).rev != source_md.rev:
@@ -14080,12 +14271,17 @@ def sync_journal_status_copy(force=False):
                     raise
             mode = dropbox.files.WriteMode.update(output_md.rev) if output_md else dropbox.files.WriteMode.add
             _dbx().files_upload(data, remote_out, mode=mode, autorename=False, mute=True, strict_conflict=True)
+            # The expense copy is written only by this job, so it can simply be replaced.
+            _dbx().files_upload(exp_data, _rpath(STATUS_COPY_FOLDER + "/" + exp_base),
+                                mode=dropbox.files.WriteMode.overwrite, autorename=False, mute=True)
         else:
             if os.path.exists(os.path.join(os.path.dirname(local_out), "~$" + base)):
                 raise RuntimeError("Close the status copy in Excel to let it refresh")
         _write_atomic(local_out, data)
+        _write_atomic(os.path.join(os.path.dirname(local_out), exp_base), exp_data)
         state.update(fingerprint=(source_name, fingerprint), path=local_out, error=False,
-                     message=f"Updated {now_kh():%d %b %H:%M} — {stats['highlighted']} invoice statuses ready for Excel. "
+                     message=f"Updated {now_kh():%d %b %H:%M} — {stats['highlighted']} invoice statuses ready for Excel; "
+                             f"delivery expense for {exp_stats['done']} invoices ({exp_stats['pending']} still pending). "
                              f"{stats['ambiguous']} ambiguous customer/day matches skipped; {stats['unmatched']} log customer/day matches absent from this journal.")
     except Exception as e:
         state.update(error=True, message="Invoice status update pending: " + str(e)[:220])
@@ -14202,27 +14398,15 @@ st.caption(_chips)
 if ROLE in ("staff", "admin"):
     health_status()
 
-_perms = effective_permissions(current_user())
-labels = []
-if _perms.get("tasks"):
-    labels.extend(["📦 1. Packing Progress (Prep)", "🚚 2. Log Delivery (Ops)"])
-if ROLE in ("admin", "staff", "sales"):
-    labels.append("📝 Sale Order")
-if _perms.get("view"):
-    labels.append("📊 Live Dashboard (Sales)")
-    labels.append("📍 Customer Map")
-    labels.append("🎯 Sales Insights")
-elif _perms.get("reports"):
-    labels.append("📑 Reports")
-if _perms.get("view") or _perms.get("reports"):
-    labels.append("📞 Customer Follow-ups")
-if ROLE in ("admin", "staff", "sales") and (_perms.get("edit") or _perms.get("reports")):
-    labels.append("🏪 Shop Visits")
-    labels.append("📸 Media Team")
+try:
+    _my_rec = load_users().get(current_user(), {})
+except Exception:
+    _my_rec = None
+labels = [APP_SECTION_LABEL[sid] for sid in user_sections(current_user(), _my_rec)]
 if ROLE == "admin":
-    labels.append("🤖 4. Admin: Bot, Users & Security")
+    labels.append(ADMIN_SECTION_LABEL)
 if not labels:
-    st.warning("No app sections are enabled for your account. Ask Admin to turn on Tasks, View, or Reports.")
+    st.warning("No app sections are open for your account yet. Ask Admin to choose your sections (🤖 Admin → 👁️ Sections).")
     st.stop()
 followup_alert_banner()
 if ROLE == "admin" or has_permission("reports"):
