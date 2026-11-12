@@ -6507,6 +6507,53 @@ def _locations_panel():
 
 
 
+def _copy_access_panel(perm_user, perm_rec, kp):
+    """Give the SAVED advanced access of this user to other users in one go (e.g. every operations staff)."""
+    saved = _rec_access(perm_rec)
+    st.markdown("**📋 Give the same access to other users**")
+    if not saved:
+        st.caption("Save this user's advanced access first, then you can copy it to others here.")
+        return
+    try:
+        users = load_users()
+    except Exception as err:
+        st.error(f"Cannot load accounts: {err}")
+        return
+    others = [u for u in sorted(users) if u != perm_user and users[u].get("role") != "admin"]
+    ops = [u for u in others if users[u].get("role") == "staff"]
+    key = kp + "copy_to"
+    b1, b2 = st.columns(2)
+    if b1.button(f"➕ Select all operations staff ({len(ops)})", key=kp + "copy_ops", use_container_width=True):
+        st.session_state[key] = ops
+    if b2.button("✖ Clear", key=kp + "copy_clear", use_container_width=True):
+        st.session_state[key] = []
+    targets = st.multiselect("Copy to", others, key=key,
+                             format_func=lambda u: f"{u} · {users[u].get('staff_name', '') or '-'} ({users[u].get('role')})")
+    shown = "  ".join(f"{APP_SECTION_LABEL.get(k, k).split(' ')[0]}{'✏️' if v == 'edit' else '👁️'}"
+                      for k, v in saved.items() if v != "hidden")
+    st.caption(f"They will get exactly what **{perm_user}** has now: {shown} + the same action switches. "
+               "Their old switches are replaced.")
+    if not st.button(f"📋 Copy to {len(targets)} user(s)", key=kp + "copy_go", type="primary", disabled=not targets):
+        return
+    actions = {k: bool(v) for k, v in (perm_rec.get("actions") or {}).items()}
+    flat = {k: _advanced_allows(k, saved, actions, None) for k in PERMISSION_KEYS}
+
+    def _copy(u):
+        for t in targets:
+            if t in u and u[t].get("role") != "admin":
+                u[t]["access"], u[t]["actions"], u[t]["permissions"] = dict(saved), dict(actions), dict(flat)
+                u[t].pop("sections", None)
+        return u
+    try:
+        modify_users(_copy)
+        audit("user_access_copied", f"{perm_user} -> {', '.join(targets)}: "
+              + ", ".join(f"{k}={v}" for k, v in saved.items()) + " | actions: " + ", ".join(k for k, v in actions.items() if v))
+        st.session_state.pop(key, None)
+        flash_and_refresh(f"Access of {perm_user} copied to {len(targets)} user(s): {', '.join(targets)}")
+    except (ValueError, RuntimeError, ConflictError) as err:
+        st.error(f"❌ Could not copy: {err}")
+
+
 def _advanced_access_form(perm_user, perm_rec):
     """Admin: for one user choose Hidden / View only / Can edit per section, plus single action switches."""
     kp = f"acc_{perm_user}_"
@@ -6548,6 +6595,7 @@ def _advanced_access_form(perm_user, perm_rec):
         st.caption("👁️ View only = can open and read, every save button is locked. ✏️ Can edit = can pack / send / save there. "
                    "Without 👥 they can change only records under their own staff name.")
         save = st.form_submit_button("💾 Save advanced access", type="primary")
+    _copy_access_panel(perm_user, perm_rec, kp)
     if not save:
         return
     if all(v == "hidden" for v in new_access.values()):
@@ -6704,9 +6752,10 @@ def _users_panel():
         "Edit": "ON" if effective_permissions(u, r).get("edit") else "OFF",
         "Reports": "ON" if effective_permissions(u, r).get("reports") else "OFF",
         "💵 Money": "ON" if effective_permissions(u, r).get("money") else "OFF",
-        "Sections": ("🎛️ Advanced · " if _rec_access(r) else
-                     "Auto · " if not (isinstance(r.get("sections"), dict) and r.get("sections")) else "Custom · ")
-                    + ", ".join(APP_SECTION_LABEL[sid].split(" ", 1)[0] for sid in user_sections(u, r)),
+        "Sections": ("🎛️ " + "  ".join(f"{APP_SECTION_LABEL.get(k, k).split(' ')[0]}{'✏️' if v == 'edit' else '👁️'}"
+                                         for k, v in _rec_access(r).items() if v != "hidden")) if _rec_access(r) else
+                    (("Auto · " if not (isinstance(r.get("sections"), dict) and r.get("sections")) else "Custom · ")
+                     + ", ".join(APP_SECTION_LABEL[sid].split(" ", 1)[0] for sid in user_sections(u, r))),
         "Starter password": "yes" if r.get("must_change") else "",
         "Last login": r.get("last_login", ""), "Password changed": r.get("pw_changed", "")}
         for u, r in sorted(users.items())]))
@@ -6719,13 +6768,19 @@ def _users_panel():
         is_admin_target = perm_rec.get("role") == "admin"
         if is_admin_target:
             st.info("Admin permissions are always ON for security and account recovery.")
-        adv_now = bool(_rec_access(perm_rec))
-        mode = st.radio("Access mode", ["Simple switches", "🎛️ Advanced: each section + actions"], index=1 if adv_now else 0,
-                        horizontal=True, key=f"perm_mode_{perm_user}", disabled=is_admin_target,
-                        help="Advanced: choose for every section Hidden / View only / Can edit, and switch single actions on or off.")
-        if mode.startswith("🎛️") and not is_admin_target:
+        if is_admin_target:
+            st.info("👑 Admin accounts always have every section and every action. Choose another user to change rights.")
+        mode = "simple" if is_admin_target else st.radio(
+            "Access mode", ["🎛️ Advanced: each section + actions", "Simple switches (old way)"], index=0,
+            horizontal=True, key=f"perm_mode2_{perm_user}",
+            help="Advanced (recommended): for every section Hidden / View only / Can edit, plus single action switches. "
+                 "The form below starts with what this user can do today.")
+        if not is_admin_target and mode.startswith("🎛️"):
+            if not _rec_access(perm_rec):
+                st.caption("ℹ️ This user is still on the old simple switches. The form shows what they can do today — "
+                           "change it and press 💾 Save advanced access to switch them over.")
             _advanced_access_form(perm_user, perm_rec)
-        else:
+        elif not is_admin_target:
             with st.form(f"permissions_form_{perm_user}"):
                 p_tasks = st.checkbox(PERMISSION_LABELS["tasks"], value=perm_values["tasks"], key=f"perm_tasks_{perm_user}", disabled=is_admin_target)
                 p_view = st.checkbox(PERMISSION_LABELS["view"], value=perm_values["view"], key=f"perm_view_{perm_user}", disabled=is_admin_target)
