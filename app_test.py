@@ -3104,6 +3104,20 @@ def kpi(container, label, value):
         container.metric(label, value)
 
 
+def _remember_choice(key):
+    st.session_state["_keep_" + key] = st.session_state.get(key)
+
+
+def keep_choice(key, options):
+    """Filters whose labels show live counts ('🟡 Ready (12)'): Streamlit remembers a choice by its label text, so
+    when the count changes to (11) after a save / auto-update the choice was lost and jumped back to All.
+    This puts the person's last real choice back before the widget is drawn. Use with on_change=_remember_choice."""
+    mem = st.session_state.get("_keep_" + key)
+    if mem is not None and mem in options:
+        st.session_state[key] = mem          # always: the old label still reads fine here, but not once drawn
+    return dict(on_change=_remember_choice, args=(key,))
+
+
 def flash_and_refresh(msg, reset_prefix=None):
     if reset_prefix:
         st.session_state["reset_form_prefix"] = reset_prefix + "_"
@@ -4016,9 +4030,10 @@ def _delivery_zone_picker(recs, key):
     """Group filter: all, one Phnom Penh zone, or province customers. Remembered while the app is open."""
     counts = Counter(r["Zone"] for r in recs)
     options = [DEL_ZONE_ALL] + sorted(counts, key=_delivery_zone_rank)
+    keep = keep_choice(key, options)
     if st.session_state.get(key) not in options:
         st.session_state[key] = DEL_ZONE_ALL
-    return st.selectbox("📍 ក្រុម / តំបន់ (Group)", options, key=key,
+    return st.selectbox("📍 ក្រុម / តំបន់ (Group)", options, key=key, **keep,
                         format_func=lambda z: f"{z}  ({len(recs)})" if z == DEL_ZONE_ALL else f"{_km(z)}  ({counts.get(z, 0)})")
 
 
@@ -4843,8 +4858,10 @@ def _dispatch_body():
     task_view_selector("delivery")
     linked_staff = staff_name_for_user()
     default_staff_index = DELIVERY_HANDLERS.index(linked_staff) + 1 if linked_staff in DELIVERY_HANDLERS else 0
-    me = st.selectbox("👷 I am (choose your name once — office staff or delivery driver)",
-                      ["-- Select Staff --"] + DELIVERY_HANDLERS, index=default_staff_index, key="me_staff")
+    _me_opts = ["-- Select Staff --"] + DELIVERY_HANDLERS
+    _me_keep = keep_choice("me_staff", _me_opts)              # stays chosen after visiting another section
+    me = st.selectbox("👷 I am (choose your name once — office staff or delivery driver)", _me_opts,
+                      index=0 if "me_staff" in st.session_state else default_staff_index, key="me_staff", **_me_keep)
     st.caption("Both delivery drivers can select their own names here, choose customers, mark deliveries as sent, and check any expenses under their names.")
     ctx = delivery_context()
     mine = [r for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
@@ -5456,7 +5473,7 @@ def _dashboard_body():
     if st.session_state.get("dash_status_pick") in STATUS_RANK and st.session_state["dash_status_pick"] not in st_keys:
         st_keys.append(st.session_state["dash_status_pick"])   # keep the chosen status (now 0) instead of jumping to All
     pick_one = st.radio("👆 Click a status to see its customers in the table", ["All"] + st_keys, horizontal=True,
-                        key="dash_status_pick",
+                        key="dash_status_pick", **keep_choice("dash_status_pick", ["All"] + st_keys),
                         format_func=lambda k: f"All ({total})" if k == "All" else f"{k.split(' ')[0]} {k.split(' ', 1)[1]} ({int(counts.get(k, 0))})")
     if can_reports:
         with st.expander("📊 Summary: Phnom Penh vs Province, regions and provinces", expanded=not mobile):
@@ -10761,6 +10778,7 @@ def _visit_zone_picker(zone_map, key, due=None, allow_all=False):
     if allow_all:
         options = [VISIT_ALL_ZONES] + options
     mem = st.session_state.get("visit_zone_today")
+    keep = keep_choice(key, options)
     if st.session_state.get(key) not in options:
         st.session_state[key] = mem if mem in options else options[1 if allow_all else 0]
     n_all, due_all = sum(counts.get(z, 0) for z in options[1:] if allow_all), sum(due.values())
@@ -10769,7 +10787,7 @@ def _visit_zone_picker(zone_map, key, due=None, allow_all=False):
         if z == VISIT_ALL_ZONES:
             return f"{z}  ({n_all} ហាង" + (f" · ត្រូវចុះ {due_all}" if due_all else "") + ")"
         return f"{_km(z)}  ({counts.get(z, 0)} ហាង" + (f" · ត្រូវចុះ {due[z]}" if due.get(z) else "") + ")"
-    zone = st.selectbox("🗺️ តំបន់របស់ខ្ញុំថ្ងៃនេះ", options, key=key, format_func=_fmt)
+    zone = st.selectbox("🗺️ តំបន់របស់ខ្ញុំថ្ងៃនេះ", options, key=key, format_func=_fmt, **keep)
     if zone != VISIT_ALL_ZONES:
         st.session_state["visit_zone_today"] = zone        # the New visit form starts in this zone
     return zone
@@ -13725,9 +13743,10 @@ def _media_zone_picker(view):
     """Zone filter with one more choice: all zones on one map."""
     counts = Counter(view["Zone"])
     options = [MEDIA_ALL_ZONES] + [z for z in VISIT_ZONE_NAMES if counts.get(z) and not z.startswith("🚫")]
+    keep = keep_choice("media_zone", options)
     if st.session_state.get("media_zone") not in options:
         st.session_state["media_zone"] = MEDIA_ALL_ZONES
-    return st.selectbox("🗺️ តំបន់", options, key="media_zone",
+    return st.selectbox("🗺️ តំបន់", options, key="media_zone", **keep,
                         format_func=lambda z: f"{z}  ({len(view)} ហាង)" if z == MEDIA_ALL_ZONES else f"{_km(z)}  ({counts.get(z, 0)} ហាង)")
 
 
