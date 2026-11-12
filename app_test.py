@@ -169,6 +169,9 @@ SALES_STAFF = ["ចែម សារី", "ឃួន សុលីសា", "ថា
 VERIFY_STAFF = OPS_STAFF + SALES_STAFF
 # Delivery drivers can also own, claim, send, and review their delivery tasks.
 DELIVERY_HANDLERS = OPS_STAFF + LOCAL_DRIVERS
+# Name lists when packing / sending / editing: sales staff sometimes pack or send too, so they are in every list.
+PACK_STAFF = OPS_STAFF + [n for n in SALES_STAFF if n not in OPS_STAFF]
+SEND_STAFF = DELIVERY_HANDLERS + [n for n in SALES_STAFF if n not in DELIVERY_HANDLERS]
 
 DISPATCH_COLS = ["Date", "Handled_By", "Customer", "Cases", "Local_Driver",
                  "Taxi_Station", "Phnom_Penh_Expense", "Taxi_Expense", "Note", "Verified_By", "Expense_Status", "Invoice"]
@@ -211,6 +214,66 @@ DEFAULT_PERMISSIONS_BY_ROLE = {          # sales money is hidden from everyone e
 }
 PERMISSION_KEYS = tuple(PERMISSION_LABELS)
 
+# ---------- Advanced access: each section Hidden / View only / Can edit + action switches ----------
+ACCESS_LEVELS = ("hidden", "view", "edit")
+ACCESS_LABEL = {"hidden": "🚫 Hidden", "view": "👁️ View only", "edit": "✏️ Can edit"}
+ACTION_LABELS = {
+    "money": "💵 See sales money (sales riel amounts, prices)",
+    "reports": "📥 Summaries + download Excel reports",
+    "exp_edit": "🧾 Edit delivery expenses (Grab / TukTuk / taxi amounts)",
+    "others": "👥 Change other staff's records (not only their own)",
+    "final_edit": "✏️ Edit final packed / sent cases",
+    "hold": "📅 Move orders to tomorrow / ❌ cancel",
+    "fix_raw": "🛠️ Fix or delete raw packing / delivery rows",
+    "locations": "📍 Edit customer locations and map matches",
+}
+ACTION_KEYS = tuple(k for k in ACTION_LABELS if k not in PERMISSION_KEYS)      # new switches (money/reports exist)
+ACCESS_PRESETS = {                       # quick start for the Admin form; every box can still be changed after
+    "📦 Packer": ({"packing": "edit", "delivery": "view", "dashboard": "view"}, []),
+    "🚚 Driver / delivery staff": ({"packing": "view", "delivery": "edit", "dashboard": "view", "map": "view"}, ["exp_edit"]),
+    "💼 Sales": ({"sale_order": "edit", "dashboard": "view", "map": "view", "insights": "view", "followups": "edit",
+                 "visits": "edit"}, ["reports"]),
+    "🧑‍💼 Supervisor": ({"packing": "edit", "delivery": "edit", "sale_order": "edit", "dashboard": "edit", "map": "view",
+                        "insights": "view", "followups": "edit", "visits": "edit", "media": "edit"},
+                       ["money", "reports", "exp_edit", "others", "final_edit", "hold"]),
+    "👁️ Viewer": ({"dashboard": "view", "reports": "view"}, []),
+}
+
+
+def _legacy_action(key, role, perms):
+    """Users still on the simple switches keep exactly what they could do before the action switches existed."""
+    if key in ("money", "reports"):
+        return bool(perms.get(key))
+    if key == "exp_edit":
+        return bool(perms.get("edit") and perms.get("tasks"))
+    if key in ("final_edit", "hold"):
+        return bool(perms.get("edit"))
+    if key in ("fix_raw", "locations", "others"):
+        return role == "admin"
+    return False
+
+
+def _advanced_allows(permission, access, actions, section):
+    """access = {section: hidden/view/edit}. Inside a section, View / Edit follow THAT section's level."""
+    if permission in ACTION_LABELS:
+        return bool(actions.get(permission))
+    if section and section != "admin":
+        level = access.get(section, "hidden")
+        if permission == "edit":
+            return level == "edit"
+        return level in ("view", "edit")              # view / tasks
+    levels = set(access.values())
+    if permission == "edit":
+        return "edit" in levels
+    if permission == "tasks":
+        return any(access.get(x, "hidden") != "hidden" for x in ("packing", "delivery"))
+    return bool(levels - {"hidden"})
+
+
+def _rec_access(rec):
+    a = (rec or {}).get("access")
+    return {k: v for k, v in a.items() if v in ACCESS_LEVELS} if isinstance(a, dict) and a else None
+
 
 def default_permissions(role):
     """Copy the baseline capabilities for a role; per-user choices can override them."""
@@ -227,13 +290,19 @@ def effective_permissions(username=None, rec=None):
             rec = {}
     role = str((rec or {}).get("role") or (current_role() if who == current_user() else "viewer"))
     if role == "admin":
-        return {k: True for k in PERMISSION_KEYS}
+        return {k: True for k in PERMISSION_KEYS + ACTION_KEYS}
+    access = _rec_access(rec)
+    if access:
+        actions = (rec or {}).get("actions") or {}
+        return {k: _advanced_allows(k, access, actions, None) for k in PERMISSION_KEYS + ACTION_KEYS}
     result = default_permissions(role)
     saved = (rec or {}).get("permissions", {})
     if isinstance(saved, dict):
         for key in PERMISSION_KEYS:
             if key in saved:
                 result[key] = bool(saved[key])
+    for key in ACTION_KEYS:
+        result[key] = _legacy_action(key, role, result)
     return result
 
 
@@ -284,6 +353,9 @@ def user_sections(username=None, rec=None):
     perms = effective_permissions(who, rec)
     if role == "admin":
         return [sid for sid, _l in APP_SECTIONS if sid != "reports"]
+    access = _rec_access(rec)
+    if access:
+        return [sid for sid, _l in APP_SECTIONS if access.get(sid, "hidden") != "hidden"]
     defaults = default_sections(role, perms)
     saved = (rec or {}).get("sections")
     if not isinstance(saved, dict) or not saved:
@@ -296,8 +368,9 @@ SECTION_NEEDS = {"packing": "tasks", "delivery": "tasks", "dashboard": "view", "
 
 
 def has_permission(permission, username=None):
-    """Check an individual capability. Unknown permissions fail closed."""
-    if permission not in PERMISSION_KEYS:
+    """Check an individual capability. Unknown permissions fail closed.
+    Advanced users: View / Edit follow the level of the section that is open; actions follow their switches."""
+    if permission not in PERMISSION_KEYS and permission not in ACTION_KEYS:
         return False
     who = username or current_user()
     if not who:
@@ -306,12 +379,18 @@ def has_permission(permission, username=None):
         role = current_role()
         if role == "admin":
             return True
+        access = st.session_state.get("user_access")
+        if isinstance(access, dict) and access:
+            return _advanced_allows(permission, access, st.session_state.get("user_actions") or {},
+                                    st.session_state.get("_cur_section"))
         saved = st.session_state.get("user_permissions", {})
         if isinstance(saved, dict):
             result = default_permissions(role)
             for key in PERMISSION_KEYS:
                 if key in saved:
                     result[key] = bool(saved[key])
+            if permission in ACTION_KEYS:
+                return _legacy_action(permission, role, result)
             return bool(result.get(permission, False))
     try:
         return bool(effective_permissions(who).get(permission, False))
@@ -321,7 +400,7 @@ def has_permission(permission, username=None):
 
 MONEY_LOCK = "🔒"
 _MONEY_EXACT = {"sales", "salesactual", "amount", "price", "sell", "avg sales", "sales basis"}
-_NOT_SALES_MONEY = ("expense", "សេវា", "taxi", "phnom penh ៛")
+_NOT_SALES_MONEY = ("expense", "សេវា", "taxi", "phnom penh ៛", "grab", "tuktuk")
 
 
 def can_see_money():
@@ -1139,7 +1218,8 @@ def _clear_session():
     st.session_state.pop("_table_drafts", None)
     st.session_state.pop("_task_preferences", None)
     st.session_state.pop("last_customer_upload_export", None)
-    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions", "_url_tok"):
+    for k in ("role", "user", "login_time", "must_change", "sel_cust", "me_staff", "user_permissions", "_url_tok",
+              "user_access", "user_actions"):
         st.session_state.pop(k, None)
 
 
@@ -1172,6 +1252,8 @@ def session_ok():
         return False
     st.session_state["must_change"] = bool(rec.get("must_change"))
     st.session_state["user_permissions"] = rec.get("permissions", {}) if isinstance(rec.get("permissions", {}), dict) else {}
+    st.session_state["user_access"] = _rec_access(rec)
+    st.session_state["user_actions"] = rec.get("actions", {}) if isinstance(rec.get("actions"), dict) else {}
     return True
 
 
@@ -1732,9 +1814,28 @@ def _remote_list_worker(state, dbx):
             with state["lock"]:
                 state["entries"], state["t"] = entries, time.time()
         except Exception:
-            pass
+            continue
+        _journal_prewarm(entries)
     with state["lock"]:
         state["thread"] = None
+
+
+def _journal_prewarm(entries):
+    """When Sales saves the journal in Excel, download and read it here in the background (≈1-3 s), so the next
+    tap of any staff member finds it ready instead of waiting for it."""
+    try:
+        S = _sync_state()
+        changed = [e for e in entries.values()
+                   if fnmatch.fnmatchcase(e["name"].lower(), EXCEL_PATTERN.lower())
+                   and S["xl_hash"].get(e["name"]) not in (None, e["hash"])]     # only journals in use that changed
+        if not changed:
+            return
+        for path in find_excel_files():                     # downloads only the journals in use that changed
+            if path and os.path.exists(path):
+                stt = os.stat(path)
+                load_snapshot(path, stt.st_mtime_ns, stt.st_size)   # writes the read result to the disk cache
+    except Exception:
+        pass
 
 
 def _remote_listing():
@@ -2202,8 +2303,10 @@ def _dropbox_fetch_journal(chosen):
     S = _sync_state()
     local = os.path.join(DATA_DIR, chosen["name"])
     with S["lock"]:
-        if (not os.path.exists(local)) or S["xl_hash"].get(chosen["name"]) != chosen["hash"]:
-            _, res = _dbx().files_download(_rpath(chosen["name"]))
+        fresh = os.path.exists(local) and S["xl_hash"].get(chosen["name"]) == chosen["hash"]
+    if not fresh:
+        _, res = _dbx().files_download(_rpath(chosen["name"]))       # 1 MB: not under the shared lock
+        with S["lock"]:
             _write_atomic(local, res.content)
             S["xl_hash"][chosen["name"]] = chosen["hash"]
     return local
@@ -2456,7 +2559,8 @@ def _read_excel_snapshot(path):
 def load_snapshot(path, mtime_ns, size):
     """Returns (data, source). source = 'disk' | 'fresh' | 'stale' (last good copy used)."""
     os.makedirs(CACHE_DIR, exist_ok=True)
-    cache_file = os.path.join(CACHE_DIR, "excel_snapshot.pkl")
+    tag = hashlib.sha1(os.path.basename(path).encode("utf-8")).hexdigest()[:10]
+    cache_file = os.path.join(CACHE_DIR, f"excel_snapshot_{tag}.pkl")     # one per journal (NOV + DEC both stay cached)
     key = (SNAPSHOT_VERSION, os.path.abspath(path), mtime_ns, size)
     obj = None
     try:
@@ -2480,8 +2584,10 @@ def load_snapshot(path, mtime_ns, size):
     return data, "fresh"
 
 
-@st.cache_data(ttl=120, show_spinner="📄 Loading journal (first time only)...", max_entries=4)
+@st.cache_resource(show_spinner="📄 Loading journal (first time only)...", max_entries=6)
 def get_snapshot(path, mtime_ns, size):
+    """Kept in memory until the journal file changes (its time/size is part of the key). Shared by every visitor
+    and never copied, so it must be treated as read-only (it is)."""
     return load_snapshot(path, mtime_ns, size)
 
 
@@ -3168,7 +3274,7 @@ def dispatch_form(form_key, fixed_customer=None, default_cases=1, verify=False):
     k = form_key
     with st.form(form_key, clear_on_submit=False):
         st.markdown("#### Order Details")
-        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + DELIVERY_HANDLERS, key=f"{k}_by")
+        dispatched_by = st.selectbox("Dispatched By:", ["-- Select Staff --"] + SEND_STAFF, key=f"{k}_by")
         if fixed_customer is None:
             opts, lab, jset = customer_choices()
             customer_name = st.selectbox(f"Customer Name / ID (Type to search) - 🧾 = has an order in today's sale journal ({len(jset)}):",
@@ -3254,7 +3360,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
             customer = fixed_customer
             st.markdown(f"**Customer:** {fixed_customer}")
         invoice_number = ""  # Invoice linking is automatic; staff save by customer.
-        prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + OPS_STAFF, key=f"{k}_by")
+        prepared_by = st.selectbox("Prepared / Packed By:", ["-- Select Staff --"] + PACK_STAFF, key=f"{k}_by")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -3291,7 +3397,7 @@ def packing_form(form_key, fixed_customer=None, default_cases=1):
 
 
 def admin_editor(path, cols, num_cols, key, label_cols):
-    if current_role() != "admin" or not has_permission("edit"):
+    if not has_permission("fix_raw"):
         st.info("🔒 Admin only. Log in with the admin access code to fix or delete entries.")
         return
     try:
@@ -3637,7 +3743,7 @@ def bulk_editor(df, ctx, key, check_col="Save?", column_order=None, scope=""):
     st.caption("Tick several customers and edit their cases, then save once. Ticks and typing stay on this screen until you save.")
     preferences = _form_preferences("packing_staff")
     linked = preferences.get("prepared_by") or staff_name_for_user()
-    staff_options = ["-- Select Staff --"] + OPS_STAFF
+    staff_options = ["-- Select Staff --"] + PACK_STAFF
     with st.form("batch_" + editor_key, clear_on_submit=False):
         prepared_by = st.selectbox("👷 Prepared / packed by", staff_options,
             index=staff_options.index(linked) if linked in staff_options else 0, key=f"{key}_by")
@@ -3821,7 +3927,7 @@ def _packing_body():
     else:
         packing_form("packing_form")
 
-    with st.expander("🛠️ Admin: Fix or Edit Today's Packing"):
+    if has_permission("fix_raw") and st.toggle("🛠️ Fix or Edit Today's Packing", key="pack_admin_open"):
         admin_editor(PACKING_FILE, PACKING_COLS, PACKING_NUM_COLS, key="pack",
                      label_cols=["Customer", "Cases_Packed", "Status"])
 
@@ -3852,6 +3958,7 @@ def _packing_task_save(changes, allowed):
     modify_csv(PACKING_FILE, PACKING_COLS, apply)
 
 
+@st.fragment
 def _packing_tasks_panel():
     """Packing slips of one staff member (or everyone) for any day / period; who packed, cases and status editable."""
     st.subheader("📋 Packing log by staff")
@@ -3861,7 +3968,7 @@ def _packing_tasks_panel():
     df_all = read_raw(PACKING_FILE, PACKING_COLS)
     recent = df_all[df_all["_dt"] >= pd.Timestamp(today_kh() - timedelta(days=62))] if not df_all.empty else df_all
     recorded = {str(x).strip() for x in recent["Prepared_By"].dropna() if str(x).strip() not in ("", "-", "nan", "None")}
-    staff_options = [STAFF_TASK_ALL] + sorted(set(OPS_STAFF) | recorded)
+    staff_options = [STAFF_TASK_ALL] + sorted(set(PACK_STAFF) | recorded)
     c1, c2, c3 = st.columns([2, 1.4, 1.6])
     staff = c1.selectbox("Packed by", staff_options, key="pack_task_staff")
     period = c2.selectbox("📅 Date / period", STAFF_TASK_PERIODS, key="pack_task_period")
@@ -3907,7 +4014,7 @@ def _packing_tasks_panel():
             show_df(per_day.rename_axis("Day").reset_index())
 
     my_name = staff_name_for_user()
-    is_admin = current_role() == "admin"
+    is_admin = has_permission("others")              # Admin, or anyone allowed to change other staff's records
     can_edit = has_permission("edit") and has_permission("tasks")
 
     def allowed(row):
@@ -3925,7 +4032,7 @@ def _packing_tasks_panel():
                + ("" if is_admin else " You can change only the packing saved under your own name."))
     sig = hashlib.sha1(pd.util.hash_pandas_object(tasks[PACKING_COLS].astype(str), index=False).values.tobytes()).hexdigest()[:12]
     sig += f"_{st.session_state.get('pack_task_undo', 0)}"
-    who_opts = sorted(set(OPS_STAFF) | set(view["Packed by"]))
+    who_opts = sorted(set(PACK_STAFF) | set(view["Packed by"]))
     st_opts = sorted({PACK_ST_WIP, PACK_ST_DONE} | set(view["Status"]))
     cfg = {"When": st.column_config.TextColumn("When", disabled=True),
            "Customer": st.column_config.TextColumn("Customer", disabled=True, width="large"),
@@ -3941,7 +4048,7 @@ def _packing_tasks_panel():
         undo = b2.form_submit_button("↩️ Undo my changes", use_container_width=True)
     if undo:
         st.session_state["pack_task_undo"] = st.session_state.get("pack_task_undo", 0) + 1
-        st.rerun()
+        st.rerun(scope="fragment")
     if save:
         changes, denied = [], []
         originals = tasks.to_dict("records")
@@ -3968,7 +4075,7 @@ def _packing_tasks_panel():
                 audit("packing_edit", f'{o["Customer"]} {o["Date"]}: {o["Prepared_By"]}/{o["Cases_Packed"]}/{o["Status"]} -> '
                                       f'{new["Prepared_By"]}/{new["Cases_Packed"]}/{new["Status"]}')
             st.session_state["pack_task_flash"] = f"✅ Saved {len(changes)} packing slip(s)"
-            st.rerun()
+            st.rerun(scope="fragment")
         except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
             st.error(f"Not saved: {err}")
 
@@ -4083,7 +4190,7 @@ def _claim_tab(me, ctx):
                 owner = assigned.get(r["Customer"])
                 if owner == me:
                     continue
-                if owner and current_role() != "admin":
+                if owner and not has_permission("others"):
                     blocked.append(f"{r['Customer']} (taken by {owner})")
                     continue
                 new.append({"Date": now_str(), "Handler": me, "Customer": r["Customer"], "Action": "Assign"})
@@ -4102,7 +4209,7 @@ def _claim_tab(me, ctx):
                     st.error(f"⚠️ Could not save: {err}")
 
     mine = [r["Customer"] for r in ctx["recs"] if ctx["assigned"].get(r["Customer"]) == me and r["Status"] not in NOT_TO_SEND]
-    pool = mine if current_role() != "admin" else [r["Customer"] for r in ctx["recs"] if r["Customer"] in ctx["assigned"]]
+    pool = mine if not has_permission("others") else [r["Customer"] for r in ctx["recs"] if r["Customer"] in ctx["assigned"]]
     with st.expander(f"↩️ Release customers ({len(mine)} are mine)"):
         with st.form("release_customers", clear_on_submit=False):
             rel = st.multiselect("Customers I will NOT deliver after all", pool, key="claim_release")
@@ -4180,7 +4287,7 @@ def _send_tab(me, ctx):
         blocked = {r["Customer"] for r in selected_rows if r["Customer"] not in fresh
                    or fresh[r["Customer"]]["Status"] in NOT_TO_SEND
                    or _int(fresh[r["Customer"]]["Sent Cases"]) != _int(r["Saved sent cases"])
-                   or (assigned.get(r["Customer"]) not in (None, me) and current_role() != "admin")}
+                   or (assigned.get(r["Customer"]) not in (None, me) and not has_permission("others"))}
         if blocked and len(blocked) == len(selected_rows):
             st.error("Not saved — these customers were already sent / changed by someone else: "
                      + ", ".join(sorted(blocked)[:5]) + ". Press ↻ Reload this list.")
@@ -4249,8 +4356,8 @@ def _expense_tab(me):
     if st.session_state.get("_task_view_preference", "Cards") == "Cards":
         st.caption("Complete one customer card and Save. Choose the driver before entering expenses. Other cards stay open.")
     who = me
-    if current_role() == "admin":
-        pick = st.selectbox("Staff", ["My deliveries", "Everyone"] + DELIVERY_HANDLERS, key="phone_exp_staff")
+    if has_permission("others"):
+        pick = st.selectbox("Staff", ["My deliveries", "Everyone"] + SEND_STAFF, key="phone_exp_staff")
         who = None if pick == "Everyone" else me if pick == "My deliveries" else pick
     query = st.text_input("🔎 Find customer or invoice", key="phone_exp_search").strip().casefold()
     df = pending_expense_df(who, "All waiting")
@@ -4457,8 +4564,8 @@ def _delivery_log():
     """Today's operation records, with detail and report features controlled per user."""
     can_view = has_permission("view")
     can_reports = has_permission("reports")
-    if current_role() == "admin" and has_permission("edit"):
-        with st.expander("🛠️ Admin: Fix or Edit Today's Dispatches"):
+    if has_permission("fix_raw") and st.toggle("🛠️ Fix or Edit Today's Dispatches", key="disp_admin_open"):
+        with st.container(border=True):
             admin_editor(DATA_FILE, DISPATCH_COLS, DISPATCH_NUM_COLS, key="disp",
                          label_cols=["Customer", "Cases"])
 
@@ -4554,6 +4661,7 @@ def _staff_task_save(changes, allowed):
     modify_csv(DATA_FILE, DISPATCH_COLS, apply)
 
 
+@st.fragment
 def _staff_tasks_panel():
     """Completed delivery slips of one staff member (or everyone) for any day / period, with expenses editable."""
     st.markdown("**🔎 Check completed delivery tasks by staff**")
@@ -4563,7 +4671,7 @@ def _staff_tasks_panel():
     df_all = read_raw(DATA_FILE, DISPATCH_COLS)
     recent = df_all[df_all["_dt"] >= pd.Timestamp(today_kh() - timedelta(days=62))] if not df_all.empty else df_all
     recorded = {str(x).strip() for x in recent["Handled_By"].dropna() if str(x).strip() not in ("", "-", "nan", "None")}
-    staff_options = ["-- Select Staff --", STAFF_TASK_ALL] + sorted(set(DELIVERY_HANDLERS) | recorded)
+    staff_options = ["-- Select Staff --", STAFF_TASK_ALL] + sorted(set(SEND_STAFF) | recorded)
     my_name = staff_name_for_user()
     if "dispatch_completed_staff" not in st.session_state and my_name in staff_options:
         st.session_state["dispatch_completed_staff"] = my_name
@@ -4600,13 +4708,12 @@ def _staff_tasks_panel():
         st.info(f"No delivery tasks for {who} on {when}.")
         return
 
-    money = can_see_money()
     pp_sum, taxi_sum = int(tasks["Phnom_Penh_Expense"].sum()), int(tasks["Taxi_Expense"].sum())
     k1, k2, k3, k4, k5 = st.columns(5)
     kpi(k1, "Completed delivery slips", len(tasks))
     kpi(k2, "Cases dispatched", int(pd.to_numeric(tasks["Cases"], errors="coerce").fillna(0).sum()))
-    kpi(k3, "Grab/TukTuk ៛", f"{pp_sum:,}")
-    kpi(k4, "Taxi ៛", f"{taxi_sum:,}")
+    kpi(k3, "Grab/TukTuk expense ៛", f"{pp_sum:,}")       # delivery costs are not sales money: always shown
+    kpi(k4, "Taxi expense ៛", f"{taxi_sum:,}")
     kpi(k5, "Expenses still pending", int((tasks["Expense_Status"] == "Pending").sum()))
     if d_from != d_to:
         per_day = tasks.groupby(tasks["_dt"].dt.date).agg(Slips=("Customer", "count"), Cases=("Cases", "sum"),
@@ -4615,8 +4722,8 @@ def _staff_tasks_panel():
         with st.expander(f"📆 Per day ({len(per_day)} days)"):
             show_df(per_day.rename_axis("Day").reset_index())
 
-    can_edit = has_permission("edit") and has_permission("tasks") and money
-    is_admin = current_role() == "admin"
+    can_edit = has_permission("exp_edit")
+    is_admin = has_permission("others")              # Admin, or anyone allowed to change other staff's records
 
     def allowed(row):
         return is_admin or (my_name and my_name in (str(row.get("Handled_By", "")).strip(), str(row.get("Local_Driver", "")).strip()))
@@ -4631,9 +4738,6 @@ def _staff_tasks_panel():
         "Note": tasks["Note"].astype(str).replace({"-": ""}),
         "Status": tasks["Expense_Status"].map(lambda x: "⏳ Pending" if x == "Pending" else "✅ Done"),
         "Verified by": tasks["Verified_By"], "Invoice": tasks["Invoice"]})
-    if not money:
-        view["Grab/TukTuk ៛"] = MONEY_LOCK
-        view["Taxi ៛"] = MONEY_LOCK
     if staff == STAFF_TASK_ALL:
         cols = list(view.columns)
     else:
@@ -4674,7 +4778,7 @@ def _staff_tasks_panel():
             undo = b2.form_submit_button("↩️ Undo my changes", use_container_width=True)
         if undo:
             st.session_state["staff_task_undo"] = st.session_state.get("staff_task_undo", 0) + 1
-            st.rerun()
+            st.rerun(scope="fragment")
         if save:
             changes, denied, bad = [], [], []
             originals = tasks.to_dict("records")
@@ -4716,7 +4820,7 @@ def _staff_tasks_panel():
                     done = sum(1 for _, n in changes if n["Expense_Status"] == "Done")
                     st.session_state["staff_task_flash"] = (f"✅ Saved {len(changes)} delivery(ies)"
                                                             + (f" · {len(changes) - done} still ⏳ Pending (amount missing)" if done < len(changes) else ""))
-                    st.rerun()
+                    st.rerun(scope="fragment")
                 except (ValueError, RuntimeError, ConflictError, PermissionError) as err:
                     st.error(f"Not saved: {err}")
     if has_permission("reports"):
@@ -4857,8 +4961,8 @@ def _dispatch_body():
     st.markdown("### 🚚 Delivery")
     task_view_selector("delivery")
     linked_staff = staff_name_for_user()
-    default_staff_index = DELIVERY_HANDLERS.index(linked_staff) + 1 if linked_staff in DELIVERY_HANDLERS else 0
-    _me_opts = ["-- Select Staff --"] + DELIVERY_HANDLERS
+    default_staff_index = SEND_STAFF.index(linked_staff) + 1 if linked_staff in SEND_STAFF else 0
+    _me_opts = ["-- Select Staff --"] + SEND_STAFF
     _me_keep = keep_choice("me_staff", _me_opts)              # stays chosen after visiting another section
     me = st.selectbox("👷 I am (choose your name once — office staff or delivery driver)", _me_opts,
                       index=0 if "me_staff" in st.session_state else default_staff_index, key="me_staff", **_me_keep)
@@ -5485,7 +5589,8 @@ def _dashboard_body():
             with t_prov:
                 show_df(summarize(df_scope, "Province"))
     _bun_panel(df_scope, selected_date, mobile)
-    with st.expander("🗺️ Map of Cambodia", expanded=not mobile):
+    if st.toggle("🗺️ Show map of Cambodia", key="dash_show_map",
+                 help="The map is heavy for phones: it loads only when switched on (remembered)."):
         metric = st.radio("Circle size shows", ["Customers", "Customers still waiting", "Cases ordered (កេស)", "Cases sent"],
                           horizontal=True, key="map_metric")
         render_cambodia_map(df_scope, metric)
@@ -5654,10 +5759,14 @@ def _update_panel(selected, df_report, selected_date):
                 f"packed {packed_n}  ·  left to send **{max(target_n - sent_n, 0)}**"
                 + (f"   \n✏️ {p_row['Sent Note']}" if p_row["Sent Note"] else "")
                 + (f"   \n✏️ {p_row['Packed Note']}" if p_row["Packed Note"] else ""))
-    _upd_steps = ["📦 Step 1: Packing (who prepared the buns)", "🚚 Step 2: Send (who delivered + verify កេស)",
-                  "✏️ Edit final packed / sent", "📅 Move to tomorrow / ❌ Cancel"]
+    _upd_steps = ["📦 Step 1: Packing (who prepared the buns)", "🚚 Step 2: Send (who delivered + verify កេស)"]
+    if has_permission("final_edit"):
+        _upd_steps.append("✏️ Edit final packed / sent")
+    if has_permission("hold"):
+        _upd_steps.append("📅 Move to tomorrow / ❌ Cancel")
     _upd_pick = st.radio("Update step", _upd_steps, horizontal=True, key=f"upd_step_{selected}")
-    t_pack, t_send, t_final, t_hold = (_upd_pick == name for name in _upd_steps)           # only the chosen one is built
+    t_pack, t_send = _upd_pick == _upd_steps[0], _upd_pick == _upd_steps[1]      # only the chosen one is built
+    t_final, t_hold = _upd_pick == "✏️ Edit final packed / sent", _upd_pick == "📅 Move to tomorrow / ❌ Cancel"
     if t_pack:
         packing_form(f"dash_pack_{selected}_{pack_default}", fixed_customer=selected, default_cases=pack_default)
     if t_send:
@@ -5903,7 +6012,7 @@ def _final_panel(selected, p_row):
         pwhy = pc2.selectbox("Reason", ["Not enough stock", "Packed less than the order", "Customer asked for less",
                                         "Packing log was wrong", "Packed more", "Other"], key=f"finp_r_{selected}")
         pnote = st.text_input("Extra note (optional)", max_chars=80, key=f"finp_t_{selected}")
-        pwho = st.selectbox("Who is editing?", ["-- Select Staff --"] + OPS_STAFF, key=f"finp_w_{selected}")
+        pwho = st.selectbox("Who is editing?", ["-- Select Staff --"] + PACK_STAFF, key=f"finp_w_{selected}")
         q1, q2 = st.columns(2)
         if q1.form_submit_button("💾 Save final packed", type="primary"):
             if pwho.startswith("--"):
@@ -5938,7 +6047,7 @@ def _final_panel(selected, p_row):
         why = c2.selectbox("Reason", ["Counted again at the truck", "Slip entered twice", "A slip was missing",
                                       "Customer returned some", "Extra items added", "Other"], key=f"fin_r_{selected}")
         note = st.text_input("Extra note (optional)", max_chars=80, key=f"fin_t_{selected}")
-        who = st.selectbox("Who is editing?", ["-- Select Staff --"] + OPS_STAFF, key=f"fin_w_{selected}")
+        who = st.selectbox("Who is editing?", ["-- Select Staff --"] + PACK_STAFF, key=f"fin_w_{selected}")
         b1, b2 = st.columns(2)
         if b1.form_submit_button("💾 Save final sent", type="primary"):
             if who.startswith("--"):
@@ -5971,7 +6080,7 @@ def _hold_panel(selected, p_row, left):
         st.warning(f"This customer is now **{status}** - {p_row['Moved/Cancel Reason'] or 'no reason written'}")
         with st.form(f"restore_customer_{selected}", clear_on_submit=False):
             c1, c2 = st.columns(2)
-            who = c1.selectbox("Who is doing this?", ["-- Select Staff --"] + OPS_STAFF, key=f"hold_who_{selected}")
+            who = c1.selectbox("Who is doing this?", ["-- Select Staff --"] + PACK_STAFF, key=f"hold_who_{selected}")
             if c2.form_submit_button("↩ Put back as normal (today)"):
                 if who.startswith("--"):
                     st.error("Choose your name first.")
@@ -5999,7 +6108,7 @@ def _hold_panel(selected, p_row, left):
         extra = c2.text_input("Extra note (optional)", max_chars=80, key=f"hold_note_{selected}")
         cases = st.number_input("កេស to carry to tomorrow (ignored when cancelling)", min_value=0, max_value=MAX_CASES, step=1,
                                 value=max(int(left), 0), key=f"hold_cases_{selected}")
-        who = st.selectbox("Who is doing this?", ["-- Select Staff --"] + OPS_STAFF, key=f"hold_who2_{selected}")
+        who = st.selectbox("Who is doing this?", ["-- Select Staff --"] + PACK_STAFF, key=f"hold_who2_{selected}")
         if st.form_submit_button("💾 Save move / cancellation", type="primary"):
             if who.startswith("--"):
                 st.error("Choose your name first.")
@@ -6397,6 +6506,72 @@ def _locations_panel():
                 st.error(f"❌ {err2}")
 
 
+
+def _advanced_access_form(perm_user, perm_rec):
+    """Admin: for one user choose Hidden / View only / Can edit per section, plus single action switches."""
+    kp = f"acc_{perm_user}_"
+    access = _rec_access(perm_rec)
+    if not access:                                       # first time: start from what the user can do today
+        eff, secs = effective_permissions(perm_user, perm_rec), set(user_sections(perm_user, perm_rec))
+        access = {sid: ("edit" if eff.get("edit") and sid not in ("dashboard", "reports", "map", "insights") else "view")
+                  if sid in secs else "hidden" for sid, _l in APP_SECTIONS}
+        actions = {k: bool(eff.get(k)) for k in ACTION_LABELS}
+    else:
+        actions = perm_rec.get("actions") or {}
+    p1, p2 = st.columns([3, 1])
+    preset = p1.selectbox("Start from a ready-made role (optional)", ["—"] + list(ACCESS_PRESETS), key=kp + "preset")
+    p2.write("")
+    if p2.button("Fill the form", key=kp + "apply", disabled=preset == "—", use_container_width=True):
+        secs, acts = ACCESS_PRESETS[preset]
+        for sid, _l in APP_SECTIONS:
+            st.session_state[kp + "sec_" + sid] = secs.get(sid, "hidden")
+        for a in ACTION_LABELS:
+            st.session_state[kp + "act_" + a] = a in acts
+        st.rerun()
+    with st.form(kp + "form"):
+        st.markdown("**📂 Sections** — can this user open it, and can they change things there?")
+        cols = st.columns(2)
+        new_access = {}
+        for i, (sid, label) in enumerate(APP_SECTIONS):
+            k = kp + "sec_" + sid
+            if k not in st.session_state:
+                st.session_state[k] = access.get(sid, "hidden")
+            new_access[sid] = cols[i % 2].selectbox(label, ACCESS_LEVELS, format_func=ACCESS_LABEL.get, key=k)
+        st.markdown("**⚙️ Actions** — extra things this user may do (inside the sections they can open)")
+        cols = st.columns(2)
+        new_actions = {}
+        for i, (a, label) in enumerate(ACTION_LABELS.items()):
+            k = kp + "act_" + a
+            if k not in st.session_state:
+                st.session_state[k] = bool(actions.get(a))
+            new_actions[a] = cols[i % 2].checkbox(label, key=k)
+        st.caption("👁️ View only = can open and read, every save button is locked. ✏️ Can edit = can pack / send / save there. "
+                   "Without 👥 they can change only records under their own staff name.")
+        save = st.form_submit_button("💾 Save advanced access", type="primary")
+    if not save:
+        return
+    if all(v == "hidden" for v in new_access.values()):
+        st.error("Choose at least one section that is not 🚫 Hidden.")
+        return
+    flat = {k: _advanced_allows(k, new_access, new_actions, None) for k in PERMISSION_KEYS}
+
+    def _save(u):
+        if perm_user not in u:
+            raise ValueError("That user no longer exists. Refresh and try again.")
+        u[perm_user]["access"] = dict(new_access)
+        u[perm_user]["actions"] = {k: bool(v) for k, v in new_actions.items()}
+        u[perm_user]["permissions"] = flat           # kept in step for older screens / exports
+        u[perm_user].pop("sections", None)
+        return u
+    try:
+        modify_users(_save)
+        audit("user_access_changed", f"{perm_user}: " + ", ".join(f"{sid}={lvl}" for sid, lvl in new_access.items())
+              + " | actions: " + ", ".join(k for k, v in new_actions.items() if v))
+        flash_and_refresh(f"Advanced access saved for {perm_user}")
+    except (ValueError, RuntimeError, ConflictError) as err:
+        st.error(f"❌ Could not save: {err}")
+
+
 def _users_panel():
     st.markdown("### 👥 Users & Security")
     try:
@@ -6529,7 +6704,8 @@ def _users_panel():
         "Edit": "ON" if effective_permissions(u, r).get("edit") else "OFF",
         "Reports": "ON" if effective_permissions(u, r).get("reports") else "OFF",
         "💵 Money": "ON" if effective_permissions(u, r).get("money") else "OFF",
-        "Sections": ("Auto · " if not (isinstance(r.get("sections"), dict) and r.get("sections")) else "Custom · ")
+        "Sections": ("🎛️ Advanced · " if _rec_access(r) else
+                     "Auto · " if not (isinstance(r.get("sections"), dict) and r.get("sections")) else "Custom · ")
                     + ", ".join(APP_SECTION_LABEL[sid].split(" ", 1)[0] for sid in user_sections(u, r)),
         "Starter password": "yes" if r.get("must_change") else "",
         "Last login": r.get("last_login", ""), "Password changed": r.get("pw_changed", "")}
@@ -6543,61 +6719,70 @@ def _users_panel():
         is_admin_target = perm_rec.get("role") == "admin"
         if is_admin_target:
             st.info("Admin permissions are always ON for security and account recovery.")
-        with st.form(f"permissions_form_{perm_user}"):
-            p_tasks = st.checkbox(PERMISSION_LABELS["tasks"], value=perm_values["tasks"], key=f"perm_tasks_{perm_user}", disabled=is_admin_target)
-            p_view = st.checkbox(PERMISSION_LABELS["view"], value=perm_values["view"], key=f"perm_view_{perm_user}", disabled=is_admin_target)
-            p_edit = st.checkbox(PERMISSION_LABELS["edit"], value=perm_values["edit"], key=f"perm_edit_{perm_user}", disabled=is_admin_target)
-            p_reports = st.checkbox(PERMISSION_LABELS["reports"], value=perm_values["reports"], key=f"perm_reports_{perm_user}", disabled=is_admin_target)
-            p_money = st.checkbox(PERMISSION_LABELS["money"], value=perm_values["money"], key=f"perm_money_{perm_user}", disabled=is_admin_target,
-                                  help="OFF = riel amounts, prices and sales money are hidden (🔒). Bun pieces stay visible.")
-            st.markdown("**👁️ Sections this user can open** (Open section menu)")
-            saved_secs = perm_rec.get("sections") if isinstance(perm_rec.get("sections"), dict) and perm_rec.get("sections") else None
-            use_default = st.checkbox("Automatic — follow the permissions above", value=saved_secs is None,
-                                      key=f"perm_secdef_{perm_user}", disabled=is_admin_target,
-                                      help="Untick to choose the sections by hand below.")
-            now_secs = set(user_sections(perm_user, perm_rec))
-            grid = st.columns(2)
-            sec_ticks = {sid: grid[i % 2].checkbox(label, value=sid in now_secs, key=f"perm_sec_{perm_user}_{sid}",
-                                                   disabled=is_admin_target)
-                         for i, (sid, label) in enumerate(APP_SECTIONS)}
-            st.caption("Automatic ticked = the boxes are ignored and sections follow Tasks / View / Edit / Reports. "
-                       "Untick Automatic to show exactly the ticked sections.")
-            save_perms = st.form_submit_button("💾 Save permissions & sections", type="primary")
-        if save_perms:
-            if is_admin_target:
-                st.info("Admin access remains fully enabled.")
-            else:
-                new_perms = {"tasks": p_tasks, "view": p_view, "edit": p_edit, "reports": p_reports, "money": p_money}
-                new_secs = None if use_default else {sid: bool(v) for sid, v in sec_ticks.items()}
-                if new_secs is not None and not any(new_secs.values()):
-                    new_secs = None
-                    st.session_state["save_warning"] = "No section was ticked, so this user stays on Automatic sections."
-                missing = [f"{APP_SECTION_LABEL[sid]} needs “{PERMISSION_LABELS[SECTION_NEEDS[sid]]}”"
-                           for sid, on in (new_secs or {}).items() if on and sid in SECTION_NEEDS and not new_perms[SECTION_NEEDS[sid]]]
+        adv_now = bool(_rec_access(perm_rec))
+        mode = st.radio("Access mode", ["Simple switches", "🎛️ Advanced: each section + actions"], index=1 if adv_now else 0,
+                        horizontal=True, key=f"perm_mode_{perm_user}", disabled=is_admin_target,
+                        help="Advanced: choose for every section Hidden / View only / Can edit, and switch single actions on or off.")
+        if mode.startswith("🎛️") and not is_admin_target:
+            _advanced_access_form(perm_user, perm_rec)
+        else:
+            with st.form(f"permissions_form_{perm_user}"):
+                p_tasks = st.checkbox(PERMISSION_LABELS["tasks"], value=perm_values["tasks"], key=f"perm_tasks_{perm_user}", disabled=is_admin_target)
+                p_view = st.checkbox(PERMISSION_LABELS["view"], value=perm_values["view"], key=f"perm_view_{perm_user}", disabled=is_admin_target)
+                p_edit = st.checkbox(PERMISSION_LABELS["edit"], value=perm_values["edit"], key=f"perm_edit_{perm_user}", disabled=is_admin_target)
+                p_reports = st.checkbox(PERMISSION_LABELS["reports"], value=perm_values["reports"], key=f"perm_reports_{perm_user}", disabled=is_admin_target)
+                p_money = st.checkbox(PERMISSION_LABELS["money"], value=perm_values["money"], key=f"perm_money_{perm_user}", disabled=is_admin_target,
+                                      help="OFF = riel amounts, prices and sales money are hidden (🔒). Bun pieces stay visible.")
+                st.markdown("**👁️ Sections this user can open** (Open section menu)")
+                saved_secs = perm_rec.get("sections") if isinstance(perm_rec.get("sections"), dict) and perm_rec.get("sections") else None
+                use_default = st.checkbox("Automatic — follow the permissions above", value=saved_secs is None,
+                                          key=f"perm_secdef_{perm_user}", disabled=is_admin_target,
+                                          help="Untick to choose the sections by hand below.")
+                now_secs = set(user_sections(perm_user, perm_rec))
+                grid = st.columns(2)
+                sec_ticks = {sid: grid[i % 2].checkbox(label, value=sid in now_secs, key=f"perm_sec_{perm_user}_{sid}",
+                                                       disabled=is_admin_target)
+                             for i, (sid, label) in enumerate(APP_SECTIONS)}
+                st.caption("Automatic ticked = the boxes are ignored and sections follow Tasks / View / Edit / Reports. "
+                           "Untick Automatic to show exactly the ticked sections.")
+                save_perms = st.form_submit_button("💾 Save permissions & sections", type="primary")
+            if save_perms:
+                if is_admin_target:
+                    st.info("Admin access remains fully enabled.")
+                else:
+                    new_perms = {"tasks": p_tasks, "view": p_view, "edit": p_edit, "reports": p_reports, "money": p_money}
+                    new_secs = None if use_default else {sid: bool(v) for sid, v in sec_ticks.items()}
+                    if new_secs is not None and not any(new_secs.values()):
+                        new_secs = None
+                        st.session_state["save_warning"] = "No section was ticked, so this user stays on Automatic sections."
+                    missing = [f"{APP_SECTION_LABEL[sid]} needs “{PERMISSION_LABELS[SECTION_NEEDS[sid]]}”"
+                               for sid, on in (new_secs or {}).items() if on and sid in SECTION_NEEDS and not new_perms[SECTION_NEEDS[sid]]]
 
-                def _save_perms(u):
-                    if perm_user not in u:
-                        raise ValueError("That user no longer exists. Refresh and try again.")
-                    if u[perm_user].get("role") == "admin":
-                        u[perm_user]["permissions"] = {k: True for k in PERMISSION_KEYS}
-                        u[perm_user].pop("sections", None)
-                    else:
-                        u[perm_user]["permissions"] = dict(new_perms)
-                        if new_secs is None:
+                    def _save_perms(u):
+                        if perm_user not in u:
+                            raise ValueError("That user no longer exists. Refresh and try again.")
+                        u[perm_user].pop("access", None)          # simple switches replace advanced access
+                        u[perm_user].pop("actions", None)
+                        if u[perm_user].get("role") == "admin":
+                            u[perm_user]["permissions"] = {k: True for k in PERMISSION_KEYS}
                             u[perm_user].pop("sections", None)
                         else:
-                            u[perm_user]["sections"] = dict(new_secs)
-                    return u
-                try:
-                    modify_users(_save_perms)
-                    if missing:
-                        st.session_state["save_warning"] = ("Saved. These sections will open but stay read-only / locked until you also turn on: "
-                                                            + "; ".join(missing))
-                    audit("user_permissions_changed", f"{perm_user}: " + ", ".join(f"{k}={'ON' if v else 'OFF'}" for k, v in new_perms.items())
-                          + " | sections: " + ("automatic" if new_secs is None else ", ".join(k for k, v in new_secs.items() if v)))
-                    flash_and_refresh(f"Permissions saved for {perm_user}")
-                except (ValueError, RuntimeError, ConflictError) as err:
-                    st.error(f"❌ Could not save permissions: {err}")
+                            u[perm_user]["permissions"] = dict(new_perms)
+                            if new_secs is None:
+                                u[perm_user].pop("sections", None)
+                            else:
+                                u[perm_user]["sections"] = dict(new_secs)
+                        return u
+                    try:
+                        modify_users(_save_perms)
+                        if missing:
+                            st.session_state["save_warning"] = ("Saved. These sections will open but stay read-only / locked until you also turn on: "
+                                                                + "; ".join(missing))
+                        audit("user_permissions_changed", f"{perm_user}: " + ", ".join(f"{k}={'ON' if v else 'OFF'}" for k, v in new_perms.items())
+                              + " | sections: " + ("automatic" if new_secs is None else ", ".join(k for k, v in new_secs.items() if v)))
+                        flash_and_refresh(f"Permissions saved for {perm_user}")
+                    except (ValueError, RuntimeError, ConflictError) as err:
+                        st.error(f"❌ Could not save permissions: {err}")
 
     with st.expander("➕ Add a user"):
         with st.form("add_user_form", clear_on_submit=True):
@@ -7406,8 +7591,8 @@ def load_map_registry(force=False):
 
 
 def modify_map_registry(fn):
-    """Admin-only, atomic read/change/save with revision conflict retries."""
-    if current_role() != "admin" or not has_permission("edit"):
+    """Atomic read/change/save with revision conflict retries (needs the 📍 locations switch)."""
+    if not has_permission("locations"):
         raise PermissionError("Only Admin can change customer map locations.")
     for attempt in range(6):
         try:
@@ -7648,7 +7833,7 @@ def _draw_customer_pins(frame):
 
 
 def _map_admin_panel(registry, locations):
-    if current_role() != "admin" or not has_permission("edit"):
+    if not has_permission("locations"):
         return
     st.markdown("#### Manage customer locations")
     with st.expander("Add a new customer location"):
@@ -7829,8 +8014,8 @@ def _customer_map_body():
     if has_permission("reports"):
         st.download_button("Download location list", data=view.apply(lambda col: col.map(lambda v: safe_text(v, 6000) if isinstance(v, str) else v)).to_csv(index=False).encode("utf-8-sig"),
                            file_name="customer_map_locations.csv", mime="text/csv", key="map_export")
-    if current_role() == "admin":
-        with st.expander("Admin: add locations, correct links and match customers"):
+    if has_permission("locations"):
+        with st.expander("📍 Add locations, correct links and match customers"):
             _map_admin_panel(registry, locations)
 
 
@@ -10224,6 +10409,7 @@ st.set_page_config(page_title="Delivery Operations", page_icon="🚚", layout="w
                    initial_sidebar_state="collapsed")
 st.markdown(CSS, unsafe_allow_html=True)
 st.markdown(POSTER_CSS, unsafe_allow_html=True)
+st.session_state["_cur_section"] = None          # set again just before the open section is drawn
 _reset_prefix = st.session_state.pop("reset_form_prefix", None)
 if _reset_prefix:
     for _key in list(st.session_state):
@@ -15099,12 +15285,40 @@ try:
 except Exception:
     pass
 st.caption("Save your form before changing sections. Only the selected section loads.")
-if _label.startswith("📦"):
+st.session_state["_cur_section"] = _SEC_BY_LABEL.get(_label, "admin")     # View / Edit rights of this section
+
+
+@st.fragment
+def _sec_packing():
     tab_packing()
-elif _label.startswith("🚚"):
+
+
+@st.fragment
+def _sec_dispatch():
     tab_dispatch()
-elif _label.startswith("📝"):
+
+
+@st.fragment
+def _sec_sale_order():
     tab_sale_order()
+
+
+@st.fragment
+def _sec_map():
+    tab_customer_map()
+
+
+@st.fragment
+def _sec_followups():
+    tab_followups()
+
+
+if _label.startswith("📦"):
+    _sec_packing()
+elif _label.startswith("🚚"):
+    _sec_dispatch()
+elif _label.startswith("📝"):
+    _sec_sale_order()
 elif _label.startswith("📊"):
     _live = st.checkbox(f"🔄 Live mode (updates by itself every {LIVE_REFRESH_SECONDS} s, pauses while you edit a customer)",
                         value=True, key="live_mode")
@@ -15112,11 +15326,11 @@ elif _label.startswith("📊"):
 elif _label.startswith("📑"):
     tab_dashboard(False)
 elif _label.startswith("📍"):
-    tab_customer_map()
+    _sec_map()
 elif _label.startswith("🎯"):
     tab_sales_insights()
 elif _label.startswith("📞"):
-    tab_followups()
+    _sec_followups()
 elif _label.startswith("🏪"):
     tab_shop_visits()
 elif _label.startswith("📸"):
