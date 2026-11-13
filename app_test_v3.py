@@ -25,8 +25,11 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 
+import secrets as pysecrets
+
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from zoneinfo import ZoneInfo
@@ -57,6 +60,10 @@ COUNT_FILE = "stock_counts.csv"
 ADJ_FILE = "stock_adjustments.csv"
 SETTINGS_FILE = "production_settings.json"
 USERS_FILE = "users.json"
+REMEMBER_FILE = "production_remember.json"    # "keep me signed in": only a hash of each browser's token is stored
+COOKIE = "hk_prod_rt"
+URL_TOK = "p_rt"
+REMEMBER_DAYS = 30
 JOURNAL_PATTERN = "*_Sale_Jou*.xlsx"
 JOURNAL_SHEET = "DAILY SALE JOUNAL"
 BUN_RE = re.compile(r"^N\d+$")
@@ -269,6 +276,106 @@ def access_of(username, role, settings):
     return settings.get("access", {}).get(username, settings.get("access_default", "view"))
 
 
+# ---- keep me signed in (survives refresh, closed tab, phone lock, app restart) ----
+def _tok_hash(t):
+    return hashlib.sha256(str(t).encode("utf-8")).hexdigest()
+
+
+def _modify_json(name, fn):
+    for attempt in range(4):
+        try:
+            data, rev = read_bytes(name, max_age=0)
+            d = json.loads(data.decode("utf-8")) if data else {}
+            d = fn(d if isinstance(d, dict) else {}) or d
+            write_bytes(name, json.dumps(d).encode("utf-8"), rev)
+            return True
+        except Conflict:
+            time.sleep(0.3 * (attempt + 1))
+        except Exception:
+            return False
+    return False
+
+
+def _js(code):
+    try:
+        components.html(f"<script>try{{var W=window.parent;{code}}}catch(e){{}}</script>", height=0)
+    except Exception:
+        pass
+
+
+def _js_set_cookie(tok):
+    t, age = json.dumps(tok), REMEMBER_DAYS * 86400
+    return (f"var s=(W.location.protocol==='https:')?'; Secure':'';"
+            f"W.document.cookie='{COOKIE}='+{t}+'; max-age={age}; path=/; SameSite=Lax'+s;"
+            f"try{{W.localStorage.setItem('{COOKIE}',{t});}}catch(e){{}}")
+
+
+def _js_clear_cookie():
+    return (f"W.document.cookie='{COOKIE}=; max-age=0; path=/';"
+            f"try{{W.localStorage.removeItem('{COOKIE}');}}catch(e){{}}")
+
+
+def issue_token(user, pw_stamp):
+    tok, now = pysecrets.token_urlsafe(32), time.time()
+
+    def add(d):
+        for h in [h for h, r in d.items() if r.get("exp", 0) < now]:
+            d.pop(h, None)
+        mine = sorted((r.get("created", 0), h) for h, r in d.items() if r.get("user") == user)
+        for _c, h in mine[:-39]:
+            d.pop(h, None)                                # at most 40 browsers per person
+        d[_tok_hash(tok)] = {"user": user, "created": now, "exp": now + REMEMBER_DAYS * 86400, "pw": pw_stamp}
+        return d
+    return tok if _modify_json(REMEMBER_FILE, add) else None
+
+
+def restore_login():
+    """Signs the person in again from the token saved in this browser. True / False."""
+    tok = None
+    try:
+        tok = st.query_params.get(URL_TOK)
+        if URL_TOK in st.query_params:
+            del st.query_params[URL_TOK]                   # never stays in the address
+    except Exception:
+        pass
+    if not tok:
+        try:
+            tok = st.context.cookies.get(COOKIE)
+        except Exception:
+            tok = None
+    if not isinstance(tok, str) or not 20 <= len(tok) <= 100:
+        return False
+    h, now = _tok_hash(tok), time.time()
+    rec = None
+    for age in (30, 0):                                    # second try reads the newest file
+        data, _rev = read_bytes(REMEMBER_FILE, max_age=age)
+        try:
+            rec = (json.loads(data.decode("utf-8")) if data else {}).get(h)
+        except Exception:
+            rec = None
+        if rec:
+            break
+    users = load_users()
+    u = users.get(rec["user"]) if rec else None
+    if not rec or rec.get("exp", 0) < now or not u or not u.get("active", True) or rec.get("pw", "") != u.get("pw_changed", ""):
+        st.session_state["p_cookie_clear"] = True          # bad / old token: forget it in this browser
+        return False
+    st.session_state.update(p_user=rec["user"], p_role=u.get("role", "staff"), p_name=u.get("staff_name") or rec["user"],
+                            p_tok=tok)
+    if rec.get("exp", 0) - now < (REMEMBER_DAYS - 1) * 86400:     # renew once a day
+        _modify_json(REMEMBER_FILE, lambda d: (d[h].update(exp=now + REMEMBER_DAYS * 86400) if h in d else None, d)[1])
+    return True
+
+
+def sign_out():
+    tok = st.session_state.get("p_tok")
+    if tok:
+        _modify_json(REMEMBER_FILE, lambda d: (d.pop(_tok_hash(tok), None), d)[1])
+    for k in [k for k in st.session_state.keys()]:
+        del st.session_state[k]
+    st.session_state["p_cookie_clear"] = True
+
+
 def login_box():
     users = load_users()
     st.markdown("## 🏭 Production & Live Stock")
@@ -279,15 +386,33 @@ def login_box():
         st.info("Local test mode: no accounts file — you are signed in as admin.")
         st.session_state.update(p_user="admin", p_role="admin", p_name="admin")
         st.rerun()
+    if st.session_state.pop("p_cookie_clear", False):
+        _js(_js_clear_cookie())
+    else:
+        # the browser still has a saved sign-in that did not reach the server (phone woke up, first load...):
+        # hand it over once through the address, at most every 20 s (never loops)
+        _js(f"var t='';try{{t=W.localStorage.getItem('{COOKIE}')||'';}}catch(e){{}}"
+            f"if(!t){{var m=W.document.cookie.match(/(?:^|; ){COOKIE}=([^;]+)/);t=m?m[1]:'';}}"
+            f"var last=+(W.sessionStorage.getItem('p_rescued')||0);"
+            f"if(t&&Date.now()-last>20000){{W.sessionStorage.setItem('p_rescued',String(Date.now()));"
+            f"var sc=W.document.createElement('script');"          # run in the page itself (the frame may not reload it)
+            f"sc.text=\"var u=new URL(location.href);u.searchParams.set('{URL_TOK}',\"+JSON.stringify(t)+\");location.replace(u.toString());\";"
+            f"W.document.body.appendChild(sc);}}")
     with st.form("login"):
         u = st.text_input("Username").strip().lower()
         p = st.text_input("Password", type="password")
+        keep = st.checkbox(f"Keep me signed in on this phone / computer ({REMEMBER_DAYS} days)", value=True)
         ok = st.form_submit_button("Sign in", type="primary")
     st.caption("Use the same username and password as the Supply Hub app.")
     if ok:
         rec = users.get(u)
         if rec and rec.get("active", True) and _check_pw(p, rec):
             st.session_state.update(p_user=u, p_role=rec.get("role", "staff"), p_name=rec.get("staff_name") or u)
+            if keep:
+                tok = issue_token(u, rec.get("pw_changed", ""))
+                if tok:
+                    st.session_state["p_tok"] = tok
+                    st.session_state["p_cookie_set"] = True
             st.rerun()
         time.sleep(1)
         st.error("Wrong username or password.")
@@ -1327,8 +1452,12 @@ def page_settings(cfg, me):
 # MAIN
 # ==========================================
 st.markdown(CSS, unsafe_allow_html=True)
-if not st.session_state.get("p_user"):
+if not st.session_state.get("p_user") and not restore_login():
     login_box()
+if st.session_state.get("p_tok") and (st.session_state.pop("p_cookie_set", False)
+                                      or time.time() - st.session_state.get("p_cookie_t", 0) > 600):
+    _js(_js_set_cookie(st.session_state["p_tok"]))           # written again every 10 min (iPhone Safari keeps it fresh)
+    st.session_state["p_cookie_t"] = time.time()
 cfg, _srev = load_settings()
 me_user, me_role = st.session_state["p_user"], st.session_state.get("p_role", "staff")
 me = st.session_state.get("p_name") or me_user
@@ -1336,7 +1465,7 @@ level = access_of(me_user, me_role, cfg)
 if level == "hidden":
     st.error("You do not have access to the Production app. Ask Admin.")
     if st.button("Sign out"):
-        st.session_state.clear()
+        sign_out()
         st.rerun()
     st.stop()
 can_edit = level == "edit"
@@ -1346,7 +1475,7 @@ top1.markdown(f"### 🏭 Production & Live Stock · នំប៉ាវហុង�
 with top2:
     st.caption(f"👤 {me} · {'✏️ edit' if can_edit else '👁️ view'}")
     if st.button("Sign out", key="signout"):
-        st.session_state.clear()
+        sign_out()
         st.rerun()
 pages = ["📊 Live stock", "🏭 Log production", "📦 Stock count", "📅 Next week plan"]
 if me_role == "admin":
