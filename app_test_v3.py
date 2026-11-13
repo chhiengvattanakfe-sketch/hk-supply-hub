@@ -65,7 +65,7 @@ KH_DAYS = ["ច័ន្ទ", "អង្គារ", "ពុធ", "ព្រហ�
 EN_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 PROD_COLS = ["Saved_At", "Prod_Date", "Bun", "Pcs", "By", "Note", "Entry_Id"]
-COUNT_COLS = ["Saved_At", "Count_Date", "Bun", "Prod_Date", "Pcs", "By", "Count_Id"]
+COUNT_COLS = ["Saved_At", "Count_Date", "Bun", "Prod_Date", "Pcs", "By", "Count_Id", "Place"]
 ADJ_COLS = ["Saved_At", "Date", "Bun", "Prod_Date", "Pcs", "Reason", "By", "Adj_Id"]
 DEFAULT_BUNS = ["N1", "N2", "N21", "N22", "N23", "N3", "N31", "N32", "N34", "N4", "N41", "N42", "N43"]
 PRIORITY_DEFAULT = ["N1", "N2"]
@@ -83,6 +83,7 @@ DEFAULT_SETTINGS = {
     "max_prod_per_day": 0,          # 0 = no limit
     "access": {},                   # username -> hidden / view / edit (Admin always edit)
     "access_default": "view",
+    "places": ["ស្តុកនំក្នុងទូរ", "ស្តុកទូរកក"],   # freezers counted every evening (one tab each)
 }
 
 
@@ -613,6 +614,60 @@ def bun_label(b, names):
     return f"{b} {n}".strip()
 
 
+# Your sheet: short names and column colours (ស / ល / ក / តយ = N4 / N41 / N42 / N43)
+SHORT = {"N4": "ស", "N41": "ល", "N42": "ក", "N43": "តយ"}
+COLORS = {"N1": "#ED7D31", "N2": "#D9E1F2", "N21": "#FCE4D6", "N22": "#ACB9CA", "N23": "#F4B084", "N3": "#B4C6E7",
+          "N31": "#FFF2CC", "N32": "#FCE4D6", "N34": "#EDEDED", "N4": "#FFFFFF", "N41": "#FFE699", "N42": "#F8CBAD",
+          "N43": "#E2EFDA"}
+TOTAL_BG, HEAD_BG, SUM_BG = "#BDD7EE", "#BDD7EE", "#FFC000"
+
+
+def short(b):
+    return SHORT.get(b, b)
+
+
+def day_label(d):
+    return f"{d:%a, %b/%d, %y}"
+
+
+def active_buns(buns, sales, batches=None):
+    """Hide a bun (e.g. N34) that has no sales in the last weeks and no stock."""
+    sold = set(sales["Bun"]) if not sales.empty else set()
+    have = {b for b, v in (batches or {}).items() if v and sum(v.values()) > 0.5}
+    return [b for b in buns if b in sold or b in have or b in DEFAULT_BUNS and b != "N34"]
+
+
+def excel_html(title, rows, buns, total_title="សរុប", first_col="Item", note=""):
+    """Your Excel layout: blue title, coloured bun columns, blue សរុប column, yellow total row.
+    rows = [(label, {bun: pcs})]."""
+    th = "padding:6px 8px;border:1px solid #333;text-align:center;font-weight:700;"
+    td = "padding:5px 8px;border:1px solid #333;text-align:center;"
+    h = (f"<div style='overflow-x:auto;margin:4px 0 10px'><table style='border-collapse:collapse;font-size:.92rem;"
+         f"min-width:{180 + 70 * (len(buns) + 1)}px;color:#111;background:#fff'>"
+         f"<tr><th style='{th}background:{HEAD_BG}'>Date</th><th colspan='{len(buns)}' style='{th}background:{HEAD_BG}'>{title}</th>"
+         f"<th style='{th}background:{HEAD_BG}'>{total_title}</th></tr><tr><th style='{th}background:#fff'>{first_col}</th>")
+    for b in buns:
+        h += f"<th style='{th}background:{COLORS.get(b, '#fff')}' title='{b}'>{short(b)}</th>"
+    h += f"<th style='{th}background:#FFFF00'></th></tr>"
+    col_tot = {b: 0 for b in buns}
+    for label, vals in rows:
+        h += f"<tr><td style='{td}background:#fff;white-space:nowrap'>{label}</td>"
+        rt = 0
+        for b in buns:
+            v = int(round(vals.get(b, 0) or 0))
+            rt += v
+            col_tot[b] += v
+            h += f"<td style='{td}background:{COLORS.get(b, '#fff')}'>{f'{v:,}' if v else ''}</td>"
+        h += f"<td style='{td}background:{TOTAL_BG}'>{rt:,}</td></tr>"
+    h += f"<tr><td style='{td}background:#fff'></td>"
+    for b in buns:
+        h += f"<td style='{td}background:{SUM_BG};font-weight:800'>{col_tot[b]:,}</td>"
+    h += f"<td style='{td}background:{TOTAL_BG};font-weight:800'>{sum(col_tot.values()):,}</td></tr></table></div>"
+    if note:
+        h += f"<div style='font-size:.8rem;opacity:.75;margin:-6px 0 8px'>{note}</div>"
+    return h
+
+
 def get_data(cfg):
     prod, _ = read_csv(PROD_FILE, PROD_COLS)
     counts, _ = read_csv(COUNT_FILE, COUNT_COLS)
@@ -697,16 +752,15 @@ def page_live(cfg, can_edit):
     st.dataframe(df, hide_index=True, width="stretch", column_config={
         "Days of stock": st.column_config.ProgressColumn("Days of stock", min_value=0, max_value=10, format="%.1f d"),
         "In stock (pcs)": st.column_config.NumberColumn(format="%d")})
-    with st.expander("🗓️ Stock by production date (which batch to sell first)", expanded=True):
+    with st.expander("🗓️ Stock by production date (oldest at the top = sell first)", expanded=True):
         dates = sorted({k for v in batches.values() for k in v})
         if dates:
-            mat = pd.DataFrame([{**{"Bun": bun_label(b, names)},
-                                 **{f"{k:%d %b}": (f"{int(round(batches[b][k])):,}" if batches[b].get(k, 0) >= 0.5 else "")
-                                    for k in dates}} for b in buns if batches[b]])
-            st.dataframe(mat, hide_index=True, width="stretch")
-            st.caption("Columns = production date (oldest on the left = sell first).")
+            show = active_buns(buns, sales, batches)
+            st.markdown(excel_html(f"ស្តុកនំសរុប ({t:%d.%m.%Y}) — calculated now", [
+                (day_label(k), {b: batches[b].get(k, 0) for b in show}) for k in dates], show,
+                note=f"Older than {shelf} days = check / sell first."), unsafe_allow_html=True)
         else:
-            st.info("No stock yet. Start with a stock count in 📦 Stock count.")
+            st.info("No stock yet. Start with the evening stock count in 📦 Stock count.")
     with st.expander("📈 Total stock per day (last 21 days)"):
         if not hist.empty:
             h = hist[hist["Date"] >= t - timedelta(days=21)].groupby("Date")["Stock"].sum().reset_index()
@@ -714,39 +768,78 @@ def page_live(cfg, can_edit):
             st.line_chart(h.set_index("Date"))
 
 
+def _rerun_here():
+    """Refresh only this page (smooth); falls back to a full refresh when not inside a page refresh."""
+    try:
+        st.rerun(scope="fragment")
+    except st.errors.StreamlitAPIException:
+        st.rerun()
+
+
+def _grid_values(df, buns):
+    """Editor rows -> [(date, {bun: pcs})] (rows without a date or pcs are skipped)."""
+    out = []
+    for r in df.to_dict("records"):
+        try:
+            ts = pd.Timestamp(r.get("Production date"))
+        except (ValueError, TypeError):
+            continue
+        if pd.isna(ts):
+            continue
+        d = ts.date()
+        vals = {b: int(_num(r.get(short(b)))) for b in buns if _num(r.get(short(b))) > 0}
+        out.append((d, vals))
+    return out
+
+
+def _grid(rows, buns, key, height=None, max_date=None):
+    """Excel-like editor: one row per production date, one column per bun (your short names)."""
+    data = [{"Production date": d, **{short(b): (int(v[b]) if v.get(b) else None) for b in buns}} for d, v in rows]
+    df = pd.DataFrame(data, columns=["Production date"] + [short(b) for b in buns])
+    df["Production date"] = pd.to_datetime(df["Production date"])
+    for b in buns:                    # digits as text: an empty cell stays really empty (no grey 'None')
+        df[short(b)] = ["" if v is None or pd.isna(v) else str(int(v)) for v in df[short(b)]]
+    cfg = {"Production date": st.column_config.DateColumn("Date", format="ddd, MMM/DD, YY", max_value=max_date,
+                                                          required=True, width="medium")}
+    for b in buns:
+        cfg[short(b)] = st.column_config.TextColumn(short(b), help=f"{b} — pcs (numbers only)", width="small",
+                                                    validate=r"^[0-9]{0,6}$", max_chars=6)
+    return st.data_editor(df, key=key, num_rows="dynamic", hide_index=True, width="stretch", column_config=cfg,
+                          height=height or min(80 + 35 * (len(df) + 1), 560))
+
+
 def page_production(cfg, can_edit, me):
     st.subheader("🏭 Log production")
     prod, _rev = read_csv(PROD_FILE, PROD_COLS)
     _p, _c, _a, sales, names, buns = get_data(cfg)
+    show = active_buns(buns, sales)
     flash = st.session_state.pop("p_flash", None)
     if flash:
         st.success(flash)
     if can_edit:
-        with st.form("prod_form", clear_on_submit=True):
-            c1, c2 = st.columns([1, 2])
-            d = c1.date_input("Production date", value=today_kh(), max_value=today_kh() + timedelta(days=1))
-            note = c2.text_input("Note (optional)", max_chars=120)
-            st.caption("Type the pcs produced for each bun (leave 0 for buns not produced).")
-            cols = st.columns(4)
-            vals = {}
-            for i, b in enumerate(buns):
-                vals[b] = cols[i % 4].number_input(bun_label(b, names), min_value=0, max_value=100000, step=10, key=f"pq_{b}")
-            ok = st.form_submit_button("💾 Save production", type="primary")
-        if ok:
-            got = {b: v for b, v in vals.items() if v}
-            if not got:
-                st.warning("Enter at least one bun.")
-            else:
-                stamp = now_kh().strftime("%Y-%m-%d %H:%M:%S")
-                eid = uuid.uuid4().hex[:10]
-                new = pd.DataFrame([{"Saved_At": stamp, "Prod_Date": d.isoformat(), "Bun": b, "Pcs": str(int(v)),
-                                     "By": me, "Note": note.strip(), "Entry_Id": eid} for b, v in got.items()])
-                try:
-                    modify_csv(PROD_FILE, PROD_COLS, lambda df: pd.concat([df, new], ignore_index=True))
-                    st.session_state["p_flash"] = f"✅ Saved {sum(got.values()):,} pcs for {d:%d %b %Y} ({len(got)} buns)"
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Not saved: {e}")
+        st.markdown("Type the pcs produced like in your Excel sheet — **one row per production date** "
+                    "(add a row with ＋ for another day). Empty = 0.")
+        n = st.session_state.get("prod_grid_n", 0)
+        ed = _grid([(today_kh(), {})], show, key=f"prod_grid_{n}", height=120, max_date=today_kh() + timedelta(days=1))
+        got = [(d, v) for d, v in _grid_values(ed, show) if v]
+        if got:
+            st.markdown(excel_html("ផលិតថ្មី (not saved yet)", [(day_label(d), v) for d, v in got], show),
+                        unsafe_allow_html=True)
+        c1, c2 = st.columns([3, 1])
+        note = c1.text_input("Note (optional)", max_chars=120, key="prod_note")
+        c2.write("")
+        if c2.button("💾 Save production", type="primary", width="stretch", disabled=not got):
+            stamp, eid = now_kh().strftime("%Y-%m-%d %H:%M:%S"), uuid.uuid4().hex[:10]
+            new = pd.DataFrame([{"Saved_At": stamp, "Prod_Date": d.isoformat(), "Bun": b, "Pcs": str(int(v)),
+                                 "By": me, "Note": note.strip(), "Entry_Id": eid} for d, vals in got for b, v in vals.items()])
+            try:
+                modify_csv(PROD_FILE, PROD_COLS, lambda df: pd.concat([df, new], ignore_index=True))
+                st.session_state["p_flash"] = (f"✅ Saved {int(new['Pcs'].astype(int).sum()):,} pcs · "
+                                               + ", ".join(f"{d:%d %b}" for d, _v in got))
+                st.session_state["prod_grid_n"] = n + 1           # empty sheet for the next entry
+                _rerun_here()
+            except Exception as e:
+                st.error(f"Not saved: {e}")
     else:
         st.info("👁️ View only — ask Admin for edit access to log production.")
     st.markdown("**📋 Production logged**")
@@ -759,16 +852,14 @@ def page_production(cfg, can_edit, me):
     if view.empty:
         st.info("Nothing logged in these dates.")
         return
-    view = view.assign(Pcs=view["Pcs"].map(_num).astype(int))
-    piv = view.pivot_table(index="_d", columns="Bun", values="Pcs", aggfunc="sum", fill_value=0)
-    piv = piv[[b for b in buns if b in piv.columns]]
-    piv["TOTAL"] = piv.sum(axis=1)
-    piv.index = [f"{x:%a %d %b}" for x in piv.index]
-    st.dataframe(piv, width="stretch")
-    with st.expander(f"✏️ Fix a saved entry ({len(view)} lines)"):
+    view = view.assign(_n=view["Pcs"].map(_num))
+    by_day = view.groupby(["_d", "Bun"])["_n"].sum()
+    rows = [(day_label(d), {b: by_day.get((d, b), 0) for b in show}) for d in sorted(set(view["_d"]))]
+    st.markdown(excel_html(f"ផលិត ({d_from:%d.%m} – {d_to:%d.%m.%Y})", rows, show), unsafe_allow_html=True)
+    with st.expander(f"✏️ Fix or delete a saved line ({len(view)} lines)"):
         mine = view if st.session_state.get("p_role") == "admin" else view[view["By"] == me]
         if not can_edit or mine.empty:
-            st.caption("Only your own entries (Admin: all) can be changed here.")
+            st.caption("Only your own lines (Admin: all) can be changed here.")
             return
         ed = st.data_editor(mine[["Saved_At", "Prod_Date", "Bun", "Pcs", "By", "Note", "Entry_Id"]].assign(Delete=False),
                             hide_index=True, width="stretch", key="prod_fix",
@@ -776,73 +867,207 @@ def page_production(cfg, can_edit, me):
                             column_config={"Pcs": st.column_config.NumberColumn(min_value=0, step=10),
                                            "Delete": st.column_config.CheckboxColumn("🗑️ Delete")})
         if st.button("💾 Save fixes", key="prod_fix_save"):
-            changes = {(r["Entry_Id"], r["Bun"]): r for r in ed.to_dict("records")}
+            changes = {(r["Entry_Id"], r["Bun"], r["Prod_Date"]): r for r in ed.to_dict("records")}
 
             def apply(df):
                 keep = []
                 for _, r in df.iterrows():
-                    k = (r["Entry_Id"], r["Bun"])
+                    k = (r["Entry_Id"], r["Bun"], r["Prod_Date"])
                     if k in changes:
                         c = changes[k]
                         if c["Delete"]:
                             continue
-                        r["Pcs"], r["Prod_Date"], r["Note"] = str(int(_num(c["Pcs"]))), str(c["Prod_Date"])[:10], c["Note"]
+                        r["Pcs"], r["Note"] = str(int(_num(c["Pcs"]))), c["Note"]
                     keep.append(r)
                 return pd.DataFrame(keep, columns=PROD_COLS)
             try:
                 modify_csv(PROD_FILE, PROD_COLS, apply)
                 st.session_state["p_flash"] = "✅ Fixes saved"
-                st.rerun()
+                _rerun_here()
             except Exception as e:
                 st.error(f"Not saved: {e}")
 
 
+def _place_of(row, places):
+    p = str(row.get("Place", "") or "").strip()
+    if p:
+        return p
+    return places[1] if len(places) > 1 and "ទូរកក" in str(row.get("By", "")) else places[0]
+
+
+def last_place_counts(counts, places):
+    """{place: (count_date, {(prod_date, bun): pcs})} — the newest count of each freezer."""
+    out = {}
+    if counts.empty:
+        return out
+    c = counts.copy()
+    c["_cd"] = c["Count_Date"].map(_day)
+    c = c[c["_cd"].notna()]
+    c["_pl"] = [_place_of(r, places) for r in c.to_dict("records")]
+    for pl, g in c.groupby("_pl"):
+        g = g.sort_values(["_cd", "Saved_At"])
+        last = g[g["Count_Id"] == g["Count_Id"].iloc[-1]]
+        vals = {}
+        for r in last.to_dict("records"):
+            pd_ = _day(r["Prod_Date"])
+            if pd_ and _num(r["Pcs"]) > 0:
+                vals[(pd_, r["Bun"])] = vals.get((pd_, r["Bun"]), 0) + _num(r["Pcs"])
+        out[pl] = (last["_cd"].iloc[0], vals)
+    return out
+
+
+def count_sheet_excel(places, sheets, buns, cd):
+    """Printable count sheet in your layout (one sheet per freezer), pre-filled."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    wb = Workbook()
+    wb.remove(wb.active)
+    thin = Side(style="thin", color="333333")
+    box = Border(left=thin, right=thin, top=thin, bottom=thin)
+    fill = lambda c: PatternFill("solid", fgColor=c.replace("#", ""))
+    for pl in places:
+        ws = wb.create_sheet(re.sub(r"[\[\]\*\?/\\:]", "", pl)[:28] or "Count")
+        rows = sheets.get(pl, [])
+        n = len(buns)
+        ws.cell(1, 1, f"{pl}({cd:%d.%m.%Y})").font = Font(bold=True, size=13)
+        ws.cell(2, 1, "Date").font = Font(bold=True)
+        ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=1 + n)
+        ws.cell(2, 2, f"{pl} ({cd:%d.%m.%Y})").alignment = Alignment(horizontal="center")
+        ws.cell(2, 2 + n, "សរុប")
+        ws.cell(3, 1, "Item")
+        for i, b in enumerate(buns):
+            ws.cell(3, 2 + i, short(b))
+        for c in range(1, 3 + n):
+            for r in (2, 3):
+                cell = ws.cell(r, c)
+                cell.border, cell.font = box, Font(bold=True, size=12)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.fill = fill(HEAD_BG if r == 2 else (COLORS.get(buns[c - 2], "#FFFFFF") if 1 < c < 2 + n
+                                                          else ("#FFFF00" if c == 2 + n else "#FFFFFF")))
+        body = list(rows) + [(None, {})] * 4                     # 4 empty lines to write new dates
+        for j, (d, vals) in enumerate(body):
+            r = 4 + j
+            ws.cell(r, 1, day_label(d) if d else "")
+            for i, b in enumerate(buns):
+                ws.cell(r, 2 + i, int(vals[b]) if vals.get(b) else None)
+            ws.cell(r, 2 + n, f"=SUM(B{r}:{ws.cell(r, 1 + n).column_letter}{r})")
+            for c in range(1, 3 + n):
+                cell = ws.cell(r, c)
+                cell.border, cell.number_format = box, "#,##0"
+                cell.alignment = Alignment(horizontal="center")
+                cell.fill = fill(COLORS.get(buns[c - 2], "#FFFFFF") if 1 < c < 2 + n else (TOTAL_BG if c == 2 + n else "#FFFFFF"))
+        tr = 4 + len(body)
+        for c in range(2, 3 + n):
+            L = ws.cell(tr, c).column_letter
+            cell = ws.cell(tr, c, f"=SUM({L}4:{L}{tr - 1})")
+            cell.border, cell.font, cell.number_format = box, Font(bold=True), "#,##0"
+            cell.alignment, cell.fill = Alignment(horizontal="center"), fill(SUM_BG if c < 2 + n else TOTAL_BG)
+        ws.column_dimensions["A"].width = 18
+        for c in range(2, 3 + n):
+            ws.column_dimensions[ws.cell(1, c).column_letter].width = 9
+        ws.freeze_panes = "B4"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def page_count(cfg, can_edit, me):
-    st.subheader("📦 Stock count & adjustments")
-    _p, counts, adjs, sales, names, buns = get_data(cfg)
+    st.subheader("📦 Evening stock count")
+    prod, counts, adjs, sales, names, buns = get_data(cfg)
+    places = list(cfg.get("places") or DEFAULT_SETTINGS["places"])
     flash = st.session_state.pop("c_flash", None)
     if flash:
         st.success(flash)
-    st.markdown("**1️⃣ Physical stock count** — the real pcs in the freezer at the **end** of the count date, "
-                "by production date. It replaces the calculated stock of the buns you count.")
-    if can_edit:
-        cd = st.date_input("Count date (stock at the end of this day)", value=today_kh() - timedelta(days=1),
-                           max_value=today_kh(), key="cnt_date")
-        base = pd.DataFrame([{"Bun": bun_label(b, names), "Production date": cd, "Pcs": 0} for b in buns])
-        st.caption("One line per bun and production date. Add lines (＋ at the bottom) for buns with several batches. "
-                   "Buns left at 0 pcs are counted as empty only if you tick them below.")
-        ed = st.data_editor(base, num_rows="dynamic", hide_index=True, width="stretch", key=f"cnt_ed_{cd}",
-                            column_config={
-                                "Bun": st.column_config.SelectboxColumn("Bun", options=[bun_label(b, names) for b in buns], required=True),
-                                "Production date": st.column_config.DateColumn("Production date", max_value=cd, required=True),
-                                "Pcs": st.column_config.NumberColumn("Pcs", min_value=0, step=10, required=True)})
-        zero_ok = st.multiselect("Buns that are really EMPTY (0 pcs) on this date", [bun_label(b, names) for b in buns],
-                                 key="cnt_zero")
-        if st.button("💾 Save stock count", type="primary", key="cnt_save"):
-            lab2code = {bun_label(b, names): b for b in buns}
-            lines = [r for r in ed.to_dict("records") if r.get("Bun") and _num(r.get("Pcs")) > 0]
-            counted = {lab2code[r["Bun"]] for r in lines} | {lab2code[z] for z in zero_ok}
-            if not counted:
-                st.warning("Enter pcs for at least one bun (or tick a bun as empty).")
-            else:
+    c1, c2 = st.columns([1, 2])
+    cd = c1.date_input("Count date (stock at the END of this day)", value=today_kh(), max_value=today_kh(), key="cnt_date")
+    expected, _short, _h, _nc = compute_stock(buns, prod, counts, adjs, sales, cd)
+    show = active_buns(buns, sales, expected)
+    lastp = last_place_counts(counts, places)
+    c2.caption("Count every freezer in the evening, after the last delivery. Each tab is one freezer, laid out like your "
+               "Excel sheet. It starts filled in — **only change the numbers that are different**, add a row (＋) for a "
+               "date that is missing, clear a cell that is empty in the freezer.")
+    # what each freezer probably holds now: other freezers = their last count, the first freezer = the rest
+    other = {}
+    for pl in places[1:]:
+        for (d, b), v in lastp.get(pl, (None, {}))[1].items():
+            if d <= cd:
+                other[(d, b)] = other.get((d, b), 0) + v
+    start_rows = {}
+    for i, pl in enumerate(places):
+        if i == 0:
+            vals = {}
+            for b in show:
+                for d, v in expected.get(b, {}).items():
+                    rest = v - other.get((d, b), 0)
+                    if rest >= 0.5:
+                        vals.setdefault(d, {})[b] = round(rest)
+            vals.setdefault(cd, {})
+        else:
+            vals = {}
+            for (d, b), v in lastp.get(pl, (None, {}))[1].items():
+                if b in show and d <= cd:
+                    vals.setdefault(d, {})[b] = v
+        start_rows[pl] = sorted(vals.items())
+    mode = st.radio("Start the sheets from", ["🧮 What the app expects (recommended)", "⬜ Empty sheets"],
+                    horizontal=True, key="cnt_mode")
+    if mode.startswith("⬜"):
+        start_rows = {pl: [(cd, {})] for pl in places}
+    tabs = st.tabs([f"🧊 {pl}" for pl in places] + ["✅ Check & save"])
+    counted = {}
+    for pl, tab in zip(places, tabs):
+        with tab:
+            ed = _grid(start_rows[pl], show, key=f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}",
+                       max_date=cd)
+            counted[pl] = _grid_values(ed, show)
+            st.markdown(excel_html(f"{pl} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted[pl])], show),
+                        unsafe_allow_html=True)
+    with tabs[-1]:
+        tot_c = {b: sum(v.get(b, 0) for pl in places for _d, v in counted[pl]) for b in show}
+        tot_e = {b: sum(expected.get(b, {}).values()) for b in show}
+        chk = pd.DataFrame([{"Bun": short(b), "Code": b, "App expected": int(round(tot_e[b])), "Counted": int(tot_c[b]),
+                             "Difference": int(tot_c[b] - round(tot_e[b]))} for b in show])
+        chk.loc[len(chk)] = ["សរុប", "", int(chk["App expected"].sum()), int(chk["Counted"].sum()), int(chk["Difference"].sum())]
+        st.dataframe(chk.style.map(lambda v: "color:#c62828;font-weight:700" if isinstance(v, (int, float)) and v < 0
+                                   else ("color:#2e7d32;font-weight:700" if isinstance(v, (int, float)) and v > 0 else ""),
+                                   subset=["Difference"]), hide_index=True, width="stretch")
+        st.caption("Difference = counted − what the app expected from the last count + production − journal sales. "
+                   "A big minus = sold/taken without invoice, damaged, or production not logged.")
+        all_rows = {}
+        for pl in places:
+            for d, v in counted[pl]:
+                for b, n in v.items():
+                    all_rows[(d, b)] = all_rows.get((d, b), 0) + n
+        st.markdown(excel_html(f"ស្តុកនំសរុប ({cd:%d.%m.%Y}) — all freezers",
+                               [(day_label(d), {b: all_rows.get((d, b), 0) for b in show})
+                                for d in sorted({d for d, _b in all_rows})], show), unsafe_allow_html=True)
+        if can_edit:
+            if st.button(f"💾 Save the evening count ({int(sum(tot_c.values())):,} pcs)", type="primary", key="cnt_save"):
                 cid, stamp = uuid.uuid4().hex[:10], now_kh().strftime("%Y-%m-%d %H:%M:%S")
-                new = [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": lab2code[r["Bun"]],
-                        "Prod_Date": pd.Timestamp(r["Production date"]).date().isoformat(), "Pcs": str(int(_num(r["Pcs"]))),
-                        "By": me, "Count_Id": cid} for r in lines]
-                new += [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": lab2code[z], "Prod_Date": cd.isoformat(),
-                         "Pcs": "0", "By": me, "Count_Id": cid} for z in zero_ok if lab2code[z] not in {lab2code[r["Bun"]] for r in lines}]
+                new = [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": b, "Prod_Date": d.isoformat(),
+                        "Pcs": str(int(n)), "By": me, "Count_Id": cid, "Place": pl}
+                       for pl in places for d, v in counted[pl] for b, n in v.items()]
+                have = {r["Bun"] for r in new}
+                new += [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": b, "Prod_Date": cd.isoformat(), "Pcs": "0",
+                         "By": me, "Count_Id": cid, "Place": places[0]} for b in buns if b not in have]   # counted empty
                 try:
                     modify_csv(COUNT_FILE, COUNT_COLS, lambda df: pd.concat([df, pd.DataFrame(new)], ignore_index=True))
-                    st.session_state["c_flash"] = f"✅ Count saved for {len(counted)} buns ({cd:%d %b %Y})"
-                    st.rerun()
+                    st.session_state["c_flash"] = f"✅ Evening count saved for {cd:%d %b %Y}: {int(sum(tot_c.values())):,} pcs"
+                    st.session_state["cnt_n"] = st.session_state.get("cnt_n", 0) + 1
+                    _rerun_here()
                 except Exception as e:
                     st.error(f"Not saved: {e}")
+        else:
+            st.info("👁️ View only — ask Admin for edit access to save a count.")
+        st.download_button("📥 Count sheet for printing (Excel, your layout)",
+                           data=count_sheet_excel(places, {pl: sorted(counted[pl]) for pl in places}, show, cd),
+                           file_name=f"Stock_count_{cd:%Y-%m-%d}.xlsx", key="cnt_xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     lc = latest_counts(counts)
     if lc:
-        st.caption("Latest count per bun: " + " · ".join(f"{b} {v[0]:%d %b}" for b, v in sorted(lc.items())))
+        st.caption("Last saved count: " + ", ".join(sorted({f"{v[0]:%d %b %Y}" for v in lc.values()})))
     st.divider()
-    st.markdown("**2️⃣ Adjustment** — buns that leave or enter stock without a sale invoice "
-                "(damaged, samples, staff meals, returned, found in count...).")
+    st.markdown("**➕➖ Adjustment** — buns that leave or enter stock without a sale invoice "
+                "(damaged, samples, staff meals, returned...).")
     if can_edit:
         with st.form("adj_form", clear_on_submit=True):
             c1, c2, c3, c4 = st.columns([1.3, 1, 1, 1.4])
@@ -853,7 +1078,7 @@ def page_count(cfg, can_edit, me):
             c5, c6 = st.columns([1, 2])
             pdte = c5.date_input("Batch production date (optional)", value=None)
             reason = c6.selectbox("Reason", ["Damaged / broken", "Expired / old", "Sample / FOC not in journal",
-                                             "Staff meal", "Returned by customer", "Count difference", "Other"])
+                                             "Staff meal", "Returned by customer", "Other"])
             ok = st.form_submit_button("💾 Save adjustment")
         if ok:
             code = {bun_label(x, names): x for x in buns}[b]
@@ -863,7 +1088,7 @@ def page_count(cfg, can_edit, me):
             try:
                 modify_csv(ADJ_FILE, ADJ_COLS, lambda df: pd.concat([df, pd.DataFrame([row])], ignore_index=True))
                 st.session_state["c_flash"] = f"✅ Adjustment saved: {kind[2:]} {n:,} pcs {b}"
-                st.rerun()
+                _rerun_here()
             except Exception as e:
                 st.error(f"Not saved: {e}")
     if not adjs.empty:
