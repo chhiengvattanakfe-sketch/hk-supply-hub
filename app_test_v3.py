@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import threading
@@ -103,6 +104,7 @@ DEFAULT_SETTINGS = {
     "places": ["ស្តុកនំក្នុងទូរ", "ស្តុកទូរកក"],   # freezers counted every evening (one tab each)
     "tasks": DEFAULT_TASKS,         # daily checklist (Admin adds / assigns in ⚙️ Settings and 📋 Tasks)
     "prod_staff": [],               # names offered in "👷 Produced by"
+    "crate_pcs_default": 100,       # 🧊 3D rooms: rooms / bun_room / crate_pcs are set in ⚙️ Settings
 }
 
 
@@ -1752,7 +1754,8 @@ def page_settings(cfg, me):
                               help="auto = by role (above)")}) if urows else None
     dflt = cfg.get("access_default", "view")
 
-    extra = users_admin_box(cfg)
+    extra = rooms_settings(cfg, buns, names, n)
+    extra.update(users_admin_box(cfg))
 
     if st.button("💾 Save settings", type="primary", key="set_save"):
         new = dict(cfg)
@@ -1781,6 +1784,321 @@ def page_settings(cfg, me):
             st.rerun()
         except Exception as e:
             st.error(f"Not saved: {e}")
+
+
+# ==========================================
+# 🧊 3D ROOMS — crates on racks, FIFO (oldest at the door side = pick first)
+# ==========================================
+CRATE_W, CRATE_D, CRATE_H = 0.60, 0.40, 0.30          # metres (one crate)
+AISLE = 1.3
+DEFAULT_ROOMS = [{"name": "❄️ Cooling room", "racks": 2, "bays": 5, "levels": 4, "across": 2, "high": 3},
+                 {"name": "🧊 Freezer room", "racks": 4, "bays": 8, "levels": 5, "across": 2, "high": 3}]
+CRATE_COLORS = {"N1": "#e8590c", "N2": "#1c7ed6", "N21": "#a0522d", "N22": "#495057", "N23": "#f08c00", "N3": "#4263eb",
+                "N31": "#fab005", "N32": "#9c6644", "N34": "#adb5bd", "N4": "#ced4da", "N41": "#ffd43b",
+                "N42": "#ff8787", "N43": "#40c057"}
+EXTRA_COLORS = ["#ae3ec9", "#0ca678", "#d6336c", "#5c940d", "#1098ad", "#7048e8", "#e67700"]
+
+
+def rooms_of(cfg):
+    out = []
+    for r in cfg.get("rooms") or DEFAULT_ROOMS:
+        try:
+            out.append({"name": str(r["name"]).strip(), **{k: max(1, int(r.get(k) or 1))
+                                                         for k in ("racks", "bays", "levels", "across", "high")}})
+        except Exception:
+            continue
+    return [r for r in out if r["name"]] or [dict(x) for x in DEFAULT_ROOMS]
+
+
+def room_of_bun(cfg, b, rooms):
+    names = [r["name"] for r in rooms]
+    r = (cfg.get("bun_room") or {}).get(b)
+    return r if r in names else names[-1]                       # not set yet: the last room (freezer)
+
+
+def crate_pcs(cfg, b):
+    try:
+        return max(1, int((cfg.get("crate_pcs") or {}).get(b) or cfg.get("crate_pcs_default") or 100))
+    except Exception:
+        return 100
+
+
+def _crate_color(b, i):
+    return CRATE_COLORS.get(b, EXTRA_COLORS[i % len(EXTRA_COLORS)])
+
+
+def room_layout(cfg, room, buns, batches, speed, names, t):
+    """Places every crate of the buns kept in this room on the racks.
+    Each bun gets its own block of bays (room for its target stock if possible); inside it the oldest
+    production date sits at the door side, bottom shelf first = the crate to pick first."""
+    R, B, L, A, H = room["racks"], room["bays"], room["levels"], room["across"], room["high"]
+    per_bay = L * A * H
+    bays_total = R * B
+    mine = [b for b in buns if room_of_bun(cfg, b, rooms_of(cfg)) == room["name"]]
+    crates, need_now, need_tgt = {}, {}, {}
+    for b in mine:
+        cp = crate_pcs(cfg, b)
+        lst = []
+        for d in sorted(batches.get(b, {})):
+            left = int(round(batches[b][d]))
+            while left > 0:
+                n = min(cp, left)
+                lst.append((d, n))
+                left -= n
+        crates[b] = lst
+        tgt = float(cfg["target_days"].get(b, cfg["target_default"])) * float(speed.get(b, 0))
+        need_now[b] = -(-len(lst) // per_bay)
+        need_tgt[b] = max(need_now[b], -(-int(math.ceil(tgt / cp)) // per_bay))
+    use = need_tgt if sum(need_tgt.values()) <= bays_total else need_now
+    bay_w, lvl_h, rack_d = A * CRATE_W + 0.10, H * CRATE_H + 0.14, CRATE_D + 0.10
+    rack_z = [i * (rack_d + AISLE) for i in range(R)]
+    boxes, ghosts, zones, picks, rows, overflow = [], [], [], [], [], {}
+    next_bay = 0
+    in_bay = [(lv, a, h) for lv in range(L) for a in range(A) for h in range(H)]   # bottom shelf first
+    for idx, b in enumerate(mine):
+        nb = use.get(b, 0)
+        if not nb and not crates[b]:
+            continue
+        nb = max(nb, 1)
+        give = list(range(next_bay, min(next_bay + nb, bays_total)))
+        next_bay += len(give)
+        slots = []
+        for g in give:                                            # bays in this bun's block, rack by rack
+            r, bay = divmod(g, B)
+            slots += [(r, bay, lv, a, h) for (lv, a, h) in in_bay]
+        col = _crate_color(b, idx)
+        cp = crate_pcs(cfg, b)
+        shelf = int(cfg.get("shelf_by_bun", {}).get(b, cfg.get("shelf_days", 10)))
+        for i, (d, n) in enumerate(crates[b]):
+            if i >= len(slots):
+                overflow[b] = overflow.get(b, 0) + 1
+                continue
+            r, bay, lv, a, h = slots[i]
+            age = (t - d).days
+            agec = "#2f9e44" if age <= 2 else "#fcc419" if age <= shelf * 0.6 else "#fd7e14" if age <= shelf else "#e03131"
+            loc = f"R{r + 1}-B{bay + 1}-L{lv + 1}"
+            info = (f"{bun_label(b, names)} · made {d:%d %b} ({age} d) · {n} pcs{'' if n == cp else ' (part crate)'} · "
+                    f"Rack {r + 1} · Bay {bay + 1} · Shelf {lv + 1}" + (" · 👉 PICK FIRST" if i == 0 else f" · pick #{i + 1}"))
+            boxes.append({"x": round(0.06 + bay * bay_w + a * CRATE_W, 3), "y": round(0.10 + lv * lvl_h + h * CRATE_H, 3),
+                          "z": round(rack_z[r] + 0.05, 3), "cb": col, "ca": agec, "bun": b, "i": info, "p": int(i == 0)})
+            rows.append({"Room": room["name"], "Rack": r + 1, "Bay": bay + 1, "Shelf": lv + 1, "Bun": bun_label(b, names),
+                         "Made": d.isoformat(), "Age (days)": age, "Pcs": n, "Pick order": i + 1})
+            if i == 0:
+                picks.append({"Bun": bun_label(b, names), "👉 Pick first at": loc, "Made": f"{d:%d %b}", "Age": f"{age} d",
+                              "Crates": len(crates[b]), "Pcs": int(sum(x[1] for x in crates[b]))})
+        for j in range(len(crates[b]), min(len(slots), len(crates[b]) + per_bay * 2)):
+            r, bay, lv, a, h = slots[j]                            # free reserved places (new production goes here)
+            if h == 0:
+                ghosts.append({"x": round(0.06 + bay * bay_w + a * CRATE_W, 3), "y": round(0.10 + lv * lvl_h, 3),
+                               "z": round(rack_z[r] + 0.05, 3), "cb": col, "bun": b,
+                               "i": f"{bun_label(b, names)} · free place for new crates · Rack {r + 1} · Bay {bay + 1} · Shelf {lv + 1}"})
+        if give:
+            r0, b0 = divmod(give[0], B)
+            r1, b1 = divmod(give[-1], B)
+            zones.append({"t": f"{short(b)} {names.get(b, '')}".strip(), "x": round((b0 + 0.5) * bay_w, 2),
+                          "y": round(L * lvl_h + 0.35, 2), "z": round(rack_z[r0] + rack_d / 2, 2), "c": col,
+                          "bun": b, "label": bun_label(b, names)})
+            if not picks or picks[-1]["Bun"] != bun_label(b, names):
+                picks.append({"Bun": bun_label(b, names), "👉 Pick first at": "– (no stock)", "Made": "", "Age": "",
+                              "Crates": 0, "Pcs": 0})
+            picks[-1]["Bays"] = (f"R{r0 + 1} B{b0 + 1}" + (f" → R{r1 + 1} B{b1 + 1}" if give[-1] != give[0] else ""))
+            picks[-1]["Space (crates)"] = len(slots)
+        elif crates[b]:
+            overflow[b] = len(crates[b])
+    frame = []
+    for ri, z in enumerate(rack_z):                                 # rack shelves and posts
+        for bay in range(B):
+            for lv in range(L + 1):
+                frame.append({"x": round(bay * bay_w, 3), "y": round(lv * lvl_h + 0.06, 3), "z": round(z, 3),
+                              "w": round(bay_w, 3), "h": 0.04, "d": round(rack_d, 3)})
+        for bay in range(B + 1):
+            frame.append({"x": round(bay * bay_w - 0.03, 3), "y": 0, "z": round(z, 3), "w": 0.06,
+                          "h": round(L * lvl_h + 0.1, 3), "d": 0.06})
+            frame.append({"x": round(bay * bay_w - 0.03, 3), "y": 0, "z": round(z + rack_d - 0.06, 3), "w": 0.06,
+                          "h": round(L * lvl_h + 0.1, 3), "d": 0.06})
+    size = {"x": round(B * bay_w, 2), "y": round(L * lvl_h + 0.2, 2), "z": round(rack_z[-1] + rack_d, 2)}
+    return {"boxes": boxes, "ghosts": ghosts, "zones": zones, "frame": frame, "size": size,
+            "cw": CRATE_W, "ch": CRATE_H, "cd": CRATE_D, "racks": [round(z, 2) for z in rack_z], "rack_d": rack_d,
+            "capacity": bays_total * per_bay, "used": len(boxes), "picks": picks, "rows": rows, "overflow": overflow,
+            "mine": mine}
+
+
+ROOM3D_HTML = r"""
+<div id="w" style="position:relative;font-family:system-ui,-apple-system,sans-serif">
+ <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+  <button id="cb" class="b on">🎨 Colour by bun</button><button id="ca" class="b">⏳ Colour by age</button>
+  <select id="fb" class="b"><option value="">All buns</option></select>
+  <button id="rv" class="b">↺ Reset view</button><button id="tv" class="b">⬇ Top view</button>
+ </div>
+ <canvas id="c" style="width:100%;height:__H__px;touch-action:none;border-radius:10px;background:linear-gradient(#eef3f8,#dfe7ef)"></canvas>
+ <div id="info" style="min-height:40px;margin-top:6px;padding:8px 10px;border-radius:8px;background:#f1f3f5;font-size:14px">
+  👆 Tap a crate to see the bun, production date and place. Drag to turn · pinch / wheel to zoom.</div>
+ <div id="lg" style="font-size:12px;margin-top:4px;opacity:.85"></div>
+</div>
+<style>.b{border:1px solid #ccd;background:#fff;border-radius:8px;padding:6px 10px;font-size:13px;cursor:pointer}
+.b.on{background:#1c7ed6;color:#fff;border-color:#1c7ed6}</style>
+<script>
+const D=__DATA__;
+const cv=document.getElementById('c'),ctx=cv.getContext('2d'),info=document.getElementById('info');
+let mode='bun',only='',sel=null,DPR=window.devicePixelRatio||1;
+const C={x:D.size.x/2,y:D.size.y/3,z:D.size.z/2};
+const R0=Math.max(D.size.x,D.size.z,D.size.y)*1.45+1.5;
+let yaw=-0.65,pitch=-0.5,dist=R0;
+const fb=document.getElementById('fb');
+D.zones.forEach(z=>{const o=document.createElement('option');o.value=z.bun;o.textContent=z.label;fb.appendChild(o);});
+document.getElementById('lg').innerHTML = (mode==='bun'?'':'')+
+ '⏳ age colours: <b style="color:#2f9e44">■</b> 0–2 d · <b style="color:#fcc419">■</b> fresh · <b style="color:#fd7e14">■</b> near shelf life · <b style="color:#e03131">■</b> too old'+
+ ' &nbsp;·&nbsp; 🔲 dashed = free place kept for this bun · ⭐ = pick first · 🚪 door / pick side on the left';
+function shade(hex,f,a){const n=parseInt(hex.slice(1),16);let r=(n>>16)&255,g=(n>>8)&255,b=n&255;
+ r=Math.min(255,r*f|0);g=Math.min(255,g*f|0);b=Math.min(255,b*f|0);return `rgba(${r},${g},${b},${a})`;}
+function size(){const r=cv.getBoundingClientRect();cv.width=r.width*DPR;cv.height=r.height*DPR;}
+function cam(){const cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch);
+ return {cy,sy,cp,sp,pos:{x:C.x-dist*cp*sy,y:C.y-dist*sp,z:C.z-dist*cp*cy}};}
+function proj(k,v){const px=v[0]-C.x,py=v[1]-C.y,pz=v[2]-C.z;
+ const x1=px*k.cy-pz*k.sy,z1=px*k.sy+pz*k.cy;const y2=py*k.cp-z1*k.sp,z2=py*k.sp+z1*k.cp;
+ const dep=dist+z2,f=Math.min(cv.width,cv.height)*1.15;
+ return [cv.width/2+f*x1/dep,cv.height/2-f*y2/dep,dep];}
+const FACES=[[[0,0,0],[0,0,1],[0,1,1],[0,1,0],[-1,0,0],.72],[[1,0,0],[1,1,0],[1,1,1],[1,0,1],[1,0,0],.72],
+ [[0,0,0],[1,0,0],[1,0,1],[0,0,1],[0,-1,0],.5],[[0,1,0],[0,1,1],[1,1,1],[1,1,0],[0,1,0],1],
+ [[0,0,0],[0,1,0],[1,1,0],[1,0,0],[0,0,-1],.86],[[0,0,1],[1,0,1],[1,1,1],[0,1,1],[0,0,1],.86]];
+let drawn=[];
+function addBox(list,k,b,w,h,d,fill,alpha,kind,ref){
+ for(const f of FACES){const n=f[4];
+  const cx=b.x+w*(n[0]>0?1:n[0]<0?0:.5),cy=b.y+h*(n[1]>0?1:n[1]<0?0:.5),cz=b.z+d*(n[2]>0?1:n[2]<0?0:.5);
+  const dot=n[0]*(k.pos.x-cx)+n[1]*(k.pos.y-cy)+n[2]*(k.pos.z-cz); if(dot<=0) continue;
+  const pts=f.slice(0,4).map(q=>proj(k,[b.x+q[0]*w,b.y+q[1]*h,b.z+q[2]*d]));
+  const dep=pts.reduce((s,p)=>s+p[2],0)/4;
+  list.push({pts,dep,col:shade(fill,f[5],alpha),kind,ref,stroke:kind==='crate'});}}
+function draw(){const k=cam();ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,cv.width,cv.height);
+ // floor
+ const fl=[[-1.2,0,-0.6],[D.size.x+0.6,0,-0.6],[D.size.x+0.6,0,D.size.z+0.6],[-1.2,0,D.size.z+0.6]].map(v=>proj(k,v));
+ ctx.beginPath();fl.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));ctx.closePath();ctx.fillStyle='#cfd8e3';ctx.fill();
+ // aisle lines
+ ctx.strokeStyle='rgba(255,200,0,.9)';ctx.lineWidth=2*DPR;
+ D.racks.forEach(z=>{const a=proj(k,[-1.2,0.001,z+D.rack_d+0.35]),b=proj(k,[D.size.x+0.6,0.001,z+D.rack_d+0.35]);
+  ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();});
+ const L=[];
+ D.frame.forEach(f=>addBox(L,k,f,f.w,f.h,f.d,'#8a96a3',1,'frame',null));
+ D.boxes.forEach(b=>{const dim=only&&b.bun!==only;
+  addBox(L,k,b,D.cw-0.03,D.ch-0.02,D.cd-0.02,mode==='bun'?b.cb:b.ca,dim?0.12:1,'crate',b);});
+ D.ghosts.forEach(g=>{if(only&&g.bun!==only)return;addBox(L,k,g,D.cw-0.03,0.05,D.cd-0.02,g.cb,0.25,'ghost',g);});
+ L.sort((a,b)=>b.dep-a.dep);drawn=L;
+ for(const p of L){ctx.beginPath();p.pts.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.closePath();
+  ctx.fillStyle=p.col;ctx.fill();
+  if(p.kind==='crate'){const hi=(sel&&p.ref===sel);ctx.lineWidth=(hi?3:(p.ref.p?2:0.6))*DPR;
+   ctx.strokeStyle=hi?'#000':(p.ref.p?'#c92a2a':'rgba(0,0,0,.35)');ctx.stroke();}
+  else if(p.kind==='ghost'){ctx.setLineDash([4*DPR,3*DPR]);ctx.lineWidth=1*DPR;ctx.strokeStyle='rgba(0,0,0,.45)';ctx.stroke();ctx.setLineDash([]);}}
+ // labels
+ ctx.textAlign='center';ctx.textBaseline='middle';
+ const used=[];   // labels: nearest first, skip one that would cover another (filter a bun to see it)
+ D.zones.map(z=>[z,proj(k,[z.x,z.y,z.z])]).sort((a,b)=>a[1][2]-b[1][2]).forEach(([z,p])=>{if(only&&z.bun!==only)return;
+  const fs=Math.max(10,Math.min(15,300/p[2]))*DPR;
+  ctx.font=`bold ${fs}px system-ui,sans-serif`;const w=ctx.measureText(z.t).width+12*DPR;
+  const rc=[p[0]-w/2,p[1]-fs*0.75,w,fs*1.5];
+  if(!only&&used.some(u=>rc[0]<u[0]+u[2]&&u[0]<rc[0]+rc[2]&&rc[1]<u[1]+u[3]&&u[1]<rc[1]+rc[3]))return;used.push(rc);
+  ctx.fillStyle='rgba(255,255,255,.9)';ctx.fillRect(rc[0],rc[1],rc[2],rc[3]);
+  ctx.fillStyle=z.c;ctx.fillRect(p[0]-w/2,p[1]-fs*0.75,5*DPR,fs*1.5);ctx.fillStyle='#111';ctx.fillText(z.t,p[0]+2*DPR,p[1]);});
+ D.boxes.forEach(b=>{if(!b.p||(only&&b.bun!==only))return;const p=proj(k,[b.x+D.cw/2,b.y+D.ch+0.05,b.z+D.cd/2]);
+  ctx.font=`${12*DPR}px system-ui`;ctx.fillText('⭐',p[0],p[1]);});
+ const dp=proj(k,[-1.5,0.05,-1.1]);ctx.font=`bold ${12*DPR}px system-ui`;ctx.fillStyle='#000';ctx.fillText('🚪 Door · pick side',dp[0],dp[1]);
+ D.racks.forEach((z,i)=>{const p=proj(k,[-0.45,0.05,z+D.rack_d/2]);ctx.font=`bold ${11*DPR}px system-ui`;ctx.fillStyle='#333';ctx.fillText('Rack '+(i+1),p[0],p[1]);});
+}
+let raf=0;function redraw(){if(!raf)raf=requestAnimationFrame(()=>{raf=0;draw();});}
+function inside(pt,poly){let c=false;for(let i=0,j=poly.length-1;i<poly.length;j=i++){const a=poly[i],b=poly[j];
+ if(((a[1]>pt[1])!==(b[1]>pt[1]))&&(pt[0]<(b[0]-a[0])*(pt[1]-a[1])/(b[1]-a[1])+a[0]))c=!c;}return c;}
+function pick(e){const r=cv.getBoundingClientRect();const pt=[(e.clientX-r.left)*DPR,(e.clientY-r.top)*DPR];
+ for(let i=drawn.length-1;i>=0;i--){const p=drawn[i];if(p.kind==='frame')continue;if(inside(pt,p.pts))return p.ref;}return null;}
+let drag=null,pinch=null,moved=0;
+cv.addEventListener('pointerdown',e=>{cv.setPointerCapture(e.pointerId);drag={x:e.clientX,y:e.clientY};moved=0;});
+cv.addEventListener('pointermove',e=>{if(!drag||pinch)return;const dx=e.clientX-drag.x,dy=e.clientY-drag.y;moved+=Math.abs(dx)+Math.abs(dy);
+ yaw+=dx*0.008;pitch=Math.max(-1.55,Math.min(-0.03,pitch+dy*0.006));drag={x:e.clientX,y:e.clientY};redraw();});
+cv.addEventListener('pointerup',e=>{if(drag&&moved<6){sel=pick(e);info.innerHTML=sel?('📦 '+sel.i):'👆 Tap a crate to see the bun, production date and place.';redraw();}drag=null;});
+cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(R0*0.15,Math.min(R0*3,dist*(e.deltaY>0?1.1:0.9)));redraw();},{passive:false});
+cv.addEventListener('touchstart',e=>{if(e.touches.length===2){const a=e.touches[0],b=e.touches[1];pinch={d:Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY),dist};}},{passive:true});
+cv.addEventListener('touchmove',e=>{if(pinch&&e.touches.length===2){const a=e.touches[0],b=e.touches[1];
+ dist=Math.max(R0*0.15,Math.min(R0*3,pinch.dist*pinch.d/Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY)));redraw();}},{passive:true});
+cv.addEventListener('touchend',e=>{if(e.touches.length<2)setTimeout(()=>pinch=null,50);},{passive:true});
+function setMode(m){mode=m;document.getElementById('cb').classList.toggle('on',m==='bun');document.getElementById('ca').classList.toggle('on',m==='age');redraw();}
+document.getElementById('cb').onclick=()=>setMode('bun');document.getElementById('ca').onclick=()=>setMode('age');
+fb.onchange=()=>{only=fb.value;sel=null;redraw();};
+document.getElementById('rv').onclick=()=>{yaw=-0.65;pitch=-0.5;dist=R0;redraw();};
+document.getElementById('tv').onclick=()=>{yaw=0;pitch=-1.5;dist=R0*0.9;redraw();};
+window.addEventListener('resize',()=>{size();redraw();});size();draw();
+</script>"""
+
+
+def page_rooms(cfg):
+    st.subheader("🧊 3D rooms — crates on the racks (FIFO)")
+    prod, counts, adjs, sales, names, buns = get_data(cfg)
+    t = today_kh()
+    batches, _short, _h, _nc = compute_stock(buns, prod, counts, adjs, sales, t)
+    speed, _n = sales_speed(sales, buns, t, int(cfg["lookback_days"]))
+    rooms = rooms_of(cfg)
+    if not cfg.get("bun_room"):
+        st.info("ℹ️ Rooms are not set yet, so every bun is shown in the last room. Admin: ⚙️ Settings → "
+                "🧊 Rooms, racks and crates — choose the room of each bun, the racks and the pcs per crate.")
+    lay = {r["name"]: room_layout(cfg, r, buns, batches, speed, names, t) for r in rooms}
+    labels = [r["name"] for r in rooms]
+    pick = st.radio("Room", labels, horizontal=True, key="room_pick",
+                    format_func=lambda x: f"{x} · {lay[x]['used']:,} / {lay[x]['capacity']:,} crates")
+    L = lay[pick]
+    cap = L["capacity"] or 1
+    tiles([("📦 Crates now", f"{L['used']:,}", f"of {cap:,} places"),
+           ("📐 Room full", f"{L['used'] / cap * 100:.0f}%", f"{cap - L['used']:,} places free"),
+           ("🥟 Buns here", len(L["mine"]), ", ".join(short(b) for b in L["mine"])[:60] or "-"),
+           ("⚠️ No place", f"{sum(L['overflow'].values()):,}", "crates do not fit")])
+    if L["overflow"]:
+        st.error("⚠️ Not enough rack places: " + ", ".join(f"{bun_label(b, names)} {n} crates" for b, n in L["overflow"].items())
+                 + " — add racks / shelves in Settings or move a bun to the other room.")
+    view = {k: L[k] for k in ("boxes", "ghosts", "zones", "frame", "size", "cw", "ch", "cd", "racks", "rack_d")}
+    h = 420 if st.session_state.get("phone_mode") else 560
+    components.html(ROOM3D_HTML.replace("__DATA__", json.dumps(view, ensure_ascii=False)).replace("__H__", str(h)),
+                    height=h + 150)
+    st.markdown("#### 👉 Pick first — oldest crate of each bun")
+    if L["picks"]:
+        st.dataframe(pd.DataFrame(L["picks"]), hide_index=True, width="stretch")
+    st.caption("FIFO rule: take crates from the door side (Bay 1, bottom shelf first); put new crates at the back of "
+               "the bun's block (the dashed free places). Places follow today's live stock and change as stock moves.")
+    rows = [r for x in lay.values() for r in x["rows"]]
+    if rows:
+        st.download_button("⬇️ Crate map — both rooms (CSV)", pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"crate_map_{t}.csv", mime="text/csv")
+
+
+def rooms_settings(cfg, buns, names, n):
+    """⚙️ Settings part: the rooms, and the room + pcs per crate of every bun. Returns the new values."""
+    st.markdown("#### 🧊 Rooms, racks and crates (for 🧊 3D rooms)")
+    st.caption("One row per room. Racks = rack rows · Bays = sections along one rack · Shelves = levels · "
+               "Across = crates side by side on one shelf of a bay · High = crates stacked on one shelf.")
+    rdf = pd.DataFrame([{"Room": r["name"], "Racks": r["racks"], "Bays per rack": r["bays"], "Shelves": r["levels"],
+                         "Across": r["across"], "High": r["high"]} for r in rooms_of(cfg)])
+    red = st.data_editor(rdf, hide_index=True, width="stretch", num_rows="dynamic", key=f"set_rooms_{n}",
+                         column_config={"Room": st.column_config.TextColumn("Room", required=True),
+                                        **{c: st.column_config.NumberColumn(c, min_value=1, max_value=60, step=1, required=True)
+                                           for c in ["Racks", "Bays per rack", "Shelves", "Across", "High"]}})
+    rooms = []
+    for r in red.to_dict("records"):
+        if str(r.get("Room") or "").strip():
+            try:
+                rooms.append({"name": str(r["Room"]).strip(), "racks": int(r["Racks"]), "bays": int(r["Bays per rack"]),
+                              "levels": int(r["Shelves"]), "across": int(r["Across"]), "high": int(r["High"])})
+            except Exception:
+                pass
+    rooms = rooms or rooms_of(cfg)
+    st.caption("Places: " + " · ".join(f"{r['name']} = {r['racks'] * r['bays'] * r['levels'] * r['across'] * r['high']:,} crates"
+                                       for r in rooms))
+    rn = [r["name"] for r in rooms]
+    bdf = pd.DataFrame([{"Bun": b, "Name": names.get(b, ""), "Room": room_of_bun(cfg, b, rooms),
+                         "Pcs per crate": crate_pcs(cfg, b)} for b in buns])
+    bed = st.data_editor(bdf, hide_index=True, width="stretch", num_rows="fixed", disabled=["Bun", "Name"],
+                         key=f"set_bunroom_{n}",
+                         column_config={"Room": st.column_config.SelectboxColumn("Room", options=rn, required=True),
+                                        "Pcs per crate": st.column_config.NumberColumn("📦 Pcs per crate", min_value=1,
+                                                                                       max_value=2000, step=1, required=True)})
+    recs = bed.to_dict("records")
+    return {"rooms": rooms,
+            "bun_room": {r["Bun"]: (r["Room"] if r["Room"] in rn else rn[-1]) for r in recs},
+            "crate_pcs": {r["Bun"]: int(r["Pcs per crate"] or 100) for r in recs}}
 
 
 # ==========================================
@@ -2191,7 +2509,8 @@ with top2:
 if st.session_state.get("p_must_change"):
     st.info("🔢 Choose your own PIN now (tap 🔑 PIN at the top) — next time just pick your name and type it.")
 my_tasks_banner(cfg, me)
-pages = ["📊 Live stock", "🏭 Log production", "📦 Stock count", "📋 Tasks", "📅 Next week plan", "🕘 History"]
+pages = ["📊 Live stock", "🏭 Log production", "📦 Stock count", "🧊 3D rooms", "📋 Tasks", "📅 Next week plan",
+         "🕘 History"]
 if me_role == "admin":
     pages.append("⚙️ Settings")
 if st.session_state.get("goto_page") in pages:
@@ -2230,6 +2549,8 @@ try:
         st.fragment(page_count)(cfg, can_edit, me)
     elif page == "📅 Next week plan":
         st.fragment(page_plan)(cfg, can_edit)
+    elif page == "🧊 3D rooms":
+        st.fragment(page_rooms)(cfg)
     elif page == "📋 Tasks":
         page_tasks(cfg, can_edit, me)
     elif page == "🕘 History":
