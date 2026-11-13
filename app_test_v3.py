@@ -1852,8 +1852,7 @@ def room_of_bun(cfg, b, rooms):
     r = (cfg.get("bun_room") or {}).get(b)
     if r in names:
         return r
-    r = (cfg.get("_auto_room") or {}).get(b)
-    return r if r in names else names[0]
+    return names[0]                                             # not set: the first room (full -> next room)
 
 
 def crate_pcs(cfg, b):
@@ -1880,37 +1879,61 @@ def room_geom(room, cr):
             "l": round(room["rows"] * (cr["l"] + GRID_GAP), 2), "h": room["h"]}
 
 
-def auto_rooms(cfg, rooms, geoms, buns, batches):
-    """Buns without a chosen room: biggest stock first, each to the room with the most free space left."""
-    names = [r["name"] for r in rooms]
-    free = {r["name"]: geoms[r["name"]]["capacity"] for r in rooms}
-    chosen = cfg.get("bun_room") or {}
-    need = {b: -(-int(sum(batches.get(b, {}).values())) // crate_pcs(cfg, b)) for b in buns}
-    for b in buns:
-        if chosen.get(b) in names:
-            free[chosen[b]] -= need[b]
-    out = {}
-    for b in sorted([b for b in buns if chosen.get(b) not in names], key=lambda x: -need[x]):
-        r = max(names, key=lambda n: free[n])
-        out[b] = r
-        free[r] -= need[b]
+def bun_crates(cfg, b, batches):
+    """One entry (lot date, pcs) per crate, oldest first."""
+    cp, out = crate_pcs(cfg, b), []
+    for d in sorted(batches.get(b, {})):
+        left = int(round(batches[b][d]))
+        while left > 0:
+            n = min(cp, left)
+            out.append((d, n))
+            left -= n
     return out
 
 
-def room_fill(cfg, g, mine, batches):
+def split_for_room(cfg, g, lists, speed):
+    """The room is too small: every bun keeps its OLDEST crates here, the same number of days of sales each
+    (whole stacks); its NEWEST lots go on to the next room (freezer). Returns (keep, move)."""
+    high, places = g["high"], g["places"]
+    if sum(-(-len(v) // high) for v in lists.values()) <= places:
+        return lists, {}
+
+    def stacks_for(days):
+        out = {}
+        for b, v in lists.items():
+            per_day = float(speed.get(b, 0)) / crate_pcs(cfg, b)
+            out[b] = min(-(-len(v) // high), int(math.ceil(per_day * days / high)) if per_day > 0 else 0)
+        return out
+    lo, hi = 0.0, 60.0
+    for _ in range(40):                                          # most days of sales that still fit
+        mid = (lo + hi) / 2
+        if sum(stacks_for(mid).values()) <= places:
+            lo = mid
+        else:
+            hi = mid
+    keep_st = stacks_for(lo)
+    free = places - sum(keep_st.values())
+    while free > 0:                                              # fill the last places: lowest days first
+        cand = [b for b in lists if keep_st[b] < -(-len(lists[b]) // high)]
+        if not cand:
+            break
+        b = min(cand, key=lambda x: keep_st[x] * high * crate_pcs(cfg, x) / max(float(speed.get(x, 0)), 0.1))
+        keep_st[b] += 1
+        free -= 1
+    keep, move = {}, {}
+    for b, v in lists.items():
+        n = min(len(v), keep_st[b] * high)
+        keep[b], move[b] = v[:n], v[n:]
+    return keep, {b: v for b, v in move.items() if v}
+
+
+def room_fill(cfg, g, lists):
     """Like your sheet: buns (in your order) fill the places column by column, from the IN side (back, row 1)
     to the OUT side (front). Inside each bun the oldest lot goes to the places nearest the OUT door."""
     spots = [(c, r) for c in range(g["cols"]) for r in range(g["rows"]) if (r, c) not in g["blocked"]]
     stacks, overflow, k = [], {}, 0
-    for b in sorted(mine, key=lambda x: (room_order(cfg, x), x)):
-        cp = crate_pcs(cfg, b)
-        crates = []                                              # one entry per crate, oldest first
-        for d in sorted(batches.get(b, {})):
-            left = int(round(batches[b][d]))
-            while left > 0:
-                n = min(cp, left)
-                crates.append((d, n))
-                left -= n
+    for b in sorted(lists, key=lambda x: (room_order(cfg, x), x)):
+        crates = lists[b]
         if not crates:
             continue
         need = -(-len(crates) // g["high"])
@@ -1930,6 +1953,27 @@ def room_fill(cfg, g, mine, batches):
                     segs.append([d, 1, n])
             stacks.append({"c": c, "r": r, "b": b, "segs": segs, "first": i == 0})
     return stacks, overflow
+
+
+def fill_rooms(cfg, rooms, geoms, buns, batches, speed):
+    """Every room in turn; what does not fit in a room goes on to the next one (cooling full -> freezer)."""
+    carry, res = {}, {}
+    for i, r in enumerate(rooms):
+        g = geoms[r["name"]]
+        lists = {b: bun_crates(cfg, b, batches) for b in buns if room_of_bun(cfg, b, rooms) == r["name"]}
+        for b, v in carry.items():                               # newest lots moved here from the room before
+            lists[b] = sorted(lists.get(b, []) + v)
+        lists = {b: v for b, v in lists.items() if v}
+        last = i == len(rooms) - 1
+        keep, move = (lists, {}) if last else split_for_room(cfg, g, lists, speed)
+        stacks, overflow = room_fill(cfg, g, keep)
+        for st_ in stacks:                                       # moved-in (newer) lots: take from the room before first
+            if st_["b"] in carry:
+                st_["first"] = False
+        res[r["name"]] = {"stacks": stacks, "overflow": overflow, "moved_in": {b: len(v) for b, v in carry.items()},
+                          "moved_out": {b: len(v) for b, v in move.items()}}
+        carry = move
+    return res
 
 
 ROOM3D_HTML = r"""
@@ -2168,13 +2212,8 @@ def page_rooms(cfg):
     t = today_kh()
     rooms, cr = rooms_of(cfg), crate_size(cfg)
     geoms = {r["name"]: room_geom(r, cr) for r in rooms}
-    if len(rooms) > 1 and any((cfg.get("bun_room") or {}).get(b) not in [r["name"] for r in rooms] for b in buns):
-        b_now, _s0, _h0, _n0 = compute_stock(buns, prod, counts, adjs, sales, t)
-        cfg = {**cfg, "_auto_room": auto_rooms(cfg, rooms, geoms, buns, b_now)}
+    speed, _sn = sales_speed(sales, buns, t, int(cfg["lookback_days"]))
     is_admin = st.session_state.get("p_role") == "admin"
-    if not cfg.get("bun_room"):
-        st.info("ℹ️ The room of each bun is not chosen yet, so the app split them between the rooms by stock size."
-                + (" Open 📐 Adjust sizes below." if is_admin else " Ask Admin."))
     if is_admin:                                         # sizes: Admin only (staff just look)
         with st.expander("📐 Adjust sizes — room grid, doors, crate, room / order / pcs per crate of each bun (Admin only)"):
             rn = st.session_state.get("room_n", 0)
@@ -2200,14 +2239,13 @@ def page_rooms(cfg):
     back = c1.selectbox("Days to replay", [7, 14, 3, 1], key="room_back", format_func=lambda n: f"last {n} days")
     days = [t - timedelta(days=i) for i in range(int(back) - 1, -1, -1)]
     lots, lot_i, out_days, today_stacks = [], {}, [], {}
-    overflow_today = {}
+    overflow_today, moved_today = {}, {}
     for d in days:
         batches, _s, _h, _nc = compute_stock(buns, prod, counts, adjs, sales, d)
         rd = {}
+        filled = fill_rooms(cfg, rooms, geoms, buns, batches, speed)
         for r in rooms:
-            g = geoms[r["name"]]
-            mine = [b for b in buns if room_of_bun(cfg, b, rooms) == r["name"]]
-            stacks, overflow = room_fill(cfg, g, mine, batches)
+            stacks, overflow = filled[r["name"]]["stacks"], filled[r["name"]]["overflow"]
             for s in stacks:
                 for seg in s["segs"]:
                     if seg[0] not in lot_i:
@@ -2220,12 +2258,20 @@ def page_rooms(cfg):
             if d == t:
                 today_stacks[r["name"]] = stacks
                 overflow_today[r["name"]] = overflow
+                moved_today[r["name"]] = filled[r["name"]]["moved_out"]
         out_days.append({"iso": d.isoformat(), "label": ("Today · " if d == t else "") + f"{d:%a %d %b}", "rooms": rd})
     today = out_days[-1]["rooms"]
     tiles([(r["name"], f"{today[r['name']]['used']:,} / {geoms[r['name']]['capacity']:,}",
             f"crates · {geoms[r['name']]['places']} stacks × {geoms[r['name']]['high']} high · "
             f"{today[r['name']]['pcs']:,} pcs · {today[r['name']]['used'] / max(geoms[r['name']]['capacity'], 1) * 100:.0f}% full")
            for r in rooms])
+    for i, r in enumerate(rooms[:-1]):
+        mv = moved_today.get(r["name"]) or {}
+        if mv:
+            st.info(f"🔄 **{r['name']} is full** → the newest lots go to **{rooms[i + 1]['name']}**: "
+                    + ", ".join(f"{short(b)} {n} crates" for b, n in mv.items())
+                    + f" (total {sum(mv.values()):,} crates). {r['name']} keeps the oldest stock of every bun "
+                      "(about the same days of sales each) to pick first.")
     parts = [f"**{r['name']}**: " + ", ".join(f"{short(b)} {n}" for b, n in overflow_today[r["name"]].items())
              for r in rooms if overflow_today.get(r["name"])]
     if parts:
