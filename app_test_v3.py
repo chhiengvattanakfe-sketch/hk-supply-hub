@@ -1218,60 +1218,106 @@ def page_plan(cfg, can_edit):
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
 
 
+def _bun_rows(cfg, buns, names):
+    return [{"Bun": b, "Name": names.get(b, ""),
+             "Target days": int(cfg["target_days"].get(b, cfg["target_default"])),
+             **{EN_DAYS[i]: i in cfg["prod_days"].get(b, cfg["prod_days_default"]) for i in range(7)},
+             "Shelf life (days)": int(cfg.get("shelf_by_bun", {}).get(b, cfg["shelf_days"]))} for b in buns]
+
+
 def page_settings(cfg, me):
     st.subheader("⚙️ Settings")
-    _p, _c, _a, _s, names, buns = get_data(cfg)
-    with st.form("settings"):
-        c1, c2, c3, c4 = st.columns(4)
-        max_total = c1.number_input("Total stock limit (pcs)", min_value=1000, max_value=1_000_000, step=1000,
-                                    value=int(cfg["max_total"]))
-        tdef = c2.number_input("Target days (other buns)", min_value=1, max_value=30, value=int(cfg["target_default"]))
-        shelf = c3.number_input("Shelf life — flag batches older than (days)", min_value=1, max_value=365,
-                                value=int(cfg["shelf_days"]))
-        look = c4.number_input("Sales history used (days)", min_value=7, max_value=90, value=int(cfg["lookback_days"]))
-        c5, c6, c7 = st.columns(3)
-        rnd = c5.number_input("Round planned pcs up to", min_value=1, max_value=1000, value=int(cfg["round_to"]))
-        capp = c6.number_input("Max production per day (0 = no limit)", min_value=0, max_value=500000, step=1000,
-                               value=int(cfg.get("max_prod_per_day") or 0))
-        prio = c7.multiselect("Keep these at target first (80,000 limit)", buns, default=[b for b in cfg["priority"] if b in buns])
-        st.markdown("**Per bun** — target days, production days and shelf life")
-        rows = [{"Bun": b, "Name": names.get(b, ""), "Target days": int(cfg["target_days"].get(b, cfg["target_default"])),
-                 **{EN_DAYS[i]: i in cfg["prod_days"].get(b, cfg["prod_days_default"]) for i in range(7)},
-                 "Shelf life (days)": int(cfg.get("shelf_by_bun", {}).get(b, cfg["shelf_days"]))} for b in buns]
-        ed = st.data_editor(pd.DataFrame(rows), hide_index=True, width="stretch", num_rows="fixed",
-                            disabled=["Bun", "Name"], key="set_buns",
-                            column_config={EN_DAYS[i]: st.column_config.CheckboxColumn(EN_DAYS[i] + " 🏭") for i in range(7)})
-        st.markdown("**Who can use this app** (Admin always can edit)")
-        users = load_users()
-        urows = [{"User": u, "Name": r.get("staff_name", ""), "Role": r.get("role", ""),
-                  "Access": cfg.get("access", {}).get(u, cfg.get("access_default", "view"))}
-                 for u, r in sorted(users.items()) if r.get("role") != "admin"]
-        uacc = st.data_editor(pd.DataFrame(urows), hide_index=True, width="stretch", num_rows="fixed",
-                              disabled=["User", "Name", "Role"], key="set_users",
-                              column_config={"Access": st.column_config.SelectboxColumn(
-                                  "Access", options=["hidden", "view", "edit"], required=True)}) if urows else None
-        dflt = st.selectbox("New / other users", ["view", "hidden", "edit"],
-                            index=["view", "hidden", "edit"].index(cfg.get("access_default", "view")))
-        ok = st.form_submit_button("💾 Save settings", type="primary")
-    if ok:
+    _p, _c, _a, sales, names, buns = get_data(cfg)
+    flash = st.session_state.pop("s_flash", None)
+    if flash:
+        st.success(flash)
+    n = st.session_state.get("set_n", 0)
+    draft = st.session_state.get("set_draft")
+    if draft is None or [r["Bun"] for r in draft] != buns:
+        draft = _bun_rows(cfg, buns, names)
+        st.session_state["set_draft"] = draft
+
+    st.markdown("#### 🎯 Stock target, production days and shelf life — per bun")
+    st.caption("The table below is what the app uses. Change any cell, or fill many buns at once with the buttons, "
+               "then press **💾 Save settings**.")
+    prio_now = [b for b in cfg.get("priority", PRIORITY_DEFAULT) if b in buns]
+    q1, q2, q3, q4 = st.columns([1.3, 1, 1.3, 1])
+    t_all = q1.number_input(f"Target days for every bun except {', '.join(prio_now) or '-'}", min_value=1,
+                            max_value=30, value=int(cfg["target_default"]), key="set_t_all")
+    q2.write("")
+    if q2.button("⬇️ Apply to the table", key="set_t_apply", width="stretch"):
+        cur = st.session_state.get(f"set_buns_{n}_rows") or draft
+        for r in cur:
+            if r["Bun"] not in prio_now:
+                r["Target days"] = int(t_all)
+        st.session_state["set_draft"] = cur
+        st.session_state["set_n"] = n + 1
+        st.rerun()
+    s_all = q3.number_input("Shelf life for every bun (days)", min_value=1, max_value=365,
+                            value=int(cfg["shelf_days"]), key="set_s_all")
+    q4.write("")
+    if q4.button("⬇️ Apply to the table", key="set_s_apply", width="stretch"):
+        cur = st.session_state.get(f"set_buns_{n}_rows") or draft
+        for r in cur:
+            r["Shelf life (days)"] = int(s_all)
+        st.session_state["set_draft"] = cur
+        st.session_state["set_n"] = n + 1
+        st.rerun()
+    ed = st.data_editor(pd.DataFrame(draft), hide_index=True, width="stretch", num_rows="fixed",
+                        disabled=["Bun", "Name"], key=f"set_buns_{n}",
+                        column_config={
+                            "Target days": st.column_config.NumberColumn("🎯 Target days", min_value=1, max_value=30, step=1),
+                            "Shelf life (days)": st.column_config.NumberColumn("🟤 Shelf life (days)", min_value=1,
+                                                                               max_value=365, step=1),
+                            **{EN_DAYS[i]: st.column_config.CheckboxColumn(EN_DAYS[i] + " 🏭") for i in range(7)}})
+    st.session_state[f"set_buns_{n}_rows"] = ed.to_dict("records")       # the buttons above keep your edits
+    st.caption("🏭 ticked = this bun can be produced on that weekday. 🎯 = days of sales to keep in stock. "
+               "🟤 = a batch older than this is flagged 'sell first'.")
+
+    st.markdown("#### 📦 Limits and planning")
+    c1, c2, c3, c4 = st.columns(4)
+    max_total = c1.number_input("Total stock limit (pcs)", min_value=1000, max_value=1_000_000, step=1000,
+                                value=int(cfg["max_total"]), key="set_max")
+    look = c2.number_input("Sales history used (days)", min_value=7, max_value=90, value=int(cfg["lookback_days"]),
+                           key="set_look")
+    rnd = c3.number_input("Round planned pcs up to", min_value=1, max_value=1000, value=int(cfg["round_to"]), key="set_rnd")
+    capp = c4.number_input("Max production per day (0 = no limit)", min_value=0, max_value=500000, step=1000,
+                           value=int(cfg.get("max_prod_per_day") or 0), key="set_cap")
+    prio = st.multiselect("Keep these at their target first when the total limit is reached", buns, default=prio_now,
+                          key="set_prio")
+    places_txt = st.text_input("Freezers counted in the evening (separate with ;)",
+                               value="; ".join(cfg.get("places") or DEFAULT_SETTINGS["places"]), key="set_places")
+
+    st.markdown("#### 👥 Who can use this app (Admin can always edit)")
+    users = load_users()
+    urows = [{"User": u, "Name": r.get("staff_name", ""), "Role": r.get("role", ""),
+              "Access": cfg.get("access", {}).get(u, cfg.get("access_default", "view"))}
+             for u, r in sorted(users.items()) if r.get("role") != "admin"]
+    uacc = st.data_editor(pd.DataFrame(urows), hide_index=True, width="stretch", num_rows="fixed",
+                          disabled=["User", "Name", "Role"], key=f"set_users_{n}",
+                          column_config={"Access": st.column_config.SelectboxColumn(
+                              "Access", options=["hidden", "view", "edit"], required=True)}) if urows else None
+    dflt = st.selectbox("New / other users", ["view", "hidden", "edit"],
+                        index=["view", "hidden", "edit"].index(cfg.get("access_default", "view")), key="set_dflt")
+
+    if st.button("💾 Save settings", type="primary", key="set_save"):
         new = dict(cfg)
-        new.update(max_total=int(max_total), target_default=int(tdef), shelf_days=int(shelf), lookback_days=int(look),
-                   round_to=int(rnd), max_prod_per_day=int(capp), priority=list(prio), access_default=dflt)
-        tdays, pdays, shelfb = {}, {}, {}
-        for r in ed.to_dict("records"):
-            if int(r["Target days"]) != int(tdef):
-                tdays[r["Bun"]] = int(r["Target days"])
-            days_on = [i for i in range(7) if r[EN_DAYS[i]]]
-            if days_on != list(cfg["prod_days_default"]):
-                pdays[r["Bun"]] = days_on
-            if int(r["Shelf life (days)"]) != int(shelf):
-                shelfb[r["Bun"]] = int(r["Shelf life (days)"])
-        new.update(target_days=tdays, prod_days=pdays, shelf_by_bun=shelfb)
+        rows = ed.to_dict("records")
+        new.update(max_total=int(max_total), target_default=int(t_all), shelf_days=int(s_all), lookback_days=int(look),
+                   round_to=int(rnd), max_prod_per_day=int(capp), priority=list(prio), access_default=dflt,
+                   places=[p.strip() for p in places_txt.split(";") if p.strip()] or DEFAULT_SETTINGS["places"],
+                   # every bun saved with its own value: exactly what the table shows is what the app uses
+                   target_days={r["Bun"]: int(r["Target days"]) for r in rows},
+                   shelf_by_bun={r["Bun"]: int(r["Shelf life (days)"]) for r in rows},
+                   prod_days={r["Bun"]: [i for i in range(7) if r[EN_DAYS[i]]] for r in rows})
         if uacc is not None:
             new["access"] = {r["User"]: r["Access"] for r in uacc.to_dict("records")}
         try:
             save_settings(new)
-            st.success("✅ Settings saved")
+            st.session_state.pop("set_draft", None)
+            st.session_state["set_n"] = n + 1
+            st.session_state["s_flash"] = ("✅ Settings saved · targets: " + ", ".join(
+                f"{short(r['Bun'])} {int(r['Target days'])}d" for r in rows))
             st.rerun()
         except Exception as e:
             st.error(f"Not saved: {e}")
