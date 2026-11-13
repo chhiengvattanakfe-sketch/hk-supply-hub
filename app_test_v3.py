@@ -97,7 +97,8 @@ DEFAULT_SETTINGS = {
     "lookback_days": 28,            # sales history used for the sales speed / forecast
     "round_to": 10,                 # planned pcs rounded up to this
     "max_prod_per_day": 0,          # 0 = no limit
-    "access": {},                   # username -> hidden / view / edit (Admin always edit)
+    "access_by_role": {"staff": "edit", "sales": "view", "viewer": "view"},   # automatic, by Supply Hub role
+    "access_override": {},          # username -> hidden / view / edit, only for people who differ from their role
     "access_default": "view",
     "places": ["ស្តុកនំក្នុងទូរ", "ស្តុកទូរកក"],   # freezers counted every evening (one tab each)
     "tasks": DEFAULT_TASKS,         # daily checklist (Admin adds / assigns in ⚙️ Settings and 📋 Tasks)
@@ -324,10 +325,26 @@ def _check_pw(password, rec):
         return False
 
 
+ROLE_TITLES = {"staff": "👷 Operation staff", "sales": "💼 Sales", "viewer": "👁️ Viewer"}
+
+
 def access_of(username, role, settings):
+    """Admin: always edit. Everyone else: their own setting if Admin gave one, otherwise automatic by role
+    (every operation staff account = edit, also new ones added later in the Supply Hub)."""
     if role == "admin":
         return "edit"
-    return settings.get("access", {}).get(username, settings.get("access_default", "view"))
+    own = (settings.get("access_override") or {}).get(username)
+    if own in ("hidden", "view", "edit"):
+        return own
+    by_role = {**DEFAULT_SETTINGS["access_by_role"], **(settings.get("access_by_role") or {})}
+    return by_role.get(role, settings.get("access_default", "view"))
+
+
+def ops_names(cfg, users=None):
+    """Operation staff (role staff) + extra names from Settings: offered in 👷 Produced by and 📋 Tasks."""
+    users = load_users() if users is None else users
+    ops = [(r.get("staff_name") or u) for u, r in users.items() if r.get("active", True) and r.get("role") == "staff"]
+    return list(dict.fromkeys(sorted(ops, key=str.lower) + list(cfg.get("prod_staff") or [])))
 
 
 # ---- keep me signed in (survives refresh, closed tab, phone lock, app restart) ----
@@ -514,12 +531,14 @@ def login_box():
     cfg, _r = load_settings()
     people = sorted([u for u, r in users.items() if r.get("active", True)
                      and access_of(u, r.get("role", "staff"), cfg) != "hidden"],
-                    key=lambda u: (users[u].get("role") == "admin", (users[u].get("staff_name") or u).lower()))
+                    key=lambda u: ({"staff": 0, "sales": 1, "viewer": 2}.get(users[u].get("role"), 3),
+                                   (users[u].get("staff_name") or u).lower()))
     t_pin, t_pw = st.tabs(["👤 My name + PIN", "🔑 Username + password"])
     with t_pin:
         with st.form("pin_login"):
             who = st.selectbox("👤 Your name", people, index=None, placeholder="Tap to choose your name",
-                               format_func=lambda u: f"{users[u].get('staff_name') or u}  ({u})")
+                               format_func=lambda u: f"{users[u].get('staff_name') or u}  ({u})"
+                               + ("" if users[u].get("pin") else "  · no PIN yet"))
             pin = st.text_input("🔢 PIN (4–6 numbers)", type="password", max_chars=6)
             keep = st.checkbox(f"Keep me signed in on this phone ({REMEMBER_DAYS} days)", value=True, key="keep_pin")
             ok = st.form_submit_button("Sign in", type="primary", width="stretch")
@@ -1172,7 +1191,7 @@ def page_production(cfg, can_edit, me):
             if got:
                 st.markdown(excel_html("ផលិតថ្មី (not saved yet)", [(day_label(d), v) for d, v in got], show),
                             unsafe_allow_html=True)
-        team_opts = sorted(set(cfg.get("prod_staff") or []) | {me})
+        team_opts = list(dict.fromkeys(ops_names(cfg) + [me]))
         team = st.multiselect("👷 Produced by", team_opts, default=[me], key=f"prod_team_{n}",
                               help="Everyone who made these buns (Admin adds names in ⚙️ Settings).")
         c1, c2 = st.columns([3, 1])
@@ -1711,16 +1730,27 @@ def page_settings(cfg, me):
                                value="; ".join(cfg.get("places") or DEFAULT_SETTINGS["places"]), key="set_places")
 
     st.markdown("#### 👥 Who can use this app (Admin can always edit)")
+    st.caption("Automatic by role: every account with role **staff** in the Supply Hub (operation staff) gets this "
+               "access by itself — also new staff added later. Change one person only if they must be different.")
     users = load_users()
+    by_role = {**DEFAULT_SETTINGS["access_by_role"], **(cfg.get("access_by_role") or {})}
+    rc = st.columns(3)
+    new_by_role = {}
+    for col, role in zip(rc, ["staff", "sales", "viewer"]):
+        new_by_role[role] = col.selectbox(f"{ROLE_TITLES[role]} (role {role})", ["edit", "view", "hidden"],
+                                          index=["edit", "view", "hidden"].index(by_role.get(role, "view")),
+                                          key=f"set_role_{role}")
+    ov = cfg.get("access_override") or {}
     urows = [{"User": u, "Name": r.get("staff_name", ""), "Role": r.get("role", ""),
-              "Access": cfg.get("access", {}).get(u, cfg.get("access_default", "view"))}
-             for u, r in sorted(users.items()) if r.get("role") != "admin"]
+              "Access": ov.get(u, "auto"), "PIN": "✅" if r.get("pin") else "–"}
+             for u, r in sorted(users.items(), key=lambda x: ({"staff": 0, "sales": 1}.get(x[1].get("role"), 2), x[0]))
+             if r.get("role") != "admin" and r.get("active", True)]
     uacc = st.data_editor(pd.DataFrame(urows), hide_index=True, width="stretch", num_rows="fixed",
-                          disabled=["User", "Name", "Role"], key=f"set_users_{n}",
+                          disabled=["User", "Name", "Role", "PIN"], key=f"set_users_{n}",
                           column_config={"Access": st.column_config.SelectboxColumn(
-                              "Access", options=["hidden", "view", "edit"], required=True)}) if urows else None
-    dflt = st.selectbox("New / other users", ["view", "hidden", "edit"],
-                        index=["view", "hidden", "edit"].index(cfg.get("access_default", "view")), key="set_dflt")
+                              "Access", options=["auto", "edit", "view", "hidden"], required=True,
+                              help="auto = by role (above)")}) if urows else None
+    dflt = cfg.get("access_default", "view")
 
     extra = users_admin_box(cfg)
 
@@ -1735,8 +1765,11 @@ def page_settings(cfg, me):
                    target_days={r["Bun"]: int(r["Target days"]) for r in rows},
                    shelf_by_bun={r["Bun"]: int(r["Shelf life (days)"]) for r in rows},
                    prod_days={r["Bun"]: [i for i in range(7) if r[EN_DAYS[i]]] for r in rows})
+        new["access_by_role"] = new_by_role
         if uacc is not None:
-            new["access"] = {r["User"]: r["Access"] for r in uacc.to_dict("records")}
+            new["access_override"] = {r["User"]: r["Access"] for r in uacc.to_dict("records")
+                                      if r["Access"] in ("hidden", "view", "edit")}
+        new.pop("access", None)                      # old per-person list (replaced by automatic by role)
         try:
             save_settings(new)
             audit("settings saved", "targets: " + ", ".join(f"{short(r['Bun'])} {int(r['Target days'])}d" for r in rows)
@@ -1775,8 +1808,8 @@ def pin_problem(a, b=None):
 
 def staff_names(cfg, users=None):
     users = load_users() if users is None else users
-    names = [(r.get("staff_name") or u) for u, r in users.items() if r.get("active", True)]
-    return sorted(set(names) | set(cfg.get("prod_staff") or []), key=str.lower)
+    others = sorted({(r.get("staff_name") or u) for u, r in users.items() if r.get("active", True)}, key=str.lower)
+    return list(dict.fromkeys(ops_names(cfg, users) + others))           # operation staff first
 
 
 def task_list(cfg):
@@ -1981,13 +2014,15 @@ def users_admin_box(cfg):
         a, b, c = st.columns(3)
         uname = a.text_input("Username (small letters / numbers)").strip().lower()
         sname = b.text_input("Staff name (shown in the app)").strip()
-        role = c.selectbox("Role", ["viewer", "staff", "sales", "admin"],
+        role = c.selectbox("Role", ["staff", "viewer", "sales", "admin"],
                            help="Same accounts as the Supply Hub: the role is also used there. "
+                                "'staff' = operation staff (also gets the operation pages in the Supply Hub). "
                                 "'viewer' = can only look in the Supply Hub.")
         d, e, f = st.columns(3)
         pin = d.text_input("🔢 PIN (4–6 numbers)", type="password", max_chars=6)
         pw = e.text_input("🔑 Password (optional, 8+ letters & numbers)", type="password")
-        acc = f.selectbox("Production app access", ["edit", "view", "hidden"])
+        acc = f.selectbox("Production app access", ["auto", "edit", "view", "hidden"],
+                          help="auto = by role (operation staff = edit)")
         ok = st.form_submit_button("➕ Create user", type="primary")
     if ok:
         err = ("Username: 3–30 small letters, numbers, . _ -" if not USERNAME_RE.match(uname)
@@ -2011,9 +2046,10 @@ def users_admin_box(cfg):
                 us[uname] = rec
             try:
                 modify_users(add)
-                new = dict(cfg)
-                new["access"] = {**cfg.get("access", {}), uname: acc}
-                save_settings(new)
+                if acc != "auto":
+                    new = dict(cfg)
+                    new["access_override"] = {**(cfg.get("access_override") or {}), uname: acc}
+                    save_settings(new)
                 audit("user created", f"{uname} · {sname} · {role} · production {acc}")
                 st.session_state["s_flash"] = (f"✅ {sname} ({uname}) created. Sign in: choose “{sname}” + "
                                                + ("the PIN." if pin else "the password."))
@@ -2049,7 +2085,49 @@ def users_admin_box(cfg):
             except Exception as ex:
                 st.error(f"Not saved: {ex}")
 
+    no_pin = [u for u, r in users.items() if r.get("role") == "staff" and r.get("active", True) and not r.get("pin")]
+    st.markdown("#### ⚡ PINs for all operation staff at once")
+    shown = st.session_state.get("auto_pins")
+    if shown:
+        st.success(f"✅ {len(shown)} PINs made. Give each person their PIN (shown only now — they can change it "
+                   "later with 🔑 PIN).")
+        dfp = pd.DataFrame(shown)
+        st.dataframe(dfp, hide_index=True, width="stretch")
+        a, b = st.columns(2)
+        a.download_button("⬇️ Download the PIN list (CSV)", dfp.to_csv(index=False).encode("utf-8-sig"),
+                          file_name=f"staff_PINs_{today_kh()}.csv", mime="text/csv")
+        if b.button("🙈 Hide the PIN list", key="auto_pin_hide"):
+            st.session_state.pop("auto_pins", None)
+            st.rerun()
+    elif no_pin:
+        st.caption(f"{len(no_pin)} operation staff have no PIN yet: "
+                   + ", ".join(users[u].get("staff_name") or u for u in sorted(no_pin)))
+        if st.button(f"⚡ Make a PIN for these {len(no_pin)} people", key="auto_pin"):
+            made = {}
+            for u in no_pin:
+                while True:
+                    pin = f"{pysecrets.randbelow(9000) + 1000}"
+                    if not pin_problem(pin) and pin not in made.values():
+                        break
+                made[u] = pin
+
+            def ch(us):
+                for u, pin in made.items():
+                    if u in us and not us[u].get("pin"):
+                        us[u]["pin"] = _pin_hash(pin)
+            try:
+                modify_users(ch)
+                audit("PINs made", ", ".join(sorted(made)))
+                st.session_state["auto_pins"] = [{"Name": users[u].get("staff_name") or u, "Username": u, "PIN": pin}
+                                                 for u, pin in sorted(made.items())]
+                st.rerun()
+            except Exception as ex:
+                st.error(f"Not saved: {ex}")
+    else:
+        st.caption("✅ Every operation staff already has a PIN.")
+
     st.markdown("#### 👷 Names in “Produced by” (people without an account)")
+    st.caption("All operation staff are already in the list by themselves — add here only helpers without an account.")
     ps = st.text_input("Separate with ;", value="; ".join(cfg.get("prod_staff") or []), key="set_pstaff")
     st.markdown("#### 📋 Daily tasks (checklist)")
     st.caption("auto **prod** = done by itself when production is saved for that day · auto **count** = done when the "
