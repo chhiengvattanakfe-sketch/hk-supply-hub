@@ -71,7 +71,16 @@ MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", 
 KH_DAYS = ["ច័ន្ទ", "អង្គារ", "ពុធ", "ព្រហស្បតិ៍", "សុក្រ", "សៅរ៍", "អាទិត្យ"]
 EN_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
-PROD_COLS = ["Saved_At", "Prod_Date", "Bun", "Pcs", "By", "Note", "Entry_Id"]
+PROD_COLS = ["Saved_At", "Prod_Date", "Bun", "Pcs", "By", "Note", "Entry_Id", "Team"]
+TASK_FILE = "production_tasks.csv"
+TASK_COLS = ["Date", "Task_Id", "Assigned", "Done_By", "Done_At", "Note", "Updated_At", "Updated_By"]
+AUDIT_FILE = "production_audit.csv"
+AUDIT_COLS = ["Time", "User", "Name", "Action", "Detail"]
+ALL_DAYS = [0, 1, 2, 3, 4, 5, 6]
+DEFAULT_TASKS = [
+    {"id": "prod", "name": "🏭 Log today's production", "due": "17:00", "who": [], "auto": "prod", "days": ALL_DAYS},
+    {"id": "count", "name": "📦 Evening stock count", "due": "19:30", "who": [], "auto": "count", "days": ALL_DAYS},
+]
 COUNT_COLS = ["Saved_At", "Count_Date", "Bun", "Prod_Date", "Pcs", "By", "Count_Id", "Place"]
 ADJ_COLS = ["Saved_At", "Date", "Bun", "Prod_Date", "Pcs", "Reason", "By", "Adj_Id"]
 DEFAULT_BUNS = ["N1", "N2", "N21", "N22", "N23", "N3", "N31", "N32", "N34", "N4", "N41", "N42", "N43"]
@@ -91,6 +100,8 @@ DEFAULT_SETTINGS = {
     "access": {},                   # username -> hidden / view / edit (Admin always edit)
     "access_default": "view",
     "places": ["ស្តុកនំក្នុងទូរ", "ស្តុកទូរកក"],   # freezers counted every evening (one tab each)
+    "tasks": DEFAULT_TASKS,         # daily checklist (Admin adds / assigns in ⚙️ Settings and 📋 Tasks)
+    "prod_staff": [],               # names offered in "👷 Produced by"
 }
 
 
@@ -262,6 +273,49 @@ def load_users():
         return {}
 
 
+def audit(action, detail=""):
+    """🕘 History: who did what, when. Never stops the work if it cannot be written."""
+    row = {"Time": now_kh().strftime("%Y-%m-%d %H:%M:%S"), "User": st.session_state.get("p_user", ""),
+           "Name": st.session_state.get("p_name", ""), "Action": action, "Detail": str(detail)[:500]}
+    try:
+        modify_csv(AUDIT_FILE, AUDIT_COLS, lambda df: pd.concat([df, pd.DataFrame([row])], ignore_index=True))
+    except Exception:
+        pass
+
+
+def _hash_pw(password):
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return {"salt": salt.hex(), "hash": dk.hex(), "iter": 200_000}
+
+
+def modify_users(change):
+    """Read-change-save of the SHARED accounts file (same accounts as the Supply Hub)."""
+    for attempt in range(4):
+        data, rev = read_bytes(USERS_FILE, max_age=0)
+        doc = json.loads(data.decode("utf-8-sig")) if data else {"users": {}}
+        if not isinstance(doc, dict) or not isinstance(doc.get("users"), dict):
+            raise RuntimeError("The accounts file cannot be read safely — nothing was changed.")
+        change(doc["users"])
+        try:
+            write_bytes(USERS_FILE, json.dumps(doc, ensure_ascii=False, indent=1).encode("utf-8"), rev)
+            return
+        except Conflict:
+            time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError("Someone else is saving the accounts right now. Try again.")
+
+
+def change_password(user, new_pw):
+    stamp = now_kh().strftime("%Y-%m-%d %H:%M:%S")
+
+    def ch(users):
+        if user not in users:
+            raise RuntimeError("Account not found.")
+        users[user].update(_hash_pw(new_pw), pw_changed=stamp, must_change=False)
+    modify_users(ch)
+    return stamp
+
+
 def _check_pw(password, rec):
     try:
         dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(rec["salt"]), int(rec["iter"]))
@@ -376,6 +430,64 @@ def sign_out():
     st.session_state["p_cookie_clear"] = True
 
 
+PIN_RE = re.compile(r"^[0-9]{4,6}$")
+
+
+def _pin_hash(pin):
+    salt = os.urandom(16)
+    return {"salt": salt.hex(), "hash": hashlib.pbkdf2_hmac("sha256", pin.encode(), salt, 100_000).hex(), "iter": 100_000}
+
+
+def _pin_ok(pin, rec):
+    p = rec.get("pin") or {}
+    try:
+        dk = hashlib.pbkdf2_hmac("sha256", str(pin).encode(), bytes.fromhex(p["salt"]), int(p["iter"]))
+        return hmac.compare_digest(dk.hex(), p["hash"])
+    except Exception:
+        return False
+
+
+def _locked(user):
+    """5 wrong PINs in 10 minutes -> wait 10 minutes (a PIN is short, so guessing is stopped)."""
+    n, t0 = _mem().setdefault("pin_fail", {}).get(user, (0, 0))
+    return n >= 5 and time.time() - t0 < 600
+
+
+def _failed(user):
+    fails = _mem().setdefault("pin_fail", {})
+    n, t0 = fails.get(user, (0, 0))
+    if time.time() - t0 >= 600:
+        n, t0 = 0, time.time()                      # a new 10-minute window
+    fails[user] = (n + 1, t0)
+
+
+def set_pin(user, pin):
+    def ch(users):
+        if user not in users:
+            raise RuntimeError("Account not found.")
+        users[user]["pin"] = _pin_hash(pin)
+    modify_users(ch)
+
+
+def _finish_login(u, rec, keep, how):
+    st.session_state.update(p_user=u, p_role=rec.get("role", "staff"), p_name=rec.get("staff_name") or u,
+                            p_must_change=bool(rec.get("must_change")) and not rec.get("pin"))
+    _mem().setdefault("pin_fail", {}).pop(u, None)
+    audit("sign in", how)
+    if keep:
+        tok = issue_token(u, rec.get("pw_changed", ""))
+        if tok:
+            st.session_state["p_tok"] = tok
+            st.session_state["p_cookie_set"] = True
+    st.rerun()
+
+
+NUMERIC_PIN_JS = ("var f=function(){W.document.querySelectorAll('input[aria-label*=\"PIN\"]').forEach(function(x){"
+                  "x.setAttribute('inputmode','numeric');x.setAttribute('pattern','[0-9]*');"
+                  "x.setAttribute('autocomplete','one-time-code');});};f();"
+                  "new MutationObserver(f).observe(W.document.body,{childList:true,subtree:true});")
+
+
 def login_box():
     users = load_users()
     st.markdown("## 🏭 Production & Live Stock")
@@ -398,25 +510,99 @@ def login_box():
             f"var sc=W.document.createElement('script');"          # run in the page itself (the frame may not reload it)
             f"sc.text=\"var u=new URL(location.href);u.searchParams.set('{URL_TOK}',\"+JSON.stringify(t)+\");location.replace(u.toString());\";"
             f"W.document.body.appendChild(sc);}}")
-    with st.form("login"):
-        u = st.text_input("Username").strip().lower()
-        p = st.text_input("Password", type="password")
-        keep = st.checkbox(f"Keep me signed in on this phone / computer ({REMEMBER_DAYS} days)", value=True)
-        ok = st.form_submit_button("Sign in", type="primary")
-    st.caption("Use the same username and password as the Supply Hub app.")
-    if ok:
-        rec = users.get(u)
-        if rec and rec.get("active", True) and _check_pw(p, rec):
-            st.session_state.update(p_user=u, p_role=rec.get("role", "staff"), p_name=rec.get("staff_name") or u)
-            if keep:
-                tok = issue_token(u, rec.get("pw_changed", ""))
-                if tok:
-                    st.session_state["p_tok"] = tok
-                    st.session_state["p_cookie_set"] = True
-            st.rerun()
-        time.sleep(1)
-        st.error("Wrong username or password.")
+    _js(NUMERIC_PIN_JS)                                    # PIN box opens the number keypad on phones
+    cfg, _r = load_settings()
+    people = sorted([u for u, r in users.items() if r.get("active", True)
+                     and access_of(u, r.get("role", "staff"), cfg) != "hidden"],
+                    key=lambda u: (users[u].get("role") == "admin", (users[u].get("staff_name") or u).lower()))
+    t_pin, t_pw = st.tabs(["👤 My name + PIN", "🔑 Username + password"])
+    with t_pin:
+        with st.form("pin_login"):
+            who = st.selectbox("👤 Your name", people, index=None, placeholder="Tap to choose your name",
+                               format_func=lambda u: f"{users[u].get('staff_name') or u}  ({u})")
+            pin = st.text_input("🔢 PIN (4–6 numbers)", type="password", max_chars=6)
+            keep = st.checkbox(f"Keep me signed in on this phone ({REMEMBER_DAYS} days)", value=True, key="keep_pin")
+            ok = st.form_submit_button("Sign in", type="primary", width="stretch")
+        st.caption("No PIN yet? Sign in once with your password (other tab), then tap 🔑 PIN at the top to choose one. "
+                   "Or ask Admin to give you one.")
+        if ok:
+            rec = users.get(who or "")
+            if not rec:
+                st.error("Choose your name first.")
+            elif _locked(who):
+                st.error("Too many wrong PINs. Wait 10 minutes, or sign in with your password.")
+            elif not rec.get("pin"):
+                st.warning("You have no PIN yet — sign in with your password once, then choose a PIN.")
+            elif rec.get("active", True) and _pin_ok(pin.strip(), rec):
+                _finish_login(who, rec, keep, "PIN")
+            else:
+                _failed(who)
+                time.sleep(1)
+                st.error("Wrong PIN.")
+    with t_pw:
+        with st.form("login"):
+            u = st.text_input("Username").strip().lower()
+            p = st.text_input("Password", type="password")
+            keep2 = st.checkbox(f"Keep me signed in on this phone / computer ({REMEMBER_DAYS} days)", value=True)
+            ok2 = st.form_submit_button("Sign in", type="primary", width="stretch")
+        st.caption("The same username and password as the Supply Hub app.")
+        if ok2:
+            rec = users.get(u)
+            if rec and rec.get("active", True) and _check_pw(p, rec):
+                _finish_login(u, rec, keep2, "password")
+            time.sleep(1)
+            st.error("Wrong username or password.")
     st.stop()
+
+
+def _say(kind, msg):
+    """Shows the result even when the 🔑 box closes after saving."""
+    st.toast(("✅ " if kind == "success" else "⚠️ ") + msg.lstrip("✅ "), duration="long")
+    (st.success if kind == "success" else st.error)(msg)
+
+
+def my_pin_password_box(me_user):
+    """🔑 Everyone: choose / change my PIN, change my password."""
+    t1, t2 = st.tabs(["🔢 My PIN", "🔑 My password"])
+    with t1:
+        with st.form("my_pin", clear_on_submit=True):
+            a = st.text_input("New PIN (4–6 numbers)", type="password", max_chars=6)
+            b = st.text_input("Type the PIN again", type="password", max_chars=6)
+            ok = st.form_submit_button("💾 Save my PIN", type="primary")
+        if ok:
+            if pin_problem(a, b):
+                _say("error", pin_problem(a, b))
+            else:
+                try:
+                    set_pin(me_user, a)
+                    st.session_state["p_must_change"] = False
+                    audit("PIN changed", me_user)
+                    _say("success", "✅ PIN saved. Next time: choose your name + type this PIN.")
+                except Exception as e:
+                    _say("error", f"Not saved: {e}")
+    with t2:
+        with st.form("my_pw", clear_on_submit=True):
+            old = st.text_input("Current password", type="password")
+            a = st.text_input("New password (8+ characters, letters and numbers)", type="password")
+            b = st.text_input("Type the new password again", type="password")
+            ok = st.form_submit_button("💾 Change my password")
+        if ok:
+            rec = load_users().get(me_user, {})
+            if not _check_pw(old, rec):
+                _say("error", "The current password is wrong.")
+            elif pw_problem(a) or a != b:
+                _say("error", pw_problem(a) or "The two new passwords are different.")
+            else:
+                try:
+                    stamp = change_password(me_user, a)
+                    tok = issue_token(me_user, stamp)               # stay signed in on this phone
+                    if tok:
+                        st.session_state["p_tok"], st.session_state["p_cookie_set"] = tok, True
+                    audit("password changed", me_user)
+                    _say("success", "✅ Password changed (also for the Supply Hub).")
+                except Exception as e:
+                    st.error(f"Not saved: {e}")
+
 
 
 # ==========================================
@@ -745,6 +931,30 @@ COLORS = {"N1": "#ED7D31", "N2": "#D9E1F2", "N21": "#FCE4D6", "N22": "#ACB9CA", 
           "N31": "#FFF2CC", "N32": "#FCE4D6", "N34": "#EDEDED", "N4": "#FFFFFF", "N41": "#FFE699", "N42": "#F8CBAD",
           "N43": "#E2EFDA"}
 TOTAL_BG, HEAD_BG, SUM_BG = "#BDD7EE", "#BDD7EE", "#FFC000"
+DOT = {"N1": "🟧", "N2": "🟦", "N21": "🟫", "N22": "⬛", "N23": "🟠", "N3": "🔷", "N31": "🟨", "N32": "🟤", "N34": "⚪",
+       "N4": "⬜", "N41": "🟡", "N42": "🔶", "N43": "🟩"}
+PHONE_CSS = """<style>
+[data-testid="stNumberInput"] input {font-size:1.3rem !important; min-height:2.8rem;}
+[data-testid="stNumberInput"] label p {font-size:1.05rem !important; font-weight:600;}
+.stButton button, .stDownloadButton button {min-height:3rem; font-size:1.05rem;}
+div[role="radiogroup"] label p {font-size:1.02rem;}
+</style>"""
+
+
+def phone_label(b, names):
+    return f"{DOT.get(b, '▫️')} {short(b)} · {names.get(b, '')}".strip(" ·")
+
+
+def bun_inputs(show, names, values, key, step=10):
+    """Phone: one big number box per bun (the number keypad opens). Empty box = 0. -> {bun: pcs}"""
+    out = {}
+    for b in show:
+        v = values.get(b)
+        n = st.number_input(phone_label(b, names), min_value=0, max_value=200000, step=step,
+                            value=int(v) if v else None, placeholder="0", key=f"{key}_{b}")
+        if n:
+            out[b] = int(n)
+    return out
 
 
 def short(b):
@@ -942,23 +1152,41 @@ def page_production(cfg, can_edit, me):
     if flash:
         st.success(flash)
     if can_edit:
-        st.markdown("Type the pcs produced like in your Excel sheet — **one row per production date** "
-                    "(add a row with ＋ for another day). Empty = 0.")
+        if st.session_state.get("phone_mode"):
+            st.markdown("Type the pcs produced for each bun. **Empty = 0.**")
+        else:
+            st.markdown("Type the pcs produced like in your Excel sheet — **one row per production date** "
+                        "(add a row with ＋ for another day). Empty = 0.")
         n = st.session_state.get("prod_grid_n", 0)
-        ed = _grid([(today_kh(), {})], show, key=f"prod_grid_{n}", height=120, max_date=today_kh() + timedelta(days=1))
-        got = [(d, v) for d, v in _grid_values(ed, show) if v]
-        if got:
-            st.markdown(excel_html("ផលិតថ្មី (not saved yet)", [(day_label(d), v) for d, v in got], show),
-                        unsafe_allow_html=True)
+        if st.session_state.get("phone_mode"):
+            pdate = st.date_input("📅 Production date", value=today_kh(), max_value=today_kh() + timedelta(days=1),
+                                  key=f"pp_date_{n}")
+            vals = bun_inputs(show, names, {}, key=f"pp_{n}")
+            got = [(pdate, vals)] if vals else []
+            if got:
+                st.info(f"🏭 {day_label(pdate)} · **{sum(vals.values()):,} pcs** · "
+                        + " · ".join(f"{short(b)} {v:,}" for b, v in vals.items()))
+        else:
+            ed = _grid([(today_kh(), {})], show, key=f"prod_grid_{n}", height=120, max_date=today_kh() + timedelta(days=1))
+            got = [(d, v) for d, v in _grid_values(ed, show) if v]
+            if got:
+                st.markdown(excel_html("ផលិតថ្មី (not saved yet)", [(day_label(d), v) for d, v in got], show),
+                            unsafe_allow_html=True)
+        team_opts = sorted(set(cfg.get("prod_staff") or []) | {me})
+        team = st.multiselect("👷 Produced by", team_opts, default=[me], key=f"prod_team_{n}",
+                              help="Everyone who made these buns (Admin adds names in ⚙️ Settings).")
         c1, c2 = st.columns([3, 1])
         note = c1.text_input("Note (optional)", max_chars=120, key="prod_note")
         c2.write("")
-        if c2.button("💾 Save production", type="primary", width="stretch", disabled=not got):
+        if c2.button("💾 Save production", type="primary", width="stretch", disabled=not got or not team):
             stamp, eid = now_kh().strftime("%Y-%m-%d %H:%M:%S"), uuid.uuid4().hex[:10]
             new = pd.DataFrame([{"Saved_At": stamp, "Prod_Date": d.isoformat(), "Bun": b, "Pcs": str(int(v)),
-                                 "By": me, "Note": note.strip(), "Entry_Id": eid} for d, vals in got for b, v in vals.items()])
+                                 "By": me, "Note": note.strip(), "Entry_Id": eid, "Team": "; ".join(team)}
+                                for d, vals in got for b, v in vals.items()])
             try:
                 modify_csv(PROD_FILE, PROD_COLS, lambda df: pd.concat([df, new], ignore_index=True))
+                audit("production saved", "; ".join(f"{d:%d %b}: " + ", ".join(f"{short(b)} {v}" for b, v in vals.items())
+                                                    for d, vals in got) + f" | by {', '.join(team)}")
                 st.session_state["p_flash"] = (f"✅ Saved {int(new['Pcs'].astype(int).sum()):,} pcs · "
                                                + ", ".join(f"{d:%d %b}" for d, _v in got))
                 st.session_state["prod_grid_n"] = n + 1           # empty sheet for the next entry
@@ -986,9 +1214,9 @@ def page_production(cfg, can_edit, me):
         if not can_edit or mine.empty:
             st.caption("Only your own lines (Admin: all) can be changed here.")
             return
-        ed = st.data_editor(mine[["Saved_At", "Prod_Date", "Bun", "Pcs", "By", "Note", "Entry_Id"]].assign(Delete=False),
+        ed = st.data_editor(mine[["Saved_At", "Prod_Date", "Bun", "Pcs", "By", "Team", "Note", "Entry_Id"]].assign(Delete=False),
                             hide_index=True, width="stretch", key="prod_fix",
-                            disabled=["Saved_At", "By", "Entry_Id", "Bun"],
+                            disabled=["Saved_At", "By", "Team", "Entry_Id", "Bun"],
                             column_config={"Pcs": st.column_config.NumberColumn(min_value=0, step=10),
                                            "Delete": st.column_config.CheckboxColumn("🗑️ Delete")})
         if st.button("💾 Save fixes", key="prod_fix_save"):
@@ -1007,6 +1235,10 @@ def page_production(cfg, can_edit, me):
                 return pd.DataFrame(keep, columns=PROD_COLS)
             try:
                 modify_csv(PROD_FILE, PROD_COLS, apply)
+                old = {(r["Entry_Id"], r["Bun"], r["Prod_Date"]): r for r in mine.to_dict("records")}
+                audit("production fixed", "; ".join(
+                    f"{k[2]} {short(k[1])}: " + ("deleted" if c["Delete"] else f"{old[k]['Pcs']} → {int(_num(c['Pcs']))}")
+                    for k, c in changes.items() if k in old and (c["Delete"] or str(int(_num(c["Pcs"]))) != str(old[k]["Pcs"]))))
                 st.session_state["p_flash"] = "✅ Fixes saved"
                 _rerun_here()
             except Exception as e:
@@ -1096,6 +1328,59 @@ def count_sheet_excel(places, sheets, buns, cd):
     return buf.getvalue()
 
 
+def _count_phone(places, start_rows, show, names, cd, sig):
+    """Phone: one freezer, one production date at a time, big number boxes, ✅ Counted · next."""
+    dk = "cntp_" + sig
+    if dk not in st.session_state:
+        st.session_state[dk] = {"data": {pl: {d: dict(v) for d, v in start_rows[pl]} for pl in places},
+                                "done": {pl: [] for pl in places}, "idx": {pl: 0 for pl in places}}
+    S = st.session_state[dk]
+    if S.get("goto_pl"):
+        st.session_state[dk + "_pl"] = S.pop("goto_pl")       # set before the picker is drawn
+    pl = st.radio("🧊 Freezer", places, horizontal=True, key=dk + "_pl")      # fixed labels: the choice never jumps
+    st.caption(" · ".join(f"{x}: {len(S['done'][x])}/{max(len(S['data'][x]), 1)} ✅" for x in places))
+    data, done = S["data"][pl], S["done"][pl]
+    if not data:
+        data[cd] = {}
+    dates = sorted(data)
+    i = min(S["idx"][pl], len(dates) - 1)
+    st.progress(sum(1 for x in dates if x in done) / len(dates),
+                text=f"{sum(1 for x in dates if x in done)} of {len(dates)} production dates counted in {pl}")
+    d = st.selectbox("📅 Production date", dates, index=i, key=f"{dk}_{pl}_sel_{i}_{len(dates)}",
+                     format_func=lambda x: f"{'✅' if x in done else '⬜'} {day_label(x)} · {sum(data[x].values()):,} pcs")
+    S["idx"][pl] = dates.index(d)
+    i = S["idx"][pl]
+    with st.container(border=True):
+        st.markdown(f"**{pl} · {day_label(d)}** — type what you see. Empty = 0.")
+        data[d] = bun_inputs(show, names, data[d], key=f"{dk}_{pl}_{d}", step=1)
+        st.markdown(f"**សរុប {sum(data[d].values()):,} pcs**")
+    b1, b2 = st.columns(2)
+    if b1.button("⬅️ Back", key=f"{dk}_back", disabled=i == 0, width="stretch"):
+        S["idx"][pl] = i - 1
+        _rerun_here()
+    last = i == len(dates) - 1
+    if b2.button("✅ Counted · next ➡️" if not last else "✅ Counted (last date)", key=f"{dk}_next", type="primary",
+                 width="stretch"):
+        if d not in done:
+            done.append(d)
+        if not last:
+            S["idx"][pl] = i + 1
+        else:
+            nxt = [x for x in places if len(S["done"][x]) < len(S["data"][x])]
+            if nxt and nxt[0] != pl:
+                S["goto_pl"] = nxt[0]                             # go on with the next freezer
+        _rerun_here()
+    with st.expander("➕ Add a production date that is missing"):
+        nd = st.date_input("Production date", value=cd, max_value=cd, key=f"{dk}_{pl}_newd")
+        if st.button("➕ Add this date", key=f"{dk}_{pl}_add"):
+            data.setdefault(nd, {})
+            S["idx"][pl] = sorted(data).index(nd)
+            _rerun_here()
+    if sum(len(S["done"][x]) for x in places) == sum(len(S["data"][x]) for x in places):
+        st.success("🎉 All freezers and dates counted — check the totals below and press 💾 Save.")
+    return {x: sorted((dd, {b: v for b, v in vals.items() if v}) for dd, vals in S["data"][x].items()) for x in places}
+
+
 def page_count(cfg, can_edit, me):
     st.subheader("📦 Evening stock count")
     prod, counts, adjs, sales, names, buns = get_data(cfg)
@@ -1108,9 +1393,11 @@ def page_count(cfg, can_edit, me):
     expected, _short, _h, _nc = compute_stock(buns, prod, counts, adjs, sales, cd)
     show = active_buns(buns, sales, expected)
     lastp = last_place_counts(counts, places)
-    c2.caption("Count every freezer in the evening, after the last delivery. Each tab is one freezer, laid out like your "
-               "Excel sheet. It starts filled in — **only change the numbers that are different**, add a row (＋) for a "
-               "date that is missing, clear a cell that is empty in the freezer.")
+    c2.caption("Count every freezer in the evening, after the last delivery. It starts filled in with what the app "
+               "expects — **only change the numbers that are different**, add a date that is missing, empty a box "
+               "that is empty in the freezer." + (" On the phone: one freezer and one production date at a time."
+                                                  if st.session_state.get("phone_mode") else
+                                                  " Each tab is one freezer, laid out like your Excel sheet."))
     # what each freezer probably holds now: other freezers = their last count, the first freezer = the rest
     other = {}
     for pl in places[1:]:
@@ -1137,16 +1424,23 @@ def page_count(cfg, can_edit, me):
                     horizontal=True, key="cnt_mode")
     if mode.startswith("⬜"):
         start_rows = {pl: [(cd, {})] for pl in places}
-    tabs = st.tabs([f"🧊 {pl}" for pl in places] + ["✅ Check & save"])
-    counted = {}
-    for pl, tab in zip(places, tabs):
-        with tab:
-            ed = _grid(start_rows[pl], show, key=f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}",
-                       max_date=cd)
-            counted[pl] = _grid_values(ed, show)
-            st.markdown(excel_html(f"{pl} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted[pl])], show),
-                        unsafe_allow_html=True)
-    with tabs[-1]:
+    if st.session_state.get("phone_mode"):
+        counted = _count_phone(places, start_rows, show, names, cd,
+                               f"{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}")
+        st.markdown("#### ✅ Check & save")
+        check_box = st.container()
+    else:
+        tabs = st.tabs([f"🧊 {pl}" for pl in places] + ["✅ Check & save"])
+        counted = {}
+        for pl, tab in zip(places, tabs):
+            with tab:
+                ed = _grid(start_rows[pl], show, key=f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}",
+                           max_date=cd)
+                counted[pl] = _grid_values(ed, show)
+                st.markdown(excel_html(f"{pl} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted[pl])], show),
+                            unsafe_allow_html=True)
+        check_box = tabs[-1]
+    with check_box:
         tot_c = {b: sum(v.get(b, 0) for pl in places for _d, v in counted[pl]) for b in show}
         tot_e = {b: sum(expected.get(b, {}).values()) for b in show}
         chk = pd.DataFrame([{"Bun": short(b), "Code": b, "App expected": int(round(tot_e[b])), "Counted": int(tot_c[b]),
@@ -1176,6 +1470,8 @@ def page_count(cfg, can_edit, me):
                          "By": me, "Count_Id": cid, "Place": places[0]} for b in buns if b not in have]   # counted empty
                 try:
                     modify_csv(COUNT_FILE, COUNT_COLS, lambda df: pd.concat([df, pd.DataFrame(new)], ignore_index=True))
+                    audit("evening count saved", f"{cd:%d %b %Y}: {int(sum(tot_c.values())):,} pcs · " + ", ".join(
+                        f"{short(b)} {int(tot_c[b])} ({int(tot_c[b] - round(tot_e[b])):+d})" for b in show if tot_c[b] or tot_e[b]))
                     st.session_state["c_flash"] = f"✅ Evening count saved for {cd:%d %b %Y}: {int(sum(tot_c.values())):,} pcs"
                     st.session_state["cnt_n"] = st.session_state.get("cnt_n", 0) + 1
                     _rerun_here()
@@ -1212,6 +1508,7 @@ def page_count(cfg, can_edit, me):
                    "Reason": reason, "By": me, "Adj_Id": uuid.uuid4().hex[:10]}
             try:
                 modify_csv(ADJ_FILE, ADJ_COLS, lambda df: pd.concat([df, pd.DataFrame([row])], ignore_index=True))
+                audit("adjustment", f"{row['Date']} {short(code)} {row['Pcs']} pcs · {reason}")
                 st.session_state["c_flash"] = f"✅ Adjustment saved: {kind[2:]} {n:,} pcs {b}"
                 _rerun_here()
             except Exception as e:
@@ -1425,8 +1722,11 @@ def page_settings(cfg, me):
     dflt = st.selectbox("New / other users", ["view", "hidden", "edit"],
                         index=["view", "hidden", "edit"].index(cfg.get("access_default", "view")), key="set_dflt")
 
+    extra = users_admin_box(cfg)
+
     if st.button("💾 Save settings", type="primary", key="set_save"):
         new = dict(cfg)
+        new.update(extra)
         rows = ed.to_dict("records")
         new.update(max_total=int(max_total), target_default=int(t_all), shelf_days=int(s_all), lookback_days=int(look),
                    round_to=int(rnd), max_prod_per_day=int(capp), priority=list(prio), access_default=dflt,
@@ -1439,6 +1739,8 @@ def page_settings(cfg, me):
             new["access"] = {r["User"]: r["Access"] for r in uacc.to_dict("records")}
         try:
             save_settings(new)
+            audit("settings saved", "targets: " + ", ".join(f"{short(r['Bun'])} {int(r['Target days'])}d" for r in rows)
+                  + f" | limit {int(max_total):,} | shelf {int(s_all)}d")
             st.session_state.pop("set_draft", None)
             st.session_state["set_n"] = n + 1
             st.session_state["s_flash"] = ("✅ Settings saved · targets: " + ", ".join(
@@ -1446,6 +1748,334 @@ def page_settings(cfg, me):
             st.rerun()
         except Exception as e:
             st.error(f"Not saved: {e}")
+
+
+# ==========================================
+# 📋 TASKS · 🕘 HISTORY · 👥 USERS
+# ==========================================
+USERNAME_RE = re.compile(r"^[a-z0-9._-]{3,30}$")
+EASY_PINS = {"0000", "1111", "1234", "4321", "123456", "000000", "111111", "654321"}
+
+
+def pw_problem(pw):
+    if len(pw or "") < 8 or not re.search(r"[A-Za-z]", pw) or not re.search(r"[0-9]", pw):
+        return "A password needs at least 8 characters, with letters and numbers."
+    return ""
+
+
+def pin_problem(a, b=None):
+    if not PIN_RE.match(a or ""):
+        return "A PIN is 4 to 6 numbers."
+    if b is not None and a != b:
+        return "The two PINs are different."
+    if a in EASY_PINS or len(set(a)) == 1:
+        return "Too easy to guess — choose another PIN."
+    return ""
+
+
+def staff_names(cfg, users=None):
+    users = load_users() if users is None else users
+    names = [(r.get("staff_name") or u) for u, r in users.items() if r.get("active", True)]
+    return sorted(set(names) | set(cfg.get("prod_staff") or []), key=str.lower)
+
+
+def task_list(cfg):
+    out = []
+    for t in cfg.get("tasks") or DEFAULT_TASKS:
+        if isinstance(t, dict) and t.get("id") and t.get("name"):
+            out.append({"id": str(t["id"]), "name": str(t["name"]), "due": str(t.get("due") or ""),
+                        "who": list(t.get("who") or []), "auto": t.get("auto") or "",
+                        "days": [int(x) for x in (t.get("days") if t.get("days") is not None else ALL_DAYS)]})
+    return out
+
+
+def _due_passed(day, due):
+    try:
+        hh, mm = [int(x) for x in due.split(":")]
+    except Exception:
+        return day < today_kh()
+    n = now_kh()
+    return day < today_kh() or (day == today_kh() and (n.hour, n.minute) >= (hh, mm))
+
+
+def tasks_for_day(cfg, day, prod=None, counts=None, trows=None):
+    """Each task of that day with its status: ✅ done · ⏳ to do · 🔴 late · ❌ missed."""
+    if prod is None:
+        prod, _ = read_csv(PROD_FILE, PROD_COLS)
+    if counts is None:
+        counts, _ = read_csv(COUNT_FILE, COUNT_COLS)
+    if trows is None:
+        trows, _ = read_csv(TASK_FILE, TASK_COLS)
+    iso = day.isoformat()
+    mine = trows[trows["Date"] == iso]
+    out = []
+    for t in task_list(cfg):
+        if day.weekday() not in t["days"]:
+            continue
+        row = mine[mine["Task_Id"] == t["id"]]
+        row = row.iloc[-1].to_dict() if len(row) else {}
+        assigned = [x.strip() for x in str(row.get("Assigned") or "").split(";") if x.strip()] if row.get("Assigned") \
+            else list(t["who"])
+        done_by, done_at, how = str(row.get("Done_By") or ""), str(row.get("Done_At") or ""), "manual"
+        if not done_by and t["auto"] in ("prod", "count"):
+            df = prod if t["auto"] == "prod" else counts
+            key = "Prod_Date" if t["auto"] == "prod" else "Count_Date"
+            hit = df[(df[key].astype(str).str[:10] == iso) |
+                     ((df["Saved_At"].astype(str).str[:10] == iso) if t["auto"] == "prod" else False)] \
+                if len(df) else df
+            if len(hit):
+                hit = hit.sort_values("Saved_At")
+                done_by = "; ".join(dict.fromkeys(hit["By"].astype(str)))
+                done_at, how = str(hit["Saved_At"].iloc[0])[11:16], "auto"
+        if done_by:
+            status = "✅ Done"
+        elif day < today_kh():
+            status = "❌ Missed"
+        elif _due_passed(day, t["due"]):
+            status = "🔴 Late"
+        else:
+            status = "⏳ To do"
+        out.append({**t, "assigned": assigned, "done_by": done_by, "done_at": done_at, "how": how,
+                    "status": status, "note": str(row.get("Note") or "")})
+    return out
+
+
+def save_task_row(day, tid, **fields):
+    iso, me = day.isoformat(), st.session_state.get("p_name", "")
+    stamp = now_kh().strftime("%Y-%m-%d %H:%M:%S")
+
+    def ch(df):
+        m = (df["Date"] == iso) & (df["Task_Id"] == tid)
+        if not m.any():
+            df = pd.concat([df, pd.DataFrame([{"Date": iso, "Task_Id": tid}])], ignore_index=True)
+            m = (df["Date"] == iso) & (df["Task_Id"] == tid)
+        for k, v in {**fields, "Updated_At": stamp, "Updated_By": me}.items():
+            df.loc[m, k] = v
+        return df
+    modify_csv(TASK_FILE, TASK_COLS, ch)
+
+
+def my_tasks_banner(cfg, me):
+    try:
+        todo = [t for t in tasks_for_day(cfg, today_kh()) if me in t["assigned"] and not t["done_by"]]
+    except Exception:
+        return
+    if todo:
+        st.warning("📋 **Your tasks today:** " + " · ".join(
+            f"{t['status'].split()[0]} {t['name']}" + (f" (before {t['due']})" if t["due"] else "") for t in todo))
+
+
+GOTO = {"prod": "🏭 Log production", "count": "📦 Stock count"}
+
+
+def page_tasks(cfg, can_edit, me):
+    st.subheader("📋 Daily tasks")
+    is_admin = st.session_state.get("p_role") == "admin"
+    c1, c2 = st.columns([1, 2])
+    day = c1.date_input("Day", value=today_kh(), max_value=today_kh() + timedelta(days=14), key="t_day")
+    only_me = c2.toggle("Show only my tasks", value=not is_admin, key="t_mine")
+    flash = st.session_state.pop("t_flash", None)
+    if flash:
+        st.success(flash)
+    prod, _ = read_csv(PROD_FILE, PROD_COLS)
+    counts, _ = read_csv(COUNT_FILE, COUNT_COLS)
+    trows, _ = read_csv(TASK_FILE, TASK_COLS)
+    rows = tasks_for_day(cfg, day, prod, counts, trows)
+    if only_me:
+        rows = [t for t in rows if me in t["assigned"] or not t["assigned"]]
+    if not rows:
+        st.info("No tasks for this day." + (" Admin adds tasks in ⚙️ Settings." if is_admin else ""))
+    people = staff_names(cfg)
+    done = sum(1 for t in rows if t["done_by"])
+    if rows:
+        st.progress(done / len(rows), text=f"{done} of {len(rows)} done")
+    for t in rows:
+        with st.container(border=True):
+            a, b = st.columns([3, 2])
+            a.markdown(f"**{t['status']} · {t['name']}**" + (f"  \n⏰ before {t['due']}" if t["due"] else ""))
+            a.caption("👥 " + (", ".join(t["assigned"]) or "anyone")
+                      + (f" · ✔️ by {t['done_by']} at {t['done_at']}" + (" (saved in the app)" if t["how"] == "auto" else "")
+                         if t["done_by"] else "")
+                      + (f" · 📝 {t['note']}" if t["note"] else ""))
+            if t["auto"] in GOTO and not t["done_by"] and day == today_kh():
+                if b.button(f"➡️ Go to {GOTO[t['auto']]}", key=f"t_go_{t['id']}", width="stretch"):
+                    st.session_state["goto_page"] = GOTO[t["auto"]]
+                    st.rerun()
+            elif not t["done_by"] and can_edit and day <= today_kh():
+                note = b.text_input("Note (optional)", key=f"t_note_{t['id']}_{day}", label_visibility="collapsed",
+                                    placeholder="Note (optional)")
+                if b.button("✅ Mark done", key=f"t_done_{t['id']}_{day}", type="primary", width="stretch"):
+                    try:
+                        save_task_row(day, t["id"], Done_By=me, Done_At=now_kh().strftime("%H:%M"), Note=note.strip())
+                        audit("task done", f"{day:%d %b}: {t['name']}" + (f" · {note.strip()}" if note.strip() else ""))
+                        st.session_state["t_flash"] = f"✅ {t['name']} — done"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Not saved: {e}")
+            elif t["done_by"] and t["how"] == "manual" and (is_admin or t["done_by"] == me):
+                if b.button("↩️ Undo", key=f"t_undo_{t['id']}_{day}", width="stretch"):
+                    save_task_row(day, t["id"], Done_By="", Done_At="", Note="")
+                    audit("task undone", f"{day:%d %b}: {t['name']}")
+                    st.rerun()
+            if is_admin:
+                with b.popover("👥 Assign", width="stretch"):
+                    pick = st.multiselect("Who does it on this day", people,
+                                          default=[p for p in t["assigned"] if p in people], key=f"t_as_{t['id']}_{day}")
+                    if st.button("💾 Save", key=f"t_as_save_{t['id']}_{day}"):
+                        save_task_row(day, t["id"], Assigned="; ".join(pick))
+                        audit("task assigned", f"{day:%d %b}: {t['name']} → {', '.join(pick) or 'anyone'}")
+                        st.session_state["t_flash"] = f"👥 {t['name']} → {', '.join(pick) or 'anyone'}"
+                        st.rerun()
+    st.markdown("#### 🗓️ Last 7 days")
+    days = [today_kh() - timedelta(days=i) for i in range(6, -1, -1)]
+    grid = {}
+    for d in days:
+        for t in tasks_for_day(cfg, d, prod, counts, trows):
+            grid.setdefault(t["name"], {})[day_label(d)] = t["status"].split()[0] + (
+                f" {t['done_by']}" if t["done_by"] else "")
+    if grid:
+        st.dataframe(pd.DataFrame(grid).T.reindex(columns=[day_label(d) for d in days]).fillna("–"), width="stretch")
+
+
+def page_history(cfg, me):
+    st.subheader("🕘 History — who did what")
+    is_admin = st.session_state.get("p_role") == "admin"
+    log, _ = read_csv(AUDIT_FILE, AUDIT_COLS, max_age=5)
+    if log.empty:
+        st.info("Nothing recorded yet. Every save, count, fix, sign-in and settings change will appear here.")
+        return
+    log = log.sort_values("Time", ascending=False)
+    log["_d"] = log["Time"].astype(str).str[:10]
+    c1, c2, c3, c4 = st.columns([1.3, 1.3, 1.3, 1.5])
+    rng = c1.date_input("Period", value=(today_kh() - timedelta(days=6), today_kh()), key="h_rng")
+    if isinstance(rng, (list, tuple)):
+        d1, d2 = (rng[0], rng[-1]) if rng else (today_kh(), today_kh())
+    else:
+        d1 = d2 = rng
+    log = log[(log["_d"] >= d1.isoformat()) & (log["_d"] <= d2.isoformat())]
+    if is_admin:
+        who = c2.multiselect("Person", sorted(set(log["Name"].astype(str)) - {""}), key="h_who")
+        if who:
+            log = log[log["Name"].isin(who)]
+    else:
+        log = log[log["Name"] == me]
+        c2.caption(f"👤 Only your own actions ({me}).")
+    acts = c3.multiselect("Action", sorted(set(log["Action"].astype(str))), key="h_act")
+    if acts:
+        log = log[log["Action"].isin(acts)]
+    q = c4.text_input("Search", key="h_q", placeholder="bun, date, word…")
+    if q.strip():
+        log = log[log["Detail"].astype(str).str.contains(q.strip(), case=False, regex=False)]
+    st.caption(f"{len(log):,} actions")
+    show = log[["Time", "Name", "User", "Action", "Detail"]]
+    st.dataframe(show, hide_index=True, width="stretch", height=min(600, 38 + 35 * max(len(show), 1)))
+    st.download_button("⬇️ Download (CSV)", show.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"production_history_{d1}_{d2}.csv", mime="text/csv")
+
+
+def users_admin_box(cfg):
+    """⚙️ Settings: new user, set someone's PIN / password, the 'Produced by' names, task templates."""
+    users = load_users()
+    st.markdown("#### ➕ New user")
+    with st.form("new_user", clear_on_submit=True):
+        a, b, c = st.columns(3)
+        uname = a.text_input("Username (small letters / numbers)").strip().lower()
+        sname = b.text_input("Staff name (shown in the app)").strip()
+        role = c.selectbox("Role", ["viewer", "staff", "sales", "admin"],
+                           help="Same accounts as the Supply Hub: the role is also used there. "
+                                "'viewer' = can only look in the Supply Hub.")
+        d, e, f = st.columns(3)
+        pin = d.text_input("🔢 PIN (4–6 numbers)", type="password", max_chars=6)
+        pw = e.text_input("🔑 Password (optional, 8+ letters & numbers)", type="password")
+        acc = f.selectbox("Production app access", ["edit", "view", "hidden"])
+        ok = st.form_submit_button("➕ Create user", type="primary")
+    if ok:
+        err = ("Username: 3–30 small letters, numbers, . _ -" if not USERNAME_RE.match(uname)
+               else "This username already exists." if uname in users
+               else "Give a staff name." if not sname
+               else "Give a PIN or a password." if not pin and not pw
+               else (pin_problem(pin) if pin else "") or (pw_problem(pw) if pw else ""))
+        if err:
+            st.error(err)
+        else:
+            stamp = now_kh().strftime("%Y-%m-%d %H:%M:%S")
+            rec = {"role": role, "active": True, "must_change": False, "created": stamp, "last_login": "",
+                   "permissions": {}, "staff_name": sname, "pw_changed": stamp,
+                   **_hash_pw(pw or pysecrets.token_urlsafe(18))}          # PIN-only: a random hidden password
+            if pin:
+                rec["pin"] = _pin_hash(pin)
+
+            def add(us):
+                if uname in us:
+                    raise RuntimeError("This username already exists.")
+                us[uname] = rec
+            try:
+                modify_users(add)
+                new = dict(cfg)
+                new["access"] = {**cfg.get("access", {}), uname: acc}
+                save_settings(new)
+                audit("user created", f"{uname} · {sname} · {role} · production {acc}")
+                st.session_state["s_flash"] = (f"✅ {sname} ({uname}) created. Sign in: choose “{sname}” + "
+                                               + ("the PIN." if pin else "the password."))
+                st.rerun()
+            except Exception as ex:
+                st.error(f"Not created: {ex}")
+
+    st.markdown("#### 🔢 Give / reset someone's PIN or password")
+    others = sorted(users, key=lambda u: (users[u].get("staff_name") or u).lower())
+    with st.form("reset_user", clear_on_submit=True):
+        a, b, c = st.columns(3)
+        who = a.selectbox("Person", others, index=None, placeholder="Choose",
+                          format_func=lambda u: f"{users[u].get('staff_name') or u} ({u})"
+                          + (" · 🔢" if users[u].get("pin") else ""))
+        pin = b.text_input("New PIN (4–6 numbers)", type="password", max_chars=6)
+        pw = c.text_input("New password (optional)", type="password")
+        ok2 = st.form_submit_button("💾 Save")
+    st.caption("🔢 after a name = already has a PIN. A new password signs that person out on their other phones.")
+    if ok2:
+        err = ("Choose a person." if not who else "Give a PIN or a password." if not pin and not pw
+               else (pin_problem(pin) if pin else "") or (pw_problem(pw) if pw else ""))
+        if err:
+            st.error(err)
+        else:
+            try:
+                if pin:
+                    set_pin(who, pin)
+                if pw:
+                    change_password(who, pw)
+                audit("PIN/password reset", f"{who}: " + " + ".join(x for x, y in (("PIN", pin), ("password", pw)) if y))
+                st.session_state["s_flash"] = f"✅ Saved for {users[who].get('staff_name') or who}."
+                st.rerun()
+            except Exception as ex:
+                st.error(f"Not saved: {ex}")
+
+    st.markdown("#### 👷 Names in “Produced by” (people without an account)")
+    ps = st.text_input("Separate with ;", value="; ".join(cfg.get("prod_staff") or []), key="set_pstaff")
+    st.markdown("#### 📋 Daily tasks (checklist)")
+    st.caption("auto **prod** = done by itself when production is saved for that day · auto **count** = done when the "
+               "evening count is saved · empty = staff tap ✅. 'Who' = default people (Admin can change per day in 📋 Tasks).")
+    people = staff_names(cfg, users)
+    trs = [{"Task": t["name"], "Before": t["due"], "Auto": t["auto"] or "",
+            "Who": "; ".join(t["who"]), **{EN_DAYS[i]: i in t["days"] for i in range(7)}, "_id": t["id"]}
+           for t in task_list(cfg)]
+    ted = st.data_editor(pd.DataFrame(trs, columns=["Task", "Before", "Auto", "Who", *EN_DAYS, "_id"]),
+                         hide_index=True, width="stretch", num_rows="dynamic", key=f"set_tasks_{st.session_state.get('set_n', 0)}",
+                         column_config={"_id": None,
+                                        "Task": st.column_config.TextColumn("Task", required=True),
+                                        "Before": st.column_config.TextColumn("⏰ Before (HH:MM)", validate=r"^([01]?\d|2[0-3]):[0-5]\d$"),
+                                        "Auto": st.column_config.SelectboxColumn("Auto", options=["", "prod", "count"]),
+                                        "Who": st.column_config.TextColumn("👥 Who (names, ;)", help="; ".join(people)),
+                                        **{EN_DAYS[i]: st.column_config.CheckboxColumn(EN_DAYS[i]) for i in range(7)}})
+    st.caption("Names: " + ", ".join(people))
+    tasks = []
+    for r in ted.to_dict("records"):
+        if not str(r.get("Task") or "").strip():
+            continue
+        tid = r.get("_id") if isinstance(r.get("_id"), str) and r.get("_id") else uuid.uuid4().hex[:8]
+        tasks.append({"id": tid, "name": str(r["Task"]).strip(), "due": str(r.get("Before") or "").strip(),
+                      "auto": r.get("Auto") or "", "who": [x.strip() for x in str(r.get("Who") or "").split(";") if x.strip()],
+                      "days": [i for i in range(7) if r.get(EN_DAYS[i]) is True or r.get(EN_DAYS[i]) == 1]})
+    return {"prod_staff": [x.strip() for x in ps.split(";") if x.strip()], "tasks": tasks}
 
 
 # ==========================================
@@ -1474,19 +2104,36 @@ top1, top2 = st.columns([4, 1])
 top1.markdown(f"### 🏭 Production & Live Stock · នំប៉ាវហុងកុង")
 with top2:
     st.caption(f"👤 {me} · {'✏️ edit' if can_edit else '👁️ view'}")
-    if st.button("Sign out", key="signout"):
+    b1, b2 = st.columns(2)
+    with b1.popover("🔑 PIN", width="stretch"):
+        my_pin_password_box(me_user)
+    if b2.button("Sign out", key="signout", width="stretch"):
         sign_out()
         st.rerun()
-pages = ["📊 Live stock", "🏭 Log production", "📦 Stock count", "📅 Next week plan"]
+if st.session_state.get("p_must_change"):
+    st.info("🔢 Choose your own PIN now (tap 🔑 PIN at the top) — next time just pick your name and type it.")
+my_tasks_banner(cfg, me)
+pages = ["📊 Live stock", "🏭 Log production", "📦 Stock count", "📋 Tasks", "📅 Next week plan", "🕘 History"]
 if me_role == "admin":
     pages.append("⚙️ Settings")
+if st.session_state.get("goto_page") in pages:
+    st.session_state["page"] = st.session_state.pop("goto_page")
 try:
     want = st.query_params.get("p", "")
     if "page" not in st.session_state and want in pages:
         st.session_state["page"] = want
 except Exception:
     pass
+if "phone_mode" not in st.session_state:
+    try:
+        _ua = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        _ua = ""
+    st.session_state["phone_mode"] = bool(re.search(r"Mobi|Android|iPhone|iPad", _ua))
 page = st.radio("Page", pages, horizontal=True, key="page", label_visibility="collapsed")
+st.toggle("📱 Phone mode (big boxes, one at a time)", key="phone_mode")
+if st.session_state.get("phone_mode"):
+    st.markdown(PHONE_CSS, unsafe_allow_html=True)
 try:
     st.query_params["p"] = page
 except Exception:
@@ -1505,6 +2152,10 @@ try:
         st.fragment(page_count)(cfg, can_edit, me)
     elif page == "📅 Next week plan":
         st.fragment(page_plan)(cfg, can_edit)
+    elif page == "📋 Tasks":
+        page_tasks(cfg, can_edit, me)
+    elif page == "🕘 History":
+        st.fragment(page_history)(cfg, me)
     else:
         page_settings(cfg, me)
 except Exception as err:          # a broken file must not blank the whole app
