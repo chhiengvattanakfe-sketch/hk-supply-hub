@@ -17,7 +17,9 @@ import fnmatch
 import hashlib
 import hmac
 import io
+import csv
 import json
+import traceback
 import math
 import os
 import re
@@ -223,24 +225,56 @@ def write_bytes(name, data, rev):
             m["list"][name] = (md.rev, md.size, md.server_modified)
 
 
-def read_csv(name, cols, max_age=8):
-    data, rev = read_bytes(name, max_age)
-    if not data:
-        return pd.DataFrame(columns=cols), rev
-    df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False, encoding="utf-8-sig")
+def _parse_csv(data, cols):
+    """(frame of good lines, header, bad lines). A line with too many / too few columns (e.g. 1,200 typed
+    without quotes in Excel) is NOT read shifted: it is kept aside untouched for the 🤖 bot / Admin."""
+    text = data.decode("utf-8-sig", errors="replace")
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return pd.DataFrame(columns=cols, dtype=object), list(cols), []
+    header = [h.strip() for h in rows[0]]
+    good, bad = [], []
+    for r in rows[1:]:
+        if not any(str(x).strip() for x in r):
+            continue
+        (good if len(r) == len(header) else bad).append(r)
+    df = pd.DataFrame(good, columns=header, dtype=object)
     for c in cols:
         if c not in df.columns:
             df[c] = ""
-    return df[cols], rev
+    return df[cols].astype(object), header, bad
+
+
+def _load_csv(name, cols, max_age=8):
+    data, rev = read_bytes(name, max_age)
+    if not data:
+        return pd.DataFrame(columns=cols, dtype=object), rev, list(cols), []
+    df, header, bad = _parse_csv(data, cols)
+    return df, rev, header, bad
+
+
+def read_csv(name, cols, max_age=8):
+    df, rev, _h, _bad = _load_csv(name, cols, max_age)
+    return df, rev
+
+
+def _csv_bytes(df, cols, bad=()):
+    buf = io.StringIO()
+    df[cols].to_csv(buf, index=False, lineterminator="\n")
+    if bad:                                              # lines the app could not read stay in the file as they were
+        w = csv.writer(buf, lineterminator="\n")
+        for r in bad:
+            w.writerow(r)
+    return buf.getvalue().encode("utf-8-sig")
 
 
 def modify_csv(name, cols, change):
     """read -> change(frame) -> save; retried if someone else saved at the same moment."""
     for attempt in range(5):
-        df, rev = read_csv(name, cols, max_age=0)
-        new = change(df.copy())
+        df, rev, _h, bad = _load_csv(name, cols, max_age=0)
+        new = change(df.copy())                          # (the bot's change may raise Conflict: then nothing is saved)
         try:
-            write_bytes(name, new[cols].to_csv(index=False).encode("utf-8-sig"), rev)
+            write_bytes(name, _csv_bytes(new, cols, bad), rev)
             return new
         except Conflict:
             time.sleep(0.4 * (attempt + 1))
@@ -2931,6 +2965,462 @@ def tasks_box(cfg):
 
 
 # ==========================================
+# 🤖 AUTO-FIX BOT — checks the data files by itself, repairs what is safe, catches page errors
+# ==========================================
+ERROR_FILE = "production_errors.csv"
+ERROR_COLS = ["Time", "User", "Page", "Error", "Where", "Result"]
+BOT_ISSUES_FILE = "production_bot_issues.json"            # problems the bot could not fix alone (for Admin)
+BOT_EVERY_S = 15 * 60
+DATE_FORMATS = ["%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%d.%m.%Y", "%m/%d/%Y", "%d/%m/%y", "%Y-%m-%d %H:%M:%S"]
+BOT_FILES = [  # file, columns, date columns (must), date columns (may be empty), id column, can pcs be negative
+    (PROD_FILE, PROD_COLS, ["Prod_Date"], [], "Entry_Id", False),
+    (COUNT_FILE, COUNT_COLS, ["Count_Date", "Prod_Date"], [], "Count_Id", False),
+    (ADJ_FILE, ADJ_COLS, ["Date"], ["Prod_Date"], "Adj_Id", True),
+]
+
+
+def _fix_date(v):
+    """Any usual way of writing a date -> 'YYYY-MM-DD' (None = cannot understand it)."""
+    t = str(v).strip()
+    if not t:
+        return None
+    for f in DATE_FORMATS:
+        try:
+            return datetime.strptime(t[:19] if "%H" in f else t[:10] if f == "%Y-%m-%d" else t, f).date().isoformat()
+        except ValueError:
+            continue
+    try:
+        x = pd.to_datetime(t, dayfirst=True, errors="raise")
+        return x.date().isoformat()
+    except Exception:
+        return None
+
+
+def _fix_pcs(v):
+    """' 1,200 ' / '1200.0' / '1 200' -> '1200'  (None = not a number)."""
+    t = str(v).strip().replace(",", "").replace(" ", "").replace(" ", "")
+    if re.fullmatch(r"[+-]?\d+(\.0+)?", t or "x"):
+        return str(int(float(t)))
+    return None
+
+
+def bot_audit(action, detail):
+    row = {"Time": now_kh().strftime("%Y-%m-%d %H:%M:%S"), "User": "bot", "Name": "🤖 Auto-fix bot",
+           "Action": action, "Detail": str(detail)[:500]}
+    try:
+        modify_csv(AUDIT_FILE, AUDIT_COLS, lambda df: pd.concat([df, pd.DataFrame([row])], ignore_index=True))
+    except Exception:
+        pass
+
+
+def _bot_backup(name):
+    """A copy before the bot changes anything (Dropbox: backups/bot_<time>_<file>)."""
+    try:
+        data, _rev = read_bytes(name, max_age=0)
+        if not data:
+            return
+        bname = f"bot_{now_kh():%Y-%m-%d_%H%M}_{name}"
+        if USE_DROPBOX:
+            import dropbox
+            _dbx().files_upload(data, f"{DROPBOX_FOLDER}/backups/{bname}", mode=dropbox.files.WriteMode.overwrite,
+                                mute=True)
+        else:
+            os.makedirs(os.path.join(LOCAL_DIR, "backups"), exist_ok=True)
+            with open(os.path.join(LOCAL_DIR, "backups", bname), "wb") as f:
+                f.write(data)
+    except Exception:
+        pass
+
+
+def _merge_bad_line(fields, header):
+    """Repairs the usual broken line: a number typed with a comma (1,200) split into two columns.
+    Returns the repaired fields or None when it is not clear."""
+    extra = len(fields) - len(header)
+    if extra >= 1 and "Pcs" in header:
+        p = header.index("Pcs")
+        joined = ",".join(fields[p:p + extra + 1])
+        if re.fullmatch(r"\s*[+-]?\d{1,3}(,\d{3})+\s*", joined):          # only a real 1,200 / 12,500 / 1,250,000
+            return fields[:p] + [joined.strip()] + fields[p + extra + 1:]
+    if extra == -1 and header and header[-1] in ("Team", "Place", "Note"):
+        return fields + [""]                                # only the last (optional) column is missing
+    return None
+
+
+def _write_lines(name, cols, header, new_rows_by_bad, rev_check=True):
+    """Puts repaired broken lines back as normal lines (or drops them). new_rows_by_bad: {tuple(bad): fields|None}."""
+    for attempt in range(4):
+        df, rev, hdr, bad = _load_csv(name, cols, max_age=0)
+        add, keep_bad = [], []
+        for r in bad:
+            k = tuple(r)
+            if k in new_rows_by_bad:
+                if new_rows_by_bad[k] is not None:
+                    add.append(dict(zip(hdr, new_rows_by_bad[k])))
+            else:
+                keep_bad.append(r)
+        if add:
+            df = pd.concat([df, pd.DataFrame(add).reindex(columns=cols).fillna("")], ignore_index=True)
+        try:
+            write_bytes(name, _csv_bytes(df, cols, keep_bad), rev)
+            return
+        except Conflict:
+            time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError("The file was being saved by someone else. Try again.")
+
+
+def bot_scan(cfg, fix=True):
+    """Looks at every data file. Safe problems are repaired at once (after a backup);
+    the others are returned for Admin. Returns (fixed: [text], issues: [dict])."""
+    known = set(DEFAULT_BUNS) | set((cfg.get("target_days") or {}).keys()) | set((cfg.get("crate_pcs") or {}).keys())
+    fixed, issues = [], []
+    for name, cols, must_dates, may_dates, idcol, neg_ok in BOT_FILES:
+        df, _rev, header, bad = _load_csv(name, cols, max_age=0)
+        # 1) broken lines (wrong number of columns): repair the clear ones, keep the rest for Admin
+        if bad:
+            repaired = {tuple(r): _merge_bad_line(r, header) for r in bad}
+            ok = {k: v for k, v in repaired.items() if v is not None}
+            for k, v in repaired.items():
+                if v is None:
+                    issues.append({"kind": "line", "file": name, "fields": list(k), "header": header,
+                                   "what": f"broken line ({len(k)} columns, needs {len(header)})", "value": ",".join(k),
+                                   "line": ",".join(k)[:160]})
+            if ok and fix:
+                _bot_backup(name)
+                try:
+                    _write_lines(name, cols, header, ok)
+                    fixed.append(f"{name}: {len(ok)} broken line(s) repaired (a number typed with a comma)")
+                    bot_audit("bot fixed", fixed[-1] + " · " + " | ".join(",".join(v) for v in list(ok.values())[:3]))
+                    df, _rev, header, bad = _load_csv(name, cols, max_age=0)
+                except Exception:
+                    pass
+        if df.empty:
+            continue
+        work = df.copy()
+        notes = []
+
+        def cell_issue(i, col, value, what):
+            issues.append({"kind": "cell", "file": name, "row": dict(df.loc[i]), "col": col, "value": str(value),
+                           "what": what, "line": _line(work, i)})
+        for c in must_dates + may_dates:                   # dates written another way -> YYYY-MM-DD
+            for i, v in work[c].items():
+                if not str(v).strip():
+                    if c in must_dates:
+                        cell_issue(i, c, "", "date is empty")
+                    continue
+                good = _fix_date(v)
+                if good is None:
+                    cell_issue(i, c, v, "date cannot be read")
+                elif good != str(v):
+                    work.at[i, c] = good
+                    notes.append(f"{c} '{v}' → {good}")
+        for i, v in work["Pcs"].items():                   # numbers typed with commas / spaces / .0
+            good = _fix_pcs(v)
+            if good is None:
+                cell_issue(i, "Pcs", v, "pcs is not a number")
+            else:
+                if good != str(v):
+                    work.at[i, "Pcs"] = good
+                    notes.append(f"Pcs '{v}' → {good}")
+                if not neg_ok and int(good) < 0:
+                    cell_issue(i, "Pcs", good, "pcs is below 0")
+        for i, v in work["Bun"].items():                   # 'n1 ' -> 'N1'
+            good = str(v).strip().upper().replace(" ", "")
+            if good in known:
+                if good != str(v):
+                    work.at[i, "Bun"] = good
+                    notes.append(f"Bun '{v}' → {good}")
+            else:
+                cell_issue(i, "Bun", v, "unknown bun code")
+        empty_id = work[idcol].astype(str).str.strip() == ""
+        if empty_id.any():                                  # lines without an id cannot be fixed / undone
+            for i in work.index[empty_id]:
+                work.at[i, idcol] = "bot" + uuid.uuid4().hex[:8]
+            notes.append(f"{int(empty_id.sum())} line(s) got a missing {idcol}")
+        dup = work.duplicated(keep="first")                 # exactly the same line twice (a double save)
+        if dup.any():
+            notes.append(f"{int(dup.sum())} exact double line(s) removed")
+            work = work[~dup]
+        if notes and fix:
+            _bot_backup(name)
+            before = df.copy()
+
+            def apply(cur, work=work, before=before):
+                if len(cur) != len(before) or not cur.reset_index(drop=True).equals(before.reset_index(drop=True)):
+                    raise Conflict("changed")              # someone saved meanwhile: the bot fixes it next time
+                return work
+            try:
+                modify_csv(name, cols, apply)
+                fixed.append(f"{name}: " + "; ".join(notes[:6]) + (f" … (+{len(notes) - 6})" if len(notes) > 6 else ""))
+                bot_audit("bot fixed", fixed[-1])
+            except Exception:
+                pass
+    # settings: values of the wrong type (text where a number must be, broken lists) -> repaired
+    try:
+        data, _r = read_bytes(SETTINGS_FILE, max_age=0)
+        raw = json.loads(data.decode("utf-8")) if data else {}
+        bad_s = _settings_problems(raw)
+        if bad_s and fix:
+            _bot_backup(SETTINGS_FILE)
+            update_settings(_repair_settings)
+            fixed.append("settings: " + "; ".join(bad_s[:6]))
+            bot_audit("bot fixed", fixed[-1])
+    except json.JSONDecodeError:
+        issues.append({"kind": "info", "file": SETTINGS_FILE, "value": "", "col": "",
+                       "what": "settings file is broken — the app uses the default settings",
+                       "line": "Open ⚙️ Settings and press 💾 Save settings to write a good file again."})
+    except Exception:
+        pass
+    return fixed, issues
+
+
+def _line(df, i):
+    r = df.loc[i]
+    return " · ".join(f"{c} {r[c]}" for c in ("Saved_At", "Prod_Date", "Count_Date", "Date", "Bun", "Pcs", "By")
+                      if c in r and str(r[c]).strip())[:160]
+
+
+def _settings_problems(raw):
+    out = []
+    for k in ("max_total", "target_default", "shelf_days", "lookback_days", "round_to", "max_prod_per_day"):
+        if k in raw:
+            try:
+                int(raw[k])
+                if isinstance(raw[k], str):
+                    out.append(f"{k} was text")
+            except (TypeError, ValueError):
+                out.append(f"{k} was not a number")
+    for k in ("target_days", "shelf_by_bun", "crate_pcs"):
+        for b, v in (raw.get(k) or {}).items() if isinstance(raw.get(k), dict) else []:
+            try:
+                int(v)
+                if isinstance(v, str):
+                    out.append(f"{k} {b} was text")
+            except (TypeError, ValueError):
+                out.append(f"{k} {b} was not a number")
+    for b, v in (raw.get("prod_days") or {}).items() if isinstance(raw.get("prod_days"), dict) else []:
+        if not isinstance(v, list) or any(not isinstance(x, int) or not 0 <= x <= 6 for x in v):
+            out.append(f"prod_days {b} broken")
+    return out
+
+
+def _repair_settings(cur):
+    for k in ("max_total", "target_default", "shelf_days", "lookback_days", "round_to", "max_prod_per_day"):
+        if k in cur:
+            try:
+                cur[k] = int(float(cur[k]))
+            except (TypeError, ValueError):
+                cur[k] = DEFAULT_SETTINGS.get(k, 0)
+    for k in ("target_days", "shelf_by_bun", "crate_pcs"):
+        if isinstance(cur.get(k), dict):
+            good = {}
+            for b, v in cur[k].items():
+                try:
+                    good[b] = int(float(v))
+                except (TypeError, ValueError):
+                    pass                                    # dropped: the bun uses the default value
+            cur[k] = good
+    if isinstance(cur.get("prod_days"), dict):
+        cur["prod_days"] = {b: sorted({int(x) for x in v if str(x).lstrip("-").isdigit() and 0 <= int(x) <= 6})
+                            for b, v in cur["prod_days"].items() if isinstance(v, list)}
+
+
+def bot_tick(cfg):
+    """Runs the check by itself at most every 15 min (for the whole app, not per person)."""
+    m = _mem()
+    if time.time() - m.get("bot_t", 0) < BOT_EVERY_S:
+        return
+    m["bot_t"] = time.time()
+    try:
+        fixed, issues = bot_scan(cfg, fix=True)
+        m["bot_last"] = {"t": now_kh().strftime("%d %b %H:%M"), "fixed": fixed, "issues": issues}
+    except Exception as e:
+        m["bot_last"] = {"t": now_kh().strftime("%d %b %H:%M"), "fixed": [], "issues": [],
+                         "err": f"check could not finish: {e}"}
+
+
+def log_error(page, err):
+    tb = traceback.extract_tb(err.__traceback__)
+    where = next((f"line {f.lineno} in {f.name}" for f in reversed(tb) if f.filename.endswith(".py")
+                  and "site-packages" not in f.filename), "")
+    m = _mem()
+    key = (page, type(err).__name__, str(err)[:80])
+    if time.time() - m.setdefault("err_seen", {}).get(key, 0) < 600:    # the same error: once per 10 min
+        return
+    m["err_seen"][key] = time.time()
+    row = {"Time": now_kh().strftime("%Y-%m-%d %H:%M:%S"), "User": st.session_state.get("p_name", ""), "Page": page,
+           "Error": f"{type(err).__name__}: {err}"[:300], "Where": where, "Result": ""}
+    try:
+        modify_csv(ERROR_FILE, ERROR_COLS, lambda df: pd.concat([df, pd.DataFrame([row])], ignore_index=True))
+    except Exception:
+        pass
+
+
+def guarded(fn, page):
+    """Runs a page. If it breaks: the bot clears the cache, repairs the data and tries once more by itself.
+    Only if it still breaks is a short message shown (and the error kept for Admin / the developer)."""
+    def run(*a, **k):
+        heal = st.session_state.setdefault("_heal", {})
+        try:
+            fn(*a, **k)
+            heal.pop(page, None)
+        except Exception as err:
+            log_error(page, err)
+            if heal.get(page, 0) < 1:
+                heal[page] = 1
+                try:
+                    m = _mem()
+                    with m["lock"]:
+                        m["files"].clear()
+                        m["list"] = None
+                    st.cache_data.clear()
+                    bot_scan(a[0] if a and isinstance(a[0], dict) else load_settings()[0], fix=True)
+                except Exception:
+                    pass
+                st.toast("🤖 A problem was found — the bot repaired the data and is trying again…")
+                _rerun_here()
+            heal.pop(page, None)
+            st.error(f"⚠️ This part could not load: {err}. The 🤖 bot already tried to repair it and kept the error "
+                     "for Admin. Your saved data is safe — try again in a minute.")
+            if st.session_state.get("p_role") == "admin":
+                with st.expander("Details for Admin"):
+                    st.exception(err)
+    run.__name__ = getattr(fn, "__name__", "page")
+    run.__qualname__ = f"guarded_{run.__name__}"           # each page keeps its own fragment
+    return run
+
+
+def page_bot(cfg):
+    st.subheader("🤖 Auto-fix bot")
+    st.caption("The bot checks the data files by itself every 15 minutes and whenever a page breaks. It repairs safe "
+               "problems at once (always keeping a backup first) and lists here what needs a person.")
+    show_flash("bot_flash")
+    c1, c2 = st.columns([1, 3])
+    if c1.button("🔍 Check now", type="primary", width="stretch", key="bot_now"):
+        with st.spinner("Checking every file…"):
+            fixed, issues = bot_scan(cfg, fix=True)
+        _mem()["bot_last"] = {"t": now_kh().strftime("%d %b %H:%M"), "fixed": fixed, "issues": issues}
+        _mem()["bot_t"] = time.time()
+    last = _mem().get("bot_last")
+    if last:
+        c2.markdown(f"Last check: **{last['t']}** · fixed **{len(last['fixed'])}** · need you **{len(last['issues'])}**"
+                    + (f" · ⚠️ {last['err']}" if last.get("err") else ""))
+        for f in last["fixed"]:
+            st.success("🔧 " + f)
+        issues = last["issues"]
+        if issues:
+            st.markdown("#### 🙋 Needs a person")
+            for k, it in enumerate(issues[:40]):
+                with st.container(border=True):
+                    a, b = st.columns([3, 2])
+                    a.markdown(f"**{it['what']}** · `{it['file']}`" + (f" · value: `{it['value']}`"
+                                                                        if it["value"] and it["kind"] == "cell" else ""))
+                    a.caption(it["line"])
+                    if it["kind"] == "info":
+                        continue
+                    if it["kind"] == "line":
+                        newv = b.text_input("Correct line", value=",".join(it["fields"]), key=f"bot_v_{k}",
+                                            help="Columns: " + ",".join(it["header"]) + ' — put "quotes" around a '
+                                                 "number with a comma, or remove the comma.",
+                                            label_visibility="collapsed")
+                    elif it["col"] == "Pcs":
+                        newv = b.text_input("Right pcs", key=f"bot_v_{k}", placeholder="e.g. 1200",
+                                            label_visibility="collapsed")
+                    elif it["col"] == "Bun":
+                        newv = b.selectbox("Right bun", sorted(set(DEFAULT_BUNS) | set(cfg.get("target_days") or {})),
+                                           index=None, key=f"bot_v_{k}", placeholder="Choose the bun",
+                                           label_visibility="collapsed")
+                    else:
+                        d = b.date_input("Right date", value=None, key=f"bot_v_{k}", label_visibility="collapsed")
+                        newv = d.isoformat() if d else None
+                    x, y = b.columns(2)
+                    if x.button("✅ Fix", key=f"bot_fix_{k}", disabled=not newv, width="stretch"):
+                        _bot_fix(it, newv, delete=False)
+                    if y.button("🗑️ Delete line", key=f"bot_del_{k}", width="stretch"):
+                        _bot_fix(it, None, delete=True)
+        elif not last.get("err"):
+            st.info("✅ Nothing needs you — all data files are fine.")
+    else:
+        st.info("The first check runs within a minute of opening the app — or press 🔍 Check now.")
+    st.markdown("#### ⚠️ Page errors kept by the bot")
+    errs, _r = read_csv(ERROR_FILE, ERROR_COLS, max_age=5)
+    if errs.empty:
+        st.caption("No page errors. 👍")
+    else:
+        errs = errs.sort_values("Time", ascending=False)
+        st.dataframe(errs.head(100), hide_index=True, width="stretch")
+        st.caption("Errors the bot cannot repair by itself are mistakes in the program — send this list (or a screenshot) "
+                   "to get the program fixed. Tick them off below when solved.")
+        if st.button("🧹 Clear the error list", key="bot_clear_err"):
+            modify_csv(ERROR_FILE, ERROR_COLS, lambda df: df.iloc[0:0])
+            audit("bot errors cleared", f"{len(errs)} errors")
+            st.session_state["bot_flash"] = "🧹 Error list cleared."
+            _rerun_here()
+    log, _r = read_csv(AUDIT_FILE, AUDIT_COLS, max_age=5)
+    mine = log[log["User"] == "bot"].sort_values("Time", ascending=False) if not log.empty else log
+    if not mine.empty:
+        st.markdown("#### 🔧 What the bot repaired")
+        st.dataframe(mine[["Time", "Action", "Detail"]].head(100), hide_index=True, width="stretch")
+
+
+def _bot_fix(it, val, delete):
+    """Admin's one-tap fix of one problem the bot could not repair alone (a backup is kept first)."""
+    name = it["file"]
+    cols = next(x[1] for x in BOT_FILES if x[0] == name)
+    try:
+        if it["kind"] == "line":
+            new_fields = None
+            if not delete:
+                new_fields = next(csv.reader(io.StringIO(val)), [])
+                if len(new_fields) != len(it["header"]):
+                    st.error(f"The line has {len(new_fields)} columns — it needs {len(it['header'])}. "
+                             'Put "quotes" around a number with a comma (e.g. "1,200") or remove the comma.')
+                    return
+            _bot_backup(name)
+            _write_lines(name, cols, it["header"], {tuple(it["fields"]): new_fields})
+        else:
+            if not delete and it["col"] == "Pcs":
+                val = _fix_pcs(val)
+                if val is None:
+                    st.error("Type numbers only.")
+                    return
+
+            def ch(df):
+                m = pd.Series(True, index=df.index)
+                for c, v in it["row"].items():               # exactly that line (all columns the same)
+                    m &= df[c].astype(str) == str(v)
+                hit = df.index[m]
+                if not len(hit):
+                    return df
+                if delete:
+                    return df.drop(hit[:1])
+                df.loc[hit[:1], it["col"]] = val
+                return df
+            _bot_backup(name)
+            modify_csv(name, cols, ch)
+        audit("bot issue " + ("deleted" if delete else "fixed"),
+              f"{name}: {it['line']} · {it.get('col') or 'line'} → {'deleted' if delete else val}")
+        last = _mem().get("bot_last") or {}
+        last["issues"] = [x for x in last.get("issues", []) if x is not it]
+        st.session_state["bot_flash"] = "✅ Done — " + ("line deleted." if delete else "fixed.")
+        _rerun_here()
+    except Exception as e:
+        st.error(f"Not changed: {e}")
+
+
+def bot_banner():
+    """Admin: one line at the top when the bot needs you or saw errors today."""
+    last = _mem().get("bot_last") or {}
+    need = len(last.get("issues", []))
+    try:
+        errs, _r = read_csv(ERROR_FILE, ERROR_COLS)
+        today_errs = int((errs["Time"].astype(str).str[:10] == today_kh().isoformat()).sum()) if not errs.empty else 0
+    except Exception:
+        today_errs = 0
+    if need or today_errs:
+        st.warning(f"🤖 Bot: {need} data problem(s) need you · {today_errs} page error(s) today — open **🤖 Bot**.")
+
+
+# ==========================================
 # MAIN
 # ==========================================
 st.markdown(CSS, unsafe_allow_html=True)
@@ -2965,10 +3455,13 @@ with top2:
 if st.session_state.get("p_must_change"):
     st.info("🔢 Choose your own PIN now (tap 🔑 PIN at the top) — next time just pick your name and type it.")
 my_tasks_banner(cfg, me)
+bot_tick(cfg)                                       # 🤖 checks / repairs the data files by itself (every 15 min)
+if me_role == "admin":
+    bot_banner()
 pages = ["📊 Live stock", "🏭 Log production", "📦 Stock count", "🧊 3D rooms", "📋 Tasks", "📅 Next week plan",
          "🕘 History"]
 if me_role == "admin":
-    pages.append("⚙️ Settings")
+    pages += ["🤖 Bot", "⚙️ Settings"]
 if st.session_state.get("goto_page") in pages:
     st.session_state["page"] = st.session_state.pop("goto_page")
 try:
@@ -2994,28 +3487,23 @@ except Exception:
 if not USE_DROPBOX:
     st.caption(f"💻 Local mode: data files in {LOCAL_DIR}")
 
-try:
-    if page == "📊 Live stock":
-        live = st.toggle("🔄 Update by itself every 60 s", value=True, key="live_on")
-        frag = st.fragment(run_every=60)(page_live) if live else st.fragment(page_live)
-        frag(cfg, can_edit)
-    elif page == "🏭 Log production":
-        st.fragment(page_production)(cfg, can_edit, me)
-    elif page == "📦 Stock count":
-        st.fragment(page_count)(cfg, can_edit, me)
-    elif page == "📅 Next week plan":
-        st.fragment(page_plan)(cfg, can_edit)
-    elif page == "🧊 3D rooms":
-        st.fragment(page_rooms)(cfg)
-    elif page == "📋 Tasks":
-        page_tasks(cfg, can_edit, me)
-    elif page == "🕘 History":
-        st.fragment(page_history)(cfg, me)
-    else:
-        page_settings(cfg, me)
-except Exception as err:          # a broken file must not blank the whole app
-    st.error(f"⚠️ This page could not load: {err}. Press **R** or refresh the page; your saved data is safe. "
-             "If it keeps happening, tell Admin.")
-    if me_role == "admin":
-        with st.expander("Details for Admin"):
-            st.exception(err)
+if page == "📊 Live stock":
+    live = st.toggle("🔄 Update by itself every 60 s", value=True, key="live_on")
+    frag = st.fragment(run_every=60)(guarded(page_live, page)) if live else st.fragment(guarded(page_live, page))
+    frag(cfg, can_edit)
+elif page == "🏭 Log production":
+    st.fragment(guarded(page_production, page))(cfg, can_edit, me)
+elif page == "📦 Stock count":
+    st.fragment(guarded(page_count, page))(cfg, can_edit, me)
+elif page == "📅 Next week plan":
+    st.fragment(guarded(page_plan, page))(cfg, can_edit)
+elif page == "🧊 3D rooms":
+    st.fragment(guarded(page_rooms, page))(cfg)
+elif page == "📋 Tasks":
+    guarded(page_tasks, page)(cfg, can_edit, me)
+elif page == "🕘 History":
+    st.fragment(guarded(page_history, page))(cfg, me)
+elif page == "🤖 Bot":
+    st.fragment(guarded(page_bot, page))(cfg)
+else:
+    guarded(page_settings, page)(cfg, me)
