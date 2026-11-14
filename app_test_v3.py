@@ -1600,6 +1600,7 @@ def page_count(cfg, can_edit, me):
                     horizontal=True, key="cnt_mode")
     if mode.startswith("⬜"):
         start_rows = {pl: [(cd, {})] for pl in places}
+    tab_slots = []
     if st.session_state.get("phone_mode"):
         counted = _count_phone(places, start_rows, show, names, cd,
                                f"{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}")
@@ -1609,7 +1610,7 @@ def page_count(cfg, can_edit, me):
         st.caption("➡️ Count each freezer tab, then open **✅ Check & save** to save. What you type is kept if you "
                    "open another page and come back.")
         tabs = st.tabs([f"🧊 {pl}" for pl in places] + ["✅ Check & save"])
-        counted, any_restored = {}, False
+        counted, any_restored, tab_slots = {}, False, []
         for i, (pl, tab) in enumerate(zip(places, tabs)):
             with tab:
                 gk = f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}"
@@ -1617,8 +1618,9 @@ def page_count(cfg, can_edit, me):
                 any_restored = any_restored or restored
                 st.markdown(excel_html(f"{pl} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted[pl])], show),
                             unsafe_allow_html=True)
+                tab_slots.append(st.container())                # 💾 save right here (filled below)
                 nxt = f"🧊 {places[i + 1]}" if i + 1 < len(places) else "✅ Check & save"
-                st.caption(f"➡️ Next: open the **{nxt}** tab above.")
+                st.caption(f"➡️ Next: open the **{nxt}** tab above — or save now with the button above.")
         if any_restored:
             st.info("📝 Your count from before is still here — it is NOT saved yet.")
         check_box = tabs[-1]
@@ -1663,10 +1665,27 @@ def page_count(cfg, can_edit, me):
             clicked = st.button(f"💾 Save the evening count ({int(sum(tot_c.values())):,} pcs)", type="primary",
                                 key="cnt_save", disabled=not ok_big, width="stretch")
             undo_bar("count", "c_flash")
+
+            # the same save under every freezer tab: save right after editing
+            def _cells(rows):
+                return {(d, b): v for d, vals in rows for b, v in vals.items() if v}
+            untouched = [pl for pl in places if _cells(counted[pl]) == _cells(start_rows[pl])]
+            for i, slot in enumerate(tab_slots):
+                with slot:
+                    others = [pl for pl in untouched if pl != places[i]]
+                    if others:
+                        st.caption("ℹ️ Not changed yet: " + ", ".join(f"🧊 {pl}" for pl in others)
+                                   + " — saving now keeps it as shown in its tab.")
+                    if not ok_big:
+                        st.caption("⚠️ Big difference — open **✅ Check & save** to confirm the numbers first.")
+                    if st.button(f"💾 Save the count — all freezers ({int(sum(tot_c.values())):,} pcs)", type="primary",
+                                 key=f"cnt_save_tab_{i}", disabled=not ok_big, width="stretch"):
+                        clicked = True
             sig = json.dumps([cd.isoformat()] + [(pl, [(d.isoformat(), sorted(v.items())) for d, v in sorted(counted[pl])])
                                                  for pl in places])
             if clicked and not save_guard("count", sig):
                 st.info("✅ This count was already saved a moment ago — it is not saved twice.")
+                st.toast("✅ Already saved a moment ago — not saved twice.")
             elif clicked:
                 cid, stamp = uuid.uuid4().hex[:10], now_kh().strftime("%Y-%m-%d %H:%M:%S")
                 new = [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": b, "Prod_Date": d.isoformat(),
@@ -1688,6 +1707,7 @@ def page_count(cfg, can_edit, me):
                 except Exception as e:
                     st.session_state.pop("_sig_count", None)
                     st.error(f"Not saved: {e}")
+                    st.toast(f"⚠️ Not saved: {e}"[:140])
         else:
             st.info("👁️ View only — ask Admin for edit access to save a count.")
         st.download_button("📥 Count sheet for printing (Excel, your layout)",
