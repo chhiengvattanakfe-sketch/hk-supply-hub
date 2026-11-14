@@ -195,19 +195,27 @@ def write_bytes(name, data, rev):
     import dropbox
     path = f"{DROPBOX_FOLDER}/{name}"
     mode = dropbox.files.WriteMode.update(rev) if rev else dropbox.files.WriteMode.add
-    try:
-        if rev:
-            day_copy = f"{DROPBOX_FOLDER}/backups/{today_kh():%Y-%m-%d}_{name}"
-            try:
-                _dbx().files_copy_v2(path, day_copy)       # first save of the day keeps yesterday's version
-            except Exception:
-                pass
-        md = _dbx().files_upload(data, path, mode=mode, mute=True, autorename=False)
-    except dropbox.exceptions.ApiError as e:
-        if "conflict" in str(e).lower():
-            raise Conflict(name) from e
-        raise
     m = _mem()
+    day_key = (name, today_kh().isoformat())
+    if rev and day_key not in m.setdefault("backed_up", set()):
+        try:                                               # first save of the day keeps yesterday's version
+            _dbx().files_copy_v2(path, f"{DROPBOX_FOLDER}/backups/{today_kh():%Y-%m-%d}_{name}")
+        except Exception:
+            pass                                           # already copied today (or no file yet)
+        m["backed_up"].add(day_key)                        # only once a day: saving stays fast
+    for attempt in range(3):
+        try:
+            md = _dbx().files_upload(data, path, mode=mode, mute=True, autorename=False)
+            break
+        except dropbox.exceptions.ApiError as e:
+            if "conflict" in str(e).lower():
+                raise Conflict(name) from e
+            raise
+        except Exception:                                  # network hiccup: try again, then tell the person
+            if attempt == 2:
+                raise RuntimeError("No connection to Dropbox — check the internet and press Save again. "
+                                   "Your numbers are still on the screen.")
+            time.sleep(1.0 * (attempt + 1))
     with m["lock"]:
         m["files"][name] = (md.rev, data)
         if m["list"] is not None:
@@ -250,14 +258,27 @@ def load_settings():
     return s, rev
 
 
-def save_settings(new):
+def update_settings(changes):
+    """Saves only the parts that changed, on top of the NEWEST settings file — so two people saving
+    different parts (e.g. room sizes and stock targets) never undo each other.
+    `changes` = {key: value} or a function(settings) that changes the dict."""
     for attempt in range(4):
-        _old, rev = read_bytes(SETTINGS_FILE, max_age=0)
+        data, rev = read_bytes(SETTINGS_FILE, max_age=0)
+        cur = {}
+        if data:
+            try:
+                cur = json.loads(data.decode("utf-8"))
+            except Exception:
+                raise RuntimeError("The settings file cannot be read — nothing was changed.")
+        if callable(changes):
+            changes(cur)
+        else:
+            cur.update(changes)
         try:
-            write_bytes(SETTINGS_FILE, json.dumps(new, ensure_ascii=False, indent=1).encode("utf-8"), rev)
-            return
+            write_bytes(SETTINGS_FILE, json.dumps(cur, ensure_ascii=False, indent=1).encode("utf-8"), rev)
+            return cur
         except Conflict:
-            time.sleep(0.4)
+            time.sleep(0.4 * (attempt + 1))
     raise RuntimeError("Settings were being saved by someone else. Try again.")
 
 
@@ -765,11 +786,11 @@ def compute_stock(buns, prod, counts, adjs, sales, until):
     base = latest_counts(counts)
     p = prod.copy()
     p["_d"] = p["Prod_Date"].map(_day)
-    p["_n"] = p["Pcs"].map(_num)
+    p["_n"] = p["Pcs"].map(_num).astype(float)
     a = adjs.copy()
     a["_d"] = a["Date"].map(_day)
     a["_pd"] = a["Prod_Date"].map(_day)
-    a["_n"] = a["Pcs"].map(_num)
+    a["_n"] = a["Pcs"].map(_num).astype(float)
     sale_map = {}
     for d, b, n in sales[["Date", "Bun", "Pcs"]].itertuples(index=False):
         sale_map[(d, b)] = sale_map.get((d, b), 0) + n
@@ -1056,7 +1077,7 @@ def page_live(cfg, can_edit):
     speed, n_sell = sales_speed(sales, buns, t, int(cfg["lookback_days"]))
     total = sum(sum(v.values()) for v in batches.values())
     cap = float(cfg["max_total"])
-    p_today = prod[prod["Prod_Date"].map(_day) == t]["Pcs"].map(_num).sum()
+    p_today = prod[prod["Prod_Date"].map(_day) == t]["Pcs"].map(_num).astype(float).sum()
     s_today = sales[sales["Date"] == t]["Pcs"].sum() if not sales.empty else 0
     shelf = int(cfg.get("shelf_days", 10))
     rows, alerts = [], []
@@ -1131,6 +1152,74 @@ def _rerun_here():
         st.rerun()
 
 
+# ---- saving made safe and easy: drafts kept, no double saves, undo ----
+UNDO_MINUTES = 15
+
+
+def show_flash(key):
+    """Green message after a save (also a toast, seen even when the page is scrolled down)."""
+    msg = st.session_state.pop(key, None)
+    if msg:
+        st.success(msg)
+        st.toast(msg[:140])
+
+
+def save_guard(kind, sig):
+    """False when exactly the same data was just saved (double tap / slow phone) — it is never saved twice."""
+    last = st.session_state.get(f"_sig_{kind}")
+    if last and last[0] == sig and time.time() - last[1] < 120:
+        return False
+    st.session_state[f"_sig_{kind}"] = (sig, time.time())
+    return True
+
+
+def remember_undo(kind, file, cols, idcol, rid, label):
+    st.session_state[f"_undo_{kind}"] = {"file": file, "cols": cols, "idcol": idcol, "id": rid, "label": label,
+                                         "t": time.time(), "at": now_kh().strftime("%H:%M")}
+
+
+def undo_bar(kind, flash_key):
+    """'↩️ Undo last save' for a few minutes after a save (removes exactly the lines of that save)."""
+    u = st.session_state.get(f"_undo_{kind}")
+    if not u or time.time() - u["t"] > UNDO_MINUTES * 60:
+        return
+    c1, c2 = st.columns([3, 1])
+    c1.caption(f"🕘 Your last save ({u['at']}): {u['label']} — saved something wrong? You can undo it for "
+               f"{UNDO_MINUTES} minutes.")
+    if c2.button("↩️ Undo last save", key=f"undo_{kind}", width="stretch"):
+        try:
+            modify_csv(u["file"], u["cols"], lambda df: df[df[u["idcol"]] != u["id"]])
+            audit(f"{kind} undone", u["label"])
+            st.session_state.pop(f"_undo_{kind}", None)
+            st.session_state.pop(f"_sig_{kind}", None)
+            st.session_state[flash_key] = f"↩️ Undone: {u['label']}"
+            _rerun_here()
+        except Exception as e:
+            st.error(f"Not undone: {e}")
+
+
+def draft_grid(default_rows, buns, key, **kw):
+    """The Excel-like editor, but what you typed is KEPT when you open another page and come back.
+    Returns (rows, restored_from_draft)."""
+    bases = st.session_state.setdefault("_grid_base", {})
+    drafts = st.session_state.setdefault("_grid_draft", {})
+    restored = False
+    if key not in st.session_state:                      # shown for the first time, or back from another page
+        d = drafts.get(key)
+        restored = bool(d) and any(v for _d, v in d)
+        bases[key] = d if restored else default_rows
+    ed = _grid(bases[key], buns, key, **kw)
+    rows = _grid_values(ed, buns)
+    drafts[key] = rows
+    return rows, restored
+
+
+def drop_draft(*keys):
+    for k in keys:
+        st.session_state.get("_grid_base", {}).pop(k, None)
+        st.session_state.get("_grid_draft", {}).pop(k, None)
+
+
 def _grid_values(df, buns):
     """Editor rows -> [(date, {bun: pcs})] (rows without a date or pcs are skipped)."""
     out = []
@@ -1149,11 +1238,13 @@ def _grid_values(df, buns):
 
 def _grid(rows, buns, key, height=None, max_date=None):
     """Excel-like editor: one row per production date, one column per bun (your short names)."""
+    rows = list(rows) or [(max_date or today_kh(), {})]         # never an empty table: one row to start typing
     data = [{"Production date": d, **{short(b): (int(v[b]) if v.get(b) else None) for b in buns}} for d, v in rows]
     df = pd.DataFrame(data, columns=["Production date"] + [short(b) for b in buns])
     df["Production date"] = pd.to_datetime(df["Production date"])
     for b in buns:                    # digits as text: an empty cell stays really empty (no grey 'None')
-        df[short(b)] = ["" if v is None or pd.isna(v) else str(int(v)) for v in df[short(b)]]
+        df[short(b)] = pd.Series(["" if v is None or pd.isna(v) else str(int(v)) for v in df[short(b)]],
+                                 index=df.index, dtype="string")
     cfg = {"Production date": st.column_config.DateColumn("Date", format="ddd, MMM/DD, YY", max_value=max_date,
                                                           required=True, width="medium")}
     for b in buns:
@@ -1168,51 +1259,84 @@ def page_production(cfg, can_edit, me):
     prod, _rev = read_csv(PROD_FILE, PROD_COLS)
     _p, _c, _a, sales, names, buns = get_data(cfg)
     show = active_buns(buns, sales)
-    flash = st.session_state.pop("p_flash", None)
-    if flash:
-        st.success(flash)
+    show_flash("p_flash")
     if can_edit:
-        if st.session_state.get("phone_mode"):
-            st.markdown("Type the pcs produced for each bun. **Empty = 0.**")
-        else:
-            st.markdown("Type the pcs produced like in your Excel sheet — **one row per production date** "
-                        "(add a row with ＋ for another day). Empty = 0.")
+        phone = st.session_state.get("phone_mode")
+        st.markdown("Type the pcs produced for each bun. **Empty = 0.**" if phone else
+                    "Type the pcs produced like in your Excel sheet — **one row per production date** "
+                    "(add a row with ＋ for another day). Empty = 0.")
         n = st.session_state.get("prod_grid_n", 0)
-        if st.session_state.get("phone_mode"):
-            pdate = st.date_input("📅 Production date", value=today_kh(), max_value=today_kh() + timedelta(days=1),
-                                  key=f"pp_date_{n}")
-            vals = bun_inputs(show, names, {}, key=f"pp_{n}")
+        gkey = f"prod_grid_{n}"
+        if phone:
+            dr = st.session_state.get("_pp_draft") or {}
+            dr = dr if dr.get("n") == n else {}
+            pdate = st.date_input("📅 Production date", value=dr.get("date") or today_kh(),
+                                  max_value=today_kh() + timedelta(days=1), key=f"pp_date_{n}")
+            vals = bun_inputs(show, names, dr.get("vals") or {}, key=f"pp_{n}")
+            st.session_state["_pp_draft"] = {"n": n, "date": pdate, "vals": vals}
             got = [(pdate, vals)] if vals else []
             if got:
-                st.info(f"🏭 {day_label(pdate)} · **{sum(vals.values()):,} pcs** · "
+                st.info(f"📝 Not saved yet · {day_label(pdate)} · **{sum(vals.values()):,} pcs** · "
                         + " · ".join(f"{short(b)} {v:,}" for b, v in vals.items()))
         else:
-            ed = _grid([(today_kh(), {})], show, key=f"prod_grid_{n}", height=120, max_date=today_kh() + timedelta(days=1))
-            got = [(d, v) for d, v in _grid_values(ed, show) if v]
+            rows, restored = draft_grid([(today_kh(), {})], show, gkey, height=120,
+                                        max_date=today_kh() + timedelta(days=1))
+            got = [(d, v) for d, v in rows if v]
+            if restored:
+                st.info("📝 Your numbers from before are still here — they are NOT saved yet.")
             if got:
-                st.markdown(excel_html("ផលិតថ្មី (not saved yet)", [(day_label(d), v) for d, v in got], show),
+                st.markdown(excel_html("ផលិតថ្មី (📝 not saved yet)", [(day_label(d), v) for d, v in got], show),
                             unsafe_allow_html=True)
+        # same day + bun already logged? (a second save ADDS — warn so nothing is counted twice)
+        if got and not prod.empty:
+            have = prod.assign(_n=prod["Pcs"].map(_num).astype(float))
+            dup = []
+            for d, vals in got:
+                for b in vals:
+                    m = have[(have["Prod_Date"] == d.isoformat()) & (have["Bun"] == b)]
+                    if len(m):
+                        dup.append(f"{d:%d %b} {short(b)} {int(m['_n'].sum()):,} pcs "
+                                   f"({', '.join(sorted(set(m['By'])))} {str(m['Saved_At'].iloc[-1])[11:16]})")
+            if dup:
+                st.warning("ℹ️ Already saved before: " + " · ".join(dup[:8]) + (" …" if len(dup) > 8 else "")
+                           + " — saving now **adds** these pcs. If it is the same production, do not save again.")
         team_opts = list(dict.fromkeys(ops_names(cfg) + [me]))
         team = st.multiselect("👷 Produced by", team_opts, default=[me], key=f"prod_team_{n}",
                               help="Everyone who made these buns (Admin adds names in ⚙️ Settings).")
         c1, c2 = st.columns([3, 1])
-        note = c1.text_input("Note (optional)", max_chars=120, key="prod_note")
+        note = c1.text_input("Note (optional)", max_chars=120, key=f"prod_note_{n}")
         c2.write("")
-        if c2.button("💾 Save production", type="primary", width="stretch", disabled=not got or not team):
-            stamp, eid = now_kh().strftime("%Y-%m-%d %H:%M:%S"), uuid.uuid4().hex[:10]
-            new = pd.DataFrame([{"Saved_At": stamp, "Prod_Date": d.isoformat(), "Bun": b, "Pcs": str(int(v)),
-                                 "By": me, "Note": note.strip(), "Entry_Id": eid, "Team": "; ".join(team)}
-                                for d, vals in got for b, v in vals.items()])
-            try:
-                modify_csv(PROD_FILE, PROD_COLS, lambda df: pd.concat([df, new], ignore_index=True))
-                audit("production saved", "; ".join(f"{d:%d %b}: " + ", ".join(f"{short(b)} {v}" for b, v in vals.items())
-                                                    for d, vals in got) + f" | by {', '.join(team)}")
-                st.session_state["p_flash"] = (f"✅ Saved {int(new['Pcs'].astype(int).sum()):,} pcs · "
-                                               + ", ".join(f"{d:%d %b}" for d, _v in got))
-                st.session_state["prod_grid_n"] = n + 1           # empty sheet for the next entry
-                _rerun_here()
-            except Exception as e:
-                st.error(f"Not saved: {e}")
+        total_new = sum(v for _d, vals in got for v in vals.values())
+        clicked = c2.button(f"💾 Save {total_new:,} pcs" if got else "💾 Save production", type="primary",
+                            width="stretch", disabled=not got or not team, key=f"prod_save_{n}")
+        if not got:
+            st.caption("Type at least one number to save.")
+        elif not team:
+            st.caption("Choose who produced these buns (👷 Produced by).")
+        if clicked:
+            sig = json.dumps([(d.isoformat(), sorted(v.items())) for d, v in got])
+            if not save_guard("production", sig):
+                st.info("✅ This was already saved a moment ago — it is not saved twice.")
+            else:
+                stamp, eid = now_kh().strftime("%Y-%m-%d %H:%M:%S"), uuid.uuid4().hex[:10]
+                new = pd.DataFrame([{"Saved_At": stamp, "Prod_Date": d.isoformat(), "Bun": b, "Pcs": str(int(v)),
+                                     "By": me, "Note": note.strip(), "Entry_Id": eid, "Team": "; ".join(team)}
+                                    for d, vals in got for b, v in vals.items()])
+                try:
+                    modify_csv(PROD_FILE, PROD_COLS, lambda df: pd.concat([df, new], ignore_index=True))
+                    label = (f"{total_new:,} pcs · " + ", ".join(f"{d:%d %b}" for d, _v in got))
+                    audit("production saved", "; ".join(f"{d:%d %b}: " + ", ".join(f"{short(b)} {v}" for b, v in vals.items())
+                                                        for d, vals in got) + f" | by {', '.join(team)}")
+                    remember_undo("production", PROD_FILE, PROD_COLS, "Entry_Id", eid, label)
+                    st.session_state["p_flash"] = f"✅ Saved {label}"
+                    st.session_state["prod_grid_n"] = n + 1           # empty sheet for the next entry
+                    st.session_state.pop("_pp_draft", None)
+                    drop_draft(gkey)
+                    _rerun_here()
+                except Exception as e:
+                    st.session_state.pop("_sig_production", None)    # not saved: the next tap may save
+                    st.error(f"Not saved: {e}")
+        undo_bar("production", "p_flash")
     else:
         st.info("👁️ View only — ask Admin for edit access to log production.")
     st.markdown("**📋 Production logged**")
@@ -1225,7 +1349,7 @@ def page_production(cfg, can_edit, me):
     if view.empty:
         st.info("Nothing logged in these dates.")
         return
-    view = view.assign(_n=view["Pcs"].map(_num))
+    view = view.assign(_n=view["Pcs"].map(_num).astype(float))
     by_day = view.groupby(["_d", "Bun"])["_n"].sum()
     rows = [(day_label(d), {b: by_day.get((d, b), 0) for b in show}) for d in sorted(set(view["_d"]))]
     st.markdown(excel_html(f"ផលិត ({d_from:%d.%m} – {d_to:%d.%m.%Y})", rows, show), unsafe_allow_html=True)
@@ -1405,9 +1529,7 @@ def page_count(cfg, can_edit, me):
     st.subheader("📦 Evening stock count")
     prod, counts, adjs, sales, names, buns = get_data(cfg)
     places = list(cfg.get("places") or DEFAULT_SETTINGS["places"])
-    flash = st.session_state.pop("c_flash", None)
-    if flash:
-        st.success(flash)
+    show_flash("c_flash")
     c1, c2 = st.columns([1, 2])
     cd = c1.date_input("Count date (stock at the END of this day)", value=today_kh(), max_value=today_kh(), key="cnt_date")
     expected, _short, _h, _nc = compute_stock(buns, prod, counts, adjs, sales, cd)
@@ -1450,15 +1572,21 @@ def page_count(cfg, can_edit, me):
         st.markdown("#### ✅ Check & save")
         check_box = st.container()
     else:
+        st.caption("➡️ Count each freezer tab, then open **✅ Check & save** to save. What you type is kept if you "
+                   "open another page and come back.")
         tabs = st.tabs([f"🧊 {pl}" for pl in places] + ["✅ Check & save"])
-        counted = {}
-        for pl, tab in zip(places, tabs):
+        counted, any_restored = {}, False
+        for i, (pl, tab) in enumerate(zip(places, tabs)):
             with tab:
-                ed = _grid(start_rows[pl], show, key=f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}",
-                           max_date=cd)
-                counted[pl] = _grid_values(ed, show)
+                gk = f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}"
+                counted[pl], restored = draft_grid(start_rows[pl], show, gk, max_date=cd)
+                any_restored = any_restored or restored
                 st.markdown(excel_html(f"{pl} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted[pl])], show),
                             unsafe_allow_html=True)
+                nxt = f"🧊 {places[i + 1]}" if i + 1 < len(places) else "✅ Check & save"
+                st.caption(f"➡️ Next: open the **{nxt}** tab above.")
+        if any_restored:
+            st.info("📝 Your count from before is still here — it is NOT saved yet.")
         check_box = tabs[-1]
     with check_box:
         tot_c = {b: sum(v.get(b, 0) for pl in places for _d, v in counted[pl]) for b in show}
@@ -1480,7 +1608,32 @@ def page_count(cfg, can_edit, me):
                                [(day_label(d), {b: all_rows.get((d, b), 0) for b in show})
                                 for d in sorted({d for d, _b in all_rows})], show), unsafe_allow_html=True)
         if can_edit:
-            if st.button(f"💾 Save the evening count ({int(sum(tot_c.values())):,} pcs)", type="primary", key="cnt_save"):
+            # a count for this day already saved? (saving again replaces it — say so)
+            same = counts[counts["Count_Date"] == cd.isoformat()] if not counts.empty else counts
+            if len(same):
+                lastc = same[same["Count_Id"] == same.sort_values("Saved_At")["Count_Id"].iloc[-1]]
+                st.warning(f"ℹ️ A count for {cd:%d %b %Y} was already saved at {str(lastc['Saved_At'].iloc[0])[11:16]} "
+                           f"by {', '.join(sorted(set(lastc['By'])))} ({int(lastc['Pcs'].map(_num).astype(float).sum()):,} pcs). "
+                           "Saving again **replaces** it with the numbers here.")
+            # big differences: ask for one more look before saving
+            exp_all = sum(tot_e.values())
+            big = [b for b in show if abs(tot_c[b] - tot_e[b]) > max(300, 0.15 * tot_e[b])]
+            big_total = abs(sum(tot_c.values()) - exp_all) > max(500, 0.03 * exp_all)
+            ok_big = True
+            if big or big_total:
+                st.warning("⚠️ Big difference from what the app expected: " + ", ".join(
+                    f"{short(b)} {int(tot_c[b] - round(tot_e[b])):+,}" for b in big[:8])
+                    + (f" · total {int(sum(tot_c.values()) - round(exp_all)):+,} pcs" if big_total else "")
+                    + ". Check those buns once more (a missing date? a typo?).")
+                ok_big = st.checkbox("✔️ I checked these numbers — they are right", key=f"cnt_ok_{st.session_state.get('cnt_n', 0)}")
+            clicked = st.button(f"💾 Save the evening count ({int(sum(tot_c.values())):,} pcs)", type="primary",
+                                key="cnt_save", disabled=not ok_big, width="stretch")
+            undo_bar("count", "c_flash")
+            sig = json.dumps([cd.isoformat()] + [(pl, [(d.isoformat(), sorted(v.items())) for d, v in sorted(counted[pl])])
+                                                 for pl in places])
+            if clicked and not save_guard("count", sig):
+                st.info("✅ This count was already saved a moment ago — it is not saved twice.")
+            elif clicked:
                 cid, stamp = uuid.uuid4().hex[:10], now_kh().strftime("%Y-%m-%d %H:%M:%S")
                 new = [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": b, "Prod_Date": d.isoformat(),
                         "Pcs": str(int(n)), "By": me, "Count_Id": cid, "Place": pl}
@@ -1492,10 +1645,14 @@ def page_count(cfg, can_edit, me):
                     modify_csv(COUNT_FILE, COUNT_COLS, lambda df: pd.concat([df, pd.DataFrame(new)], ignore_index=True))
                     audit("evening count saved", f"{cd:%d %b %Y}: {int(sum(tot_c.values())):,} pcs · " + ", ".join(
                         f"{short(b)} {int(tot_c[b])} ({int(tot_c[b] - round(tot_e[b])):+d})" for b in show if tot_c[b] or tot_e[b]))
+                    label = f"count {cd:%d %b %Y} · {int(sum(tot_c.values())):,} pcs"
+                    remember_undo("count", COUNT_FILE, COUNT_COLS, "Count_Id", cid, label)
                     st.session_state["c_flash"] = f"✅ Evening count saved for {cd:%d %b %Y}: {int(sum(tot_c.values())):,} pcs"
+                    drop_draft(*[f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}" for pl in places])
                     st.session_state["cnt_n"] = st.session_state.get("cnt_n", 0) + 1
                     _rerun_here()
                 except Exception as e:
+                    st.session_state.pop("_sig_count", None)
                     st.error(f"Not saved: {e}")
         else:
             st.info("👁️ View only — ask Admin for edit access to save a count.")
@@ -1526,16 +1683,42 @@ def page_count(cfg, can_edit, me):
             row = {"Saved_At": now_kh().strftime("%Y-%m-%d %H:%M:%S"), "Date": d.isoformat(), "Bun": code,
                    "Prod_Date": pdte.isoformat() if pdte else "", "Pcs": str(int(n if kind.startswith("➕") else -n)),
                    "Reason": reason, "By": me, "Adj_Id": uuid.uuid4().hex[:10]}
-            try:
-                modify_csv(ADJ_FILE, ADJ_COLS, lambda df: pd.concat([df, pd.DataFrame([row])], ignore_index=True))
-                audit("adjustment", f"{row['Date']} {short(code)} {row['Pcs']} pcs · {reason}")
-                st.session_state["c_flash"] = f"✅ Adjustment saved: {kind[2:]} {n:,} pcs {b}"
-                _rerun_here()
-            except Exception as e:
-                st.error(f"Not saved: {e}")
+            if not save_guard("adjustment", json.dumps([row["Date"], code, row["Pcs"], reason])):
+                st.info("✅ This adjustment was already saved a moment ago — it is not saved twice.")
+            else:
+                try:
+                    modify_csv(ADJ_FILE, ADJ_COLS, lambda df: pd.concat([df, pd.DataFrame([row])], ignore_index=True))
+                    audit("adjustment", f"{row['Date']} {short(code)} {row['Pcs']} pcs · {reason}")
+                    remember_undo("adjustment", ADJ_FILE, ADJ_COLS, "Adj_Id", row["Adj_Id"],
+                                  f"{kind[2:]} {n:,} pcs {short(code)} · {reason}")
+                    st.session_state["c_flash"] = f"✅ Adjustment saved: {kind[2:]} {n:,} pcs {b}"
+                    _rerun_here()
+                except Exception as e:
+                    st.session_state.pop("_sig_adjustment", None)
+                    st.error(f"Not saved: {e}")
+        undo_bar("adjustment", "c_flash")
     if not adjs.empty:
-        st.dataframe(adjs.sort_values("Saved_At", ascending=False).head(50)[["Date", "Bun", "Prod_Date", "Pcs", "Reason", "By"]],
-                     hide_index=True, width="stretch")
+        recent = adjs.sort_values("Saved_At", ascending=False).head(50)
+        mine = recent if st.session_state.get("p_role") == "admin" else recent[recent["By"] == me]
+        st.dataframe(recent[["Date", "Bun", "Prod_Date", "Pcs", "Reason", "By"]], hide_index=True, width="stretch")
+        if can_edit and not mine.empty:
+            with st.expander("🗑️ Delete a wrong adjustment" + ("" if st.session_state.get("p_role") == "admin"
+                                                              else " (your own lines)")):
+                ed = st.data_editor(mine[["Saved_At", "Date", "Bun", "Pcs", "Reason", "By", "Adj_Id"]].assign(Delete=False),
+                                    hide_index=True, width="stretch", key="adj_del",
+                                    disabled=["Saved_At", "Date", "Bun", "Pcs", "Reason", "By", "Adj_Id"],
+                                    column_config={"Adj_Id": None, "Delete": st.column_config.CheckboxColumn("🗑️ Delete")})
+                gone = [r for r in ed.to_dict("records") if r["Delete"]]
+                if st.button(f"🗑️ Delete {len(gone)} line(s)", key="adj_del_save", disabled=not gone):
+                    ids = {r["Adj_Id"] for r in gone}
+                    try:
+                        modify_csv(ADJ_FILE, ADJ_COLS, lambda df: df[~df["Adj_Id"].isin(ids)])
+                        audit("adjustment deleted", "; ".join(f"{r['Date']} {short(r['Bun'])} {r['Pcs']} · {r['Reason']}"
+                                                              for r in gone))
+                        st.session_state["c_flash"] = f"🗑️ Deleted {len(gone)} adjustment line(s)"
+                        _rerun_here()
+                    except Exception as e:
+                        st.error(f"Not deleted: {e}")
 
 
 def plan_excel(plan, buns, names, start, days, cfg):
@@ -1670,112 +1853,119 @@ def _bun_rows(cfg, buns, names):
 def page_settings(cfg, me):
     st.subheader("⚙️ Settings")
     _p, _c, _a, sales, names, buns = get_data(cfg)
-    flash = st.session_state.pop("s_flash", None)
-    if flash:
-        st.success(flash)
+    show_flash("s_flash")
     n = st.session_state.get("set_n", 0)
     draft = st.session_state.get("set_draft")
     if draft is None or [r["Bun"] for r in draft] != buns:
         draft = _bun_rows(cfg, buns, names)
         st.session_state["set_draft"] = draft
+    bar = st.container(border=True)                       # save bar at the top (filled at the end)
+    t1, t2, t3, t4 = st.tabs(["🎯 Stock rules", "🧊 Rooms & crates", "📋 Tasks & names", "👥 Users & access"])
 
-    st.markdown("#### 🎯 Stock target, production days and shelf life — per bun")
-    st.caption("The table below is what the app uses. Change any cell, or fill many buns at once with the buttons, "
-               "then press **💾 Save settings**.")
-    prio_now = [b for b in cfg.get("priority", PRIORITY_DEFAULT) if b in buns]
-    q1, q2, q3, q4 = st.columns([1.3, 1, 1.3, 1])
-    t_all = q1.number_input(f"Target days for every bun except {', '.join(prio_now) or '-'}", min_value=1,
-                            max_value=30, value=int(cfg["target_default"]), key="set_t_all")
-    q2.write("")
-    if q2.button("⬇️ Apply to the table", key="set_t_apply", width="stretch"):
-        cur = st.session_state.get(f"set_buns_{n}_rows") or draft
-        for r in cur:
-            if r["Bun"] not in prio_now:
-                r["Target days"] = int(t_all)
-        st.session_state["set_draft"] = cur
-        st.session_state["set_n"] = n + 1
-        st.rerun()
-    s_all = q3.number_input("Shelf life for every bun (days)", min_value=1, max_value=365,
-                            value=int(cfg["shelf_days"]), key="set_s_all")
-    q4.write("")
-    if q4.button("⬇️ Apply to the table", key="set_s_apply", width="stretch"):
-        cur = st.session_state.get(f"set_buns_{n}_rows") or draft
-        for r in cur:
-            r["Shelf life (days)"] = int(s_all)
-        st.session_state["set_draft"] = cur
-        st.session_state["set_n"] = n + 1
-        st.rerun()
-    ed = st.data_editor(pd.DataFrame(draft), hide_index=True, width="stretch", num_rows="fixed",
-                        disabled=["Bun", "Name"], key=f"set_buns_{n}",
-                        column_config={
-                            "Target days": st.column_config.NumberColumn("🎯 Target days", min_value=1, max_value=30, step=1),
-                            "Shelf life (days)": st.column_config.NumberColumn("🟤 Shelf life (days)", min_value=1,
-                                                                               max_value=365, step=1),
-                            **{EN_DAYS[i]: st.column_config.CheckboxColumn(EN_DAYS[i] + " 🏭") for i in range(7)}})
-    st.session_state[f"set_buns_{n}_rows"] = ed.to_dict("records")       # the buttons above keep your edits
-    st.caption("🏭 ticked = this bun can be produced on that weekday. 🎯 = days of sales to keep in stock. "
-               "🟤 = a batch older than this is flagged 'sell first'.")
+    with t1:
+        st.markdown("#### 🎯 Stock target, production days and shelf life — per bun")
+        st.caption("The table is what the app uses. Change any cell, or fill many buns at once with the buttons.")
+        prio_now = [b for b in cfg.get("priority", PRIORITY_DEFAULT) if b in buns]
+        q1, q2, q3, q4 = st.columns([1.3, 1, 1.3, 1])
+        t_all = q1.number_input(f"Target days for every bun except {', '.join(prio_now) or '-'}", min_value=1,
+                                max_value=30, value=int(cfg["target_default"]), key="set_t_all")
+        q2.write("")
+        if q2.button("⬇️ Apply to the table", key="set_t_apply", width="stretch"):
+            cur = st.session_state.get(f"set_buns_{n}_rows") or draft
+            for r in cur:
+                if r["Bun"] not in prio_now:
+                    r["Target days"] = int(t_all)
+            st.session_state["set_draft"] = cur
+            st.session_state["set_n"] = n + 1
+            st.rerun()
+        s_all = q3.number_input("Shelf life for every bun (days)", min_value=1, max_value=365,
+                                value=int(cfg["shelf_days"]), key="set_s_all")
+        q4.write("")
+        if q4.button("⬇️ Apply to the table", key="set_s_apply", width="stretch"):
+            cur = st.session_state.get(f"set_buns_{n}_rows") or draft
+            for r in cur:
+                r["Shelf life (days)"] = int(s_all)
+            st.session_state["set_draft"] = cur
+            st.session_state["set_n"] = n + 1
+            st.rerun()
+        ed = st.data_editor(pd.DataFrame(draft), hide_index=True, width="stretch", num_rows="fixed",
+                            disabled=["Bun", "Name"], key=f"set_buns_{n}",
+                            column_config={
+                                "Target days": st.column_config.NumberColumn("🎯 Target days", min_value=1, max_value=30, step=1),
+                                "Shelf life (days)": st.column_config.NumberColumn("🟤 Shelf life (days)", min_value=1,
+                                                                                   max_value=365, step=1),
+                                **{EN_DAYS[i]: st.column_config.CheckboxColumn(EN_DAYS[i] + " 🏭") for i in range(7)}})
+        st.session_state[f"set_buns_{n}_rows"] = ed.to_dict("records")       # the buttons above keep your edits
+        st.caption("🏭 ticked = this bun can be produced on that weekday. 🎯 = days of sales to keep in stock. "
+                   "🟤 = a batch older than this is flagged 'sell first'.")
+        st.markdown("#### 📦 Limits and planning")
+        c1, c2, c3, c4 = st.columns(4)
+        max_total = c1.number_input("Total stock limit (pcs)", min_value=1000, max_value=1_000_000, step=1000,
+                                    value=int(cfg["max_total"]), key="set_max")
+        look = c2.number_input("Sales history used (days)", min_value=7, max_value=90, value=int(cfg["lookback_days"]),
+                               key="set_look")
+        rnd = c3.number_input("Round planned pcs up to", min_value=1, max_value=1000, value=int(cfg["round_to"]),
+                              key="set_rnd")
+        capp = c4.number_input("Max production per day (0 = no limit)", min_value=0, max_value=500000, step=1000,
+                               value=int(cfg.get("max_prod_per_day") or 0), key="set_cap")
+        prio = st.multiselect("Keep these at their target first when the total limit is reached", buns,
+                              default=prio_now, key="set_prio")
+        places_txt = st.text_input("Freezers counted in the evening (separate with ;)",
+                                   value="; ".join(cfg.get("places") or DEFAULT_SETTINGS["places"]), key="set_places")
 
-    st.markdown("#### 📦 Limits and planning")
-    c1, c2, c3, c4 = st.columns(4)
-    max_total = c1.number_input("Total stock limit (pcs)", min_value=1000, max_value=1_000_000, step=1000,
-                                value=int(cfg["max_total"]), key="set_max")
-    look = c2.number_input("Sales history used (days)", min_value=7, max_value=90, value=int(cfg["lookback_days"]),
-                           key="set_look")
-    rnd = c3.number_input("Round planned pcs up to", min_value=1, max_value=1000, value=int(cfg["round_to"]), key="set_rnd")
-    capp = c4.number_input("Max production per day (0 = no limit)", min_value=0, max_value=500000, step=1000,
-                           value=int(cfg.get("max_prod_per_day") or 0), key="set_cap")
-    prio = st.multiselect("Keep these at their target first when the total limit is reached", buns, default=prio_now,
-                          key="set_prio")
-    places_txt = st.text_input("Freezers counted in the evening (separate with ;)",
-                               value="; ".join(cfg.get("places") or DEFAULT_SETTINGS["places"]), key="set_places")
+    with t2:
+        room_vals = rooms_settings(cfg, buns, names, n)
 
-    st.markdown("#### 👥 Who can use this app (Admin can always edit)")
-    st.caption("Automatic by role: every account with role **staff** in the Supply Hub (operation staff) gets this "
-               "access by itself — also new staff added later. Change one person only if they must be different.")
-    users = load_users()
-    by_role = {**DEFAULT_SETTINGS["access_by_role"], **(cfg.get("access_by_role") or {})}
-    rc = st.columns(3)
-    new_by_role = {}
-    for col, role in zip(rc, ["staff", "sales", "viewer"]):
-        new_by_role[role] = col.selectbox(f"{ROLE_TITLES[role]} (role {role})", ["edit", "view", "hidden"],
-                                          index=["edit", "view", "hidden"].index(by_role.get(role, "view")),
-                                          key=f"set_role_{role}")
-    ov = cfg.get("access_override") or {}
-    urows = [{"User": u, "Name": r.get("staff_name", ""), "Role": r.get("role", ""),
-              "Access": ov.get(u, "auto"), "PIN": "✅" if r.get("pin") else "–"}
-             for u, r in sorted(users.items(), key=lambda x: ({"staff": 0, "sales": 1}.get(x[1].get("role"), 2), x[0]))
-             if r.get("role") != "admin" and r.get("active", True)]
-    uacc = st.data_editor(pd.DataFrame(urows), hide_index=True, width="stretch", num_rows="fixed",
-                          disabled=["User", "Name", "Role", "PIN"], key=f"set_users_{n}",
-                          column_config={"Access": st.column_config.SelectboxColumn(
-                              "Access", options=["auto", "edit", "view", "hidden"], required=True,
-                              help="auto = by role (above)")}) if urows else None
-    dflt = cfg.get("access_default", "view")
+    with t3:
+        task_vals = tasks_box(cfg)
 
-    extra = rooms_settings(cfg, buns, names, n)
-    extra.update(users_admin_box(cfg))
+    with t4:
+        st.markdown("#### 👥 Who can use this app (Admin can always edit)")
+        st.caption("Automatic by role: every account with role **staff** in the Supply Hub (operation staff) gets this "
+                   "access by itself — also new staff added later. Change one person only if they must be different.")
+        users = load_users()
+        by_role = {**DEFAULT_SETTINGS["access_by_role"], **(cfg.get("access_by_role") or {})}
+        rc = st.columns(3)
+        new_by_role = {}
+        for col, role in zip(rc, ["staff", "sales", "viewer"]):
+            new_by_role[role] = col.selectbox(f"{ROLE_TITLES[role]} (role {role})", ["edit", "view", "hidden"],
+                                              index=["edit", "view", "hidden"].index(by_role.get(role, "view")),
+                                              key=f"set_role_{role}")
+        ov = cfg.get("access_override") or {}
+        urows = [{"User": u, "Name": r.get("staff_name", ""), "Role": r.get("role", ""),
+                  "Access": ov.get(u, "auto"), "PIN": "✅" if r.get("pin") else "–"}
+                 for u, r in sorted(users.items(), key=lambda x: ({"staff": 0, "sales": 1}.get(x[1].get("role"), 2), x[0]))
+                 if r.get("role") != "admin" and r.get("active", True)]
+        uacc = st.data_editor(pd.DataFrame(urows), hide_index=True, width="stretch", num_rows="fixed",
+                              disabled=["User", "Name", "Role", "PIN"], key=f"set_users_{n}",
+                              column_config={"Access": st.column_config.SelectboxColumn(
+                                  "Access", options=["auto", "edit", "view", "hidden"], required=True,
+                                  help="auto = by role (above)")}) if urows else None
+        st.caption("The access above is saved with **💾 Save settings**. The boxes below save by themselves.")
+        st.divider()
+        users_box(cfg)
 
-    if st.button("💾 Save settings", type="primary", key="set_save"):
-        new = dict(cfg)
-        new.update(extra)
+    def do_save():
         rows = ed.to_dict("records")
-        new.update(max_total=int(max_total), target_default=int(t_all), shelf_days=int(s_all), lookback_days=int(look),
-                   round_to=int(rnd), max_prod_per_day=int(capp), priority=list(prio), access_default=dflt,
-                   places=[p.strip() for p in places_txt.split(";") if p.strip()] or DEFAULT_SETTINGS["places"],
-                   # every bun saved with its own value: exactly what the table shows is what the app uses
-                   target_days={r["Bun"]: int(r["Target days"]) for r in rows},
-                   shelf_by_bun={r["Bun"]: int(r["Shelf life (days)"]) for r in rows},
-                   prod_days={r["Bun"]: [i for i in range(7) if r[EN_DAYS[i]]] for r in rows})
-        new["access_by_role"] = new_by_role
+        changes = dict(max_total=int(max_total), target_default=int(t_all), shelf_days=int(s_all), lookback_days=int(look),
+                       round_to=int(rnd), max_prod_per_day=int(capp), priority=list(prio),
+                       places=[p.strip() for p in places_txt.split(";") if p.strip()] or DEFAULT_SETTINGS["places"],
+                       # every bun saved with its own value: exactly what the table shows is what the app uses
+                       target_days={r["Bun"]: int(r["Target days"]) for r in rows},
+                       shelf_by_bun={r["Bun"]: int(r["Shelf life (days)"]) for r in rows},
+                       prod_days={r["Bun"]: [i for i in range(7) if r[EN_DAYS[i]]] for r in rows},
+                       access_by_role=new_by_role, **room_vals, **task_vals)
         if uacc is not None:
-            new["access_override"] = {r["User"]: r["Access"] for r in uacc.to_dict("records")
-                                      if r["Access"] in ("hidden", "view", "edit")}
-        new.pop("access", None)                      # old per-person list (replaced by automatic by role)
+            changes["access_override"] = {r["User"]: r["Access"] for r in uacc.to_dict("records")
+                                          if r["Access"] in ("hidden", "view", "edit")}
+
+        def ch(cur):
+            cur.update(changes)
+            cur.pop("access", None)                      # old per-person list (replaced by automatic by role)
         try:
-            save_settings(new)
+            update_settings(ch)
             audit("settings saved", "targets: " + ", ".join(f"{short(r['Bun'])} {int(r['Target days'])}d" for r in rows)
-                  + f" | limit {int(max_total):,} | shelf {int(s_all)}d")
+                  + f" | limit {int(max_total):,} | shelf {int(s_all)}d | {len(task_vals['tasks'])} tasks")
             st.session_state.pop("set_draft", None)
             st.session_state["set_n"] = n + 1
             st.session_state["s_flash"] = ("✅ Settings saved · targets: " + ", ".join(
@@ -1783,6 +1973,15 @@ def page_settings(cfg, me):
             st.rerun()
         except Exception as e:
             st.error(f"Not saved: {e}")
+
+    with bar:
+        c1, c2 = st.columns([3, 1])
+        c1.markdown("Change anything in the tabs below, then press **💾 Save settings** — "
+                    "one button saves 🎯 🧊 📋 and the access table.")
+        if c2.button("💾 Save settings", type="primary", key="set_save_top", width="stretch"):
+            do_save()
+    if st.button("💾 Save settings", type="primary", key="set_save", width="stretch"):
+        do_save()
 
 
 # ==========================================
@@ -2220,9 +2419,7 @@ def page_rooms(cfg):
             new_vals = rooms_settings(cfg, buns, names, rn, kp="rm")
             if st.button("💾 Save sizes", type="primary", key="rm_save"):
                 try:
-                    fresh, _r = load_settings()
-                    fresh.update(new_vals)
-                    save_settings(fresh)
+                    update_settings(new_vals)
                     audit("room sizes saved", " · ".join(
                         f"{r['name']} {r['cols']}×{r['rows']} stacks, {r['high']} high, blocked [{r['blocked']}], "
                         f"in {r['door_in']}, out {r['door_out']}" for r in new_vals["rooms"])
@@ -2232,9 +2429,7 @@ def page_rooms(cfg):
                     st.rerun()
                 except Exception as e:
                     st.error(f"Not saved: {e}")
-    fl = st.session_state.pop("room_flash", None)
-    if fl:
-        st.success(fl)
+    show_flash("room_flash")
     c1, c2 = st.columns([1, 3])
     back = c1.selectbox("Days to replay", [7, 14, 3, 1], key="room_back", format_func=lambda n: f"last {n} days")
     days = [t - timedelta(days=i) for i in range(int(back) - 1, -1, -1)]
@@ -2485,9 +2680,7 @@ def page_tasks(cfg, can_edit, me):
     c1, c2 = st.columns([1, 2])
     day = c1.date_input("Day", value=today_kh(), max_value=today_kh() + timedelta(days=14), key="t_day")
     only_me = c2.toggle("Show only my tasks", value=not is_admin, key="t_mine")
-    flash = st.session_state.pop("t_flash", None)
-    if flash:
-        st.success(flash)
+    show_flash("t_flash")
     prod, _ = read_csv(PROD_FILE, PROD_COLS)
     counts, _ = read_csv(COUNT_FILE, COUNT_COLS)
     trows, _ = read_csv(TASK_FILE, TASK_COLS)
@@ -2584,8 +2777,8 @@ def page_history(cfg, me):
                        file_name=f"production_history_{d1}_{d2}.csv", mime="text/csv")
 
 
-def users_admin_box(cfg):
-    """⚙️ Settings: new user, set someone's PIN / password, the 'Produced by' names, task templates."""
+def users_box(cfg):
+    """⚙️ Settings: new user, set someone's PIN / password, PINs for everybody (each box saves by itself)."""
     users = load_users()
     st.markdown("#### ➕ New user")
     with st.form("new_user", clear_on_submit=True):
@@ -2625,9 +2818,7 @@ def users_admin_box(cfg):
             try:
                 modify_users(add)
                 if acc != "auto":
-                    new = dict(cfg)
-                    new["access_override"] = {**(cfg.get("access_override") or {}), uname: acc}
-                    save_settings(new)
+                    update_settings(lambda c: c.setdefault("access_override", {}).__setitem__(uname, acc))
                 audit("user created", f"{uname} · {sname} · {role} · production {acc}")
                 st.session_state["s_flash"] = (f"✅ {sname} ({uname}) created. Sign in: choose “{sname}” + "
                                                + ("the PIN." if pin else "the password."))
@@ -2704,6 +2895,11 @@ def users_admin_box(cfg):
     else:
         st.caption("✅ Every operation staff already has a PIN.")
 
+
+
+def tasks_box(cfg):
+    """⚙️ Settings: the 'Produced by' extra names and the daily task list. Returns the new values."""
+    users = load_users()
     st.markdown("#### 👷 Names in “Produced by” (people without an account)")
     st.caption("All operation staff are already in the list by themselves — add here only helpers without an account.")
     ps = st.text_input("Separate with ;", value="; ".join(cfg.get("prod_staff") or []), key="set_pstaff")
@@ -2818,5 +3014,8 @@ try:
     else:
         page_settings(cfg, me)
 except Exception as err:          # a broken file must not blank the whole app
-    st.error(f"Something went wrong on this page: {err}")
-    st.exception(err)
+    st.error(f"⚠️ This page could not load: {err}. Press **R** or refresh the page; your saved data is safe. "
+             "If it keeps happening, tell Admin.")
+    if me_role == "admin":
+        with st.expander("Details for Admin"):
+            st.exception(err)
