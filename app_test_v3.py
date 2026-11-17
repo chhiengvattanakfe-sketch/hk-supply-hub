@@ -1787,22 +1787,47 @@ def _count_place(cfg, can_edit, me, role, cd, mode, pl_stock, base, show, names,
 
 
 def move_suggestion(cfg, pl_stock, sales, buns, day):
-    """What to move from the frozen room to the cooling room this evening so the cooling room holds the next
-    `cool_days` days of sales — whole crates, oldest production date first."""
+    """What to move this evening from the frozen room to the cooling room, in WHOLE CRATES (oldest production date
+    first), so the cooling room holds the next `cool_days` days of sales — and never more than the cooling room's
+    stack places can take (then the buns with the most days already in the cooling room get fewer crates)."""
     days = max(1, int(float(cfg.get("cool_days") or 1)))
     fc = forecast(sales, buns, day + timedelta(days=1), days, int(cfg["lookback_days"]))
-    out = {}
+    rooms, cr = rooms_of(cfg), crate_size(cfg)
+    g = room_geom(rooms[0], cr)
+    info = {}
     for b in buns:
+        cp = crate_pcs(cfg, b)
         need = sum(fc.get((day + timedelta(days=i + 1), b), 0) for i in range(days))
         cool = sum(pl_stock["cool"].get(b, {}).values())
-        frozen = pl_stock["frozen"].get(b, {})
-        fr = sum(frozen.values())
-        cp = crate_pcs(cfg, b)
-        want = max(0.0, need - cool)
-        move = min(fr, math.ceil(want / cp) * cp) if want > 0 else 0
-        out[b] = {"need": need, "cool": cool, "frozen": fr, "move": int(round(move)), "cp": cp,
-                  "dates": sorted(frozen)}
-    return out, days
+        fr_crates = bun_crates(cfg, b, {b: pl_stock["frozen"].get(b, {})})        # oldest first
+        cool_crates = len(bun_crates(cfg, b, {b: pl_stock["cool"].get(b, {})}))
+        want = math.ceil(max(0.0, need - cool) / cp)
+        info[b] = {"need": need, "cool": cool, "frozen": sum(x[1] for x in fr_crates), "cp": cp,
+                   "fr_crates": fr_crates, "cool_crates": cool_crates, "crates": min(want, len(fr_crates)),
+                   "want": want}
+
+    def stacks_after(mv):
+        return sum(-(-(info[b]["cool_crates"] + mv[b]) // g["high"]) for b in info if info[b]["cool_crates"] + mv[b] > 0)
+    mv = {b: v["crates"] for b, v in info.items()}
+    capped = False
+    while stacks_after(mv) > g["places"] and any(mv.values()):    # cooling room full: fewer crates
+        b = max((x for x in mv if mv[x] > 0),
+                key=lambda x: (info[x]["cool"] + mv[x] * info[x]["cp"]) / max(info[x]["need"], 1))
+        mv[b] -= 1
+        capped = True
+    for b, v in info.items():
+        v["crates"] = mv[b]
+    room = {"places": g["places"], "high": g["high"], "before": stacks_after({b: 0 for b in info}),
+            "after": stacks_after(mv), "capped": capped, "name": rooms[0]["name"]}
+    return info, days, room
+
+
+def _take_crates(fr_crates, k):
+    """The first k crates (oldest first) -> {prod_date: pcs}."""
+    out = {}
+    for d, n in fr_crates[:max(0, int(k))]:
+        out[d] = out.get(d, 0) + n
+    return out
 
 
 def _move_panel(cfg, can_edit, me, cd, pl_stock, sales, buns, names, show):
@@ -1811,58 +1836,99 @@ def _move_panel(cfg, can_edit, me, cd, pl_stock, sales, buns, names, show):
     if cd != t:
         st.info("🚚 Moves are made for today's evening — choose today's date above.")
         return
-    sug, days = move_suggestion(cfg, pl_stock, sales, buns, t)
+    info, days, room = move_suggestion(cfg, pl_stock, sales, buns, t)
     moves, _r = read_csv(MOVE_FILE, MOVE_COLS)
     done_today = moves[moves["Date"] == t.isoformat()] if not moves.empty else moves
-    st.markdown(f"**🚚 Move from {ROLE_ICON['frozen']} {pn['frozen']} to {ROLE_ICON['cool']} {pn['cool']}** — so the "
-                f"cooling room holds **{days} day{'s' if days > 1 else ''}** of sales (tomorrow"
-                + (f" + {days - 1} more" if days > 1 else "") + "). Oldest production dates first, whole crates.")
+    st.markdown(f"**🚚 Move from {ROLE_ICON['frozen']} {pn['frozen']} to {ROLE_ICON['cool']} {pn['cool']}** — the app "
+                f"suggests it by itself: enough for **{days} day{'s' if days > 1 else ''}** of sales (tomorrow"
+                + (f" + {days - 1} more" if days > 1 else "") + "), **whole crates, oldest production date first**.")
     if len(done_today):
         st.success("✅ Already moved today: " + ", ".join(
-            f"{short(b)} {int(g['Pcs'].map(_num).astype(float).sum()):,}" for b, g in done_today.groupby("Bun"))
-            + " — the list below already counts them.")
-    rows = [{"Bun": b, "Name": names.get(b, ""), "❄️ Cooling now": int(round(v["cool"])),
-             "Needed": int(round(v["need"])), "🧊 Frozen now": int(round(v["frozen"])), "🚚 Move (pcs)": v["move"],
-             "Crate pcs": v["cp"], "Take from (oldest)": ", ".join(f"{d:%d/%m}" for d in v["dates"][:3])}
-            for b, v in sug.items() if b in show or v["move"]]
+            f"{short(b)} {int(g_['Pcs'].map(_num).astype(float).sum()):,}" for b, g_ in done_today.groupby("Bun"))
+            + " pcs — the list below already counts them.")
+    if room["capped"]:
+        st.warning(f"⚠️ The cooling room has {room['places']} stack places — the list was made smaller so everything "
+                   f"fits (buns that already have the most days in the cooling room get fewer crates).")
+    rows = []
+    for b, v in info.items():
+        if not (b in show or v["crates"]):
+            continue
+        took = _take_crates(v["fr_crates"], v["crates"])
+        rows.append({"Bun": b, "Name": names.get(b, ""), "❄️ Cooling now (pcs)": int(round(v["cool"])),
+                     "Needed (pcs)": int(round(v["need"])), "🧊 Frozen now (pcs)": int(round(v["frozen"])),
+                     "🚚 Move (crates)": int(v["crates"]), "= pcs": int(round(sum(took.values()))),
+                     "Pcs / crate": v["cp"],
+                     "Take these dates": ", ".join(f"{d:%d/%m}×{sum(1 for x in v['fr_crates'][:v['crates']] if x[0] == d)}"
+                                                   for d in sorted(took))})
     df = pd.DataFrame(rows)
     n = st.session_state.get("mv_n", 0)
-    ed = st.data_editor(df, hide_index=True, width="stretch", key=f"mv_{n}", disabled=[c for c in df.columns
-                                                                                       if c != "🚚 Move (pcs)"],
-                        column_config={"🚚 Move (pcs)": st.column_config.NumberColumn("🚚 Move (pcs)", min_value=0,
-                                                                                      step=1, help="Change if you moved a different amount")})
-    mv = {r["Bun"]: int(r["🚚 Move (pcs)"] or 0) for r in ed.to_dict("records")}
-    tot = sum(mv.values())
-    crates = sum(math.ceil(q / sug[b]["cp"]) for b, q in mv.items() if q)
-    st.markdown(f"**Total to move: {tot:,} pcs ≈ {crates:,} crates**" if tot else
-                "✅ Nothing to move — the cooling room already has enough for tomorrow.")
+    ed = st.data_editor(df, hide_index=True, width="stretch", key=f"mv_{n}",
+                        disabled=[c for c in df.columns if c != "🚚 Move (crates)"],
+                        column_config={"🚚 Move (crates)": st.column_config.NumberColumn(
+                            "🚚 Move (crates)", min_value=0, step=1, help="Change it if you moved a different number of crates"),
+                            "= pcs": st.column_config.NumberColumn("= pcs (suggested)")})
+    mv = {r["Bun"]: max(0, min(int(r["🚚 Move (crates)"] or 0), len(info[r["Bun"]]["fr_crates"])))
+          for r in ed.to_dict("records")}
+    took = {b: _take_crates(info[b]["fr_crates"], k) for b, k in mv.items() if k}
+    tot_pcs = int(round(sum(sum(x.values()) for x in took.values())))
+    tot_cr = sum(mv.values())
+    if tot_cr:
+        st.markdown(f"### 🚚 Move **{tot_cr:,} crates = {tot_pcs:,} pcs**")
+        st.caption(" · ".join(f"{short(b)} {k} crates ({int(round(sum(took[b].values()))):,} pcs)" for b, k in mv.items() if k))
+    else:
+        st.markdown("✅ Nothing to move — the cooling room already has enough for tomorrow.")
+    over = [b for b, k in ed.set_index("Bun")["🚚 Move (crates)"].items() if int(k or 0) > len(info[b]["fr_crates"])]
+    if over:
+        st.warning("⚠️ More crates than the frozen room has: " + ", ".join(short(b) for b in over)
+                   + " — only what the frozen room has is counted. Count the frozen room?")
+
+    # 🗺️ where to put them: the cooling room after the move (your sheet layout)
+    rooms, cr = rooms_of(cfg), crate_size(cfg)
+    g = room_geom(rooms[0], cr)
+    cool_after = {b: dict(pl_stock["cool"].get(b, {})) for b in buns}
+    for b, add in took.items():
+        for d, q in add.items():
+            cool_after[b][d] = cool_after[b].get(d, 0) + q
+    lists = {b: bun_crates(cfg, b, cool_after) for b in buns}
+    stacks, overflow = room_fill(cfg, g, {b: v for b, v in lists.items() if v})
+    new_marks = {}
+    for b, k in mv.items():                 # the moved (newer) crates sit at the back of the bun's places
+        left = k
+        for s_ in sorted([x for x in stacks if x["b"] == b], key=lambda x: (x["r"], x["c"])):
+            if left <= 0:
+                break
+            q = min(left, sum(x[1] for x in s_["segs"]))
+            new_marks[(s_["r"], s_["c"])] = q
+            left -= q
+    with st.expander(f"🗺️ {rooms[0]['name']} after the move — where to put the crates", expanded=bool(tot_cr)):
+        st.caption("Like your sheet: **🆕 = put the moved crates here** (back side, by the IN door). The oldest crates "
+                   "stay at the front by the OUT door (⭐ = take first). Each bun keeps its own columns, in your order. "
+                   f"Places used: {room['before']} → **{len(stacks)}** of {g['places']} stacks.")
+        if overflow:
+            st.warning("⚠️ No place for: " + ", ".join(f"{short(b)} {q} crates" for b, q in overflow.items())
+                       + " — move fewer crates.")
+        html, _tot = room_sheet_html(rooms[0], g, stacks, names, new=new_marks)
+        st.markdown(html, unsafe_allow_html=True)
+        st.download_button("⬇️ This map (Excel)", room_sheet_excel(rooms[0], g, stacks),
+                           file_name=f"cooling_room_after_move_{t}.xlsx", key="mv_map_xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if not can_edit:
         return
-    over = [b for b, q in mv.items() if q > sug[b]["frozen"] + 0.5]
-    if over:
-        st.warning("⚠️ More than the frozen room has: " + ", ".join(short(b) for b in over) + " — count the frozen room?")
-    clicked = st.button(f"✅ We moved these — save ({tot:,} pcs)", type="primary", key="mv_save", disabled=not tot,
-                        width="stretch")
+    clicked = st.button(f"✅ We moved these — save ({tot_cr:,} crates · {tot_pcs:,} pcs)", type="primary",
+                        key="mv_save", disabled=not tot_cr, width="stretch")
     undo_bar("move", "c_flash")
     if clicked:
         if not save_guard("move", json.dumps(sorted(mv.items()))):
             st.info("✅ Already saved a moment ago — it is not saved twice.")
             return
         mid, stamp = uuid.uuid4().hex[:10], now_kh().strftime("%Y-%m-%d %H:%M:%S")
-        new = []
-        for b, q in mv.items():
-            if q <= 0:
-                continue
-            batch = dict(pl_stock["frozen"].get(b, {}))
-            got, rest = _take(batch, q)
-            if rest > 0:
-                got.append((t, rest))                     # more than the app knew: date unknown -> today
-            new += [{"Saved_At": stamp, "Date": t.isoformat(), "Bun": b, "Prod_Date": d.isoformat(), "Pcs": str(int(round(x))),
-                     "From": "frozen", "To": "cool", "By": me, "Move_Id": mid} for d, x in got if x >= 0.5]
+        new = [{"Saved_At": stamp, "Date": t.isoformat(), "Bun": b, "Prod_Date": d.isoformat(), "Pcs": str(int(round(q))),
+                "From": "frozen", "To": "cool", "By": me, "Move_Id": mid}
+               for b, add in took.items() for d, q in sorted(add.items()) if q >= 0.5]
         try:
-            modify_csv(MOVE_FILE, MOVE_COLS, lambda df: pd.concat([df, pd.DataFrame(new)], ignore_index=True))
-            label = f"moved {tot:,} pcs frozen → cooling"
-            audit("move saved", label + " · " + ", ".join(f"{short(b)} {q}" for b, q in mv.items() if q))
+            modify_csv(MOVE_FILE, MOVE_COLS, lambda df_: pd.concat([df_, pd.DataFrame(new)], ignore_index=True))
+            label = f"moved {tot_cr:,} crates ({tot_pcs:,} pcs) frozen → cooling"
+            audit("move saved", label + " · " + ", ".join(f"{short(b)} {k} cr" for b, k in mv.items() if k))
             remember_undo("move", MOVE_FILE, MOVE_COLS, "Move_Id", mid, label)
             st.session_state["c_flash"] = f"✅ Saved: {label}"
             st.session_state["mv_n"] = n + 1
@@ -2551,7 +2617,7 @@ window.addEventListener('resize',()=>{size();redraw();});legend();size();__START
 </script>"""
 
 
-def room_sheet_html(room, g, stacks, names):
+def room_sheet_html(room, g, stacks, names, new=None):
     """Your Excel 'ស្តុកនំប្រចាំថ្ងៃ' layout: one cell per stack (lot date + bun / pcs), column totals, total."""
     cells = {(s["r"], s["c"]): s for s in stacks}
     bd = "border:1px solid #444;"
@@ -2577,8 +2643,12 @@ def room_sheet_html(room, g, stacks, names):
                 pcs = sum(x[2] for x in s["segs"])
                 col_tot[c] += pcs
                 star = "⭐ " if s["first"] else ""
-                h.append(f"<td style='{bd}background:{COLORS.get(s['b'], '#fff')};padding:4px 6px;min-width:70px'>"
-                         f"{star}{top:%d/%m} {s['b']}<br><b>{pcs:,}</b></td>")
+                k_new = (new or {}).get((r, c))
+                mark = (f"<br><span style='background:#2f9e44;color:#fff;border-radius:4px;padding:0 4px;font-size:11px'>"
+                        f"🆕 put {k_new} cr</span>") if k_new else ""
+                edge = "outline:3px solid #2f9e44;outline-offset:-3px;" if k_new else ""
+                h.append(f"<td style='{bd}{edge}background:{COLORS.get(s['b'], '#fff')};padding:4px 6px;min-width:70px'>"
+                         f"{star}{top:%d/%m} {s['b']}<br><b>{pcs:,}</b>{mark}</td>")
             else:
                 h.append(f"<td style='{bd}padding:4px 6px;min-width:70px;color:#999'>–</td>")
             c += 1
