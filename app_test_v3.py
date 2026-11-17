@@ -115,6 +115,7 @@ DEFAULT_SETTINGS = {
     "places": ["ស្តុកនំក្នុងទូរ", "ស្តុកទូរកក"],   # (old setting, replaced by place_names)
     "place_names": dict(DEFAULT_PLACE_NAMES),       # cooling room / frozen room / frozen AEON
     "cool_days": 1,                                 # evening move: cooling room keeps this many days of sales
+    "daily_in_pcs": 16000,                          # the frozen room always keeps space for this much new production
     "tasks": DEFAULT_TASKS,         # daily checklist (Admin adds / assigns in ⚙️ Settings and 📋 Tasks)
     "prod_staff": [],               # names offered in "👷 Produced by"
 }
@@ -1215,6 +1216,15 @@ def page_live(cfg, can_edit):
             (f"counted {base[r][0]:%d %b}" if r in base else "never counted")
             + (" · new production comes here" if r == "frozen" else " · AEON orders only" if r == "aeon" else ""))
            for r in ROLES])
+    if float(cfg.get("daily_in_pcs", 16000) or 0) > 0:
+        sp = frozen_space(cfg, {b: len(bun_crates(cfg, b, {b: pl_stock["frozen"].get(b, {})})) for b in buns}, speed, buns)
+        msg = (f"📥 **Room for new production** in {sp['room']}: **{sp['free']} free stacks ≈ {sp['free_pcs']:,} pcs** · "
+               f"needed every day: {sp['need']} stacks for {int(sp['daily']):,} pcs")
+        if sp["ok"]:
+            st.success(msg)
+        else:
+            st.error(msg + " — ⚠️ not enough. This evening's 🚚 move list (📦 Stock count) frees space by moving old "
+                           "crates to the cooling room.")
     cap = float(cfg["max_total"])
     p_today = prod[prod["Prod_Date"].map(_day) == t]["Pcs"].map(_num).astype(float).sum()
     s_today = sales[sales["Date"] == t]["Pcs"].sum() if not sales.empty else 0
@@ -1786,6 +1796,28 @@ def _count_place(cfg, can_edit, me, role, cd, mode, pl_stock, base, show, names,
     return counted
 
 
+def frozen_space(cfg, frozen_crates, speed, buns):
+    """Free stack places in the frozen room (without the raw material area and the AEON line) and how many are
+    needed for one day of new production (`daily_in_pcs`, split over the buns like the sales; each bun its own stacks).
+    frozen_crates = {bun: number of crates in the frozen room}."""
+    rooms, cr = rooms_of(cfg), crate_size(cfg)
+    room = rooms[1] if len(rooms) > 1 else rooms[0]
+    g = room_geom(room, cr)
+    aeon_line = (g["aeon_rows"] if g.get("aeon_rows") else
+                 sum(1 for r in range(g["rows"]) if (r, g["cols"] - 1) not in g["blocked"])) if g["cols"] > 1 else 0
+    places = g["places"] - aeon_line
+    used = sum(-(-int(n) // g["high"]) for n in frozen_crates.values() if n > 0)
+    daily = float(cfg.get("daily_in_pcs", 16000) or 0)
+    tot_sp = sum(max(float(speed.get(b, 0)), 0) for b in buns) or 1.0
+    need = sum(math.ceil(daily * max(float(speed.get(b, 0)), 0) / tot_sp / crate_pcs(cfg, b) / g["high"])
+               for b in buns if speed.get(b, 0) > 0) if daily > 0 else 0
+    avg_cp = daily / max(sum(daily * max(float(speed.get(b, 0)), 0) / tot_sp / crate_pcs(cfg, b) for b in buns), 1e-9) \
+        if daily > 0 else 60
+    free = max(0, places - used)
+    return {"room": room["name"], "places": places, "used": used, "free": free, "need": need, "high": g["high"],
+            "daily": daily, "free_pcs": int(free * g["high"] * avg_cp), "ok": free >= need}
+
+
 def move_suggestion(cfg, pl_stock, sales, buns, day):
     """What to move this evening from the frozen room to the cooling room, in WHOLE CRATES (oldest production date
     first), so the cooling room holds the next `cool_days` days of sales — and never more than the cooling room's
@@ -1815,10 +1847,35 @@ def move_suggestion(cfg, pl_stock, sales, buns, day):
                 key=lambda x: (info[x]["cool"] + mv[x] * info[x]["cp"]) / max(info[x]["need"], 1))
         mv[b] -= 1
         capped = True
+    # 📥 the frozen room must keep space for tomorrow's production: move more old crates if needed
+    speed, _n = sales_speed(sales, buns, day + timedelta(days=1), int(cfg["lookback_days"]))
+    extra = {b: 0 for b in info}
+
+    def frz_after():
+        return {b: len(info[b]["fr_crates"]) - mv[b] for b in info}
+    sp = frozen_space(cfg, frz_after(), speed, buns)
+    while not sp["ok"]:
+        best = None
+        for b in info:
+            left = len(info[b]["fr_crates"]) - mv[b]
+            if left <= 0:
+                continue
+            k = left % sp["high"] or sp["high"]                 # crates that free one whole stack of this bun
+            mv[b] += k
+            fits = stacks_after(mv) <= g["places"]
+            mv[b] -= k
+            if fits and (best is None or k < best[1]):
+                best = (b, k)
+        if best is None:
+            break                                              # the cooling room is full too
+        mv[best[0]] += best[1]
+        extra[best[0]] += best[1]
+        sp = frozen_space(cfg, frz_after(), speed, buns)
     for b, v in info.items():
         v["crates"] = mv[b]
+        v["extra"] = extra[b]
     room = {"places": g["places"], "high": g["high"], "before": stacks_after({b: 0 for b in info}),
-            "after": stacks_after(mv), "capped": capped, "name": rooms[0]["name"]}
+            "after": stacks_after(mv), "capped": capped, "name": rooms[0]["name"], "frozen": sp}
     return info, days, room
 
 
@@ -1846,6 +1903,16 @@ def _move_panel(cfg, can_edit, me, cd, pl_stock, sales, buns, names, show):
         st.success("✅ Already moved today: " + ", ".join(
             f"{short(b)} {int(g_['Pcs'].map(_num).astype(float).sum()):,}" for b, g_ in done_today.groupby("Bun"))
             + " pcs — the list below already counts them.")
+    sp = room["frozen"]
+    if sp["daily"]:
+        msg = (f"📥 After this move the frozen room has **{sp['free']} free stacks (≈ {sp['free_pcs']:,} pcs)** for "
+               f"tomorrow's production — needed: **{sp['need']} stacks for {int(sp['daily']):,} pcs**.")
+        (st.success if sp["ok"] else st.error)(msg + ("" if sp["ok"] else " ⚠️ Not enough even after moving — "
+                                                     "the cooling room is full too: produce less tomorrow, or sell / "
+                                                     "move stock elsewhere."))
+        if any(v.get("extra") for v in info.values()):
+            st.caption("🚚 includes extra old crates moved only to make room for tomorrow's production: " + ", ".join(
+                f"{short(b)} +{v['extra']}" for b, v in info.items() if v.get("extra")))
     if room["capped"]:
         st.warning(f"⚠️ The cooling room has {room['places']} stack places — the list was made smaller so everything "
                    f"fits (buns that already have the most days in the cooling room get fewer crates).")
@@ -2197,6 +2264,9 @@ def page_settings(cfg, me):
         cool_days = pc[3].number_input("❄️ Cooling room keeps (days of sales)", min_value=1, max_value=7,
                                        value=int(float(cfg.get("cool_days") or 1)), key="set_cool_days",
                                        help="The evening 🚚 move list fills the cooling room up to this many days.")
+        daily_in = st.number_input("🧊 Frozen room keeps space for new production (pcs per day)", min_value=0,
+                                   max_value=200000, step=1000, value=int(cfg.get("daily_in_pcs", 16000) or 0),
+                                   key="set_daily_in", help="Checked every day; the 🚚 move list frees space when needed.")
         st.caption("New production goes to 🧊 the frozen room. Orders from customers with “AEON” in the name are taken "
                    "from 🛒 the AEON stock (when it is empty: from the normal stock). Other orders: ❄️ cooling room "
                    "first, then 🧊 frozen room.")
@@ -2237,7 +2307,7 @@ def page_settings(cfg, me):
         rows = ed.to_dict("records")
         changes = dict(max_total=int(max_total), target_default=int(t_all), shelf_days=int(s_all), lookback_days=int(look),
                        round_to=int(rnd), max_prod_per_day=int(capp), priority=list(prio),
-                       place_names=new_pn, cool_days=int(cool_days),
+                       place_names=new_pn, cool_days=int(cool_days), daily_in_pcs=int(daily_in),
                        # every bun saved with its own value: exactly what the table shows is what the app uses
                        target_days={r["Bun"]: int(r["Target days"]) for r in rows},
                        shelf_by_bun={r["Bun"]: int(r["Shelf life (days)"]) for r in rows},
@@ -2280,7 +2350,7 @@ DOOR_SPOTS = ["front-middle", "front-left", "front-right", "back-middle", "back-
 DEFAULT_ROOMS = [{"name": "❄️ Cooling room", "cols": 10, "rows": 8, "high": 15, "blocked": "1:5-8=Cooling fan; 1:9-10",
                   "door_in": "right-back", "door_out": "front-middle", "h": 3.0},
                  {"name": "🧊 Freezer room", "cols": 9, "rows": 9, "high": 15, "blocked": "",
-                  "door_in": "front-middle", "door_out": "front-middle", "h": 3.0, "back_m": 1.6}]
+                  "door_in": "front-middle", "door_out": "front-middle", "h": 3.0, "back_m": 1.6, "aeon_rows": 11}]
 RAW_LABEL = "Raw material"                                 # the empty space kept at the back of a room
 DEFAULT_CRATE = {"w": 44.0, "l": 63.0, "h": 14.6}                  # cm
 DEFAULT_CRATE_PCS = {"N1": 48, "N2": 62, "N21": 52, "N22": 62, "N23": 62, "N3": 63, "N31": 63, "N32": 63, "N33": 63,
@@ -2322,11 +2392,13 @@ def rooms_of(cfg):
                 continue
             back = r.get("back_m")
             back = (1.6 if i == 1 else 0.0) if back is None or back == "" else max(0.0, float(back))
+            arows = r.get("aeon_rows")
+            arows = (11 if i == 1 else 0) if arows is None or arows == "" else max(0, int(float(arows)))
             out.append({"name": str(r["name"]).strip(), "cols": max(1, int(r["cols"])), "rows": max(1, int(r["rows"])),
                         "high": max(1, int(r.get("high") or 15)), "blocked": str(r.get("blocked") or ""),
                         "door_in": r.get("door_in") if r.get("door_in") in DOOR_SPOTS else "back-middle",
                         "door_out": r.get("door_out") if r.get("door_out") in DOOR_SPOTS else "front-middle",
-                        "h": float(r.get("h") or 3.0), "back_m": back})
+                        "h": float(r.get("h") or 3.0), "back_m": back, "aeon_rows": arows})
         except Exception:
             continue
     return [r for r in out if r["name"]] or [dict(x) for x in DEFAULT_ROOMS]
@@ -2355,13 +2427,18 @@ def room_order(cfg, b):
 def room_geom(room, cr):
     blocked = parse_blocked(room["blocked"], room["rows"], room["cols"])
     back_rows = min(room["rows"], math.ceil(round(float(room.get("back_m") or 0) / (cr["l"] + GRID_GAP), 6)))
+    arows = int(room.get("aeon_rows") or 0) if room["cols"] > 1 else 0
     for r in range(back_rows):                                 # kept empty at the back (row 1 = back)
-        for c in range(room["cols"]):
+        for c in range(room["cols"] - (1 if arows else 0)):    # (the turned AEON line runs the whole wall)
             blocked.setdefault((r, c), RAW_LABEL)
     high = max(1, min(room["high"], int((room["h"] - 0.15) // cr["h"])))
-    places = room["rows"] * room["cols"] - len(blocked)
+    if arows:   # the right-hand line = the AEON line with turned crates: its own number of places
+        places = sum(1 for r in range(room["rows"]) for c in range(room["cols"] - 1) if (r, c) not in blocked) + arows
+    else:
+        places = room["rows"] * room["cols"] - len(blocked)
     return {"cols": room["cols"], "rows": room["rows"], "high": high, "places": places, "capacity": places * high,
-            "blocked": blocked, "back_rows": back_rows, "w": round(room["cols"] * (cr["w"] + GRID_GAP), 2),
+            "blocked": blocked, "back_rows": back_rows, "aeon_rows": arows,
+            "w": round((room["cols"] - (1 if arows else 0)) * (cr["w"] + GRID_GAP) + ((cr["l"] + GRID_GAP) if arows else 0), 2),
             "l": round(room["rows"] * (cr["l"] + GRID_GAP), 2), "h": room["h"]}
 
 
@@ -2420,7 +2497,10 @@ def room_fill(cfg, g, lists, aeon=None):
     spots = [(c, r) for c in range(g["cols"]) for r in range(g["rows"]) if (r, c) not in g["blocked"]]
     if aeon is not None and g["cols"] > 1:
         last = g["cols"] - 1
-        a_spots = [x for x in spots if x[0] == last]
+        if g.get("aeon_rows"):      # turned crates: its own places along the whole wall (row number = 0 back .. front)
+            a_spots = [(last, i) for i in range(int(g["aeon_rows"]))]
+        else:
+            a_spots = [x for x in spots if x[0] == last]
         spots = [x for x in spots if x[0] != last]
         # the AEON line: one stack can hold several buns (small amounts), oldest crates at the front
         flat = [(b, d, q) for b in sorted(aeon, key=lambda x: (room_order(cfg, x), x)) for d, q in aeon[b]]
@@ -2493,8 +2573,14 @@ def fill_rooms(cfg, rooms, geoms, buns, pl_stock, speed):
     ae = {b: bun_crates(cfg, b, pl_stock["aeon"]) for b in buns}
     ae = {b: v for b, v in ae.items() if v}
     stacks, overflow = room_fill(cfg, geoms[frz_room], frz, aeon=ae)
+    g = geoms[frz_room]
+    sp = frozen_space(cfg, {b: len(v) for b, v in frz.items()}, speed, buns)
+    taken = {(x["r"], x["c"]) for x in stacks}
+    free = [(r_, c_) for c_ in range(g["cols"] - (1 if g["cols"] > 1 else 0)) for r_ in range(g["rows"])
+            if (r_, c_) not in g["blocked"] and (r_, c_) not in taken]
+    free.sort(key=lambda x: (x[0], x[1]))                       # from the back (IN side) forward
     res[frz_room] = {"stacks": stacks, "overflow": overflow, "moved_in": {b: len(v) for b, v in carry.items()},
-                     "moved_out": {}}
+                     "moved_out": {}, "reserve": free[:sp["need"]], "space": sp}
     for r in rooms:
         res.setdefault(r["name"], {"stacks": [], "overflow": {}, "moved_in": {}, "moved_out": {}})
     return res
@@ -2577,6 +2663,8 @@ function draw(){const k=cam();ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,cv
    line(k,[a[0],0,a[1]],[a[0],2,a[1]],col,2);line(k,[b[0],0,b[1]],[b[0],2,b[1]],col,2);
    const mx=(a[0]+b[0])/2,mz=(a[1]+b[1])/2;labels.push({v:[mx,2.3,mz],t,c:col,fs:11,pr:3});});
   const rd=dd.rooms[r.name]||{stacks:[],used:0};
+  (rd.reserve||[]).forEach(([row,c],i)=>{const [x,z]=XZ(r,c,row);quad(x,z,x+CW,z+CL,'rgba(64,192,87,.35)');
+   if(i===0)labels.push({v:[x+CW/2,0.12,z+CL/2],t:'📥 New production ('+rd.reserve.length+' stacks)',c:'#b2f2bb',fs:10,pr:2});});
   labels.push({v:[o+r.w/2,r.h+0.4,r.l/2],t:r.name+' · '+rd.used.toLocaleString()+' / '+r.cap.toLocaleString()+' crates · '+rd.pcs.toLocaleString()+' pcs',c:'#e9ecef',fs:12,pr:4});
   if(dims){line(k,[o,0,-0.45],[o+r.w,0,-0.45],'#adb5bd',1);labels.push({v:[o+r.w/2,0,-0.75],t:r.cols+' stacks · '+r.w+' m',c:'#ced4da',fs:10,pr:2});
    line(k,[o-0.4,0,0],[o-0.4,0,r.l],'#adb5bd',1);labels.push({v:[o-0.8,0,r.l/2],t:r.rows+' deep · '+r.l+' m',c:'#ced4da',fs:10,pr:2});}
@@ -2584,12 +2672,15 @@ function draw(){const k=cam();ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,cv
    if(raw){quad(x,z,x+CW+GAP,z+CL+GAP,'rgba(173,181,189,.35)');if(t&&t.trim())labels.push({v:[x+CW/2,0.15,z+CL/2],t:'📦 '+t+' (keep empty)',c:'#dee2e6',fs:10,pr:1});return;}
    addBox(L,k,x,0,z,CW,1.4,CL,t?'#364fc7':'#e8590c',0.55,null,0);
    if(t&&t.trim())labels.push({v:[x+CW/2,1.6,z+CL/2],t,c:'#bac8ff',fs:10,pr:1});});
-  rd.stacks.forEach(s=>{const [c,row,bun,segs,first,isA]=s;const bn=BUN[bun]||{color:'#adb5bd',label:bun};const [x,z]=XZ(r,c,row);let lev=0;
+  rd.stacks.forEach(s=>{const [c,row,bun,segs,first,isA]=s;const bn=BUN[bun]||{color:'#adb5bd',label:bun};
+   const turned=isA&&r.arows>0;   // AEON line: crates turned, 63 cm across, 44 cm deep
+   const [x,z]=turned?[off[r.name]+c*PX+GAP/2,(r.arows-1-row)*(CW+GAP)+GAP/2]:XZ(r,c,row);
+   const BW=turned?CL:CW,BD=turned?CW:CL;let lev=0;
    const dim=only&&!segs.some(g=>(g[3]||bun)===only);
-   segs.forEach(([lot,n,pcs,b2])=>{const sb=b2||bun,sbn=BUN[sb]||bn;const a=age(D.lots[lot]);addBox(L,k,x,lev*CH,z,CW,n*CH-0.004,CL,colBun?sbn.color:ageCol(sb,a),dim?0.12:1,
-     {room:r.name,s,row,c,lot,n,pcs,a,bun:sb,rows:r.rows,aeon:isA},n);lev+=n;});
+   segs.forEach(([lot,n,pcs,b2])=>{const sb=b2||bun,sbn=BUN[sb]||bn;const a=age(D.lots[lot]);addBox(L,k,x,lev*CH,z,BW,n*CH-0.004,BD,colBun?sbn.color:ageCol(sb,a),dim?0.12:1,
+     {room:r.name,s,row,c,lot,n,pcs,a,bun:sb,rows:turned?r.arows:r.rows,aeon:isA},n);lev+=n;});
    if(!dim){const top=segs[segs.length-1];const lot=D.lots[top[0]];
-    labels.push({v:[x+CW/2,lev*CH+0.12,z+CL/2],t:(isA?'🛒 ':'')+(first?'⭐ ':'')+(lotLbl?lot.slice(8,10)+'/'+lot.slice(5,7)+' ':'')+(top[3]||bun),c:'#fff',fs:9,bg:shade((BUN[top[3]||bun]||bn).color,0.5,0.92),pr:first?2:0});}});
+    labels.push({v:[x+BW/2,lev*CH+0.12,z+BD/2],t:(isA?'🛒 ':'')+(first?'⭐ ':'')+(lotLbl?lot.slice(8,10)+'/'+lot.slice(5,7)+' ':'')+(top[3]||bun),c:'#fff',fs:9,bg:shade((BUN[top[3]||bun]||bn).color,0.5,0.92),pr:first?2:0});}});
  });
  L.sort((a,b)=>b.dep-a.dep);drawn=L;
  for(const p of L){ctx.beginPath();p.pts.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.closePath();ctx.fillStyle=p.col;ctx.fill();
@@ -2642,9 +2733,11 @@ window.addEventListener('resize',()=>{size();redraw();});legend();size();__START
 </script>"""
 
 
-def room_sheet_html(room, g, stacks, names, new=None):
+def room_sheet_html(room, g, stacks, names, new=None, reserve=None):
     """Your Excel 'ស្តុកនំប្រចាំថ្ងៃ' layout: one cell per stack (lot date + bun / pcs), column totals, total."""
-    cells = {(s["r"], s["c"]): s for s in stacks}
+    cells = {(s["r"], s["c"]): s for s in stacks if not s.get("aeon")}
+    a_line = sorted([s for s in stacks if s.get("aeon")], key=lambda s: -s["r"])      # front first
+    arows = int(g.get("aeon_rows") or 0)
     bd = "border:1px solid #444;"
     h = [f"<div style='overflow-x:auto'><table style='border-collapse:collapse;font-size:13px;text-align:center;min-width:{g['cols'] * 78}px'>",
          f"<tr><td colspan='{g['cols']}' style='{bd}font-size:18px;font-weight:700;padding:6px'>ស្តុកនំប្រចាំថ្ងៃ · {room['name']}</td>"
@@ -2654,6 +2747,19 @@ def room_sheet_html(room, g, stacks, names, new=None):
         h.append("<tr>")
         c = 0
         while c < g["cols"]:
+            if arows and c == g["cols"] - 1:                    # the turned AEON line: one tall cell
+                if r == 0:
+                    a_pcs = int(sum(x[2] for s_ in a_line for x in s_["segs"]))
+                    col_tot[c] += a_pcs
+                    items = "".join(
+                        f"<div style='border-bottom:1px solid #ccc;padding:2px'>{'⭐ ' if s_['first'] else ''}"
+                        f"{i + 1}. {s_['segs'][-1][0]:%d/%m} {' '.join(sorted({x[3] for x in s_['segs'] if len(x) > 3}) or [s_['b']])}"
+                        f" · <b>{int(sum(x[2] for x in s_['segs'])):,}</b></div>" for i, s_ in enumerate(a_line))
+                    h.append(f"<td rowspan='{g['rows']}' style='{bd}background:#fff4e6;vertical-align:top;padding:4px;"
+                             f"min-width:120px;font-size:12px'><b>🛒 AEON line</b><br>{arows} places, crates turned · "
+                             f"front (OUT) first<br>{items or '–'}</td>")
+                c += 1
+                continue
             if (r, c) in g["blocked"]:
                 lab, span = g["blocked"][(r, c)], 1
                 while c + span < g["cols"] and g["blocked"].get((r, c + span)) == lab and (r, c + span) in g["blocked"]:
@@ -2675,6 +2781,8 @@ def room_sheet_html(room, g, stacks, names, new=None):
                 edge = "outline:3px solid #2f9e44;outline-offset:-3px;" if k_new else ""
                 h.append(f"<td style='{bd}{edge}background:{COLORS.get(s['b'], '#fff')};padding:4px 6px;min-width:70px'>"
                          f"{star}{'🛒 ' if mix else ''}{top:%d/%m} {' '.join(mix) if mix else s['b']}<br><b>{pcs:,}</b>{mark}</td>")
+            elif (r, c) in (reserve or set()):
+                h.append(f"<td style='{bd}background:#d3f9d8;padding:4px 6px;min-width:70px;color:#2b8a3e'>📥 new</td>")
             else:
                 h.append(f"<td style='{bd}padding:4px 6px;min-width:70px;color:#999'>–</td>")
             c += 1
@@ -2700,7 +2808,8 @@ def room_sheet_excel(room, g, stacks):
     ws.cell(1, 1, f"ស្តុកនំប្រចាំថ្ងៃ · {room['name']}").font = Font(bold=True, size=14)
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=g["cols"])
     ws.cell(1, 1).alignment = mid
-    cells = {(s["r"], s["c"]): s for s in stacks}
+    cells = {(s["r"], s["c"]): s for s in stacks if not s.get("aeon")}
+    a_line = sorted([s for s in stacks if s.get("aeon")], key=lambda s: -s["r"])
     col_tot = [0] * g["cols"]
     for r in range(g["rows"]):
         for c in range(g["cols"]):
@@ -2733,6 +2842,14 @@ def room_sheet_excel(room, g, stacks):
     from openpyxl.utils import get_column_letter
     for c in range(g["cols"] + 2):
         ws.column_dimensions[get_column_letter(c + 1)].width = 12
+    if a_line:                                              # the AEON line (turned crates), front first
+        ar = tr + 3
+        ws.cell(ar, 1, "🛒 AEON line (front / OUT first)").font = Font(bold=True)
+        for i, s_ in enumerate(a_line):
+            ws.cell(ar + 1 + i, 1, i + 1)
+            ws.cell(ar + 1 + i, 2, f"{s_['segs'][-1][0]:%d/%m}")
+            ws.cell(ar + 1 + i, 3, " ".join(sorted({x[3] for x in s_["segs"] if len(x) > 3}) or [s_["b"]]))
+            ws.cell(ar + 1 + i, 4, int(sum(x[2] for x in s_["segs"]))).number_format = "#,##0"
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
@@ -2779,7 +2896,8 @@ def page_rooms(cfg):
                     if seg[0] not in lot_i:
                         lot_i[seg[0]] = len(lots)
                         lots.append(seg[0].isoformat())
-            rd[r["name"]] = {"stacks": [[s["c"], s["r"], s["b"], [[lot_i[x[0]], x[1], x[2]] + ([x[3]] if len(x) > 3 else [])
+            rd[r["name"]] = {"reserve": [list(x) for x in filled[r["name"]].get("reserve", [])],
+                             "stacks": [[s["c"], s["r"], s["b"], [[lot_i[x[0]], x[1], x[2]] + ([x[3]] if len(x) > 3 else [])
                                                                     for x in s["segs"]], s["first"], int(bool(s.get("aeon")))]
                                         for s in stacks],
                              "used": sum(x[1] for s in stacks for x in s["segs"]),
@@ -2790,6 +2908,7 @@ def page_rooms(cfg):
                 moved_today[r["name"]] = filled[r["name"]]["moved_out"]
         out_days.append({"iso": d.isoformat(), "label": ("Today · " if d == t else "") + f"{d:%a %d %b}", "rooms": rd})
     today = out_days[-1]["rooms"]
+    sp_today = next((v["space"] for v in filled.values() if v.get("space")), None)
     tiles([(r["name"], f"{today[r['name']]['used']:,} / {geoms[r['name']]['capacity']:,}",
             f"crates · {geoms[r['name']]['places']} stacks × {geoms[r['name']]['high']} high · "
             f"{today[r['name']]['pcs']:,} pcs · {today[r['name']]['used'] / max(geoms[r['name']]['capacity'], 1) * 100:.0f}% full")
@@ -2801,6 +2920,11 @@ def page_rooms(cfg):
                     + ", ".join(f"{short(b)} {n} crates" for b, n in mv.items())
                     + f" (total {sum(mv.values()):,} crates). {r['name']} keeps the oldest stock of every bun "
                       "(about the same days of sales each) to pick first.")
+    if sp_today and sp_today["daily"]:
+        (st.success if sp_today["ok"] else st.error)(
+            f"📥 {sp_today['room']}: **{sp_today['free']} free stacks ≈ {sp_today['free_pcs']:,} pcs** for new production "
+            f"(green 📥 places) — needed every day: {sp_today['need']} stacks for {int(sp_today['daily']):,} pcs"
+            + ("" if sp_today["ok"] else " — ⚠️ not enough: use this evening's 🚚 move list."))
     parts = [f"**{r['name']}**: " + ", ".join(f"{short(b)} {n}" for b, n in overflow_today[r["name"]].items())
              for r in rooms if overflow_today.get(r["name"])]
     if parts:
@@ -2810,6 +2934,7 @@ def page_rooms(cfg):
                                       for x in today_stacks.values() for s in x)]
     data = {"days": out_days, "lots": lots, "crate": cr, "gap": GRID_GAP,
             "rooms": [{"name": r["name"], "cols": geoms[r["name"]]["cols"], "rows": geoms[r["name"]]["rows"],
+                       "arows": geoms[r["name"]].get("aeon_rows", 0),
                        "w": geoms[r["name"]]["w"], "l": geoms[r["name"]]["l"], "h": geoms[r["name"]]["h"],
                        "cap": geoms[r["name"]]["capacity"], "din": r["door_in"], "dout": r["door_out"],
                        "blocked": [[k[0], k[1], v if v and (k[0], k[1] - 1) not in geoms[r["name"]]["blocked"]
@@ -2827,7 +2952,8 @@ def page_rooms(cfg):
     pick = st.radio("Room sheet", [r["name"] for r in rooms], horizontal=True, key="room_sheet",
                     label_visibility="collapsed")
     room = next(r for r in rooms if r["name"] == pick)
-    html, tot = room_sheet_html(room, geoms[pick], today_stacks.get(pick, []), names)
+    html, tot = room_sheet_html(room, geoms[pick], today_stacks.get(pick, []), names,
+                                reserve={tuple(x) for x in today.get(pick, {}).get("reserve", [])})
     st.markdown(html, unsafe_allow_html=True)
     st.download_button(f"⬇️ {pick} sheet (Excel)", room_sheet_excel(room, geoms[pick], today_stacks.get(pick, [])),
                        file_name=f"room_stock_{t}.xlsx",
@@ -2844,7 +2970,8 @@ def rooms_settings(cfg, buns, names, n, kp="set"):
     st.caption("A room = a grid of stack places like your sheet. Across = columns, Deep = rows (row 1 = back, at the IN "
                "side). Blocked = places with no stock, e.g. `1:5-8=Cooling fan; 1:9-10` (row:columns=name).")
     rdf = pd.DataFrame([{"Room": r["name"], "Stacks across": r["cols"], "Stacks deep": r["rows"], "Crates high": r["high"],
-                         "Height (m)": r["h"], "Empty at back (m)": r["back_m"], "Blocked places": r["blocked"],
+                         "Height (m)": r["h"], "Empty at back (m)": r["back_m"], "AEON line places": r["aeon_rows"],
+                         "Blocked places": r["blocked"],
                          "Door IN": r["door_in"], "Door OUT": r["door_out"]} for r in rooms_of(cfg)])
     red = st.data_editor(rdf, hide_index=True, width="stretch", num_rows="dynamic", key=f"{kp}_rooms3_{n}",
                          column_config={"Room": st.column_config.TextColumn("Room", required=True),
@@ -2855,6 +2982,10 @@ def rooms_settings(cfg, buns, names, n, kp="set"):
                                         "Empty at back (m)": st.column_config.NumberColumn(
                                             "Empty at back (m)", min_value=0.0, max_value=50.0, step=0.1, format="%.1f",
                                             help="Kept free at the back (row 1 side), e.g. 1.6 m for raw material"),
+                                        "AEON line places": st.column_config.NumberColumn(
+                                            "🛒 AEON line places", min_value=0, max_value=40, step=1,
+                                            help="Right-hand line for the AEON stock with the crates turned (e.g. 11). "
+                                                 "0 = no AEON line in this room"),
                                         "Blocked places": st.column_config.TextColumn("Blocked places"),
                                         "Door IN": st.column_config.SelectboxColumn("🟢 Door IN", options=DOOR_SPOTS, required=True),
                                         "Door OUT": st.column_config.SelectboxColumn("🟠 Door OUT", options=DOOR_SPOTS, required=True)})
@@ -2865,6 +2996,7 @@ def rooms_settings(cfg, buns, names, n, kp="set"):
                 rooms.append({"name": str(r["Room"]).strip(), "cols": int(r["Stacks across"]), "rows": int(r["Stacks deep"]),
                               "high": int(r["Crates high"]), "h": float(r.get("Height (m)") or 3.0),
                               "back_m": float(r.get("Empty at back (m)") or 0),
+                              "aeon_rows": int(r.get("AEON line places") or 0),
                               "blocked": str(r.get("Blocked places") or ""), "door_in": r.get("Door IN") or "back-middle",
                               "door_out": r.get("Door OUT") or "front-middle"})
             except Exception:
