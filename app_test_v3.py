@@ -2280,7 +2280,8 @@ DOOR_SPOTS = ["front-middle", "front-left", "front-right", "back-middle", "back-
 DEFAULT_ROOMS = [{"name": "❄️ Cooling room", "cols": 10, "rows": 8, "high": 15, "blocked": "1:5-8=Cooling fan; 1:9-10",
                   "door_in": "right-back", "door_out": "front-middle", "h": 3.0},
                  {"name": "🧊 Freezer room", "cols": 9, "rows": 9, "high": 15, "blocked": "",
-                  "door_in": "front-middle", "door_out": "front-middle", "h": 3.0}]
+                  "door_in": "front-middle", "door_out": "front-middle", "h": 3.0, "back_m": 1.6}]
+RAW_LABEL = "Raw material"                                 # the empty space kept at the back of a room
 DEFAULT_CRATE = {"w": 44.0, "l": 63.0, "h": 14.6}                  # cm
 DEFAULT_CRATE_PCS = {"N1": 48, "N2": 62, "N21": 52, "N22": 62, "N23": 62, "N3": 63, "N31": 63, "N32": 63, "N33": 63,
                      "N34": 63, "N4": 60, "N41": 60, "N42": 60, "N43": 60}
@@ -2315,15 +2316,17 @@ def parse_blocked(txt, rows, cols):
 
 def rooms_of(cfg):
     out = []
-    for r in cfg.get("rooms") or DEFAULT_ROOMS:
+    for i, r in enumerate(cfg.get("rooms") or DEFAULT_ROOMS):
         try:
             if "cols" not in r:                                  # an older room format: use the defaults
                 continue
+            back = r.get("back_m")
+            back = (1.6 if i == 1 else 0.0) if back is None or back == "" else max(0.0, float(back))
             out.append({"name": str(r["name"]).strip(), "cols": max(1, int(r["cols"])), "rows": max(1, int(r["rows"])),
                         "high": max(1, int(r.get("high") or 15)), "blocked": str(r.get("blocked") or ""),
                         "door_in": r.get("door_in") if r.get("door_in") in DOOR_SPOTS else "back-middle",
                         "door_out": r.get("door_out") if r.get("door_out") in DOOR_SPOTS else "front-middle",
-                        "h": float(r.get("h") or 3.0)})
+                        "h": float(r.get("h") or 3.0), "back_m": back})
         except Exception:
             continue
     return [r for r in out if r["name"]] or [dict(x) for x in DEFAULT_ROOMS]
@@ -2351,10 +2354,14 @@ def room_order(cfg, b):
 
 def room_geom(room, cr):
     blocked = parse_blocked(room["blocked"], room["rows"], room["cols"])
+    back_rows = min(room["rows"], math.ceil(round(float(room.get("back_m") or 0) / (cr["l"] + GRID_GAP), 6)))
+    for r in range(back_rows):                                 # kept empty at the back (row 1 = back)
+        for c in range(room["cols"]):
+            blocked.setdefault((r, c), RAW_LABEL)
     high = max(1, min(room["high"], int((room["h"] - 0.15) // cr["h"])))
     places = room["rows"] * room["cols"] - len(blocked)
     return {"cols": room["cols"], "rows": room["rows"], "high": high, "places": places, "capacity": places * high,
-            "blocked": blocked, "w": round(room["cols"] * (cr["w"] + GRID_GAP), 2),
+            "blocked": blocked, "back_rows": back_rows, "w": round(room["cols"] * (cr["w"] + GRID_GAP), 2),
             "l": round(room["rows"] * (cr["l"] + GRID_GAP), 2), "h": room["h"]}
 
 
@@ -2415,9 +2422,24 @@ def room_fill(cfg, g, lists, aeon=None):
         last = g["cols"] - 1
         a_spots = [x for x in spots if x[0] == last]
         spots = [x for x in spots if x[0] != last]
-        a_stacks, a_over = room_fill(cfg, {**g, "cols": 1, "rows": len(a_spots), "blocked": {}}, aeon)
-        for stx in a_stacks:                                     # placed in the right-hand line (same order)
-            stx["c"], stx["r"] = a_spots[stx["r"]]
+        # the AEON line: one stack can hold several buns (small amounts), oldest crates at the front
+        flat = [(b, d, q) for b in sorted(aeon, key=lambda x: (room_order(cfg, x), x)) for d, q in aeon[b]]
+        a_stacks, a_over = [], {}
+        front_first = sorted(a_spots, key=lambda x: -x[1])
+        for i, (c_, r_) in enumerate(front_first):
+            part = flat[i * g["high"]:(i + 1) * g["high"]]
+            if not part:
+                break
+            segs = []
+            for b, d, q in reversed(part):                       # bottom = newer, top = older
+                if segs and segs[-1][0] == d and segs[-1][3] == b:
+                    segs[-1][1] += 1
+                    segs[-1][2] += q
+                else:
+                    segs.append([d, 1, q, b])
+            a_stacks.append({"c": c_, "r": r_, "b": segs[-1][3], "segs": segs, "first": i == 0})
+        for b, d, q in flat[len(front_first) * g["high"]:]:
+            a_over[b] = a_over.get(b, 0) + 1
         for x in a_stacks:
             x["aeon"] = True
         rest, over = room_fill(cfg, {**g, "cols": last}, lists)
@@ -2558,13 +2580,16 @@ function draw(){const k=cam();ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,cv
   labels.push({v:[o+r.w/2,r.h+0.4,r.l/2],t:r.name+' · '+rd.used.toLocaleString()+' / '+r.cap.toLocaleString()+' crates · '+rd.pcs.toLocaleString()+' pcs',c:'#e9ecef',fs:12,pr:4});
   if(dims){line(k,[o,0,-0.45],[o+r.w,0,-0.45],'#adb5bd',1);labels.push({v:[o+r.w/2,0,-0.75],t:r.cols+' stacks · '+r.w+' m',c:'#ced4da',fs:10,pr:2});
    line(k,[o-0.4,0,0],[o-0.4,0,r.l],'#adb5bd',1);labels.push({v:[o-0.8,0,r.l/2],t:r.rows+' deep · '+r.l+' m',c:'#ced4da',fs:10,pr:2});}
-  r.blocked.forEach(([row,c,t])=>{const [x,z]=XZ(r,c,row);addBox(L,k,x,0,z,CW,1.4,CL,t?'#364fc7':'#e8590c',0.55,null,0);
+  r.blocked.forEach(([row,c,t,raw])=>{const [x,z]=XZ(r,c,row);
+   if(raw){quad(x,z,x+CW+GAP,z+CL+GAP,'rgba(173,181,189,.35)');if(t&&t.trim())labels.push({v:[x+CW/2,0.15,z+CL/2],t:'📦 '+t+' (keep empty)',c:'#dee2e6',fs:10,pr:1});return;}
+   addBox(L,k,x,0,z,CW,1.4,CL,t?'#364fc7':'#e8590c',0.55,null,0);
    if(t&&t.trim())labels.push({v:[x+CW/2,1.6,z+CL/2],t,c:'#bac8ff',fs:10,pr:1});});
-  rd.stacks.forEach(s=>{const [c,row,bun,segs,first]=s;const bn=BUN[bun];const dim=only&&bun!==only;const [x,z]=XZ(r,c,row);let lev=0;
-   segs.forEach(([lot,n,pcs])=>{const a=age(D.lots[lot]);addBox(L,k,x,lev*CH,z,CW,n*CH-0.004,CL,colBun?bn.color:ageCol(bun,a),dim?0.12:1,
-     {room:r.name,s,row,c,lot,n,pcs,a,bun,rows:r.rows},n);lev+=n;});
+  rd.stacks.forEach(s=>{const [c,row,bun,segs,first,isA]=s;const bn=BUN[bun]||{color:'#adb5bd',label:bun};const [x,z]=XZ(r,c,row);let lev=0;
+   const dim=only&&!segs.some(g=>(g[3]||bun)===only);
+   segs.forEach(([lot,n,pcs,b2])=>{const sb=b2||bun,sbn=BUN[sb]||bn;const a=age(D.lots[lot]);addBox(L,k,x,lev*CH,z,CW,n*CH-0.004,CL,colBun?sbn.color:ageCol(sb,a),dim?0.12:1,
+     {room:r.name,s,row,c,lot,n,pcs,a,bun:sb,rows:r.rows,aeon:isA},n);lev+=n;});
    if(!dim){const top=segs[segs.length-1];const lot=D.lots[top[0]];
-    labels.push({v:[x+CW/2,lev*CH+0.12,z+CL/2],t:(first?'⭐ ':'')+(lotLbl?lot.slice(8,10)+'/'+lot.slice(5,7)+' ':'')+bun,c:'#fff',fs:9,bg:shade(bn.color,0.5,0.92),pr:first?2:0});}});
+    labels.push({v:[x+CW/2,lev*CH+0.12,z+CL/2],t:(isA?'🛒 ':'')+(first?'⭐ ':'')+(lotLbl?lot.slice(8,10)+'/'+lot.slice(5,7)+' ':'')+(top[3]||bun),c:'#fff',fs:9,bg:shade((BUN[top[3]||bun]||bn).color,0.5,0.92),pr:first?2:0});}});
  });
  L.sort((a,b)=>b.dep-a.dep);drawn=L;
  for(const p of L){ctx.beginPath();p.pts.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.closePath();ctx.fillStyle=p.col;ctx.fill();
@@ -2580,7 +2605,7 @@ function inside(pt,poly){let c=false;for(let i=0,j=poly.length-1;i<poly.length;j
  if(((a[1]>pt[1])!==(b[1]>pt[1]))&&(pt[0]<(b[0]-a[0])*(pt[1]-a[1])/(b[1]-a[1])+a[0]))c=!c;}return c;}
 function pick(e){const r=cv.getBoundingClientRect(),pt=[(e.clientX-r.left)*DPR,(e.clientY-r.top)*DPR];
  for(let i=drawn.length-1;i>=0;i--){const p=drawn[i];if(p.ref&&inside(pt,p.pts))return p.ref;}return null;}
-function describe(r){if(!r)return '👆 Tap a stack: bun, lot date, age, crates, pcs.';const b=BUN[r.bun],lot=D.lots[r.lot];
+function describe(r){if(!r)return '👆 Tap a stack: bun, lot date, age, crates, pcs.';const b=BUN[r.bun]||{label:r.bun},lot=D.lots[r.lot];
  const tot=r.s[3].reduce((a,x)=>a+x[2],0),cr=r.s[3].reduce((a,x)=>a+x[1],0);
  return `📦 ${r.room} · column ${r.c+1} · row ${r.row+1} (${r.rows-r.row}${r.rows-r.row===1?'st':'th'} from the OUT door) · <b>${b.label}</b> · lot <b>${lot.slice(8,10)}/${lot.slice(5,7)}</b>`+
   ` · ${r.a} d old · this lot ${r.n} crates ≈ ${r.pcs.toLocaleString()} pcs · whole stack ${cr} crates = ${tot.toLocaleString()} pcs`+(r.s[4]?' · ⭐ TAKE FIRST':'');}
@@ -2633,7 +2658,7 @@ def room_sheet_html(room, g, stacks, names, new=None):
                 lab, span = g["blocked"][(r, c)], 1
                 while c + span < g["cols"] and g["blocked"].get((r, c + span)) == lab and (r, c + span) in g["blocked"]:
                     span += 1
-                bg = "#ED7D31" if not lab else "#fff"
+                bg = "#ED7D31" if not lab else ("#e9ecef" if lab == RAW_LABEL else "#fff")
                 h.append(f"<td colspan='{span}' style='{bd}background:{bg};padding:6px'>{lab}</td>")
                 c += span
                 continue
@@ -2641,6 +2666,7 @@ def room_sheet_html(room, g, stacks, names, new=None):
             if s:
                 top = s["segs"][-1][0]
                 pcs = sum(x[2] for x in s["segs"])
+                mix = sorted({x[3] for x in s["segs"] if len(x) > 3})
                 col_tot[c] += pcs
                 star = "⭐ " if s["first"] else ""
                 k_new = (new or {}).get((r, c))
@@ -2648,7 +2674,7 @@ def room_sheet_html(room, g, stacks, names, new=None):
                         f"🆕 put {k_new} cr</span>") if k_new else ""
                 edge = "outline:3px solid #2f9e44;outline-offset:-3px;" if k_new else ""
                 h.append(f"<td style='{bd}{edge}background:{COLORS.get(s['b'], '#fff')};padding:4px 6px;min-width:70px'>"
-                         f"{star}{top:%d/%m} {s['b']}<br><b>{pcs:,}</b>{mark}</td>")
+                         f"{star}{'🛒 ' if mix else ''}{top:%d/%m} {' '.join(mix) if mix else s['b']}<br><b>{pcs:,}</b>{mark}</td>")
             else:
                 h.append(f"<td style='{bd}padding:4px 6px;min-width:70px;color:#999'>–</td>")
             c += 1
@@ -2753,7 +2779,8 @@ def page_rooms(cfg):
                     if seg[0] not in lot_i:
                         lot_i[seg[0]] = len(lots)
                         lots.append(seg[0].isoformat())
-            rd[r["name"]] = {"stacks": [[s["c"], s["r"], s["b"], [[lot_i[x[0]], x[1], x[2]] for x in s["segs"]], s["first"]]
+            rd[r["name"]] = {"stacks": [[s["c"], s["r"], s["b"], [[lot_i[x[0]], x[1], x[2]] + ([x[3]] if len(x) > 3 else [])
+                                                                    for x in s["segs"]], s["first"], int(bool(s.get("aeon")))]
                                         for s in stacks],
                              "used": sum(x[1] for s in stacks for x in s["segs"]),
                              "pcs": int(sum(x[2] for s in stacks for x in s["segs"]))}
@@ -2779,13 +2806,15 @@ def page_rooms(cfg):
     if parts:
         st.warning("⚠️ No place today for these crates — " + " · ".join(parts)
                    + ". Move a bun to the other room" + (", or adjust the room grid (📐)." if is_admin else "."))
-    present = [b for b in buns if any(s["b"] == b for x in today_stacks.values() for s in x)]
+    present = [b for b in buns if any(s["b"] == b or any(len(g_) > 3 and g_[3] == b for g_ in s["segs"])
+                                      for x in today_stacks.values() for s in x)]
     data = {"days": out_days, "lots": lots, "crate": cr, "gap": GRID_GAP,
             "rooms": [{"name": r["name"], "cols": geoms[r["name"]]["cols"], "rows": geoms[r["name"]]["rows"],
                        "w": geoms[r["name"]]["w"], "l": geoms[r["name"]]["l"], "h": geoms[r["name"]]["h"],
                        "cap": geoms[r["name"]]["capacity"], "din": r["door_in"], "dout": r["door_out"],
                        "blocked": [[k[0], k[1], v if v and (k[0], k[1] - 1) not in geoms[r["name"]]["blocked"]
-                                    or v and geoms[r["name"]]["blocked"].get((k[0], k[1] - 1)) != v else ("" if not v else " ")]
+                                    or v and geoms[r["name"]]["blocked"].get((k[0], k[1] - 1)) != v else ("" if not v else " "),
+                                    1 if v == RAW_LABEL else 0]
                                    for k, v in sorted(geoms[r["name"]]["blocked"].items())]} for r in rooms],
             "buns": [{"code": b, "label": f"{b} {names.get(b, '')}".strip(), "color": CRATE_COLORS.get(b, EXTRA_COLORS[i % 7])}
                      for i, b in enumerate(present)],
@@ -2815,14 +2844,17 @@ def rooms_settings(cfg, buns, names, n, kp="set"):
     st.caption("A room = a grid of stack places like your sheet. Across = columns, Deep = rows (row 1 = back, at the IN "
                "side). Blocked = places with no stock, e.g. `1:5-8=Cooling fan; 1:9-10` (row:columns=name).")
     rdf = pd.DataFrame([{"Room": r["name"], "Stacks across": r["cols"], "Stacks deep": r["rows"], "Crates high": r["high"],
-                         "Height (m)": r["h"], "Blocked places": r["blocked"], "Door IN": r["door_in"],
-                         "Door OUT": r["door_out"]} for r in rooms_of(cfg)])
+                         "Height (m)": r["h"], "Empty at back (m)": r["back_m"], "Blocked places": r["blocked"],
+                         "Door IN": r["door_in"], "Door OUT": r["door_out"]} for r in rooms_of(cfg)])
     red = st.data_editor(rdf, hide_index=True, width="stretch", num_rows="dynamic", key=f"{kp}_rooms3_{n}",
                          column_config={"Room": st.column_config.TextColumn("Room", required=True),
                                         **{c: st.column_config.NumberColumn(c, min_value=1, max_value=60, step=1, required=True)
                                            for c in ["Stacks across", "Stacks deep", "Crates high"]},
                                         "Height (m)": st.column_config.NumberColumn("Height (m)", min_value=1.0,
                                                                                     max_value=20.0, step=0.1, format="%.1f"),
+                                        "Empty at back (m)": st.column_config.NumberColumn(
+                                            "Empty at back (m)", min_value=0.0, max_value=50.0, step=0.1, format="%.1f",
+                                            help="Kept free at the back (row 1 side), e.g. 1.6 m for raw material"),
                                         "Blocked places": st.column_config.TextColumn("Blocked places"),
                                         "Door IN": st.column_config.SelectboxColumn("🟢 Door IN", options=DOOR_SPOTS, required=True),
                                         "Door OUT": st.column_config.SelectboxColumn("🟠 Door OUT", options=DOOR_SPOTS, required=True)})
@@ -2832,6 +2864,7 @@ def rooms_settings(cfg, buns, names, n, kp="set"):
             try:
                 rooms.append({"name": str(r["Room"]).strip(), "cols": int(r["Stacks across"]), "rows": int(r["Stacks deep"]),
                               "high": int(r["Crates high"]), "h": float(r.get("Height (m)") or 3.0),
+                              "back_m": float(r.get("Empty at back (m)") or 0),
                               "blocked": str(r.get("Blocked places") or ""), "door_in": r.get("Door IN") or "back-middle",
                               "door_out": r.get("Door OUT") or "front-middle"})
             except Exception:
@@ -2845,6 +2878,7 @@ def rooms_settings(cfg, buns, names, n, kp="set"):
     cr = {"w": cw / 100, "l": cl / 100, "h": ch / 100}
     st.caption("Space: " + " · ".join(
         f"{r['name']} ≈ {g['w']} × {g['l']} m = {g['places']} stacks × {g['high']} high = {g['capacity']:,} crates"
+        + (f" (back {g['back_rows']} rows = {g['back_rows'] * (cr['l'] + GRID_GAP):.2f} m kept empty)" if g["back_rows"] else "")
         for r in rooms for g in [room_geom(r, cr)]))
     st.caption("Which room: ❄️ cooling stock → the first room · 🧊 frozen stock → the second room · 🛒 AEON stock → "
                "its own line on the right of the frozen room (from the evening counts and 🚚 moves).")
