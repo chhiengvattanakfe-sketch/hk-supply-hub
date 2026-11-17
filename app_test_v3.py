@@ -1905,7 +1905,7 @@ def move_suggestion(cfg, pl_stock, sales, buns, day):
         v["extra"] = extra[b]
     room = {"places": sum(cap.values()) // g["high"], "high": g["high"], "before": stacks_after({b: 0 for b in info}),
             "after": stacks_after(mv), "capped": capped, "name": rooms[0]["name"], "frozen": sp, "plan": plan,
-            "speed": speed}
+            "speed": speed, "fplan": fplan, "fname": frz_room["name"], "fgeom": room_geom(frz_room, cr)}
     return info, days, room
 
 
@@ -1989,17 +1989,52 @@ def _move_panel(cfg, can_edit, me, cd, pl_stock, sales, buns, names, show):
             cool_after[b][d] = cool_after[b].get(d, 0) + q
     lists = {b: bun_crates(cfg, b, cool_after) for b in buns}
     stacks, overflow, _l, _f = room_fill(cfg, g, {b: v for b, v in lists.items() if v}, room["plan"])
-    new_marks = {}
+    new_marks, put_by = {}, {}
     for b, k in mv.items():                 # the moved (newer) crates go to the BACK of the bun's own lanes
         left = k
-        mine = [x for x in stacks if x["b"] == b or any(len(y) > 3 and y[3] == b for y in x["segs"])]
-        for s_ in sorted(mine, key=lambda x: -x.get("i", 0)):
+        for s_ in sorted([x for x in stacks if x["b"] == b], key=lambda x: -x.get("i", 0)):
             if left <= 0:
                 break
-            q = min(left, sum(y[1] for y in s_["segs"] if (y[3] if len(y) > 3 else s_["b"]) == b))
+            q = min(left, sum(y[1] for y in s_["segs"]))
             if q > 0:
                 new_marks[(s_["r"], s_["c"])] = new_marks.get((s_["r"], s_["c"]), 0) + q
+                ln, _pos = stack_where(room["plan"], s_["c"], s_["r"])
+                put_by.setdefault(b, {})[ln] = put_by.setdefault(b, {}).get(ln, 0) + q
                 left -= q
+    # 🧊 where to take them: the frozen room before the move, oldest stacks (the fronts) first
+    fg, fplan = room["fgeom"], room["fplan"]
+    flists = {b: bun_crates(cfg, b, {b: pl_stock["frozen"].get(b, {})}) for b in buns}
+    fstacks, _fo, _fl, _ff = room_fill(cfg, fg, {b: v for b, v in flists.items() if v}, fplan)
+    take_marks, take_by = {}, {}
+    for b, k in mv.items():
+        left = k
+        for s_ in take_order(fplan, fstacks, b):
+            if left <= 0:
+                break
+            q = min(left, sum(y[1] for y in s_["segs"]))
+            take_marks[(s_["r"], s_["c"])] = q
+            ln, _pos = stack_where(fplan, s_["c"], s_["r"])
+            take_by.setdefault(b, {})[ln] = take_by.setdefault(b, {}).get(ln, 0) + q
+            left -= q
+    if tot_cr:
+        st.markdown("#### 🚚 Step by step — take from the FRONT, push in at the BACK")
+        steps = []
+        for b in sorted([b for b in mv if mv[b]], key=lambda x: min([k for k in take_by.get(x, {}) if k] or [99])):
+            fr = ", ".join(f"L{ln} ×{q}" if ln else f"⚠️ other place ×{q}" for ln, q in sorted(
+                take_by.get(b, {}).items(), key=lambda x: x[0] or 99))
+            to = ", ".join(f"L{ln} ×{q}" if ln else f"⚠️ no lane ×{q}" for ln, q in sorted(
+                put_by.get(b, {}).items(), key=lambda x: x[0] or 99))
+            steps.append(f"{len(steps) + 1}. **{b}** {names.get(b, '')} · **{mv[b]} crates** — 🧊 {room['fname']}: "
+                         f"take from the front of **{fr or '–'}** → ❄️ {rooms[0]['name']}: push in at the back of "
+                         f"**{to or '–'}**")
+        st.markdown("\n".join(steps))
+        st.caption("L = lane, counted from the left of the room (the lane names are on the maps). Do one bun at a "
+                   "time; never put a bun in another bun's lane.")
+    with st.expander(f"🧊 {room['fname']} now — where to take the crates", expanded=False):
+        st.caption("**🚚 = take this many crates** — the oldest, at the FRONT of the bun's lanes.")
+        html_f, _t = room_sheet_html({"name": room["fname"], "door_in": "", "door_out": "front"}, fg, fstacks, names,
+                                     take=take_marks, plan=fplan)
+        st.markdown(html_f, unsafe_allow_html=True)
     with st.expander(f"🗺️ {rooms[0]['name']} after the move — where to put the crates", expanded=bool(tot_cr)):
         st.caption("**🆕 = push the moved crates in here, at the BACK of the bun's own lane.** The oldest crates stay "
                    "at the FRONT (⭐ = take first). Every bun always has the same lane — the name is under each column. "
@@ -2381,7 +2416,7 @@ def page_settings(cfg, me):
 # ==========================================
 DOOR_SPOTS = ["front-middle", "front-left", "front-right", "back-middle", "back-left", "back-right",
               "right-back", "right-front", "left-back", "left-front"]
-DEFAULT_ROOMS = [{"name": "❄️ Cooling room", "cols": 10, "rows": 8, "high": 15, "blocked": "1:5-8=Cooling fan; 1:9-10",
+DEFAULT_ROOMS = [{"name": "❄️ Cooling room", "cols": 10, "rows": 8, "high": 9, "blocked": "1:5-8=Cooling fan; 1:9-10",
                   "door_in": "right-back", "door_out": "front-middle", "h": 3.0},
                  {"name": "🧊 Freezer room", "cols": 9, "rows": 9, "high": 15, "blocked": "",
                   "door_in": "front-middle", "door_out": "front-middle", "h": 3.0, "back_m": 1.6, "aeon_rows": 11}]
@@ -2665,27 +2700,20 @@ def lane_fill(cfg, g, plan, lists, high=None):
                 stacks.append({"c": c, "r": r, "b": k, "segs": _stack(crates[i * high:(i + 1) * high], bun=k),
                                "first": i == 0, "i": i})
             free[k] = sl[n:]
-        else:                                             # 🧺 shared lane: every stack has the oldest crates of
-            seq = []                                      # each of its buns (own layers), so all are at the front
-            for b in bs:
-                cr_b = list(lists[b])
-                seq += [((j + 0.5) / len(cr_b), room_order(cfg, b), b, d, q) for j, (d, q) in enumerate(cr_b)]
-            seq.sort(key=lambda x: (x[0], x[1]))
-            cap = len(sl) * high
-            for _f, _o, b, d, q in seq[cap:]:
-                left.setdefault(b, []).append((d, q))
-            seq = seq[:cap]
-            n = -(-len(seq) // high)
-            seen = set()
-            for i in range(n):
+        else:                                             # 🧺 shared lane: 1 stack = 1 bun only. Front first:
+            per = {b: [list(lists[b])[i:i + high] for i in range(0, len(lists[b]), high)] for b in bs}
+            order = [(b, j) for j in range(max([len(v) for v in per.values()] or [0]))   # the oldest stack of
+                     for b in bs if j < len(per[b])]                                       # each bun, then the next
+            for b, j in order[len(sl):]:
+                left.setdefault(b, []).extend(per[b][j])
+            order = order[:len(sl)]
+            for i, (b, j) in enumerate(order):
                 c, r = sl[i]
-                part = sorted(seq[i * high:(i + 1) * high], key=lambda x: (x[1], x[2], x[3]))
-                segs = _stack([(b, d, q) for _f, _o, b, d, q in part])
-                firsts = {x[3] for x in segs} - seen
-                seen |= firsts
-                stacks.append({"c": c, "r": r, "b": segs[-1][3], "segs": segs, "first": bool(firsts), "i": i,
-                               "mix": True})
-            free[k] = sl[n:]
+                stacks.append({"c": c, "r": r, "b": b, "segs": _stack(per[b][j], bun=b), "first": j == 0, "i": i,
+                               "j": j, "shared": True})
+            for b in left:                               # what did not fit is the newest: keep the order by date
+                left[b].sort()
+            free[k] = sl[len(order):]
     return stacks, left, free
 
 
@@ -2714,6 +2742,47 @@ def room_fill(cfg, g, lists, plan, aeon=None):
                 stacks.append({"c": c_, "r": r_, "b": b, "segs": _stack([(b, d, q) for d, q in crates[i * ah:(i + 1) * ah]]),
                                "first": i == 0, "aeon": True, "i": i})
     return stacks, {b: len(v) for b, v in left.items() if v}, left, free
+
+
+def stack_where(plan, c, r):
+    """(lane number, place from the front) of a place, e.g. (1, 1) = lane 1, the front stack."""
+    for i, ln in enumerate(plan["lanes"]):
+        if ln["c"] == c and r in ln["rows"]:
+            return i + 1, ln["rows"].index(r) + 1
+    return None, None
+
+
+def take_order(plan, stacks, b):
+    """The stacks of one bun in the order to take them (oldest first: the fronts of its lanes, then the next row)."""
+    mine = [x for x in stacks if x["b"] == b and not x.get("aeon")]
+    return sorted(mine, key=lambda x: (x.get("spill", False), x.get("i", 0)))
+
+
+def _nth(n):
+    return {1: "front", 2: "2nd", 3: "3rd"}.get(n, f"{n}th")
+
+
+def take_guide(plan, stacks, buns, names):
+    """📤 One row per bun: which stacks to take first (lane · place from the front · lot · crates)."""
+    rows = []
+    for b in buns:
+        st_ = take_order(plan, stacks, b)
+        if not st_:
+            continue
+        row = {"Bun": b, "Name": names.get(b, ""), "Crates": sum(y[1] for x in st_ for y in x["segs"])}
+        for n, x in enumerate(st_[:4]):
+            ln, pos = stack_where(plan, x["c"], x["r"])
+            blocked = ""
+            if ln and pos and pos > 1:                     # another bun in front of it (shared lane)?
+                lane = plan["lanes"][ln - 1]
+                ahead = [y for y in stacks if y["c"] == lane["c"] and y["r"] in lane["rows"][:pos - 1] and y["b"] != b]
+                if ahead:
+                    blocked = f" (move {len(ahead)} stack of {', '.join(sorted({y['b'] for y in ahead}))} first)"
+            where = f"L{ln} {_nth(pos)}" if ln else "⚠️ not its lane"
+            row[["① first", "② then", "③ then", "④ then"][n]] = (
+                f"{where} · {x['segs'][-1][0]:%d/%m} · {sum(y[1] for y in x['segs'])} cr{blocked}")
+        rows.append(row)
+    return pd.DataFrame(rows).fillna("")
 
 
 def room_plans(cfg, rooms, geoms, buns, speed):
@@ -2931,13 +3000,13 @@ window.addEventListener('resize',()=>{size();redraw();});legend();size();__START
 
 def _lane_names(g, plan):
     """{column: lane name} for the sheet / 3D: bun code, 🧺 small buns, 🛒 AEON."""
-    out = {ln["c"]: lane_label(ln.get("key")) for ln in (plan or {}).get("lanes", [])}
+    out = {ln["c"]: f"L{i + 1} {lane_label(ln.get('key'))}" for i, ln in enumerate((plan or {}).get("lanes", []))}
     if g.get("aeon_rows") and g["cols"] > 1:
         out[g["cols"] - 1] = "🛒 AEON"
     return out
 
 
-def room_sheet_html(room, g, stacks, names, new=None, reserve=None, plan=None):
+def room_sheet_html(room, g, stacks, names, new=None, reserve=None, plan=None, take=None):
     """Your Excel 'ស្តុកនំប្រចាំថ្ងៃ' layout: one cell per stack (lot date + bun / pcs), column totals, total."""
     cells = {(s["r"], s["c"]): s for s in stacks if not s.get("aeon")}
     a_line = sorted([s for s in stacks if s.get("aeon")], key=lambda s: -s["r"])      # front first
@@ -2948,10 +3017,11 @@ def room_sheet_html(room, g, stacks, names, new=None, reserve=None, plan=None):
          f"<td style='padding:4px 8px;font-size:12px'>{'Door in ⤵' if room['door_in'].startswith('right') else ''}</td></tr>"]
     col_tot = [0] * g["cols"]
     ln_names = _lane_names(g, plan)
+    kmap = {ln["c"]: ln.get("key") for ln in (plan or {}).get("lanes", [])}
     sub = "<br><span style='font-weight:400;font-size:10px'>{}</span>"
     lane_row = ("<tr>" + "".join(
         f"<td style='{bd}background:#343a40;color:#fff;font-weight:700;padding:3px 4px;font-size:12px'>"
-        + ln_names.get(c, "") + (sub.format(names[ln_names[c]]) if names.get(ln_names.get(c, "")) else "") + "</td>"
+        + ln_names.get(c, "") + (sub.format(names[kmap[c]]) if names.get(kmap.get(c) or "") else "") + "</td>"
         for c in range(g["cols"])) + "<td style='font-size:11px;padding:2px 6px'>lane</td></tr>") if ln_names else ""
     h.append(lane_row)
     for r in range(g["rows"]):
@@ -2989,7 +3059,12 @@ def room_sheet_html(room, g, stacks, names, new=None, reserve=None, plan=None):
                 k_new = (new or {}).get((r, c))
                 mark = (f"<br><span style='background:#2f9e44;color:#fff;border-radius:4px;padding:0 4px;font-size:11px'>"
                         f"🆕 put {k_new} cr</span>") if k_new else ""
-                edge = "outline:3px solid #2f9e44;outline-offset:-3px;" if k_new else ""
+                k_take = (take or {}).get((r, c))
+                if k_take:
+                    mark += (f"<br><span style='background:#e8590c;color:#fff;border-radius:4px;padding:0 4px;"
+                             f"font-size:11px'>🚚 take {k_take} cr</span>")
+                edge = ("outline:3px solid #2f9e44;outline-offset:-3px;" if k_new else
+                        "outline:3px solid #e8590c;outline-offset:-3px;" if k_take else "")
                 h.append(f"<td style='{bd}{edge}background:{COLORS.get(s['b'], '#fff')};padding:4px 6px;min-width:70px'>"
                          f"{star}{'🧺 ' if mix else ''}{top:%d/%m} {' '.join(mix) if mix else s['b']}<br><b>{pcs:,}</b>{mark}</td>")
             elif (r, c) in (reserve or {}):
@@ -3190,10 +3265,18 @@ def page_rooms(cfg):
                                                                       plan=plans[pick]),
                        file_name=f"room_stock_{t}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="room_xlsx")
+    st.markdown(f"#### 📤 Take-out order · {pick}")
+    st.caption("For each bun: take the stacks in this order (L = lane, counted from the left; front = the stack at the "
+               "door). When a front stack is empty, the next one is the new front.")
+    tg = take_guide(plans[pick], today_stacks.get(pick, []), buns, names)
+    if tg.empty:
+        st.info("No stock in this room today.")
+    else:
+        st.dataframe(tg, hide_index=True, width="stretch")
     st.caption("FIFO lanes: **1 lane = 1 bun, always the same lane** (name under each column). Take only from the "
                "**FRONT** of the lane (⭐ = oldest, take first); push new crates in at the **BACK** of the bun's own "
                "lane — never in front of older crates, never in another bun's lane. A bun with 2+ lanes: every lane "
-               "has its oldest at the front. 🧺 = one shared lane for the small buns. Use the Day slider / ▶ Play "
+               "has its oldest at the front. 🧺 = a lane shared by 2–3 small buns: still 1 stack = 1 bun. Use the Day slider / ▶ Play "
                "to see how it moved.")
 
 
@@ -3207,17 +3290,17 @@ def rooms_settings(cfg, buns, names, n, kp="set", speed=None):
                          "AEON line high": r["aeon_high"], "Height (m)": r["h"], "Empty at back (m)": r["back_m"], "AEON line places": r["aeon_rows"],
                          "Blocked places": r["blocked"],
                          "Door IN": r["door_in"], "Door OUT": r["door_out"]} for r in rooms_of(cfg)])
-    hi_opts = sorted({12, 15} | {int(r["high"]) for r in rooms_of(cfg)} | {int(r["aeon_high"]) for r in rooms_of(cfg)})
+    hi_opts = sorted({9, 12, 15} | {int(r["high"]) for r in rooms_of(cfg)} | {int(r["aeon_high"]) for r in rooms_of(cfg)})
     red = st.data_editor(rdf, hide_index=True, width="stretch", num_rows="dynamic", key=f"{kp}_rooms3_{n}",
                          column_config={"Room": st.column_config.TextColumn("Room", required=True),
                                         **{c: st.column_config.NumberColumn(c, min_value=1, max_value=60, step=1, required=True)
                                            for c in ["Stacks across", "Stacks deep"]},
                                         "Crates high": st.column_config.SelectboxColumn(
                                             "📏 Crates high", options=hi_opts, required=True,
-                                            help="How many crates in one stack: 12 or 15"),
+                                            help="How many crates in one stack: 9, 12 or 15 (cooling room: 9)"),
                                         "AEON line high": st.column_config.SelectboxColumn(
                                             "🛒 AEON line high", options=hi_opts, required=True,
-                                            help="Crates in one stack in the AEON line: 12 or 15"),
+                                            help="Crates in one stack in the AEON line: 9, 12 or 15"),
                                         "Height (m)": st.column_config.NumberColumn("Height (m)", min_value=1.0,
                                                                                     max_value=20.0, step=0.1, format="%.1f"),
                                         "Empty at back (m)": st.column_config.NumberColumn(
