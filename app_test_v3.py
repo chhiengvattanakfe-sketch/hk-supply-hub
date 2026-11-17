@@ -84,8 +84,17 @@ DEFAULT_TASKS = [
     {"id": "prod", "name": "🏭 Log today's production", "due": "17:00", "who": [], "auto": "prod", "days": ALL_DAYS},
     {"id": "count", "name": "📦 Evening stock count", "due": "19:30", "who": [], "auto": "count", "days": ALL_DAYS},
 ]
-COUNT_COLS = ["Saved_At", "Count_Date", "Bun", "Prod_Date", "Pcs", "By", "Count_Id", "Place"]
-ADJ_COLS = ["Saved_At", "Date", "Bun", "Prod_Date", "Pcs", "Reason", "By", "Adj_Id"]
+COUNT_COLS = ["Saved_At", "Count_Date", "Bun", "Prod_Date", "Pcs", "By", "Count_Id", "Place", "Kind"]
+ADJ_COLS = ["Saved_At", "Date", "Bun", "Prod_Date", "Pcs", "Reason", "By", "Adj_Id", "Place"]
+MOVE_FILE = "stock_moves.csv"                     # evening moves: frozen room -> cooling room
+MOVE_COLS = ["Saved_At", "Date", "Bun", "Prod_Date", "Pcs", "From", "To", "By", "Move_Id"]
+# ---- the 3 stocks, each counted and saved by itself ----
+ROLES = ["cool", "frozen", "aeon"]
+ROLE_ICON = {"cool": "❄️", "frozen": "🧊", "aeon": "🛒"}
+ROLE_EN = {"cool": "Cooling room", "frozen": "Frozen room", "aeon": "Frozen AEON"}
+DEFAULT_PLACE_NAMES = {"cool": "ស្តុកនំក្នុងទូរ", "frozen": "ស្តុកទូរកក", "aeon": "ស្តុកទូរកក AEON"}
+OLD_PLACE_ROLE = {"ស្តុកនំក្នុងទូរ": "cool", "ស្តុកទូរកក": "aeon"}    # counts saved before the rooms were split
+AEON_WORDS = ("AEON", "អ៊ីអន", "អ៊ីយ៉ន")             # customer names whose buns come from the AEON stock
 DEFAULT_BUNS = ["N1", "N2", "N21", "N22", "N23", "N3", "N31", "N32", "N34", "N4", "N41", "N42", "N43"]
 PRIORITY_DEFAULT = ["N1", "N2"]
 DEFAULT_SETTINGS = {
@@ -103,7 +112,9 @@ DEFAULT_SETTINGS = {
     "access_by_role": {"staff": "edit", "sales": "view", "viewer": "view"},   # automatic, by Supply Hub role
     "access_override": {},          # username -> hidden / view / edit, only for people who differ from their role
     "access_default": "view",
-    "places": ["ស្តុកនំក្នុងទូរ", "ស្តុកទូរកក"],   # freezers counted every evening (one tab each)
+    "places": ["ស្តុកនំក្នុងទូរ", "ស្តុកទូរកក"],   # (old setting, replaced by place_names)
+    "place_names": dict(DEFAULT_PLACE_NAMES),       # cooling room / frozen room / frozen AEON
+    "cool_days": 1,                                 # evening move: cooling room keeps this many days of sales
     "tasks": DEFAULT_TASKS,         # daily checklist (Admin adds / assigns in ⚙️ Settings and 📋 Tasks)
     "prod_staff": [],               # names offered in "👷 Produced by"
 }
@@ -723,7 +734,7 @@ def parse_journal(name, rev, data):
             hdr, cols = i, found
             break
     if hdr is None:
-        return pd.DataFrame(columns=["Date", "Bun", "Pcs"]), {}
+        return pd.DataFrame(columns=["Date", "Bun", "Pcs", "Aeon"]), {}
     names = {}
     if hdr >= 1:
         for k, c in cols.items():
@@ -739,16 +750,18 @@ def parse_journal(name, rev, data):
         d = _cell_date(r[0], ym)
         if d is None:
             continue
+        cust = str(r[1]).upper()
+        is_aeon = any(w in cust for w in AEON_WORDS)       # AEON orders are taken from the AEON frozen stock
         for k, c in cols.items():
             v = r[c] if c < len(r) else None
             if isinstance(v, (int, float)) and v:
-                out.append((d, k, float(v)))
+                out.append((d, k, float(v), is_aeon))
             elif isinstance(v, str) and v.strip().replace(".", "", 1).isdigit():
-                out.append((d, k, float(v)))
-    df = pd.DataFrame(out, columns=["Date", "Bun", "Pcs"])
+                out.append((d, k, float(v), is_aeon))
+    df = pd.DataFrame(out, columns=["Date", "Bun", "Pcs", "Aeon"])
     if ym and not df.empty:                       # a journal only speaks for its own month
         df = df[[(x.year, x.month) == ym for x in df["Date"]]]
-    return df.groupby(["Date", "Bun"], as_index=False)["Pcs"].sum(), names
+    return df.groupby(["Date", "Bun", "Aeon"], as_index=False)["Pcs"].sum(), names
 
 
 def journal_names_for(days_back):
@@ -771,9 +784,9 @@ def load_sales(days_back):
             df, nm = parse_journal(n, rev, data)
             frames.append(df)
             names.update({k: v for k, v in nm.items() if v})
-    sales = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["Date", "Bun", "Pcs"])
+    sales = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["Date", "Bun", "Pcs", "Aeon"])
     if not sales.empty:
-        sales = sales.groupby(["Date", "Bun"], as_index=False)["Pcs"].sum()
+        sales = sales.groupby(["Date", "Bun", "Aeon"], as_index=False)["Pcs"].sum()
     return sales, names
 
 
@@ -794,30 +807,72 @@ def _day(v):
         return None
 
 
-def latest_counts(counts):
-    """{bun: (count_date, {prod_date: pcs})} from the newest count of each bun."""
+def place_names(cfg):
+    pn = cfg.get("place_names") or {}
+    return {r: str(pn.get(r) or DEFAULT_PLACE_NAMES[r]).strip() for r in ROLES}
+
+
+def place_label(cfg, role):
+    return f"{ROLE_ICON[role]} {place_names(cfg)[role]}"
+
+
+def _row_role(place, kind):
+    k = str(kind or "").strip()
+    if k in ROLES:
+        return k
+    return OLD_PLACE_ROLE.get(str(place or "").strip(), "cool")
+
+
+def latest_place_counts(counts):
+    """{role: (count_date, {bun: {prod_date: pcs}}, count_id, saved_at, by, {buns in that count})} — the newest
+    count of each stock (cooling room / frozen room / AEON), each saved by itself."""
     out = {}
     if counts.empty:
         return out
     c = counts.copy()
     c["_cd"] = c["Count_Date"].map(_day)
     c = c[c["_cd"].notna()]
-    for bun, g in c.groupby("Bun"):
+    c["_role"] = [_row_role(p, k) for p, k in zip(c["Place"], c["Kind"])]
+    for role, g in c.groupby("_role"):
         g = g.sort_values(["_cd", "Saved_At"])
-        last = g[g["Count_Id"] == g["Count_Id"].iloc[-1]]
-        batches = {}
-        for _, r in last.iterrows():
-            pdte = _day(r["Prod_Date"]) or last["_cd"].iloc[0]
-            batches[pdte] = batches.get(pdte, 0) + _num(r["Pcs"])
-        out[bun] = (last["_cd"].iloc[0], {k: v for k, v in batches.items() if v})
+        cid = g["Count_Id"].iloc[-1]
+        last = g[g["Count_Id"] == cid]
+        cd = last["_cd"].iloc[0]
+        bt = {}
+        for r in last.to_dict("records"):
+            n = _num(r["Pcs"])
+            if n:
+                k = _day(r["Prod_Date"]) or cd
+                bt.setdefault(r["Bun"], {})
+                bt[r["Bun"]][k] = bt[r["Bun"]].get(k, 0) + n
+        out[role] = (cd, bt, cid, str(last["Saved_At"].iloc[0]), ", ".join(sorted(set(last["By"]))), set(last["Bun"]))
     return out
 
 
-def compute_stock(buns, prod, counts, adjs, sales, until):
-    """Replays every day after each bun's last count up to `until`.
-    Returns (batches {bun: {prod_date: pcs}}, short {bun: pcs sold with no stock}, history DataFrame Date/Bun/Stock,
-    no_count [buns never counted])."""
-    base = latest_counts(counts)
+def _take(batch, n, first=None):
+    """Takes n pcs, oldest production date first (or a given date first). Returns ([(date, pcs)], not found)."""
+    got = []
+    keys = ([first] if first in batch else []) + [k for k in sorted(batch) if k != first]
+    for k in keys:
+        if n <= 0:
+            break
+        q = min(batch.get(k, 0), n)
+        if q > 0:
+            batch[k] -= q
+            got.append((k, q))
+            n -= q
+    return got, n
+
+
+def compute_places(buns, prod, counts, adjs, sales, until, moves=None):
+    """The stock of each place day by day, from each place's own last count:
+    new production -> frozen room · evening moves frozen -> cooling · AEON orders from the AEON stock (if it runs
+    out: from the normal stock) · other orders from the cooling room first, then the frozen room.
+    A place counted later than another is 'not known yet' until its count day (its count already includes those days).
+    Returns ({role: {bun: {prod_date: pcs}}}, short {bun: pcs}, history, no_count [buns], last count {role: info})."""
+    if moves is None:
+        moves, _r = read_csv(MOVE_FILE, MOVE_COLS)
+    base = latest_place_counts(counts)
     p = prod.copy()
     p["_d"] = p["Prod_Date"].map(_day)
     p["_n"] = p["Pcs"].map(_num).astype(float)
@@ -825,52 +880,97 @@ def compute_stock(buns, prod, counts, adjs, sales, until):
     a["_d"] = a["Date"].map(_day)
     a["_pd"] = a["Prod_Date"].map(_day)
     a["_n"] = a["Pcs"].map(_num).astype(float)
-    sale_map = {}
-    for d, b, n in sales[["Date", "Bun", "Pcs"]].itertuples(index=False):
-        sale_map[(d, b)] = sale_map.get((d, b), 0) + n
-    batches, short, hist, no_count = {}, {}, [], []
+    a["_role"] = [x if x in ROLES else "" for x in a["Place"].astype(str).str.strip()]
+    mv = moves.copy()
+    mv["_d"] = mv["Date"].map(_day)
+    mv["_pd"] = mv["Prod_Date"].map(_day)
+    mv["_n"] = mv["Pcs"].map(_num).astype(float)
+    gen, aeon = {}, {}
+    has_flag = "Aeon" in sales.columns
+    for r in sales.itertuples(index=False):
+        tgt = aeon if has_flag and bool(getattr(r, "Aeon")) else gen
+        tgt[(r.Date, r.Bun)] = tgt.get((r.Date, r.Bun), 0) + r.Pcs
     first_day = min([d for d in p["_d"].dropna()] + [until])
+    start = min([v[0] for v in base.values()] + [first_day - timedelta(days=1)]) if base else first_day - timedelta(days=1)
+    seen = set().union(*[v[5] for v in base.values()]) if base else set()
+    out = {r: {} for r in ROLES}
+    short, hist, no_count = {}, [], []
+    prod_by = p[p["_d"].notna()].groupby(["Bun", "_d"])["_n"].sum().to_dict()
     for bun in buns:
-        if bun in base:
-            start, bt = base[bun][0], dict(base[bun][1])
-        else:
+        if bun not in seen:
             no_count.append(bun)
-            start, bt = first_day - timedelta(days=1), {}
-        miss = 0.0
-        pb = p[(p["Bun"] == bun) & p["_d"].notna()]
-        prod_by_day = pb.groupby("_d")["_n"].sum().to_dict()
+        stock, known = {}, {}
+        for r in ROLES:
+            if r in base and base[r][0] > start:
+                stock[r], known[r] = {}, False               # counted later: its count covers the days before
+            else:
+                stock[r], known[r] = dict(base[r][1].get(bun, {})) if r in base else {}, True
         ab = a[(a["Bun"] == bun) & a["_d"].notna()]
+        mb = mv[(mv["Bun"] == bun) & mv["_d"].notna()]
+        miss = 0.0
         d = start + timedelta(days=1)
         while d <= until:
-            if prod_by_day.get(d):
-                bt[d] = bt.get(d, 0) + prod_by_day[d]
-            for _, r in ab[ab["_d"] == d].iterrows():
-                n = r["_n"]
+            n = prod_by.get((bun, d), 0)
+            if n and known["frozen"]:
+                stock["frozen"][d] = stock["frozen"].get(d, 0) + n          # new production goes to the frozen room
+            for r in mb[mb["_d"] == d].to_dict("records"):
+                fr, to = str(r["From"]).strip(), str(r["To"]).strip()
+                if fr not in ROLES or to not in ROLES:
+                    continue
+                got = _take(stock[fr], r["_n"], r["_pd"])[0] if known[fr] else [(r["_pd"] or d, r["_n"])]
+                if known[to]:
+                    for k, q in got:
+                        stock[to][k] = stock[to].get(k, 0) + q
+            for r in ab[ab["_d"] == d].to_dict("records"):
+                n, role = r["_n"], r["_role"]
                 if n >= 0:
-                    k = r["_pd"] or d
-                    bt[k] = bt.get(k, 0) + n
+                    role = role or "cool"
+                    if known[role]:
+                        k = r["_pd"] or d
+                        stock[role][k] = stock[role].get(k, 0) + n
                 else:
                     rest = -n
-                    keys = [r["_pd"]] if r["_pd"] in bt else sorted(bt)
-                    for k in keys:
-                        take = min(bt.get(k, 0), rest)
-                        bt[k] = bt.get(k, 0) - take
-                        rest -= take
-                        if rest <= 0:
-                            break
-            need = sale_map.get((d, bun), 0)
-            for k in sorted(bt):                        # oldest production date first
-                if need <= 0:
-                    break
-                take = min(bt[k], need)
-                bt[k] -= take
-                need -= take
-            miss += need
-            bt = {k: v for k, v in bt.items() if v > 0.0001}
-            hist.append((d, bun, sum(bt.values())))
+                    for role2 in ([role] if role else ["cool", "frozen"]):
+                        if rest > 0 and known[role2]:
+                            rest = _take(stock[role2], rest, r["_pd"])[1]
+            need_a, need_g = aeon.get((d, bun), 0), gen.get((d, bun), 0)
+            if need_a and known["aeon"]:
+                need_g += _take(stock["aeon"], need_a)[1]        # AEON stock empty: from the normal stock
+            if need_g:
+                if not known["cool"]:
+                    need_g = 0                                   # the cooling room's count will show it
+                else:
+                    need_g = _take(stock["cool"], need_g)[1]
+                if need_g:
+                    need_g = _take(stock["frozen"], need_g)[1] if known["frozen"] else 0
+                miss += need_g
+            for r in ROLES:
+                if r in base and base[r][0] == d:                # the evening count of that place
+                    stock[r], known[r] = dict(base[r][1].get(bun, {})), True
+                stock[r] = {k: v for k, v in stock[r].items() if v > 0.0001}
+            hist.append((d, bun, sum(sum(v.values()) for v in stock.values())))
             d += timedelta(days=1)
-        batches[bun], short[bun] = bt, miss
-    return batches, short, pd.DataFrame(hist, columns=["Date", "Bun", "Stock"]), no_count
+        for r in ROLES:
+            out[r][bun] = {k: v for k, v in stock[r].items() if v > 0.0001}
+        short[bun] = miss
+    return out, short, pd.DataFrame(hist, columns=["Date", "Bun", "Stock"]), no_count, base
+
+
+def merge_places(places_stock, buns):
+    out = {}
+    for b in buns:
+        m = {}
+        for r in ROLES:
+            for k, v in places_stock[r].get(b, {}).items():
+                m[k] = m.get(k, 0) + v
+        out[b] = m
+    return out
+
+
+def compute_stock(buns, prod, counts, adjs, sales, until):
+    """All places together: (batches {bun: {prod_date: pcs}}, short, history, no_count) — used by the plan."""
+    pl, short, hist, no_count, _base = compute_places(buns, prod, counts, adjs, sales, until)
+    return merge_places(pl, buns), short, hist, no_count
 
 
 def sales_speed(sales, buns, until, lookback):
@@ -1107,9 +1207,14 @@ def page_live(cfg, can_edit):
     st.subheader("📊 Live stock")
     prod, counts, adjs, sales, names, buns = get_data(cfg)
     t = today_kh()
-    batches, short, hist, no_count = compute_stock(buns, prod, counts, adjs, sales, t)
+    pl_stock, short, hist, no_count, base = compute_places(buns, prod, counts, adjs, sales, t)
+    batches = merge_places(pl_stock, buns)
     speed, n_sell = sales_speed(sales, buns, t, int(cfg["lookback_days"]))
     total = sum(sum(v.values()) for v in batches.values())
+    tiles([(place_label(cfg, r), f"{int(round(sum(sum(v.values()) for v in pl_stock[r].values()))):,}",
+            (f"counted {base[r][0]:%d %b}" if r in base else "never counted")
+            + (" · new production comes here" if r == "frozen" else " · AEON orders only" if r == "aeon" else ""))
+           for r in ROLES])
     cap = float(cfg["max_total"])
     p_today = prod[prod["Prod_Date"].map(_day) == t]["Pcs"].map(_num).astype(float).sum()
     s_today = sales[sales["Date"] == t]["Pcs"].sum() if not sales.empty else 0
@@ -1423,34 +1528,6 @@ def page_production(cfg, can_edit, me):
                 st.error(f"Not saved: {e}")
 
 
-def _place_of(row, places):
-    p = str(row.get("Place", "") or "").strip()
-    if p:
-        return p
-    return places[1] if len(places) > 1 and "ទូរកក" in str(row.get("By", "")) else places[0]
-
-
-def last_place_counts(counts, places):
-    """{place: (count_date, {(prod_date, bun): pcs})} — the newest count of each freezer."""
-    out = {}
-    if counts.empty:
-        return out
-    c = counts.copy()
-    c["_cd"] = c["Count_Date"].map(_day)
-    c = c[c["_cd"].notna()]
-    c["_pl"] = [_place_of(r, places) for r in c.to_dict("records")]
-    for pl, g in c.groupby("_pl"):
-        g = g.sort_values(["_cd", "Saved_At"])
-        last = g[g["Count_Id"] == g["Count_Id"].iloc[-1]]
-        vals = {}
-        for r in last.to_dict("records"):
-            pd_ = _day(r["Prod_Date"])
-            if pd_ and _num(r["Pcs"]) > 0:
-                vals[(pd_, r["Bun"])] = vals.get((pd_, r["Bun"]), 0) + _num(r["Pcs"])
-        out[pl] = (last["_cd"].iloc[0], vals)
-    return out
-
-
 def count_sheet_excel(places, sheets, buns, cd):
     """Printable count sheet in your layout (one sheet per freezer), pre-filled."""
     from openpyxl import Workbook
@@ -1506,7 +1583,7 @@ def count_sheet_excel(places, sheets, buns, cd):
     return buf.getvalue()
 
 
-def _count_phone(places, start_rows, show, names, cd, sig):
+def _count_phone(places, start_rows, show, names, cd, sig, single=False):
     """Phone: one freezer, one production date at a time, big number boxes, ✅ Counted · next."""
     dk = "cntp_" + sig
     if dk not in st.session_state:
@@ -1515,8 +1592,11 @@ def _count_phone(places, start_rows, show, names, cd, sig):
     S = st.session_state[dk]
     if S.get("goto_pl"):
         st.session_state[dk + "_pl"] = S.pop("goto_pl")       # set before the picker is drawn
-    pl = st.radio("🧊 Freezer", places, horizontal=True, key=dk + "_pl")      # fixed labels: the choice never jumps
-    st.caption(" · ".join(f"{x}: {len(S['done'][x])}/{max(len(S['data'][x]), 1)} ✅" for x in places))
+    if single:
+        pl = places[0]
+    else:
+        pl = st.radio("🧊 Freezer", places, horizontal=True, key=dk + "_pl")   # fixed labels: the choice never jumps
+        st.caption(" · ".join(f"{x}: {len(S['done'][x])}/{max(len(S['data'][x]), 1)} ✅" for x in places))
     data, done = S["data"][pl], S["done"][pl]
     if not data:
         data[cd] = {}
@@ -1555,169 +1635,245 @@ def _count_phone(places, start_rows, show, names, cd, sig):
             S["idx"][pl] = sorted(data).index(nd)
             _rerun_here()
     if sum(len(S["done"][x]) for x in places) == sum(len(S["data"][x]) for x in places):
-        st.success("🎉 All freezers and dates counted — check the totals below and press 💾 Save.")
+        st.success("🎉 All dates counted — check the total and press 💾 Save below.")
     return {x: sorted((dd, {b: v for b, v in vals.items() if v}) for dd, vals in S["data"][x].items()) for x in places}
 
 
 def page_count(cfg, can_edit, me):
     st.subheader("📦 Evening stock count")
     prod, counts, adjs, sales, names, buns = get_data(cfg)
-    places = list(cfg.get("places") or DEFAULT_SETTINGS["places"])
     show_flash("c_flash")
+    pn = place_names(cfg)
     c1, c2 = st.columns([1, 2])
     cd = c1.date_input("Count date (stock at the END of this day)", value=today_kh(), max_value=today_kh(), key="cnt_date")
-    expected, _short, _h, _nc = compute_stock(buns, prod, counts, adjs, sales, cd)
-    show = active_buns(buns, sales, expected)
-    lastp = last_place_counts(counts, places)
-    c2.caption("Count every freezer in the evening, after the last delivery. It starts filled in with what the app "
-               "expects — **only change the numbers that are different**, add a date that is missing, empty a box "
-               "that is empty in the freezer." + (" On the phone: one freezer and one production date at a time."
-                                                  if st.session_state.get("phone_mode") else
-                                                  " Each tab is one freezer, laid out like your Excel sheet."))
-    # what each freezer probably holds now: other freezers = their last count, the first freezer = the rest
-    other = {}
-    for pl in places[1:]:
-        for (d, b), v in lastp.get(pl, (None, {}))[1].items():
-            if d <= cd:
-                other[(d, b)] = other.get((d, b), 0) + v
-    start_rows = {}
-    for i, pl in enumerate(places):
-        if i == 0:
-            vals = {}
-            for b in show:
-                for d, v in expected.get(b, {}).items():
-                    rest = v - other.get((d, b), 0)
-                    if rest >= 0.5:
-                        vals.setdefault(d, {})[b] = round(rest)
-            vals.setdefault(cd, {})
-        else:
-            vals = {}
-            for (d, b), v in lastp.get(pl, (None, {}))[1].items():
-                if b in show and d <= cd:
-                    vals.setdefault(d, {})[b] = v
-        start_rows[pl] = sorted(vals.items())
+    pl_stock, _short, _h, _nc, base = compute_places(buns, prod, counts, adjs, sales, cd)
+    show = active_buns(buns, sales, merge_places(pl_stock, buns))
+    c2.caption("Evening: first **🚚 move** what the cooling room needs for tomorrow, then count each stock. "
+               "**Each stock is saved by itself** — count and save one, the others keep their last count. "
+               "The sheets start with what the app expects: only change what is different.")
     mode = st.radio("Start the sheets from", ["🧮 What the app expects (recommended)", "⬜ Empty sheets"],
                     horizontal=True, key="cnt_mode")
-    if mode.startswith("⬜"):
-        start_rows = {pl: [(cd, {})] for pl in places}
-    tab_slots = []
+    sections = ["🚚 Move frozen → cooling"] + [place_label(cfg, r) for r in ROLES] + ["📊 All stock"]
     if st.session_state.get("phone_mode"):
-        counted = _count_phone(places, start_rows, show, names, cd,
-                               f"{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}")
-        st.markdown("#### ✅ Check & save")
-        check_box = st.container()
+        pick = st.radio("Part", sections, key="cnt_part", horizontal=False)
+        boxes = {s_: (st.container() if s_ == pick else None) for s_ in sections}
     else:
-        st.caption("➡️ Count each freezer tab, then open **✅ Check & save** to save. What you type is kept if you "
-                   "open another page and come back.")
-        tabs = st.tabs([f"🧊 {pl}" for pl in places] + ["✅ Check & save"])
-        counted, any_restored, tab_slots = {}, False, []
-        for i, (pl, tab) in enumerate(zip(places, tabs)):
-            with tab:
-                gk = f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}"
-                counted[pl], restored = draft_grid(start_rows[pl], show, gk, max_date=cd)
-                any_restored = any_restored or restored
-                st.markdown(excel_html(f"{pl} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted[pl])], show),
-                            unsafe_allow_html=True)
-                tab_slots.append(st.container())                # 💾 save right here (filled below)
-                nxt = f"🧊 {places[i + 1]}" if i + 1 < len(places) else "✅ Check & save"
-                st.caption(f"➡️ Next: open the **{nxt}** tab above — or save now with the button above.")
-        if any_restored:
+        tabs = st.tabs(sections)
+        boxes = dict(zip(sections, tabs))
+    if boxes[sections[0]] is not None:
+        with boxes[sections[0]]:
+            _move_panel(cfg, can_edit, me, cd, pl_stock, sales, buns, names, show)
+    counted_all = {}
+    for r in ROLES:
+        box = boxes[place_label(cfg, r)]
+        if box is None:
+            continue
+        with box:
+            counted_all[r] = _count_place(cfg, can_edit, me, r, cd, mode, pl_stock, base, show, names, buns)
+    if boxes[sections[-1]] is not None:
+        with boxes[sections[-1]]:
+            rows = []
+            for r in ROLES:
+                info = base.get(r)
+                rows.append({"Stock": place_label(cfg, r), "Now (app)": int(round(sum(sum(v.values()) for v in pl_stock[r].values()))),
+                             "Last count": f"{info[0]:%d %b} · {info[3][11:16]} · {info[4]}" if info else "never counted"})
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            tot = merge_places(pl_stock, show)
+            allr = {}
+            for b in show:
+                for d, v in tot.get(b, {}).items():
+                    allr.setdefault(d, {})[b] = round(v)
+            st.markdown(excel_html(f"ស្តុកនំសរុប ({cd:%d.%m.%Y}) — all 3 stocks", [(day_label(d), v) for d, v in sorted(allr.items())],
+                                   show), unsafe_allow_html=True)
+            sheets = {pn[r]: sorted(counted_all.get(r) or [(d, {b: round(v) for b, v in vals.items()}) for d, vals in
+                                                             _rows_of(pl_stock[r], show)]) for r in ROLES}
+            st.download_button("📥 Count sheets for printing (Excel, your layout)",
+                               data=count_sheet_excel([pn[r] for r in ROLES], sheets, show, cd),
+                               file_name=f"Stock_count_{cd:%Y-%m-%d}.xlsx", key="cnt_xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.divider()
+    _adjust_panel(cfg, can_edit, me, adjs, buns, names)
+
+
+def _rows_of(stock_role, show):
+    """{bun: {date: pcs}} -> [(date, {bun: pcs})]"""
+    by = {}
+    for b in show:
+        for d, v in stock_role.get(b, {}).items():
+            if v >= 0.5:
+                by.setdefault(d, {})[b] = round(v)
+    return sorted(by.items())
+
+
+def _count_place(cfg, can_edit, me, role, cd, mode, pl_stock, base, show, names, buns):
+    """One stock (cooling room / frozen room / AEON): count sheet + check + its own 💾 Save."""
+    pn = place_names(cfg)[role]
+    n_key = f"cnt_n_{role}"
+    n = st.session_state.get(n_key, 0)
+    info = base.get(role)
+    st.caption(f"{ROLE_ICON[role]} **{ROLE_EN[role]}** · "
+               + ("new production comes here · " if role == "frozen" else "")
+               + ("only for AEON orders · " if role == "aeon" else "")
+               + (f"last count {info[0]:%d %b %Y} {info[3][11:16]} by {info[4]}" if info else "never counted yet"))
+    exp = pl_stock[role]
+    start = _rows_of(exp, show) if mode.startswith("🧮") else []
+    if not any(d == cd for d, _v in start):
+        start = start + [(cd, {})]
+    if st.session_state.get("phone_mode"):
+        counted = _count_phone([pn], {pn: start}, show, names, cd, f"{role}_{cd}_{mode[:2]}_{n}", single=True)[pn]
+    else:
+        gk = f"cnt_{role}_{cd}_{mode[:2]}_{n}"
+        counted, restored = draft_grid(start, show, gk, max_date=cd)
+        if restored:
             st.info("📝 Your count from before is still here — it is NOT saved yet.")
-        check_box = tabs[-1]
-    with check_box:
-        tot_c = {b: sum(v.get(b, 0) for pl in places for _d, v in counted[pl]) for b in show}
-        tot_e = {b: sum(expected.get(b, {}).values()) for b in show}
-        chk = pd.DataFrame([{"Bun": short(b), "Code": b, "App expected": int(round(tot_e[b])), "Counted": int(tot_c[b]),
+        st.markdown(excel_html(f"{pn} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted)], show),
+                    unsafe_allow_html=True)
+    tot_c = {b: sum(v.get(b, 0) for _d, v in counted) for b in show}
+    tot_e = {b: sum(exp.get(b, {}).values()) for b in show}
+    with st.expander(f"🔍 Check: counted vs what the app expected in {pn}", expanded=False):
+        chk = pd.DataFrame([{"Bun": short(b), "App expected": int(round(tot_e[b])), "Counted": int(tot_c[b]),
                              "Difference": int(tot_c[b] - round(tot_e[b]))} for b in show])
-        chk.loc[len(chk)] = ["សរុប", "", int(chk["App expected"].sum()), int(chk["Counted"].sum()), int(chk["Difference"].sum())]
+        chk.loc[len(chk)] = ["សរុប", int(chk["App expected"].sum()), int(chk["Counted"].sum()), int(chk["Difference"].sum())]
         st.dataframe(chk.style.map(lambda v: "color:#c62828;font-weight:700" if isinstance(v, (int, float)) and v < 0
                                    else ("color:#2e7d32;font-weight:700" if isinstance(v, (int, float)) and v > 0 else ""),
                                    subset=["Difference"]), hide_index=True, width="stretch")
-        st.caption("Difference = counted − what the app expected from the last count + production − journal sales. "
-                   "A big minus = sold/taken without invoice, damaged, or production not logged.")
-        all_rows = {}
-        for pl in places:
-            for d, v in counted[pl]:
-                for b, n in v.items():
-                    all_rows[(d, b)] = all_rows.get((d, b), 0) + n
-        st.markdown(excel_html(f"ស្តុកនំសរុប ({cd:%d.%m.%Y}) — all freezers",
-                               [(day_label(d), {b: all_rows.get((d, b), 0) for b in show})
-                                for d in sorted({d for d, _b in all_rows})], show), unsafe_allow_html=True)
-        if can_edit:
-            # a count for this day already saved? (saving again replaces it — say so)
-            same = counts[counts["Count_Date"] == cd.isoformat()] if not counts.empty else counts
-            if len(same):
-                lastc = same[same["Count_Id"] == same.sort_values("Saved_At")["Count_Id"].iloc[-1]]
-                st.warning(f"ℹ️ A count for {cd:%d %b %Y} was already saved at {str(lastc['Saved_At'].iloc[0])[11:16]} "
-                           f"by {', '.join(sorted(set(lastc['By'])))} ({int(lastc['Pcs'].map(_num).astype(float).sum()):,} pcs). "
-                           "Saving again **replaces** it with the numbers here.")
-            # big differences: ask for one more look before saving
-            exp_all = sum(tot_e.values())
-            big = [b for b in show if abs(tot_c[b] - tot_e[b]) > max(300, 0.15 * tot_e[b])]
-            big_total = abs(sum(tot_c.values()) - exp_all) > max(500, 0.03 * exp_all)
-            ok_big = True
-            if big or big_total:
-                st.warning("⚠️ Big difference from what the app expected: " + ", ".join(
-                    f"{short(b)} {int(tot_c[b] - round(tot_e[b])):+,}" for b in big[:8])
-                    + (f" · total {int(sum(tot_c.values()) - round(exp_all)):+,} pcs" if big_total else "")
-                    + ". Check those buns once more (a missing date? a typo?).")
-                ok_big = st.checkbox("✔️ I checked these numbers — they are right", key=f"cnt_ok_{st.session_state.get('cnt_n', 0)}")
-            clicked = st.button(f"💾 Save the evening count ({int(sum(tot_c.values())):,} pcs)", type="primary",
-                                key="cnt_save", disabled=not ok_big, width="stretch")
-            undo_bar("count", "c_flash")
+    if not can_edit:
+        st.info("👁️ View only — ask Admin for edit access to save a count.")
+        return counted
+    if info and info[0] == cd:
+        st.warning(f"ℹ️ {pn} was already counted for {cd:%d %b} at {info[3][11:16]} by {info[4]}. "
+                   "Saving again **replaces** that count.")
+    exp_all = sum(tot_e.values())
+    big = [b for b in show if abs(tot_c[b] - tot_e[b]) > max(300, 0.15 * tot_e[b])]
+    big_total = abs(sum(tot_c.values()) - exp_all) > max(500, 0.03 * exp_all)
+    ok_big = True
+    if big or big_total:
+        st.warning("⚠️ Big difference from what the app expected: " + ", ".join(
+            f"{short(b)} {int(tot_c[b] - round(tot_e[b])):+,}" for b in big[:8])
+            + (f" · total {int(sum(tot_c.values()) - round(exp_all)):+,} pcs" if big_total else "")
+            + ". Check once more (a missing date? a typo? buns moved without 🚚?).")
+        ok_big = st.checkbox("✔️ I checked these numbers — they are right", key=f"cnt_ok_{role}_{n}")
+    clicked = st.button(f"💾 Save {ROLE_ICON[role]} {pn} ({int(sum(tot_c.values())):,} pcs)", type="primary",
+                        key=f"cnt_save_{role}", disabled=not ok_big, width="stretch")
+    undo_bar(f"count_{role}", "c_flash")
+    if clicked:
+        sig = json.dumps([role, cd.isoformat(), [(d.isoformat(), sorted(v.items())) for d, v in sorted(counted)]])
+        if not save_guard(f"count_{role}", sig):
+            st.info("✅ Already saved a moment ago — it is not saved twice.")
+            st.toast("✅ Already saved a moment ago — not saved twice.")
+            return counted
+        cid, stamp = uuid.uuid4().hex[:10], now_kh().strftime("%Y-%m-%d %H:%M:%S")
+        new = [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": b, "Prod_Date": d.isoformat(), "Pcs": str(int(q)),
+                "By": me, "Count_Id": cid, "Place": pn, "Kind": role}
+               for d, v in counted for b, q in v.items() if q]
+        have = {r_["Bun"] for r_ in new}
+        new += [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": b, "Prod_Date": cd.isoformat(), "Pcs": "0",
+                 "By": me, "Count_Id": cid, "Place": pn, "Kind": role} for b in buns if b not in have]   # counted: none
+        try:
+            modify_csv(COUNT_FILE, COUNT_COLS, lambda df: pd.concat([df, pd.DataFrame(new)], ignore_index=True))
+            audit("count saved", f"{pn} {cd:%d %b %Y}: {int(sum(tot_c.values())):,} pcs · " + ", ".join(
+                f"{short(b)} {int(tot_c[b])} ({int(tot_c[b] - round(tot_e[b])):+d})" for b in show if tot_c[b] or tot_e[b]))
+            label = f"{pn} {cd:%d %b} · {int(sum(tot_c.values())):,} pcs"
+            remember_undo(f"count_{role}", COUNT_FILE, COUNT_COLS, "Count_Id", cid, label)
+            st.session_state["c_flash"] = f"✅ Saved: {label}"
+            drop_draft(f"cnt_{role}_{cd}_{mode[:2]}_{n}")
+            st.session_state[n_key] = n + 1
+            _rerun_here()
+        except Exception as e:
+            st.session_state.pop(f"_sig_count_{role}", None)
+            st.error(f"Not saved: {e}")
+            st.toast(f"⚠️ Not saved: {e}"[:140])
+    return counted
 
-            # the same save under every freezer tab: save right after editing
-            def _cells(rows):
-                return {(d, b): v for d, vals in rows for b, v in vals.items() if v}
-            untouched = [pl for pl in places if _cells(counted[pl]) == _cells(start_rows[pl])]
-            for i, slot in enumerate(tab_slots):
-                with slot:
-                    others = [pl for pl in untouched if pl != places[i]]
-                    if others:
-                        st.caption("ℹ️ Not changed yet: " + ", ".join(f"🧊 {pl}" for pl in others)
-                                   + " — saving now keeps it as shown in its tab.")
-                    if not ok_big:
-                        st.caption("⚠️ Big difference — open **✅ Check & save** to confirm the numbers first.")
-                    if st.button(f"💾 Save the count — all freezers ({int(sum(tot_c.values())):,} pcs)", type="primary",
-                                 key=f"cnt_save_tab_{i}", disabled=not ok_big, width="stretch"):
-                        clicked = True
-            sig = json.dumps([cd.isoformat()] + [(pl, [(d.isoformat(), sorted(v.items())) for d, v in sorted(counted[pl])])
-                                                 for pl in places])
-            if clicked and not save_guard("count", sig):
-                st.info("✅ This count was already saved a moment ago — it is not saved twice.")
-                st.toast("✅ Already saved a moment ago — not saved twice.")
-            elif clicked:
-                cid, stamp = uuid.uuid4().hex[:10], now_kh().strftime("%Y-%m-%d %H:%M:%S")
-                new = [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": b, "Prod_Date": d.isoformat(),
-                        "Pcs": str(int(n)), "By": me, "Count_Id": cid, "Place": pl}
-                       for pl in places for d, v in counted[pl] for b, n in v.items()]
-                have = {r["Bun"] for r in new}
-                new += [{"Saved_At": stamp, "Count_Date": cd.isoformat(), "Bun": b, "Prod_Date": cd.isoformat(), "Pcs": "0",
-                         "By": me, "Count_Id": cid, "Place": places[0]} for b in buns if b not in have]   # counted empty
-                try:
-                    modify_csv(COUNT_FILE, COUNT_COLS, lambda df: pd.concat([df, pd.DataFrame(new)], ignore_index=True))
-                    audit("evening count saved", f"{cd:%d %b %Y}: {int(sum(tot_c.values())):,} pcs · " + ", ".join(
-                        f"{short(b)} {int(tot_c[b])} ({int(tot_c[b] - round(tot_e[b])):+d})" for b in show if tot_c[b] or tot_e[b]))
-                    label = f"count {cd:%d %b %Y} · {int(sum(tot_c.values())):,} pcs"
-                    remember_undo("count", COUNT_FILE, COUNT_COLS, "Count_Id", cid, label)
-                    st.session_state["c_flash"] = f"✅ Evening count saved for {cd:%d %b %Y}: {int(sum(tot_c.values())):,} pcs"
-                    drop_draft(*[f"cnt_{pl}_{cd}_{mode[:2]}_{st.session_state.get('cnt_n', 0)}" for pl in places])
-                    st.session_state["cnt_n"] = st.session_state.get("cnt_n", 0) + 1
-                    _rerun_here()
-                except Exception as e:
-                    st.session_state.pop("_sig_count", None)
-                    st.error(f"Not saved: {e}")
-                    st.toast(f"⚠️ Not saved: {e}"[:140])
-        else:
-            st.info("👁️ View only — ask Admin for edit access to save a count.")
-        st.download_button("📥 Count sheet for printing (Excel, your layout)",
-                           data=count_sheet_excel(places, {pl: sorted(counted[pl]) for pl in places}, show, cd),
-                           file_name=f"Stock_count_{cd:%Y-%m-%d}.xlsx", key="cnt_xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    lc = latest_counts(counts)
-    if lc:
-        st.caption("Last saved count: " + ", ".join(sorted({f"{v[0]:%d %b %Y}" for v in lc.values()})))
-    st.divider()
+
+def move_suggestion(cfg, pl_stock, sales, buns, day):
+    """What to move from the frozen room to the cooling room this evening so the cooling room holds the next
+    `cool_days` days of sales — whole crates, oldest production date first."""
+    days = max(1, int(float(cfg.get("cool_days") or 1)))
+    fc = forecast(sales, buns, day + timedelta(days=1), days, int(cfg["lookback_days"]))
+    out = {}
+    for b in buns:
+        need = sum(fc.get((day + timedelta(days=i + 1), b), 0) for i in range(days))
+        cool = sum(pl_stock["cool"].get(b, {}).values())
+        frozen = pl_stock["frozen"].get(b, {})
+        fr = sum(frozen.values())
+        cp = crate_pcs(cfg, b)
+        want = max(0.0, need - cool)
+        move = min(fr, math.ceil(want / cp) * cp) if want > 0 else 0
+        out[b] = {"need": need, "cool": cool, "frozen": fr, "move": int(round(move)), "cp": cp,
+                  "dates": sorted(frozen)}
+    return out, days
+
+
+def _move_panel(cfg, can_edit, me, cd, pl_stock, sales, buns, names, show):
+    pn = place_names(cfg)
+    t = today_kh()
+    if cd != t:
+        st.info("🚚 Moves are made for today's evening — choose today's date above.")
+        return
+    sug, days = move_suggestion(cfg, pl_stock, sales, buns, t)
+    moves, _r = read_csv(MOVE_FILE, MOVE_COLS)
+    done_today = moves[moves["Date"] == t.isoformat()] if not moves.empty else moves
+    st.markdown(f"**🚚 Move from {ROLE_ICON['frozen']} {pn['frozen']} to {ROLE_ICON['cool']} {pn['cool']}** — so the "
+                f"cooling room holds **{days} day{'s' if days > 1 else ''}** of sales (tomorrow"
+                + (f" + {days - 1} more" if days > 1 else "") + "). Oldest production dates first, whole crates.")
+    if len(done_today):
+        st.success("✅ Already moved today: " + ", ".join(
+            f"{short(b)} {int(g['Pcs'].map(_num).astype(float).sum()):,}" for b, g in done_today.groupby("Bun"))
+            + " — the list below already counts them.")
+    rows = [{"Bun": b, "Name": names.get(b, ""), "❄️ Cooling now": int(round(v["cool"])),
+             "Needed": int(round(v["need"])), "🧊 Frozen now": int(round(v["frozen"])), "🚚 Move (pcs)": v["move"],
+             "Crate pcs": v["cp"], "Take from (oldest)": ", ".join(f"{d:%d/%m}" for d in v["dates"][:3])}
+            for b, v in sug.items() if b in show or v["move"]]
+    df = pd.DataFrame(rows)
+    n = st.session_state.get("mv_n", 0)
+    ed = st.data_editor(df, hide_index=True, width="stretch", key=f"mv_{n}", disabled=[c for c in df.columns
+                                                                                       if c != "🚚 Move (pcs)"],
+                        column_config={"🚚 Move (pcs)": st.column_config.NumberColumn("🚚 Move (pcs)", min_value=0,
+                                                                                      step=1, help="Change if you moved a different amount")})
+    mv = {r["Bun"]: int(r["🚚 Move (pcs)"] or 0) for r in ed.to_dict("records")}
+    tot = sum(mv.values())
+    crates = sum(math.ceil(q / sug[b]["cp"]) for b, q in mv.items() if q)
+    st.markdown(f"**Total to move: {tot:,} pcs ≈ {crates:,} crates**" if tot else
+                "✅ Nothing to move — the cooling room already has enough for tomorrow.")
+    if not can_edit:
+        return
+    over = [b for b, q in mv.items() if q > sug[b]["frozen"] + 0.5]
+    if over:
+        st.warning("⚠️ More than the frozen room has: " + ", ".join(short(b) for b in over) + " — count the frozen room?")
+    clicked = st.button(f"✅ We moved these — save ({tot:,} pcs)", type="primary", key="mv_save", disabled=not tot,
+                        width="stretch")
+    undo_bar("move", "c_flash")
+    if clicked:
+        if not save_guard("move", json.dumps(sorted(mv.items()))):
+            st.info("✅ Already saved a moment ago — it is not saved twice.")
+            return
+        mid, stamp = uuid.uuid4().hex[:10], now_kh().strftime("%Y-%m-%d %H:%M:%S")
+        new = []
+        for b, q in mv.items():
+            if q <= 0:
+                continue
+            batch = dict(pl_stock["frozen"].get(b, {}))
+            got, rest = _take(batch, q)
+            if rest > 0:
+                got.append((t, rest))                     # more than the app knew: date unknown -> today
+            new += [{"Saved_At": stamp, "Date": t.isoformat(), "Bun": b, "Prod_Date": d.isoformat(), "Pcs": str(int(round(x))),
+                     "From": "frozen", "To": "cool", "By": me, "Move_Id": mid} for d, x in got if x >= 0.5]
+        try:
+            modify_csv(MOVE_FILE, MOVE_COLS, lambda df: pd.concat([df, pd.DataFrame(new)], ignore_index=True))
+            label = f"moved {tot:,} pcs frozen → cooling"
+            audit("move saved", label + " · " + ", ".join(f"{short(b)} {q}" for b, q in mv.items() if q))
+            remember_undo("move", MOVE_FILE, MOVE_COLS, "Move_Id", mid, label)
+            st.session_state["c_flash"] = f"✅ Saved: {label}"
+            st.session_state["mv_n"] = n + 1
+            _rerun_here()
+        except Exception as e:
+            st.session_state.pop("_sig_move", None)
+            st.error(f"Not saved: {e}")
+
+
+def _adjust_panel(cfg, can_edit, me, adjs, buns, names):
+    pn = place_names(cfg)
     st.markdown("**➕➖ Adjustment** — buns that leave or enter stock without a sale invoice "
                 "(damaged, samples, staff meals, returned...).")
     if can_edit:
@@ -1727,22 +1883,25 @@ def page_count(cfg, can_edit, me):
             kind = c2.radio("Type", ["➖ Remove", "➕ Add"], horizontal=False)
             n = c3.number_input("Pcs", min_value=1, max_value=100000, step=10)
             d = c4.date_input("Date", value=today_kh(), max_value=today_kh())
-            c5, c6 = st.columns([1, 2])
-            pdte = c5.date_input("Batch production date (optional)", value=None)
-            reason = c6.selectbox("Reason", ["Damaged / broken", "Expired / old", "Sample / FOC not in journal",
+            c5, c6, c7 = st.columns([1, 1, 1.4])
+            place = c5.selectbox("Stock", [""] + ROLES, format_func=lambda r: "Auto (cooling first)" if not r
+                                 else f"{ROLE_ICON[r]} {pn[r]}")
+            pdte = c6.date_input("Batch production date (optional)", value=None)
+            reason = c7.selectbox("Reason", ["Damaged / broken", "Expired / old", "Sample / FOC not in journal",
                                              "Staff meal", "Returned by customer", "Other"])
             ok = st.form_submit_button("💾 Save adjustment")
         if ok:
             code = {bun_label(x, names): x for x in buns}[b]
             row = {"Saved_At": now_kh().strftime("%Y-%m-%d %H:%M:%S"), "Date": d.isoformat(), "Bun": code,
                    "Prod_Date": pdte.isoformat() if pdte else "", "Pcs": str(int(n if kind.startswith("➕") else -n)),
-                   "Reason": reason, "By": me, "Adj_Id": uuid.uuid4().hex[:10]}
-            if not save_guard("adjustment", json.dumps([row["Date"], code, row["Pcs"], reason])):
+                   "Reason": reason, "By": me, "Adj_Id": uuid.uuid4().hex[:10], "Place": place}
+            if not save_guard("adjustment", json.dumps([row["Date"], code, row["Pcs"], reason, place])):
                 st.info("✅ This adjustment was already saved a moment ago — it is not saved twice.")
             else:
                 try:
                     modify_csv(ADJ_FILE, ADJ_COLS, lambda df: pd.concat([df, pd.DataFrame([row])], ignore_index=True))
-                    audit("adjustment", f"{row['Date']} {short(code)} {row['Pcs']} pcs · {reason}")
+                    audit("adjustment", f"{row['Date']} {short(code)} {row['Pcs']} pcs · {reason}"
+                          + (f" · {pn[place]}" if place else ""))
                     remember_undo("adjustment", ADJ_FILE, ADJ_COLS, "Adj_Id", row["Adj_Id"],
                                   f"{kind[2:]} {n:,} pcs {short(code)} · {reason}")
                     st.session_state["c_flash"] = f"✅ Adjustment saved: {kind[2:]} {n:,} pcs {b}"
@@ -1964,8 +2123,17 @@ def page_settings(cfg, me):
                                value=int(cfg.get("max_prod_per_day") or 0), key="set_cap")
         prio = st.multiselect("Keep these at their target first when the total limit is reached", buns,
                               default=prio_now, key="set_prio")
-        places_txt = st.text_input("Freezers counted in the evening (separate with ;)",
-                                   value="; ".join(cfg.get("places") or DEFAULT_SETTINGS["places"]), key="set_places")
+        st.markdown("#### 🧊 The 3 stocks (each counted and saved by itself)")
+        pn_now = place_names(cfg)
+        pc = st.columns(4)
+        new_pn = {r: pc[i].text_input(f"{ROLE_ICON[r]} {ROLE_EN[r]}", value=pn_now[r], key=f"set_pn_{r}").strip()
+                  or DEFAULT_PLACE_NAMES[r] for i, r in enumerate(ROLES)}
+        cool_days = pc[3].number_input("❄️ Cooling room keeps (days of sales)", min_value=1, max_value=7,
+                                       value=int(float(cfg.get("cool_days") or 1)), key="set_cool_days",
+                                       help="The evening 🚚 move list fills the cooling room up to this many days.")
+        st.caption("New production goes to 🧊 the frozen room. Orders from customers with “AEON” in the name are taken "
+                   "from 🛒 the AEON stock (when it is empty: from the normal stock). Other orders: ❄️ cooling room "
+                   "first, then 🧊 frozen room.")
 
     with t2:
         room_vals = rooms_settings(cfg, buns, names, n)
@@ -2003,7 +2171,7 @@ def page_settings(cfg, me):
         rows = ed.to_dict("records")
         changes = dict(max_total=int(max_total), target_default=int(t_all), shelf_days=int(s_all), lookback_days=int(look),
                        round_to=int(rnd), max_prod_per_day=int(capp), priority=list(prio),
-                       places=[p.strip() for p in places_txt.split(";") if p.strip()] or DEFAULT_SETTINGS["places"],
+                       place_names=new_pn, cool_days=int(cool_days),
                        # every bun saved with its own value: exactly what the table shows is what the app uses
                        target_days={r["Bun"]: int(r["Target days"]) for r in rows},
                        shelf_by_bun={r["Bun"]: int(r["Shelf life (days)"]) for r in rows},
@@ -2100,14 +2268,6 @@ def crate_size(cfg):
     return {k: max(5.0, float(c[k])) / 100 for k in ("w", "l", "h")}       # metres
 
 
-def room_of_bun(cfg, b, rooms):
-    names = [r["name"] for r in rooms]
-    r = (cfg.get("bun_room") or {}).get(b)
-    if r in names:
-        return r
-    return names[0]                                             # not set: the first room (full -> next room)
-
-
 def crate_pcs(cfg, b):
     try:
         return max(1, int((cfg.get("crate_pcs") or {}).get(b) or DEFAULT_CRATE_PCS.get(b) or 60))
@@ -2180,10 +2340,24 @@ def split_for_room(cfg, g, lists, speed):
     return keep, {b: v for b, v in move.items() if v}
 
 
-def room_fill(cfg, g, lists):
+def room_fill(cfg, g, lists, aeon=None):
     """Like your sheet: buns (in your order) fill the places column by column, from the IN side (back, row 1)
-    to the OUT side (front). Inside each bun the oldest lot goes to the places nearest the OUT door."""
+    to the OUT side (front). Inside each bun the oldest lot goes to the places nearest the OUT door.
+    aeon = {bun: crates}: the AEON stock, kept in its own line on the right (last column)."""
     spots = [(c, r) for c in range(g["cols"]) for r in range(g["rows"]) if (r, c) not in g["blocked"]]
+    if aeon is not None and g["cols"] > 1:
+        last = g["cols"] - 1
+        a_spots = [x for x in spots if x[0] == last]
+        spots = [x for x in spots if x[0] != last]
+        a_stacks, a_over = room_fill(cfg, {**g, "cols": 1, "rows": len(a_spots), "blocked": {}}, aeon)
+        for stx in a_stacks:                                     # placed in the right-hand line (same order)
+            stx["c"], stx["r"] = a_spots[stx["r"]]
+        for x in a_stacks:
+            x["aeon"] = True
+        rest, over = room_fill(cfg, {**g, "cols": last}, lists)
+        for b, n in a_over.items():
+            over[b] = over.get(b, 0) + n
+        return rest + a_stacks, over
     stacks, overflow, k = [], {}, 0
     for b in sorted(lists, key=lambda x: (room_order(cfg, x), x)):
         crates = lists[b]
@@ -2208,24 +2382,33 @@ def room_fill(cfg, g, lists):
     return stacks, overflow
 
 
-def fill_rooms(cfg, rooms, geoms, buns, batches, speed):
-    """Every room in turn; what does not fit in a room goes on to the next one (cooling full -> freezer)."""
-    carry, res = {}, {}
-    for i, r in enumerate(rooms):
-        g = geoms[r["name"]]
-        lists = {b: bun_crates(cfg, b, batches) for b in buns if room_of_bun(cfg, b, rooms) == r["name"]}
-        for b, v in carry.items():                               # newest lots moved here from the room before
-            lists[b] = sorted(lists.get(b, []) + v)
-        lists = {b: v for b, v in lists.items() if v}
-        last = i == len(rooms) - 1
-        keep, move = (lists, {}) if last else split_for_room(cfg, g, lists, speed)
-        stacks, overflow = room_fill(cfg, g, keep)
-        for st_ in stacks:                                       # moved-in (newer) lots: take from the room before first
-            if st_["b"] in carry:
-                st_["first"] = False
-        res[r["name"]] = {"stacks": stacks, "overflow": overflow, "moved_in": {b: len(v) for b, v in carry.items()},
-                          "moved_out": {b: len(v) for b, v in move.items()}}
-        carry = move
+def fill_rooms(cfg, rooms, geoms, buns, pl_stock, speed):
+    """❄️ cooling stock -> the first room · 🧊 frozen stock -> the second room · 🛒 AEON stock -> its own line on the
+    right of the frozen room. If the cooling room is too full, its newest lots are shown in the frozen room."""
+    cool_room = rooms[0]["name"]
+    frz_room = rooms[1]["name"] if len(rooms) > 1 else rooms[0]["name"]
+    res = {}
+    cool = {b: bun_crates(cfg, b, pl_stock["cool"]) for b in buns}
+    cool = {b: v for b, v in cool.items() if v}
+    keep, carry = (cool, {}) if cool_room == frz_room else split_for_room(cfg, geoms[cool_room], cool, speed)
+    if cool_room != frz_room:
+        stacks, overflow = room_fill(cfg, geoms[cool_room], keep)
+        res[cool_room] = {"stacks": stacks, "overflow": overflow, "moved_in": {},
+                          "moved_out": {b: len(v) for b, v in carry.items()}}
+    frz = {b: bun_crates(cfg, b, pl_stock["frozen"]) for b in buns}
+    for b, v in carry.items():
+        frz[b] = sorted(frz.get(b, []) + v)
+    frz = {b: v for b, v in frz.items() if v}
+    if cool_room == frz_room:
+        for b, v in keep.items():
+            frz[b] = sorted(frz.get(b, []) + v)
+    ae = {b: bun_crates(cfg, b, pl_stock["aeon"]) for b in buns}
+    ae = {b: v for b, v in ae.items() if v}
+    stacks, overflow = room_fill(cfg, geoms[frz_room], frz, aeon=ae)
+    res[frz_room] = {"stacks": stacks, "overflow": overflow, "moved_in": {b: len(v) for b, v in carry.items()},
+                     "moved_out": {}}
+    for r in rooms:
+        res.setdefault(r["name"], {"stacks": [], "overflow": {}, "moved_in": {}, "moved_out": {}})
     return res
 
 
@@ -2490,9 +2673,9 @@ def page_rooms(cfg):
     lots, lot_i, out_days, today_stacks = [], {}, [], {}
     overflow_today, moved_today = {}, {}
     for d in days:
-        batches, _s, _h, _nc = compute_stock(buns, prod, counts, adjs, sales, d)
+        pl_d, _s, _h, _nc, _b = compute_places(buns, prod, counts, adjs, sales, d)
         rd = {}
-        filled = fill_rooms(cfg, rooms, geoms, buns, batches, speed)
+        filled = fill_rooms(cfg, rooms, geoms, buns, pl_d, speed)
         for r in rooms:
             stacks, overflow = filled[r["name"]]["stacks"], filled[r["name"]]["overflow"]
             for s in stacks:
@@ -2517,7 +2700,7 @@ def page_rooms(cfg):
     for i, r in enumerate(rooms[:-1]):
         mv = moved_today.get(r["name"]) or {}
         if mv:
-            st.info(f"🔄 **{r['name']} is full** → the newest lots go to **{rooms[i + 1]['name']}**: "
+            st.info(f"🔄 **{r['name']} is too full for its racks** → shown in **{rooms[i + 1]['name']}**: "
                     + ", ".join(f"{short(b)} {n} crates" for b, n in mv.items())
                     + f" (total {sum(mv.values()):,} crates). {r['name']} keeps the oldest stock of every bun "
                       "(about the same days of sales each) to pick first.")
@@ -2593,19 +2776,18 @@ def rooms_settings(cfg, buns, names, n, kp="set"):
     st.caption("Space: " + " · ".join(
         f"{r['name']} ≈ {g['w']} × {g['l']} m = {g['places']} stacks × {g['high']} high = {g['capacity']:,} crates"
         for r in rooms for g in [room_geom(r, cr)]))
-    rn = [r["name"] for r in rooms]
-    bdf = pd.DataFrame([{"Bun": x, "Name": names.get(x, ""), "Room": room_of_bun(cfg, x, rooms),
+    st.caption("Which room: ❄️ cooling stock → the first room · 🧊 frozen stock → the second room · 🛒 AEON stock → "
+               "its own line on the right of the frozen room (from the evening counts and 🚚 moves).")
+    bdf = pd.DataFrame([{"Bun": x, "Name": names.get(x, ""),
                          "Order": int(room_order(cfg, x)), "Pcs per crate": crate_pcs(cfg, x)} for x in buns])
     bed = st.data_editor(bdf, hide_index=True, width="stretch", num_rows="fixed", disabled=["Bun", "Name"],
                          key=f"{kp}_bunroom_{n}",
-                         column_config={"Room": st.column_config.SelectboxColumn("Room", options=rn, required=True),
-                                        "Order": st.column_config.NumberColumn("↔️ Order (1 = first column)", min_value=1,
+                         column_config={"Order": st.column_config.NumberColumn("↔️ Order (1 = first column)", min_value=1,
                                                                                max_value=99, step=1, required=True),
                                         "Pcs per crate": st.column_config.NumberColumn("📦 Pcs per crate", min_value=1,
                                                                                        max_value=2000, step=1, required=True)})
     recs = bed.to_dict("records")
     return {"rooms": rooms, "crate": {"w": cw, "l": cl, "h": ch},
-            "bun_room": {r["Bun"]: (r["Room"] if r["Room"] in rn else rn[0]) for r in recs},
             "room_order": {r["Bun"]: int(r["Order"] or 99) for r in recs},
             "crate_pcs": {r["Bun"]: int(r["Pcs per crate"] or 60) for r in recs}}
 
@@ -2996,6 +3178,7 @@ BOT_FILES = [  # file, columns, date columns (must), date columns (may be empty)
     (PROD_FILE, PROD_COLS, ["Prod_Date"], [], "Entry_Id", False),
     (COUNT_FILE, COUNT_COLS, ["Count_Date", "Prod_Date"], [], "Count_Id", False),
     (ADJ_FILE, ADJ_COLS, ["Date"], ["Prod_Date"], "Adj_Id", True),
+    (MOVE_FILE, MOVE_COLS, ["Date", "Prod_Date"], [], "Move_Id", False),
 ]
 
 
