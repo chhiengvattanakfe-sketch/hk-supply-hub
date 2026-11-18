@@ -897,6 +897,16 @@ def compute_places(buns, prod, counts, adjs, sales, until, moves=None):
     out = {r: {} for r in ROLES}
     short, hist, no_count = {}, [], []
     prod_by = p[p["_d"].notna()].groupby(["Bun", "_d"])["_n"].sum().to_dict()
+    # production of the frozen room's count day that was logged AFTER that count (e.g. the evening count was done at
+    # 16:00, the day's production came in later / was logged next morning): the count could not include it
+    late_by = {}
+    if "frozen" in base:
+        fcd, fbt, _cid, f_saved = base["frozen"][0], base["frozen"][1], base["frozen"][2], base["frozen"][3]
+        sv = p["Saved_At"].astype(str).str.strip() if "Saved_At" in p.columns else pd.Series([""] * len(p))
+        late = p[(p["_d"] == fcd) & (sv > str(f_saved).strip())]
+        for b2, g2 in late.groupby("Bun"):
+            if not fbt.get(b2, {}).get(fcd):                  # the count has no lot of that day: add it
+                late_by[b2] = float(g2["_n"].sum())
     for bun in buns:
         if bun not in seen:
             no_count.append(bun)
@@ -906,6 +916,8 @@ def compute_places(buns, prod, counts, adjs, sales, until, moves=None):
                 stock[r], known[r] = {}, False               # counted later: its count covers the days before
             else:
                 stock[r], known[r] = dict(base[r][1].get(bun, {})) if r in base else {}, True
+                if r == "frozen" and r in base and base[r][0] == start and late_by.get(bun):
+                    stock[r][start] = stock[r].get(start, 0) + late_by[bun]   # logged after the count
         ab = a[(a["Bun"] == bun) & a["_d"].notna()]
         mb = mv[(mv["Bun"] == bun) & mv["_d"].notna()]
         miss = 0.0
@@ -948,6 +960,8 @@ def compute_places(buns, prod, counts, adjs, sales, until, moves=None):
             for r in ROLES:
                 if r in base and base[r][0] == d:                # the evening count of that place
                     stock[r], known[r] = dict(base[r][1].get(bun, {})), True
+                    if r == "frozen" and late_by.get(bun):       # that day's production logged after the count
+                        stock[r][d] = stock[r].get(d, 0) + late_by[bun]
                 stock[r] = {k: v for k, v in stock[r].items() if v > 0.0001}
             hist.append((d, bun, sum(sum(v.values()) for v in stock.values())))
             d += timedelta(days=1)
