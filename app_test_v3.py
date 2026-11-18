@@ -2416,7 +2416,7 @@ def page_settings(cfg, me):
 # ==========================================
 DOOR_SPOTS = ["front-middle", "front-left", "front-right", "back-middle", "back-left", "back-right",
               "right-back", "right-front", "left-back", "left-front"]
-DEFAULT_ROOMS = [{"name": "❄️ Cooling room", "cols": 10, "rows": 8, "high": 9, "blocked": "1:5-8=Cooling fan; 1:9-10",
+DEFAULT_ROOMS = [{"name": "❄️ Cooling room", "cols": 9, "rows": 8, "high": 15, "blocked": "1:5-8=Cooling fan; 1:9",
                   "door_in": "right-back", "door_out": "front-middle", "h": 3.0},
                  {"name": "🧊 Freezer room", "cols": 9, "rows": 9, "high": 15, "blocked": "",
                   "door_in": "front-middle", "door_out": "front-middle", "h": 3.0, "back_m": 1.6, "aeon_rows": 11}]
@@ -3290,17 +3290,17 @@ def rooms_settings(cfg, buns, names, n, kp="set", speed=None):
                          "AEON line high": r["aeon_high"], "Height (m)": r["h"], "Empty at back (m)": r["back_m"], "AEON line places": r["aeon_rows"],
                          "Blocked places": r["blocked"],
                          "Door IN": r["door_in"], "Door OUT": r["door_out"]} for r in rooms_of(cfg)])
-    hi_opts = sorted({9, 12, 15} | {int(r["high"]) for r in rooms_of(cfg)} | {int(r["aeon_high"]) for r in rooms_of(cfg)})
+    hi_opts = sorted({12, 15} | {int(r["high"]) for r in rooms_of(cfg)} | {int(r["aeon_high"]) for r in rooms_of(cfg)})
     red = st.data_editor(rdf, hide_index=True, width="stretch", num_rows="dynamic", key=f"{kp}_rooms3_{n}",
                          column_config={"Room": st.column_config.TextColumn("Room", required=True),
                                         **{c: st.column_config.NumberColumn(c, min_value=1, max_value=60, step=1, required=True)
                                            for c in ["Stacks across", "Stacks deep"]},
                                         "Crates high": st.column_config.SelectboxColumn(
                                             "📏 Crates high", options=hi_opts, required=True,
-                                            help="How many crates in one stack: 9, 12 or 15 (cooling room: 9)"),
+                                            help="How many crates in one stack: 12 or 15"),
                                         "AEON line high": st.column_config.SelectboxColumn(
                                             "🛒 AEON line high", options=hi_opts, required=True,
-                                            help="Crates in one stack in the AEON line: 9, 12 or 15"),
+                                            help="Crates in one stack in the AEON line: 12 or 15"),
                                         "Height (m)": st.column_config.NumberColumn("Height (m)", min_value=1.0,
                                                                                     max_value=20.0, step=0.1, format="%.1f"),
                                         "Empty at back (m)": st.column_config.NumberColumn(
