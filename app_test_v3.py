@@ -34,6 +34,957 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+# ==========================================
+# 🌐 ENGLISH / ខ្មែរ — the screen text only (data, files and codes stay as they are)
+# ==========================================
+KM = {
+    # --- pages, top bar, sign in ---------------------------------------------------------------
+    "Production & Live Stock": "ផលិតកម្ម និង ស្តុកបច្ចុប្បន្ន",
+    "Production & Stock": "ផលិតកម្ម និង ស្តុក",
+    "📊 Live stock": "📊 ស្តុកបច្ចុប្បន្ន",
+    "🏭 Log production": "🏭 កត់ត្រាការផលិត",
+    "🏭 Log today's production": "🏭 កត់ត្រាការផលិតថ្ងៃនេះ",
+    "📦 Stock count": "📦 រាប់ស្តុក",
+    "🧊 3D rooms": "🧊 បន្ទប់ 3D",
+    "📋 Tasks": "📋 ការងារ",
+    "📅 Next week plan": "📅 ផែនការសប្តាហ៍ក្រោយ",
+    "🕘 History": "🕘 ប្រវត្តិ",
+    "🤖 Bot": "🤖 បូត",
+    "⚙️ Settings": "⚙️ ការកំណត់",
+    "📱 Phone mode (big boxes, one at a time)": "📱 របៀបទូរស័ព្ទ (ប្រអប់ធំ ម្តងមួយៗ)",
+    "🔄 Update by itself every 60 s": "🔄 ធ្វើបច្ចុប្បន្នភាពដោយខ្លួនឯង រៀងរាល់ 60 វិនាទី",
+    "Sign out": "ចាកចេញ",
+    "Sign in": "ចូល",
+    "✏️ edit": "✏️ កែបាន",
+    "👁️ view": "👁️ មើលតែប៉ុណ្ណោះ",
+    "🔑 PIN": "🔑 PIN",
+    "👤 My name + PIN": "👤 ឈ្មោះខ្ញុំ + PIN",
+    "🔑 Username + password": "🔑 ឈ្មោះអ្នកប្រើ + ពាក្យសម្ងាត់",
+    "🔢 My PIN": "🔢 PIN របស់ខ្ញុំ",
+    "🔑 My password": "🔑 ពាក្យសម្ងាត់របស់ខ្ញុំ",
+    "👤 Your name": "👤 ឈ្មោះរបស់អ្នក",
+    "Tap to choose your name": "ចុចដើម្បីជ្រើសឈ្មោះរបស់អ្នក",
+    "Keep me signed in on this phone / computer": "ចងចាំខ្ញុំនៅលើទូរស័ព្ទ / កុំព្យូទ័រនេះ",
+    "Keep me signed in on this phone": "ចងចាំខ្ញុំនៅលើទូរស័ព្ទនេះ",
+    "days)": "ថ្ងៃ)",
+    "Username (small letters / numbers)": "ឈ្មោះអ្នកប្រើ (អក្សរតូច / លេខ)",
+    "Username": "ឈ្មោះអ្នកប្រើ",
+    "Password": "ពាក្យសម្ងាត់",
+    "Wrong username or password.": "ឈ្មោះអ្នកប្រើ ឬពាក្យសម្ងាត់មិនត្រឹមត្រូវ។",
+    "Wrong PIN.": "PIN មិនត្រឹមត្រូវ។",
+    "Too many wrong PINs. Wait 10 minutes, or sign in with your password.":
+        "វាយ PIN ខុសច្រើនដងពេក។ រង់ចាំ 10 នាទី ឬចូលដោយពាក្យសម្ងាត់។",
+    "Choose your name first.": "សូមជ្រើសឈ្មោះរបស់អ្នកជាមុនសិន។",
+    "The same username and password as the Supply Hub app.": "ឈ្មោះអ្នកប្រើ និងពាក្យសម្ងាត់ដូចកម្មវិធី Supply Hub។",
+    "No PIN yet? Sign in once with your password (other tab), then tap 🔑 PIN at the top to choose one. Or ask Admin to give you one.":
+        "មិនទាន់មាន PIN? ចូលម្តងដោយពាក្យសម្ងាត់ (ផ្ទាំងមួយទៀត) រួចចុច 🔑 PIN ខាងលើដើម្បីជ្រើសរើស។ ឬសុំ Admin ឲ្យ។",
+    "You have no PIN yet — sign in with your password once, then choose a PIN.":
+        "អ្នកមិនទាន់មាន PIN — ចូលដោយពាក្យសម្ងាត់ម្តង រួចជ្រើសរើស PIN។",
+    "Local test mode: no accounts file — you are signed in as admin.": "របៀបសាកល្បង: គ្មានឯកសារគណនី — អ្នកបានចូលជា admin។",
+    "Cannot read the accounts (users.json) in the Dropbox folder. Check the app Secrets.":
+        "មិនអាចអានគណនី (users.json) ក្នុង Dropbox បានទេ។ សូមពិនិត្យ Secrets របស់កម្មវិធី។",
+    "You do not have access to the Production app. Ask Admin.": "អ្នកមិនមានសិទ្ធិប្រើកម្មវិធីផលិតកម្មទេ។ សូមសួរ Admin។",
+    "🔢 Choose your own PIN now (tap 🔑 PIN at the top) — next time just pick your name and type it.":
+        "🔢 សូមជ្រើស PIN ផ្ទាល់ខ្លួនឥឡូវនេះ (ចុច 🔑 PIN ខាងលើ) — លើកក្រោយគ្រាន់តែជ្រើសឈ្មោះ ហើយវាយ PIN។",
+    "💻 Local mode: data files in": "💻 របៀបក្នុងម៉ាស៊ីន: ឯកសារទិន្នន័យនៅ",
+    "Type the PIN again": "វាយ PIN ម្តងទៀត",
+    "💾 Save my PIN": "💾 រក្សាទុក PIN របស់ខ្ញុំ",
+    "Current password": "ពាក្យសម្ងាត់បច្ចុប្បន្ន",
+    "New password (8+ characters, letters and numbers)": "ពាក្យសម្ងាត់ថ្មី (8 តួអក្សរឡើង មានអក្សរ និងលេខ)",
+    "Type the new password again": "វាយពាក្យសម្ងាត់ថ្មីម្តងទៀត",
+    "💾 Change my password": "💾 ប្តូរពាក្យសម្ងាត់",
+    "A password needs at least 8 characters, with letters and numbers.": "ពាក្យសម្ងាត់ត្រូវមានយ៉ាងតិច 8 តួ មានអក្សរ និងលេខ។",
+    "A PIN is 4 to 6 numbers.": "PIN ជាលេខ 4 ដល់ 6 ខ្ទង់។",
+    "The two PINs are different.": "PIN ទាំងពីរមិនដូចគ្នា។",
+    "Too easy to guess — choose another PIN.": "ងាយទាយពេក — សូមជ្រើស PIN ផ្សេង។",
+    "The current password is wrong.": "ពាក្យសម្ងាត់បច្ចុប្បន្នមិនត្រឹមត្រូវ។",
+    "The two new passwords are different.": "ពាក្យសម្ងាត់ថ្មីទាំងពីរមិនដូចគ្នា។",
+    "✅ Password changed (also for the Supply Hub).": "✅ បានប្តូរពាក្យសម្ងាត់ (ក៏សម្រាប់ Supply Hub ដែរ)។",
+    "✅ PIN saved. Next time: choose your name + type this PIN.": "✅ បានរក្សាទុក PIN។ លើកក្រោយ: ជ្រើសឈ្មោះ + វាយ PIN នេះ។",
+    "Account not found.": "រកមិនឃើញគណនី។",
+
+    # --- common words ---------------------------------------------------------------------------
+    "❄️ Cooling room": "❄️ ទូរត្រជាក់",
+    "🧊 Freezer room": "🧊 ទូរកក",
+    "🧊 Frozen room": "🧊 ទូរកក",
+    "Cooling room": "ទូរត្រជាក់",
+    "cooling room": "ទូរត្រជាក់",
+    "Freezer room": "ទូរកក",
+    "Frozen room": "ទូរកក",
+    "frozen room": "ទូរកក",
+    "🧊 Freezer": "🧊 ទូរកក",
+    "Frozen AEON": "AEON កក",
+    "🛒 AEON line": "🛒 ជួរ AEON",
+    "AEON line": "ជួរ AEON",
+    "AEON orders only": "សម្រាប់ការបញ្ជាទិញ AEON តែប៉ុណ្ណោះ",
+    "only for AEON orders": "សម្រាប់តែការបញ្ជាទិញ AEON",
+    "Raw material (keep empty)": "វត្ថុធាតុដើម (ទុកទំនេរ)",
+    "Raw material": "វត្ថុធាតុដើម",
+    "🚶 Walkway (keep free)": "🚶 ផ្លូវដើរ (ទុកទំនេរ)",
+    "🚶 Walkway": "🚶 ផ្លូវដើរ",
+    "walkway": "ផ្លូវដើរ",
+    "Cooling fan": "កង្ហារត្រជាក់",
+    "Door IN": "ទ្វារចូល",
+    "Door OUT": "ទ្វារចេញ",
+    "Door in": "ទ្វារចូល",
+    "door out": "ទ្វារចេញ",
+    "FRONT · take here first · door out": "ខាងមុខ · យកពីនេះមុន · ទ្វារចេញ",
+    "Production date": "ថ្ងៃផលិត",
+    "production date": "ថ្ងៃផលិត",
+    "production dates": "ថ្ងៃផលិត",
+    "oldest production date first": "ថ្ងៃផលិតចាស់ជាងគេមុន",
+    "oldest date first": "ថ្ងៃចាស់ជាងគេមុន",
+    "Oldest batch": "ឡូតិ៍ចាស់ជាងគេ",
+    "Bun(s) of this lane": "នំក្នុងជួរនេះ",
+    "Bun(s)": "នំ",
+    "Bun": "នំ",
+    "Name": "ឈ្មោះ",
+    "Date": "ថ្ងៃ",
+    "Day": "ថ្ងៃ",
+    "Pcs": "គ្រាប់",
+    "pcs": "គ្រាប់",
+    "Crates": "កេស",
+    "crates": "កេស",
+    "crate": "កេស",
+    "cr": "កេស",
+    "stacks": "ជង់",
+    "stack": "ជង់",
+    "Places": "កន្លែង",
+    "places": "កន្លែង",
+    "lanes": "ជួរ",
+    "Lane": "ជួរ",
+    "lane": "ជួរ",
+    "Column": "ជួរឈរ",
+    "front": "ខាងមុខ",
+    "2nd": "ទី2",
+    "3rd": "ទី3",
+    "4th": "ទី4",
+    "5th": "ទី5",
+    "6th": "ទី6",
+    "FRONT": "ខាងមុខ",
+    "BACK": "ខាងក្រោយ",
+    "Stock": "ស្តុក",
+    "Status": "ស្ថានភាព",
+    "Total stock": "ស្តុកសរុប",
+    "Room": "បន្ទប់",
+    "Note (optional)": "កំណត់ចំណាំ (មិនចាំបាច់)",
+    "Note": "កំណត់ចំណាំ",
+    "Time": "ម៉ោង",
+    "User": "អ្នកប្រើ",
+    "Action": "សកម្មភាព",
+    "Detail": "ព័ត៌មានលម្អិត",
+    "Person": "បុគ្គល",
+    "Role": "តួនាទី",
+    "Access": "សិទ្ធិ",
+    "Search": "ស្វែងរក",
+    "Period": "រយៈពេល",
+    "Type": "ប្រភេទ",
+    "Reason": "មូលហេតុ",
+    "Delete": "លុប",
+    "Count": "រាប់",
+    "Counted": "បានរាប់",
+    "App expected": "កម្មវិធីរំពឹង",
+    "Difference": "ខុសគ្នា",
+    "Expected sales": "ការលក់រំពឹងទុក",
+    "Produce": "ផលិត",
+    "Target days": "ថ្ងៃគោលដៅ",
+    "Shelf life (days)": "អាយុកាលប្រើប្រាស់ (ថ្ងៃ)",
+    "🎯 Target days": "🎯 ថ្ងៃគោលដៅ",
+    "🟤 Shelf life (days)": "🟤 អាយុកាលប្រើប្រាស់ (ថ្ងៃ)",
+    "Order": "លំដាប់",
+    "Pcs per crate": "គ្រាប់ក្នុងមួយកេស",
+    "📦 Pcs per crate": "📦 គ្រាប់ក្នុងមួយកេស",
+    "Pcs / crate": "គ្រាប់ / កេស",
+    "Limit": "កម្រិត",
+    "Task": "ការងារ",
+    "Before": "មុនម៉ោង",
+    "Auto": "ស្វ័យប្រវត្តិ",
+    "Who": "អ្នកណា",
+    "Error": "កំហុស",
+    "Where": "កន្លែង",
+    "Result": "លទ្ធផល",
+    "Today": "ថ្ងៃនេះ",
+    "today": "ថ្ងៃនេះ",
+    "tomorrow": "ថ្ងៃស្អែក",
+    "never counted yet": "មិនទាន់ធ្លាប់រាប់",
+    "never counted": "មិនទាន់ធ្លាប់រាប់",
+    "last count": "រាប់ចុងក្រោយ",
+    "Last count": "រាប់ចុងក្រោយ",
+    "Now (app)": "ឥឡូវ (កម្មវិធី)",
+    "new production comes here": "ការផលិតថ្មីចូលទីនេះ",
+    "💾 Save": "💾 រក្សាទុក",
+    "✅ Saved": "✅ បានរក្សាទុក",
+    "✅ Saved:": "✅ បានរក្សាទុក:",
+    "✅ Done": "✅ រួចរាល់",
+    "↩️ Undo": "↩️ មិនធ្វើវិញ",
+    "↩️ Undo last save": "↩️ លុបការរក្សាទុកចុងក្រោយ",
+    "↩️ Undone:": "↩️ បានលុបវិញ:",
+    "Not undone:": "មិនបានលុបវិញ:",
+    "Not saved:": "មិនបានរក្សាទុក:",
+    "⚠️ Not saved:": "⚠️ មិនបានរក្សាទុក:",
+    "Not changed:": "មិនបានផ្លាស់ប្តូរ:",
+    "Not deleted:": "មិនបានលុប:",
+    "Not created:": "មិនបានបង្កើត:",
+    "📝 Not saved yet": "📝 មិនទាន់រក្សាទុក",
+    "not saved yet": "មិនទាន់រក្សាទុក",
+    "⬅️ Back": "⬅️ ថយក្រោយ",
+    "➡️ Go to": "➡️ ទៅកាន់",
+    "From": "ពី",
+    "To": "ដល់",
+    "Choose": "ជ្រើសរើស",
+    "Type numbers only.": "វាយតែលេខប៉ុណ្ណោះ។",
+    "Type at least one number to save.": "វាយយ៉ាងហោចណាស់លេខមួយដើម្បីរក្សាទុក។",
+    "🕘 Your last save": "🕘 ការរក្សាទុកចុងក្រោយរបស់អ្នក",
+    "— saved something wrong? You can undo it for": "— រក្សាទុកខុស? អ្នកអាចលុបវិញបានក្នុងរយៈពេល",
+    "minutes.": "នាទី។",
+    "Someone else is saving the same file right now. Please press Save again.": "មានអ្នកផ្សេងកំពុងរក្សាទុកឯកសារនេះ។ សូមចុចរក្សាទុកម្តងទៀត។",
+    "No connection to Dropbox — check the internet and press Save again. Your numbers are still on the screen.":
+        "មិនអាចភ្ជាប់ Dropbox — ពិនិត្យអ៊ីនធឺណិត ហើយចុចរក្សាទុកម្តងទៀត។ លេខរបស់អ្នកនៅលើអេក្រង់នៅឡើយ។",
+    "The file was being saved by someone else. Try again.": "មានអ្នកផ្សេងកំពុងរក្សាទុកឯកសារ។ សូមព្យាយាមម្តងទៀត។",
+    "⚠️ This part could not load:": "⚠️ ផ្នែកនេះមិនអាចបើកបាន:",
+    ". The 🤖 bot already tried to repair it and kept the error for Admin. Your saved data is safe — try again in a minute.":
+        "។ 🤖 បូតបានព្យាយាមជួសជុល ហើយរក្សាកំហុសទុកឲ្យ Admin។ ទិន្នន័យរបស់អ្នកមានសុវត្ថិភាព — សូមព្យាយាមម្តងទៀតក្នុងមួយនាទី។",
+    "🤖 A problem was found — the bot repaired the data and is trying again…": "🤖 រកឃើញបញ្ហា — បូតបានជួសជុលទិន្នន័យ ហើយកំពុងព្យាយាមម្តងទៀត…",
+
+    # --- live stock ------------------------------------------------------------------------------
+    "📦 Total stock": "📦 ស្តុកសរុប",
+    "🏭 Produced today": "🏭 ផលិតថ្ងៃនេះ",
+    "pcs logged": "គ្រាប់ បានកត់ត្រា",
+    "🧾 Sold today": "🧾 លក់ថ្ងៃនេះ",
+    "pcs in the sale journal": "គ្រាប់ ក្នុងបញ្ជីលក់",
+    "🔴 Buns too low": "🔴 នំតិចពេក",
+    "🟤 Old pcs": "🟤 គ្រាប់ចាស់",
+    "older than shelf life": "ហួសអាយុកាលប្រើប្រាស់",
+    "% of the limit) · sales speed from the last": "% នៃកម្រិត) · ល្បឿនលក់ពី",
+    "selling days · updated": "ថ្ងៃលក់ចុងក្រោយ · បច្ចុប្បន្នភាព",
+    "In stock (pcs)": "ក្នុងស្តុក (គ្រាប់)",
+    "Sold / day": "លក់ / ថ្ងៃ",
+    "Days of stock": "ស្តុកគ្រប់ (ថ្ងៃ)",
+    "Sold today": "លក់ថ្ងៃនេះ",
+    "🔴 Out of stock": "🔴 អស់ស្តុក",
+    "⚪ No recent sales": "⚪ មិនមានការលក់ថ្មីៗ",
+    "🔴 Too low": "🔴 តិចពេក",
+    "🟡 A bit low": "🟡 តិចបន្តិច",
+    "🟠 Too much": "🟠 ច្រើនពេក",
+    "🟢 OK": "🟢 ល្អ",
+    "🗓️ Stock by production date (oldest at the top = sell first)": "🗓️ ស្តុកតាមថ្ងៃផលិត (ចាស់នៅលើ = លក់មុន)",
+    "📈 Total stock per day (last 21 days)": "📈 ស្តុកសរុបប្រចាំថ្ងៃ (21 ថ្ងៃចុងក្រោយ)",
+    ") — calculated now": ") — គណនាឥឡូវនេះ",
+    ") — all 3 stocks": ") — ស្តុកទាំង 3",
+    "Older than": "ចាស់ជាង",
+    "days = check / sell first.": "ថ្ងៃ = ពិនិត្យ / លក់មុន។",
+    "No stock yet. Start with the evening stock count in 📦 Stock count.": "មិនទាន់មានស្តុក។ ចាប់ផ្តើមដោយរាប់ស្តុកពេលល្ងាចក្នុង 📦 រាប់ស្តុក។",
+    "No stock count yet for:": "មិនទាន់រាប់ស្តុកសម្រាប់:",
+    "No stock count yet for": "មិនទាន់រាប់ស្តុកសម្រាប់",
+    ". Enter one in": "។ សូមបញ្ចូលក្នុង",
+    "— until then their stock only counts production logged here.": "— រហូតដល់ពេលនោះ ស្តុកគិតតែការផលិតដែលកត់ត្រានៅទីនេះ។",
+    "pcs is above the": "គ្រាប់ លើស",
+    "limit": "កម្រិត",
+    "produce less / sell first": "ផលិតតិចជាងមុន / លក់ជាមុន",
+    "pcs is close to the": "គ្រាប់ ជិតដល់",
+    "pcs older than": "គ្រាប់ ចាស់ជាង",
+    "days — sell first / check quality": "ថ្ងៃ — លក់មុន / ពិនិត្យគុណភាព",
+    ": the journal sold": ": បញ្ជីលក់បានលក់",
+    "pcs more than the stock (production not logged, or the stock count is missing)":
+        "គ្រាប់ ច្រើនជាងស្តុក (មិនបានកត់ត្រាការផលិត ឬខ្វះការរាប់ស្តុក)",
+    ": out of stock": ": អស់ស្តុក",
+    "Room for new production": "កន្លែងសម្រាប់ការផលិតថ្មី",
+    "free stacks": "ជង់ទំនេរ",
+    "needed every day:": "ត្រូវការរៀងរាល់ថ្ងៃ:",
+    "for new production (green 📥 places at the back of each bun's lanes) — needed every day:":
+        "សម្រាប់ការផលិតថ្មី (កន្លែងបៃតង 📥 នៅខាងក្រោយជួររបស់នំនីមួយៗ) — ត្រូវការរៀងរាល់ថ្ងៃ:",
+    "— ⚠️ not enough. This evening's 🚚 move list (📦 Stock count) frees space by moving old crates to the cooling room.":
+        "— ⚠️ មិនគ្រប់។ បញ្ជី 🚚 ផ្ទេរល្ងាចនេះ (📦 រាប់ស្តុក) នឹងទុកកន្លែងទំនេរ ដោយផ្ទេរកេសចាស់ទៅទូរត្រជាក់។",
+    "— ⚠️ not enough for:": "— ⚠️ មិនគ្រប់សម្រាប់:",
+    "stacks — use this evening's 🚚 move list.": "ជង់ — សូមប្រើបញ្ជី 🚚 ផ្ទេរល្ងាចនេះ។",
+    "stacks for": "ជង់សម្រាប់",
+    "% full": "% ពេញ",
+
+    # --- production ------------------------------------------------------------------------------
+    "📅 Production date": "📅 ថ្ងៃផលិត",
+    "— pcs (numbers only)": "— គ្រាប់ (តែលេខ)",
+    "Type the pcs produced for each bun. Empty = 0.": "វាយចំនួនគ្រាប់ដែលផលិតសម្រាប់នំនីមួយៗ។ ទទេ = 0។",
+    "Type the pcs produced like in your Excel sheet —": "វាយចំនួនគ្រាប់ដែលផលិតដូចក្នុង Excel —",
+    "one row per production date": "មួយជួរ សម្រាប់មួយថ្ងៃផលិត",
+    "(add a row with ＋ for another day). Empty = 0.": "(បន្ថែមជួរដោយ ＋ សម្រាប់ថ្ងៃផ្សេង)។ ទទេ = 0។",
+    "👷 Produced by": "👷 ផលិតដោយ",
+    "Everyone who made these buns (Admin adds names in ⚙️ Settings).": "អ្នកទាំងអស់ដែលធ្វើនំទាំងនេះ (Admin បន្ថែមឈ្មោះក្នុង ⚙️ ការកំណត់)។",
+    "Choose who produced these buns (👷 Produced by).": "សូមជ្រើសអ្នកដែលផលិតនំទាំងនេះ (👷 ផលិតដោយ)។",
+    "💾 Save production": "💾 រក្សាទុកការផលិត",
+    "👁️ View only — ask Admin for edit access to log production.": "👁️ មើលតែប៉ុណ្ណោះ — សុំ Admin សិទ្ធិកែ ដើម្បីកត់ត្រាការផលិត។",
+    "📋 Production logged": "📋 ការផលិតដែលបានកត់ត្រា",
+    "Nothing logged in these dates.": "មិនមានការកត់ត្រាក្នុងថ្ងៃទាំងនេះ។",
+    "✏️ Fix or delete a saved line": "✏️ កែ ឬលុបជួរដែលបានរក្សាទុក",
+    "lines)": "ជួរ)",
+    "💾 Save fixes": "💾 រក្សាទុកការកែ",
+    "✅ Fixes saved": "✅ បានរក្សាទុកការកែ",
+    "Only your own lines (Admin: all) can be changed here.": "អ្នកអាចកែបានតែជួររបស់អ្នក (Admin: ទាំងអស់)។",
+    "📝 Your numbers from before are still here — they are NOT saved yet.": "📝 លេខរបស់អ្នកពីមុននៅទីនេះនៅឡើយ — មិនទាន់បានរក្សាទុកទេ។",
+    "— saving now adds these pcs. If it is the same production, do not save again.":
+        "— ការរក្សាទុកឥឡូវនឹងបន្ថែមគ្រាប់ទាំងនេះ។ បើជាការផលិតដដែល សូមកុំរក្សាទុកម្តងទៀត។",
+    "— saving now": "— ការរក្សាទុកឥឡូវ",
+    "adds": "បន្ថែម",
+    "these pcs. If it is the same production, do not save again.": "គ្រាប់ទាំងនេះ។ បើជាការផលិតដដែល សូមកុំរក្សាទុកម្តងទៀត។",
+    "ℹ️ Already saved before:": "ℹ️ បានរក្សាទុករួចពីមុន:",
+    "✅ This was already saved a moment ago — it is not saved twice.": "✅ នេះបានរក្សាទុករួចមុននេះបន្តិច — មិនរក្សាទុកពីរដងទេ។",
+    "✅ Already saved a moment ago — it is not saved twice.": "✅ បានរក្សាទុករួចមុននេះបន្តិច — មិនរក្សាទុកពីរដងទេ។",
+    "✅ Already saved a moment ago — not saved twice.": "✅ បានរក្សាទុករួចមុននេះបន្តិច — មិនរក្សាទុកពីរដងទេ។",
+    "Right pcs": "គ្រាប់ត្រឹមត្រូវ",
+    "Right bun": "នំត្រឹមត្រូវ",
+    "Right date": "ថ្ងៃត្រឹមត្រូវ",
+    "Choose the bun": "ជ្រើសនំ",
+
+    # --- stock count + moves ----------------------------------------------------------------------
+    "📦 Evening stock count": "📦 រាប់ស្តុកពេលល្ងាច",
+    "Count date (stock at the END of this day)": "ថ្ងៃរាប់ (ស្តុកនៅចុងថ្ងៃនេះ)",
+    "Evening: first": "ពេលល្ងាច: ដំបូង",
+    "what the cooling room needs for tomorrow, then count each stock.": "អ្វីដែលទូរត្រជាក់ត្រូវការសម្រាប់ថ្ងៃស្អែក រួចរាប់ស្តុកនីមួយៗ។",
+    "Each stock is saved by itself": "ស្តុកនីមួយៗរក្សាទុកដាច់ដោយឡែក",
+    "— count and save one, the others keep their last count. The sheets start with what the app expects: only change what is different.":
+        "— រាប់ ហើយរក្សាទុកមួយ ស្តុកផ្សេងទៀតរក្សាការរាប់ចុងក្រោយ។ តារាងចាប់ផ្តើមពីអ្វីដែលកម្មវិធីរំពឹង: កែតែអ្វីដែលខុសប៉ុណ្ណោះ។",
+    "Start the sheets from": "ចាប់ផ្តើមតារាងពី",
+    "🧮 What the app expects (recommended)": "🧮 អ្វីដែលកម្មវិធីរំពឹង (ណែនាំ)",
+    "⬜ Empty sheets": "⬜ តារាងទទេ",
+    "🚚 Move frozen → cooling": "🚚 ផ្ទេរពីទូរកក → ទូរត្រជាក់",
+    "📊 All stock": "📊 ស្តុកទាំងអស់",
+    "Part": "ផ្នែក",
+    "✅ Counted · next ➡️": "✅ បានរាប់ · បន្ទាប់ ➡️",
+    "✅ Counted (last date)": "✅ បានរាប់ (ថ្ងៃចុងក្រោយ)",
+    "— type what you see. Empty = 0.": "— វាយអ្វីដែលអ្នកឃើញ។ ទទេ = 0។",
+    "➕ Add a production date that is missing": "➕ បន្ថែមថ្ងៃផលិតដែលខ្វះ",
+    "➕ Add this date": "➕ បន្ថែមថ្ងៃនេះ",
+    "🎉 All dates counted — check the total and press 💾 Save below.": "🎉 រាប់គ្រប់ថ្ងៃហើយ — ពិនិត្យសរុប ហើយចុច 💾 រក្សាទុក ខាងក្រោម។",
+    "🔍 Check: counted vs what the app expected in": "🔍 ពិនិត្យ: បានរាប់ ធៀបនឹងអ្វីដែលកម្មវិធីរំពឹងក្នុង",
+    "👁️ View only — ask Admin for edit access to save a count.": "👁️ មើលតែប៉ុណ្ណោះ — សុំ Admin សិទ្ធិកែ ដើម្បីរក្សាទុកការរាប់។",
+    "was already counted for": "បានរាប់រួចសម្រាប់",
+    ". Saving again replaces that count.": "។ ការរក្សាទុកម្តងទៀតនឹងជំនួសការរាប់នោះ។",
+    "replaces": "ជំនួស",
+    ". Check once more (a missing date? a typo? buns moved without 🚚?).": "។ ពិនិត្យម្តងទៀត (ខ្វះថ្ងៃ? វាយខុស? ផ្ទេរនំដោយគ្មាន 🚚?)។",
+    "⚠️ Big difference from what the app expected:": "⚠️ ខុសគ្នាច្រើនពីអ្វីដែលកម្មវិធីរំពឹង:",
+    "✔️ I checked these numbers — they are right": "✔️ ខ្ញុំបានពិនិត្យលេខទាំងនេះ — ត្រឹមត្រូវ",
+    "📥 Count sheets for printing (Excel, your layout)": "📥 តារាងរាប់សម្រាប់បោះពុម្ព (Excel តាមទម្រង់របស់អ្នក)",
+    "📝 Your count from before is still here — it is NOT saved yet.": "📝 ការរាប់របស់អ្នកពីមុននៅទីនេះនៅឡើយ — មិនទាន់បានរក្សាទុកទេ។",
+    "production dates counted in": "ថ្ងៃផលិតបានរាប់ក្នុង",
+    "🚚 Moves are made for today's evening — choose today's date above.": "🚚 ការផ្ទេរធ្វើសម្រាប់ល្ងាចថ្ងៃនេះ — សូមជ្រើសថ្ងៃនេះខាងលើ។",
+    "✅ Already moved today:": "✅ បានផ្ទេររួចថ្ងៃនេះ:",
+    "pcs — the list below already counts them.": "គ្រាប់ — បញ្ជីខាងក្រោមបានគិតរួចហើយ។",
+    "Move from": "ផ្ទេរពី",
+    "— the app suggests it by itself: enough for": "— កម្មវិធីណែនាំដោយខ្លួនឯង: គ្រប់សម្រាប់",
+    "of sales (tomorrow": "នៃការលក់ (ថ្ងៃស្អែក",
+    "whole crates, oldest production date first": "កេសពេញ ថ្ងៃផលិតចាស់ជាងគេមុន",
+    "✅ We moved these — save": "✅ យើងបានផ្ទេររួច — រក្សាទុក",
+    "✅ Nothing to move — the cooling room already has enough for tomorrow.": "✅ គ្មានអ្វីត្រូវផ្ទេរ — ទូរត្រជាក់មានគ្រប់សម្រាប់ថ្ងៃស្អែកហើយ។",
+    "❄️ Cooling now (pcs)": "❄️ ទូរត្រជាក់ឥឡូវ (គ្រាប់)",
+    "Needed (pcs)": "ត្រូវការ (គ្រាប់)",
+    "🧊 Frozen now (pcs)": "🧊 ទូរកកឥឡូវ (គ្រាប់)",
+    "🚚 Move (crates)": "🚚 ផ្ទេរ (កេស)",
+    "Take these dates": "យកថ្ងៃទាំងនេះ",
+    "Change it if you moved a different number of crates": "កែវា បើអ្នកបានផ្ទេរចំនួនកេសខុសពីនេះ",
+    "= pcs (suggested)": "= គ្រាប់ (ណែនាំ)",
+    "🚚 Move": "🚚 ផ្ទេរ",
+    "crates =": "កេស =",
+    "🚚 Step by step — take from the FRONT, push in at the BACK": "🚚 មួយជំហានម្តងៗ — យកពីខាងមុខ រុញចូលនៅខាងក្រោយ",
+    ": take from the front of": ": យកពីខាងមុខនៃ",
+    "push in at the back of": "រុញចូលនៅខាងក្រោយនៃ",
+    "⚠️ these (": "⚠️ កេសទាំងនេះ (",
+    ") are OLDER than the": ") ចាស់ជាង",
+    "crates already in": "កេសដែលមានរួចក្នុង",
+    ": take that lane out, put these in where 🆕 shows (oldest at the FRONT), push the rest back in behind":
+        ": យកជួរនោះចេញ ដាក់កេសទាំងនេះនៅកន្លែង 🆕 (ចាស់នៅខាងមុខ) ហើយរុញកេសផ្សេងចូលវិញនៅខាងក្រោយ",
+    "L = lane, counted from the left of the room (the lane names are on the maps). Do one bun at a time; never put a bun in another bun's lane.":
+        "L = ជួរ រាប់ពីខាងឆ្វេងនៃបន្ទប់ (ឈ្មោះជួរមាននៅលើផែនទី)។ ធ្វើម្តងមួយនំ; កុំដាក់នំក្នុងជួររបស់នំផ្សេង។",
+    "🔄 Today the frozen room has": "🔄 ថ្ងៃនេះទូរកកមាននំ",
+    "older": "ចាស់ជាង",
+    "bread than the cooling room for:": "ទូរត្រជាក់ សម្រាប់:",
+    ". FIFO = oldest out first, so these lanes must be re-stacked once (oldest at the front). When the old stock is used up, the moved crates are always the newest and just go in at the back.":
+        "។ FIFO = ចាស់ចេញមុន ដូច្នេះជួរទាំងនេះត្រូវរៀបម្តងទៀតម្តង (ចាស់នៅខាងមុខ)។ ពេលស្តុកចាស់អស់ កេសដែលផ្ទេរនឹងថ្មីជាងគេជានិច្ច ហើយគ្រាន់តែដាក់នៅខាងក្រោយ។",
+    "now — where to take the crates": "ឥឡូវ — យកកេសពីណា",
+    "🚚 = take this many crates": "🚚 = យកកេសចំនួននេះ",
+    "— the oldest, at the FRONT of the bun's lanes.": "— ចាស់ជាងគេ នៅខាងមុខជួររបស់នំ។",
+    "after the move — where to put the crates": "ក្រោយការផ្ទេរ — ដាក់កេសនៅណា",
+    "🆕 = put the moved crates here": "🆕 = ដាក់កេសដែលផ្ទេរនៅទីនេះ",
+    "(normally at the BACK of the bun's own lane; 🔄 = older crates: at the front). The oldest crates are always at the":
+        "(ជាធម្មតានៅខាងក្រោយជួររបស់នំនោះ; 🔄 = កេសចាស់ជាង: នៅខាងមុខ)។ កេសចាស់ជាងគេតែងតែនៅ",
+    "(⭐ = take first). Every bun always has the same lane — the name is under each column. Places used:":
+        "(⭐ = យកមុន)។ នំនីមួយៗមានជួរដដែលជានិច្ច — ឈ្មោះនៅក្រោមជួរឈរនីមួយៗ។ កន្លែងបានប្រើ:",
+    "⬇️ This map (Excel)": "⬇️ ផែនទីនេះ (Excel)",
+    "⚠️ Their cooling lanes are full — the list was made smaller so the crates fit:": "⚠️ ជួរក្នុងទូរត្រជាក់ពេញ — បញ្ជីត្រូវបានបន្ថយ ដើម្បីឲ្យកេសដាក់ចុះ:",
+    "— only what the frozen room has is counted. Count the frozen room?": "— គិតតែអ្វីដែលទូរកកមាន។ រាប់ទូរកកឬ?",
+    "⚠️ More crates than the frozen room has:": "⚠️ កេសច្រើនជាងអ្វីដែលទូរកកមាន:",
+    "— move fewer crates.": "— ផ្ទេរកេសតិចជាងនេះ។",
+    "⚠️ No place for:": "⚠️ គ្មានកន្លែងសម្រាប់:",
+    "🚚 includes extra old crates moved only to make room for tomorrow's production:": "🚚 រួមទាំងកេសចាស់បន្ថែម ដែលផ្ទេរដើម្បីទុកកន្លែងសម្រាប់ការផលិតថ្ងៃស្អែក:",
+    "📥 After this move the frozen room has": "📥 ក្រោយការផ្ទេរនេះ ទូរកកមាន",
+    "for tomorrow's production — needed:": "សម្រាប់ការផលិតថ្ងៃស្អែក — ត្រូវការ:",
+    "⚠️ Not enough even after moving for:": "⚠️ នៅតែមិនគ្រប់ក្រោយការផ្ទេរ សម្រាប់:",
+    "stacks — their cooling lanes are full too: produce less of these tomorrow, or sell / move stock elsewhere.":
+        "ជង់ — ជួរក្នុងទូរត្រជាក់ក៏ពេញដែរ: ផលិតនំទាំងនេះតិចជាងមុនថ្ងៃស្អែក ឬលក់ / ផ្ទេរស្តុកទៅកន្លែងផ្សេង។",
+    "➕➖ Adjustment": "➕➖ កែតម្រូវ",
+    "— buns that leave or enter stock without a sale invoice (damaged, samples, staff meals, returned...).":
+        "— នំដែលចេញ ឬចូលស្តុក ដោយគ្មានវិក្កយបត្រលក់ (ខូច គំរូ អាហារបុគ្គលិក ត្រឡប់មកវិញ...)។",
+    "➖ Remove": "➖ ដកចេញ",
+    "➕ Add": "➕ បន្ថែម",
+    "Batch production date (optional)": "ថ្ងៃផលិតនៃឡូតិ៍ (មិនចាំបាច់)",
+    "Damaged / broken": "ខូច / បែក",
+    "Expired / old": "ផុតកំណត់ / ចាស់",
+    "Sample / FOC not in journal": "គំរូ / FOC មិនមានក្នុងបញ្ជីលក់",
+    "Staff meal": "អាហារបុគ្គលិក",
+    "Returned by customer": "អតិថិជនប្រគល់មកវិញ",
+    "Other": "ផ្សេងៗ",
+    "💾 Save adjustment": "💾 រក្សាទុកការកែតម្រូវ",
+    "✅ Adjustment saved:": "✅ បានរក្សាទុកការកែតម្រូវ:",
+    "✅ This adjustment was already saved a moment ago — it is not saved twice.": "✅ ការកែតម្រូវនេះបានរក្សាទុករួចមុននេះបន្តិច — មិនរក្សាទុកពីរដងទេ។",
+    "🗑️ Delete a wrong adjustment": "🗑️ លុបការកែតម្រូវខុស",
+    "(your own lines)": "(ជួររបស់អ្នក)",
+    "🗑️ Delete": "🗑️ លុប",
+    "🗑️ Deleted": "🗑️ បានលុប",
+    "adjustment line(s)": "ជួរកែតម្រូវ",
+    "line(s)": "ជួរ",
+    "Auto (cooling first)": "ស្វ័យប្រវត្តិ (ទូរត្រជាក់មុន)",
+
+    # --- plan ------------------------------------------------------------------------------------
+    "📅 Next week production plan": "📅 ផែនការផលិតសប្តាហ៍ក្រោយ",
+    "Plan from": "ផែនការពី",
+    "Plan until": "ផែនការដល់",
+    "The plan starts from the stock you have now. Plan from tomorrow so the days before next week are counted too.":
+        "ផែនការចាប់ផ្តើមពីស្តុកដែលអ្នកមានឥឡូវ។ សូមធ្វើផែនការពីថ្ងៃស្អែក ដើម្បីគិតថ្ងៃមុនសប្តាហ៍ក្រោយផងដែរ។",
+    "📥 Download the plan (Excel)": "📥 ទាញយកផែនការ (Excel)",
+    "Stock end of day": "ស្តុកចុងថ្ងៃ",
+    "📈 Expected total stock per day": "📈 ស្តុកសរុបរំពឹងទុកប្រចាំថ្ងៃ",
+    "🏭 To produce": "🏭 ត្រូវផលិត",
+    "🧾 Expected sales": "🧾 ការលក់រំពឹងទុក",
+    "pcs (same weekday average)": "គ្រាប់ (មធ្យមថ្ងៃដូចគ្នាក្នុងសប្តាហ៍)",
+    "📦 Highest total stock": "📦 ស្តុកសរុបខ្ពស់បំផុត",
+    "📦 Stock now": "📦 ស្តុកឥឡូវ",
+    "✅ Limit kept": "✅ មិនលើសកម្រិត",
+    "Stock now": "ស្តុកឥឡូវ",
+    "Stock at the end": "ស្តុកនៅចុងបញ្ចប់",
+    "Days at the end": "ថ្ងៃនៅចុងបញ្ចប់",
+
+    # --- 3D rooms --------------------------------------------------------------------------------
+    "🧊 3D FIFO rooms — cooling + freezer": "🧊 បន្ទប់ FIFO 3D — ទូរត្រជាក់ + ទូរកក",
+    "Days to replay": "ចំនួនថ្ងៃដើម្បីមើលឡើងវិញ",
+    "📋 Room sheet — your Excel layout (today)": "📋 តារាងបន្ទប់ — ទម្រង់ Excel របស់អ្នក (ថ្ងៃនេះ)",
+    "Room sheet": "តារាងបន្ទប់",
+    "sheet (Excel)": "តារាង (Excel)",
+    "📤 Tomorrow's take-out": "📤 យកចេញសម្រាប់ថ្ងៃស្អែក",
+    "Expected sales for tomorrow → the crates to take,": "ការលក់រំពឹងទុកថ្ងៃស្អែក → កេសដែលត្រូវយក,",
+    "(L = lane from the left · front = at the door). '(of 15)' = take only part of that stack; the rest stays at the front.":
+        "(L = ជួរពីខាងឆ្វេង · ខាងមុខ = ជិតទ្វារ)។ '(of 15)' = យកតែមួយផ្នែកនៃជង់នោះ; ដែលនៅសល់ទុកនៅខាងមុខ។",
+    "📤 Take-out order": "📤 លំដាប់យកចេញ",
+    "For each bun: take the stacks in this order —": "សម្រាប់នំនីមួយៗ: យកជង់តាមលំដាប់នេះ —",
+    "(L = lane, counted from the left; front = the stack at the door). 1 stack = 1 bun + 1 production date.":
+        "(L = ជួរ រាប់ពីខាងឆ្វេង; ខាងមុខ = ជង់ជិតទ្វារ)។ 1 ជង់ = 1 នំ + 1 ថ្ងៃផលិត។",
+    "Tomorrow (pcs)": "ថ្ងៃស្អែក (គ្រាប់)",
+    "Take in this order (lane · place · date × crates)": "យកតាមលំដាប់នេះ (ជួរ · កន្លែង · ថ្ងៃ × កេស)",
+    "⚠️ Short": "⚠️ ខ្វះ",
+    "— take from the frozen room": "— យកពីទូរកក",
+    "No sales expected tomorrow.": "មិនរំពឹងការលក់ថ្ងៃស្អែកទេ។",
+    "No stock in this room today.": "គ្មានស្តុកក្នុងបន្ទប់នេះថ្ងៃនេះ។",
+    "① first": "① មុនគេ",
+    "② then": "② បន្ទាប់",
+    "③ then": "③ បន្ទាប់",
+    "④ then": "④ បន្ទាប់",
+    "first)": "មុន)",
+    "(move": "(ផ្ទេរ",
+    "stack of": "ជង់នៃ",
+    "⚠️ not its lane": "⚠️ មិនមែនជួររបស់វា",
+    "⚠️ other place": "⚠️ កន្លែងផ្សេង",
+    "⚠️ no lane": "⚠️ គ្មានជួរ",
+    "— spare": "— ទំនេរ",
+    "FIFO lanes:": "ជួរ FIFO:",
+    "1 lane = 1 bun, always the same lane": "1 ជួរ = 1 នំ ជួរដដែលជានិច្ច",
+    "(name under each column). Take only from the": "(ឈ្មោះនៅក្រោមជួរឈរនីមួយៗ)។ យកតែពី",
+    "of the lane (⭐ = oldest, take first); push new crates in at the": "នៃជួរ (⭐ = ចាស់ជាងគេ យកមុន); រុញកេសថ្មីចូលនៅ",
+    "of the bun's own lane — never in front of older crates, never in another bun's lane. A bun with 2+ lanes: every lane has its oldest at the front. 🧺 = a lane shared by 2–3 small buns: still 1 stack = 1 bun. Use the Day slider / ▶ Play to see how it moved.":
+        "នៃជួររបស់នំនោះ — កុំដាក់នៅមុខកេសចាស់ កុំដាក់ក្នុងជួរនំផ្សេង។ នំដែលមាន 2+ ជួរ: ជួរនីមួយៗមានកេសចាស់នៅខាងមុខ។ 🧺 = ជួររួមសម្រាប់នំតូចៗ 2–3: នៅតែ 1 ជង់ = 1 នំ។ ប្រើរំកិលថ្ងៃ / ▶ លេង ដើម្បីមើលការផ្លាស់ប្តូរ។",
+    "Which room: ❄️ cooling stock → the first room · 🧊 frozen stock → the second room · 🛒 AEON stock → its own line on the right of the frozen room (from the evening counts and 🚚 moves).":
+        "បន្ទប់ណា: ❄️ ស្តុកត្រជាក់ → បន្ទប់ទីមួយ · 🧊 ស្តុកកក → បន្ទប់ទីពីរ · 🛒 ស្តុក AEON → ជួររបស់វាខាងស្តាំទូរកក (ពីការរាប់ពេលល្ងាច និង 🚚 ការផ្ទេរ)។",
+    "🔒 The lanes are set": "🔒 ជួរត្រូវបានកំណត់",
+    "automatically from sales": "ដោយស្វ័យប្រវត្តិតាមការលក់",
+    "right now. Admin: open 📐 Adjust sizes →": "ឥឡូវនេះ។ Admin: បើក 📐 កែទំហំ →",
+    "and press 💾 Save, so every bun keeps the": "ហើយចុច 💾 រក្សាទុក ដើម្បីឲ្យនំនីមួយៗមាន",
+    "same lane every day": "ជួរដដែលរៀងរាល់ថ្ងៃ",
+    "Their lanes in": "ជួររបស់ពួកវាក្នុង",
+    "are full": "ពេញ",
+    "→ the newest crates are shown in": "→ កេសថ្មីជាងគេបង្ហាញក្នុង",
+    "crates). The oldest crates stay at the front of each lane.": "កេស)។ កេសចាស់ជាងគេនៅខាងមុខជួរនីមួយៗ។",
+    "⚠️ No place today for these crates —": "⚠️ គ្មានកន្លែងថ្ងៃនេះសម្រាប់កេសទាំងនេះ —",
+    ". Move a bun to the other room": "។ ផ្ទេរនំទៅបន្ទប់ផ្សេង",
+    ", or adjust the room grid (📐).": " ឬកែក្រឡាបន្ទប់ (📐)។",
+    "📐 Adjust sizes — room grid, doors, crate, room / order / pcs per crate of each bun (Admin only)":
+        "📐 កែទំហំ — ក្រឡាបន្ទប់ ទ្វារ កេស បន្ទប់ / លំដាប់ / គ្រាប់ក្នុងមួយកេសរបស់នំនីមួយៗ (Admin តែប៉ុណ្ណោះ)",
+    "💾 Save sizes": "💾 រក្សាទុកទំហំ",
+    "✅ Sizes saved — the 3D view uses them now.": "✅ បានរក្សាទុកទំហំ — ទិដ្ឋភាព 3D ប្រើវាឥឡូវនេះ។",
+    "🧊 Rooms and crates (for 🧊 3D rooms)": "🧊 បន្ទប់ និងកេស (សម្រាប់ 🧊 បន្ទប់ 3D)",
+    "A room = a grid of stack places like your sheet. Across = columns, Deep = rows (row 1 = back, at the IN side). Blocked = places with no stock, e.g.":
+        "បន្ទប់ = ក្រឡាកន្លែងជង់ ដូចតារាងរបស់អ្នក។ ទទឹង = ជួរឈរ, ជម្រៅ = ជួរដេក (ជួរ 1 = ខាងក្រោយ ខាងទ្វារចូល)។ បិទ = កន្លែងគ្មានស្តុក ឧ.",
+    "(row:columns=name).": "(ជួរ:ជួរឈរ=ឈ្មោះ)។",
+    "Stacks across": "ជង់តាមទទឹង",
+    "Stacks deep": "ជង់តាមជម្រៅ",
+    "Crates high": "កេសតាមកម្ពស់",
+    "📏 Crates high": "📏 កេសតាមកម្ពស់",
+    "How many crates in one stack: 12 or 15": "កេសប៉ុន្មានក្នុងមួយជង់: 12 ឬ 15",
+    "🛒 AEON line high": "🛒 កម្ពស់ជួរ AEON",
+    "Crates in one stack in the AEON line: 12 or 15": "កេសក្នុងមួយជង់នៃជួរ AEON: 12 ឬ 15",
+    "Height (m)": "កម្ពស់ (m)",
+    "Empty at back (m)": "ទុកទំនេរខាងក្រោយ (m)",
+    "Kept free at the back (row 1 side), e.g. 1.6 m for raw material": "ទុកទំនេរនៅខាងក្រោយ (ខាងជួរ 1) ឧ. 1.6 m សម្រាប់វត្ថុធាតុដើម",
+    "🛒 AEON line places": "🛒 កន្លែងជួរ AEON",
+    "Right-hand line for the AEON stock with the crates turned (e.g. 11). 0 = no AEON line in this room":
+        "ជួរខាងស្តាំសម្រាប់ស្តុក AEON ដោយបង្វិលកេស (ឧ. 11)។ 0 = គ្មានជួរ AEON ក្នុងបន្ទប់នេះ",
+    "🚶 Walkway before AEON (m)": "🚶 ផ្លូវដើរមុនជួរ AEON (m)",
+    "Free path between the frozen lanes and the AEON line (whole stack columns, ~0.49 m each). 0 = none":
+        "ផ្លូវទំនេររវាងជួរនំកក និងជួរ AEON (គិតជាជួរឈរពេញ ~0.49 m ម្តង)។ 0 = គ្មាន",
+    "Blocked places": "កន្លែងបិទ",
+    "🟢 Door IN": "🟢 ទ្វារចូល",
+    "🟠 Door OUT": "🟠 ទ្វារចេញ",
+    "↔️ Order (1 = first column)": "↔️ លំដាប់ (1 = ជួរឈរទីមួយ)",
+    "Crate W (cm)": "កេស ទទឹង (cm)",
+    "Crate L (cm)": "កេស បណ្តោយ (cm)",
+    "Crate H (cm)": "កេស កម្ពស់ (cm)",
+    "Space:": "ទំហំ:",
+    "m before the AEON line)": "m មុនជួរ AEON)",
+    "m kept empty)": "m ទុកទំនេរ)",
+    "Lanes — 1 lane (column) = 1 bun, the same every day": "ជួរ — 1 ជួរ (ជួរឈរ) = 1 នំ ដដែលរៀងរាល់ថ្ងៃ",
+    "Staff take only from the FRONT of a lane and push new crates in at the BACK. Type the bun of each lane: one code (e.g.":
+        "បុគ្គលិកយកតែពីខាងមុខជួរ ហើយរុញកេសថ្មីចូលនៅខាងក្រោយ។ វាយនំនៃជួរនីមួយៗ: កូដមួយ (ឧ.",
+    "; a big seller can have 2–3 lanes side by side), or small buns sharing one 🧺 lane joined with + (e.g.":
+        "; នំលក់ច្រើនអាចមាន 2–3 ជួរជាប់គ្នា) ឬនំតូចៗចែករំលែកជួរ 🧺 មួយ ភ្ជាប់ដោយ + (ឧ.",
+    "), or empty = spare. Press 💾 Save to fix the lanes.": ") ឬទទេ = ទំនេរ។ ចុច 💾 រក្សាទុក ដើម្បីកំណត់ជួរ។",
+    "↺ Lanes automatic from sales": "↺ ជួរស្វ័យប្រវត្តិតាមការលក់",
+    "· ✅ saved": "· ✅ បានរក្សាទុក",
+    "· ⚙️ automatic (not saved yet)": "· ⚙️ ស្វ័យប្រវត្តិ (មិនទាន់រក្សាទុក)",
+    "N1 · or N22+N23 for a shared 🧺 lane · empty = spare": "N1 · ឬ N22+N23 សម្រាប់ជួររួម 🧺 · ទទេ = ទំនេរ",
+    "⚠️ Unknown bun code:": "⚠️ កូដនំមិនស្គាល់:",
+    "⚠️ No lane for:": "⚠️ គ្មានជួរសម្រាប់:",
+    "— add them to a lane (e.g.": "— បន្ថែមពួកវាទៅក្នុងជួរ (ឧ.",
+    "places used · 1 bun per place · crates turned · front (OUT) first": "កន្លែងបានប្រើ · 1 នំ ក្នុង 1 កន្លែង · កេសបង្វិល · ខាងមុខ (ចេញ) មុន",
+    "🛒 AEON line (front / OUT first)": "🛒 ជួរ AEON (ខាងមុខ / ចេញមុន)",
+    "📥 new": "📥 ថ្មី",
+    "put": "ដាក់",
+    "take": "យក",
+    "of": "នៃ",
+
+    # --- tasks / history / settings / bot ---------------------------------------------------------
+    "📋 Daily tasks": "📋 ការងារប្រចាំថ្ងៃ",
+    "Show only my tasks": "បង្ហាញតែការងាររបស់ខ្ញុំ",
+    "🗓️ Last 7 days": "🗓️ 7 ថ្ងៃចុងក្រោយ",
+    "📋 Your tasks today:": "📋 ការងាររបស់អ្នកថ្ងៃនេះ:",
+    "No tasks for this day.": "គ្មានការងារសម្រាប់ថ្ងៃនេះ។",
+    "Admin adds tasks in ⚙️ Settings.": "Admin បន្ថែមការងារក្នុង ⚙️ ការកំណត់។",
+    "✅ Mark done": "✅ សម្គាល់ថារួចរាល់",
+    "👥 Assign": "👥 ចាត់តាំង",
+    "Who does it on this day": "អ្នកណាធ្វើនៅថ្ងៃនេះ",
+    "⏰ before": "⏰ មុន",
+    "❌ Missed": "❌ ខកខាន",
+    "🔴 Late": "🔴 យឺត",
+    "— done": "— រួចរាល់",
+    "🕘 History — who did what": "🕘 ប្រវត្តិ — អ្នកណាធ្វើអ្វី",
+    "bun, date, word…": "នំ ថ្ងៃ ពាក្យ…",
+    "⬇️ Download (CSV)": "⬇️ ទាញយក (CSV)",
+    "Nothing recorded yet. Every save, count, fix, sign-in and settings change will appear here.":
+        "មិនទាន់មានកំណត់ត្រា។ រាល់ការរក្សាទុក ការរាប់ ការកែ ការចូល និងការកែការកំណត់ នឹងបង្ហាញនៅទីនេះ។",
+    "👤 Only your own actions": "👤 តែសកម្មភាពរបស់អ្នក",
+    "🎯 Stock rules": "🎯 ច្បាប់ស្តុក",
+    "🧊 Rooms & crates": "🧊 បន្ទប់ និងកេស",
+    "📋 Tasks & names": "📋 ការងារ និងឈ្មោះ",
+    "👥 Users & access": "👥 អ្នកប្រើ និងសិទ្ធិ",
+    "💾 Save settings": "💾 រក្សាទុកការកំណត់",
+    "✅ Settings saved": "✅ បានរក្សាទុកការកំណត់",
+    "Change anything in the tabs below, then press": "កែអ្វីក៏បានក្នុងផ្ទាំងខាងក្រោម រួចចុច",
+    "— one button saves 🎯 🧊 📋 and the access table.": "— ប៊ូតុងតែមួយរក្សាទុក 🎯 🧊 📋 និងតារាងសិទ្ធិ។",
+    "🎯 Stock target, production days and shelf life — per bun": "🎯 គោលដៅស្តុក ថ្ងៃផលិត និងអាយុកាលប្រើប្រាស់ — តាមនំ",
+    "The table is what the app uses. Change any cell, or fill many buns at once with the buttons.":
+        "តារាងនេះគឺជាអ្វីដែលកម្មវិធីប្រើ។ កែក្រឡាណាក៏បាន ឬបំពេញនំច្រើនក្នុងពេលតែមួយដោយប៊ូតុង។",
+    "Target days for every bun except": "ថ្ងៃគោលដៅសម្រាប់នំទាំងអស់ លើកលែង",
+    "⬇️ Apply to the table": "⬇️ អនុវត្តទៅតារាង",
+    "Shelf life for every bun (days)": "អាយុកាលប្រើប្រាស់សម្រាប់នំទាំងអស់ (ថ្ងៃ)",
+    "📦 Limits and planning": "📦 កម្រិត និងការធ្វើផែនការ",
+    "Total stock limit (pcs)": "កម្រិតស្តុកសរុប (គ្រាប់)",
+    "Sales history used (days)": "ប្រវត្តិលក់ដែលប្រើ (ថ្ងៃ)",
+    "Round planned pcs up to": "បង្គត់គ្រាប់ក្នុងផែនការឡើងដល់",
+    "Max production per day (0 = no limit)": "ការផលិតអតិបរមាក្នុងមួយថ្ងៃ (0 = គ្មានកម្រិត)",
+    "Keep these at their target first when the total limit is reached": "រក្សានំទាំងនេះតាមគោលដៅមុន ពេលដល់កម្រិតសរុប",
+    "🧊 The 3 stocks (each counted and saved by itself)": "🧊 ស្តុកទាំង 3 (រាប់ និងរក្សាទុកដាច់ដោយឡែក)",
+    "❄️ Cooling room keeps (days of sales)": "❄️ ទូរត្រជាក់រក្សាទុក (ថ្ងៃនៃការលក់)",
+    "The evening 🚚 move list fills the cooling room up to this many days.": "បញ្ជី 🚚 ផ្ទេរពេលល្ងាចបំពេញទូរត្រជាក់ដល់ចំនួនថ្ងៃនេះ។",
+    "🧊 Frozen room keeps space for new production (pcs per day)": "🧊 ទូរកកទុកកន្លែងសម្រាប់ការផលិតថ្មី (គ្រាប់ក្នុងមួយថ្ងៃ)",
+    "Checked every day; the 🚚 move list frees space when needed.": "ពិនិត្យរៀងរាល់ថ្ងៃ; បញ្ជី 🚚 ផ្ទេរនឹងទុកកន្លែងពេលចាំបាច់។",
+    "New production goes to 🧊 the frozen room. Orders from customers with “AEON” in the name are taken from 🛒 the AEON stock (when it is empty: from the normal stock). Other orders: ❄️ cooling room first, then 🧊 frozen room.":
+        "ការផលិតថ្មីចូល 🧊 ទូរកក។ ការបញ្ជាទិញពីអតិថិជនដែលមាន “AEON” ក្នុងឈ្មោះ យកពី 🛒 ស្តុក AEON (ពេលអស់: យកពីស្តុកធម្មតា)។ ការបញ្ជាទិញផ្សេង: ❄️ ទូរត្រជាក់មុន រួច 🧊 ទូរកក។",
+    "👥 Who can use this app (Admin can always edit)": "👥 អ្នកណាអាចប្រើកម្មវិធីនេះ (Admin កែបានជានិច្ច)",
+    "➕ New user": "➕ អ្នកប្រើថ្មី",
+    "➕ Create user": "➕ បង្កើតអ្នកប្រើ",
+    "🔢 PIN (4–6 numbers)": "🔢 PIN (លេខ 4–6 ខ្ទង់)",
+    "🔑 Password (optional, 8+ letters & numbers)": "🔑 ពាក្យសម្ងាត់ (មិនចាំបាច់ 8+ អក្សរ និងលេខ)",
+    "Production app access": "សិទ្ធិកម្មវិធីផលិតកម្ម",
+    "New PIN (4–6 numbers)": "PIN ថ្មី (លេខ 4–6 ខ្ទង់)",
+    "New password (optional)": "ពាក្យសម្ងាត់ថ្មី (មិនចាំបាច់)",
+    "⚡ Make a PIN for these": "⚡ បង្កើត PIN សម្រាប់អ្នកទាំងនេះ",
+    "✅ Every operation staff already has a PIN.": "✅ បុគ្គលិកប្រតិបត្តិការទាំងអស់មាន PIN រួចហើយ។",
+    "⬇️ Download the PIN list (CSV)": "⬇️ ទាញយកបញ្ជី PIN (CSV)",
+    "🙈 Hide the PIN list": "🙈 លាក់បញ្ជី PIN",
+    "Staff name (shown in the app)": "ឈ្មោះបុគ្គលិក (បង្ហាញក្នុងកម្មវិធី)",
+    "⏰ Before (HH:MM)": "⏰ មុនម៉ោង (HH:MM)",
+    "👥 Who (names, ;)": "👥 អ្នកណា (ឈ្មោះ, ;)",
+    "Separate with ;": "បំបែកដោយ ;",
+    "🤖 Auto-fix bot": "🤖 បូតជួសជុលស្វ័យប្រវត្តិ",
+    "The bot checks the data files by itself every 15 minutes and whenever a page breaks. It repairs safe problems at once (always keeping a backup first) and lists here what needs a person.":
+        "បូតពិនិត្យឯកសារទិន្នន័យដោយខ្លួនឯងរៀងរាល់ 15 នាទី និងពេលទំព័រមានបញ្ហា។ វាជួសជុលបញ្ហាដែលមានសុវត្ថិភាពភ្លាមៗ (តែងរក្សាទុកច្បាប់ចម្លងមុន) ហើយរាយនៅទីនេះនូវអ្វីដែលត្រូវការមនុស្ស។",
+    "🔍 Check now": "🔍 ពិនិត្យឥឡូវ",
+    "Checking every file…": "កំពុងពិនិត្យឯកសារទាំងអស់…",
+    "✅ Nothing needs you — all data files are fine.": "✅ គ្មានអ្វីត្រូវការអ្នក — ឯកសារទិន្នន័យទាំងអស់ល្អ។",
+    "No page errors. 👍": "គ្មានកំហុសទំព័រ។ 👍",
+    "🧹 Clear the error list": "🧹 សម្អាតបញ្ជីកំហុស",
+    "🧹 Error list cleared.": "🧹 បានសម្អាតបញ្ជីកំហុស។",
+    "⚠️ Page errors kept by the bot": "⚠️ កំហុសទំព័រដែលបូតរក្សាទុក",
+    "🔧 What the bot repaired": "🔧 អ្វីដែលបូតបានជួសជុល",
+    "🙋 Needs a person": "🙋 ត្រូវការមនុស្ស",
+    "✅ Fix": "✅ ជួសជុល",
+    "🗑️ Delete line": "🗑️ លុបជួរ",
+    "Details for Admin": "ព័ត៌មានលម្អិតសម្រាប់ Admin",
+    "Correct line": "ជួរត្រឹមត្រូវ",
+    "data problem(s) need you": "បញ្ហាទិន្នន័យត្រូវការអ្នក",
+    "page error(s) today — open": "កំហុសទំព័រថ្ងៃនេះ — បើក",
+    "The first check runs within a minute of opening the app — or press 🔍 Check now.":
+        "ការពិនិត្យដំបូងដំណើរការក្នុងមួយនាទីបន្ទាប់ពីបើកកម្មវិធី — ឬចុច 🔍 ពិនិត្យឥឡូវ។",
+
+    # --- more words / sentences --------------------------------------------------------------------
+    "high": "ជាន់",
+    "days": "ថ្ងៃ",
+    "day": "ថ្ងៃ",
+    "days (target": "ថ្ងៃ (គោលដៅ",
+    "Too low": "តិចពេក",
+    "A bit low": "តិចបន្តិច",
+    "Too much": "ច្រើនពេក",
+    "Out of stock": "អស់ស្តុក",
+    "No recent sales": "មិនមានការលក់ថ្មីៗ",
+    "Item": "មុខទំនិញ",
+    "counted": "បានរាប់",
+    "last": "ចុងក្រោយ",
+    "edit": "កែបាន",
+    "view": "មើល",
+    "hidden": "លាក់",
+    "auto": "ស្វ័យប្រវត្តិ",
+    "anyone": "អ្នកណាក៏បាន",
+    "staff": "បុគ្គលិក",
+    "viewer": "អ្នកមើល",
+    "sales": "ការលក់",
+    "back": "ខាងក្រោយ",
+    "rows": "ជួរដេក",
+    "buns": "នំ",
+    "stock": "ស្តុក",
+    "from": "ពី",
+    "to": "ទៅ",
+    "move": "ផ្ទេរ",
+    "by": "ដោយ",
+    "in": "ក្នុង",
+    "Lanes": "ជួរ",
+    "Yes": "បាទ/ចាស",
+    "every day": "រៀងរាល់ថ្ងៃ",
+    "Empty = 0.": "ទទេ = 0។",
+    "Empty": "ទទេ",
+    "Type the pcs produced for each bun.": "វាយចំនួនគ្រាប់ដែលផលិតសម្រាប់នំនីមួយៗ។",
+    "actions": "សកម្មភាព",
+    "move saved": "បានរក្សាទុកការផ្ទេរ",
+    "count saved": "បានរក្សាទុកការរាប់",
+    "evening count saved": "បានរក្សាទុកការរាប់ពេលល្ងាច",
+    "production saved": "បានរក្សាទុកការផលិត",
+    "production fixed": "បានកែការផលិត",
+    "settings saved": "បានរក្សាទុកការកំណត់",
+    "room sizes saved": "បានរក្សាទុកទំហំបន្ទប់",
+    "sign in": "ចូល",
+    "adjustment": "កែតម្រូវ",
+    "task done": "ការងាររួចរាល់",
+    "Last check": "ពិនិត្យចុងក្រោយ",
+    "fixed": "បានជួសជុល",
+    "need you": "ត្រូវការអ្នក",
+    "✅ Done —": "✅ រួចរាល់ —",
+    "line deleted.": "បានលុបជួរ។",
+    "fixed.": "បានជួសជុល។",
+    "⏳ To do": "⏳ ត្រូវធ្វើ",
+    "due": "ត្រូវធ្វើ",
+    "(before": "(មុន",
+    "Operation staff": "បុគ្គលិកប្រតិបត្តិការ",
+    "operation staff": "បុគ្គលិកប្រតិបត្តិការ",
+    "Sales": "ផ្នែកលក់",
+    "Viewer": "អ្នកមើល",
+    "(role": "(តួនាទី",
+    "Today ·": "ថ្ងៃនេះ ·",
+    "TOTAL": "សរុប",
+    "Code": "កូដ",
+    "Stock end": "ស្តុកចុងថ្ងៃ",
+    "Targets:": "គោលដៅ:",
+    "days, others": "ថ្ងៃ, នំផ្សេង",
+    "total stock": "ស្តុកសរុប",
+    "made": "បានធ្វើ",
+    "How it is planned: each day, produce so that the stock at the end of the day covers the next":
+        "របៀបធ្វើផែនការ: រៀងរាល់ថ្ងៃ ផលិតឲ្យស្តុកនៅចុងថ្ងៃ គ្រប់សម្រាប់",
+    "selling days for N1/N2 and": "ថ្ងៃលក់បន្ទាប់សម្រាប់ N1/N2 និង",
+    "for the others (expected sales = the same weekday average of the last weeks). Days a bun is not produced are covered by the day before. If the total would pass":
+        "សម្រាប់នំផ្សេង (ការលក់រំពឹងទុក = មធ្យមថ្ងៃដូចគ្នាក្នុងសប្តាហ៍ពីសប្តាហ៍មុនៗ)។ ថ្ងៃដែលមិនផលិតនំណាមួយ ត្រូវបានគ្របដោយថ្ងៃមុន។ បើសរុបលើស",
+    "pcs, the other buns are lowered first and N1/N2 keep their days.": "គ្រាប់ នំផ្សេងត្រូវបន្ថយមុន ហើយ N1/N2 រក្សាថ្ងៃរបស់វា។",
+    "ℹ️ Keeping every bun at its target would need about": "ℹ️ ដើម្បីរក្សានំទាំងអស់តាមគោលដៅ ត្រូវការប្រហែល",
+    "in stock, more than the": "ក្នុងស្តុក ច្រើនជាង",
+    "limit — so these buns end below their target days:": "កម្រិត — ដូច្នេះនំទាំងនេះនៅក្រោមថ្ងៃគោលដៅ:",
+    ". Raise the limit or lower the target days in ⚙️ Settings to change this.": "។ បង្កើនកម្រិត ឬបន្ថយថ្ងៃគោលដៅក្នុង ⚙️ ការកំណត់ ដើម្បីផ្លាស់ប្តូរ។",
+    "— the plan treats their stock as 0.": "— ផែនការគិតស្តុករបស់ពួកវាជា 0។",
+    "🔢 Give / reset someone's PIN or password": "🔢 ផ្តល់ / កំណត់ PIN ឬពាក្យសម្ងាត់ឡើងវិញ",
+    "🔢 after a name = already has a PIN. A new password signs that person out on their other phones.":
+        "🔢 ក្រោយឈ្មោះ = មាន PIN រួចហើយ។ ពាក្យសម្ងាត់ថ្មីនឹងចាកចេញអ្នកនោះពីទូរស័ព្ទផ្សេងទៀត។",
+    "⚡ PINs for all operation staff at once": "⚡ PIN សម្រាប់បុគ្គលិកប្រតិបត្តិការទាំងអស់ក្នុងពេលតែមួយ",
+    "operation staff have no PIN yet:": "បុគ្គលិកប្រតិបត្តិការមិនទាន់មាន PIN:",
+    "people": "នាក់",
+    "PINs made. Give each person their PIN (shown only now — they can change it later with 🔑 PIN).":
+        "បានបង្កើត PIN។ ផ្តល់ PIN ឲ្យម្នាក់ៗ (បង្ហាញតែឥឡូវនេះ — ពួកគេអាចប្តូរពេលក្រោយដោយ 🔑 PIN)។",
+    "👷 Names in “Produced by” (people without an account)": "👷 ឈ្មោះក្នុង “ផលិតដោយ” (អ្នកគ្មានគណនី)",
+    "All operation staff are already in the list by themselves — add here only helpers without an account.":
+        "បុគ្គលិកប្រតិបត្តិការទាំងអស់មានក្នុងបញ្ជីដោយស្វ័យប្រវត្តិ — បន្ថែមនៅទីនេះតែអ្នកជួយដែលគ្មានគណនី។",
+    "📋 Daily tasks (checklist)": "📋 ការងារប្រចាំថ្ងៃ (បញ្ជីត្រួតពិនិត្យ)",
+    "auto prod = done by itself when production is saved for that day · auto count = done when the evening count is saved · empty = staff tap ✅. 'Who' = default people (Admin can change per day in 📋 Tasks).":
+        "auto prod = រួចរាល់ដោយខ្លួនឯង ពេលរក្សាទុកការផលិតថ្ងៃនោះ · auto count = រួចរាល់ពេលរក្សាទុកការរាប់ពេលល្ងាច · ទទេ = បុគ្គលិកចុច ✅។ 'អ្នកណា' = អ្នកលំនាំដើម (Admin អាចប្តូរតាមថ្ងៃក្នុង 📋 ការងារ)។",
+    "done by itself when production is saved for that day": "រួចរាល់ដោយខ្លួនឯង ពេលរក្សាទុកការផលិតថ្ងៃនោះ",
+    "done when the evening count is saved": "រួចរាល់ពេលរក្សាទុកការរាប់ពេលល្ងាច",
+    "staff tap": "បុគ្គលិកចុច",
+    "default people (Admin can change per day in": "អ្នកលំនាំដើម (Admin អាចប្តូរតាមថ្ងៃក្នុង",
+    "Names:": "ឈ្មោះ:",
+    "🏭 ticked = this bun can be produced on that weekday. 🎯 = days of sales to keep in stock. 🟤 = a batch older than this is flagged 'sell first'.":
+        "🏭 ធីក = នំនេះអាចផលិតនៅថ្ងៃនោះ។ 🎯 = ចំនួនថ្ងៃលក់ដែលត្រូវរក្សាក្នុងស្តុក។ 🟤 = ឡូតិ៍ចាស់ជាងនេះត្រូវសម្គាល់ 'លក់មុន'។",
+    "ticked": "ធីក",
+    "this bun can be produced on that weekday": "នំនេះអាចផលិតនៅថ្ងៃនោះ",
+    "days of sales to keep in stock": "ចំនួនថ្ងៃលក់ដែលត្រូវរក្សាក្នុងស្តុក",
+    "a batch older than this is flagged 'sell first'": "ឡូតិ៍ចាស់ជាងនេះត្រូវសម្គាល់ 'លក់មុន'",
+    "Automatic by role: every account with role staff in the Supply Hub (operation staff) gets this access by itself — also new staff added later. Change one person only if they must be different.":
+        "ស្វ័យប្រវត្តិតាមតួនាទី: គណនីទាំងអស់ដែលមានតួនាទី staff ក្នុង Supply Hub (បុគ្គលិកប្រតិបត្តិការ) ទទួលសិទ្ធិនេះដោយខ្លួនឯង — ទាំងបុគ្គលិកថ្មីដែលបន្ថែមពេលក្រោយ។ កែតែម្នាក់ៗ បើត្រូវខុសគ្នា។",
+    "Automatic by role": "ស្វ័យប្រវត្តិតាមតួនាទី",
+    "every account with role": "គណនីទាំងអស់ដែលមានតួនាទី",
+    "in the Supply Hub (operation staff) gets this access by itself": "ក្នុង Supply Hub (បុគ្គលិកប្រតិបត្តិការ) ទទួលសិទ្ធិនេះដោយខ្លួនឯង",
+    "also new staff added later": "ទាំងបុគ្គលិកថ្មីដែលបន្ថែមពេលក្រោយ",
+    "Change one person only if they must be different": "កែតែម្នាក់ៗ បើត្រូវខុសគ្នា",
+    "The access above is saved with": "សិទ្ធិខាងលើត្រូវរក្សាទុកដោយ",
+    "The boxes below save by themselves": "ប្រអប់ខាងក្រោមរក្សាទុកដោយខ្លួនឯង",
+    "Same accounts as the Supply Hub: the role is also used there. 'staff' = operation staff (also gets the operation pages in the Supply Hub). 'viewer' = can only look in the Supply Hub.":
+        "គណនីដូច Supply Hub: តួនាទីក៏ប្រើនៅទីនោះដែរ។ 'staff' = បុគ្គលិកប្រតិបត្តិការ (ទទួលទំព័រប្រតិបត្តិការក្នុង Supply Hub ផងដែរ)។ 'viewer' = អាចមើលតែក្នុង Supply Hub។",
+    "auto = by role (operation staff = edit)": "ស្វ័យប្រវត្តិ = តាមតួនាទី (បុគ្គលិកប្រតិបត្តិការ = កែបាន)",
+    "auto = by role (above)": "ស្វ័យប្រវត្តិ = តាមតួនាទី (ខាងលើ)",
+    "Errors the bot cannot repair by itself are mistakes in the program — send this list (or a screenshot) to get the program fixed. Tick them off below when solved.":
+        "កំហុសដែលបូតមិនអាចជួសជុលដោយខ្លួនឯង គឺជាកំហុសក្នុងកម្មវិធី — ផ្ញើបញ្ជីនេះ (ឬរូបថតអេក្រង់) ដើម្បីឲ្យកែកម្មវិធី។ ធីកចេញពេលដោះស្រាយរួច។",
+    "Put \"quotes\" around a number with a comma (e.g. \"1,200\") or remove the comma.": "ដាក់ \"សញ្ញាសម្រង់\" ជុំវិញលេខដែលមានក្បៀស (ឧ. \"1,200\") ឬលុបក្បៀសចេញ។",
+    "The line has": "ជួរនេះមាន",
+    "columns — it needs": "ជួរឈរ — វាត្រូវការ",
+    "Columns:": "ជួរឈរ:",
+    "Give a staff name.": "សូមដាក់ឈ្មោះបុគ្គលិក។",
+    "Choose a person.": "សូមជ្រើសបុគ្គល។",
+    "This username already exists.": "ឈ្មោះអ្នកប្រើនេះមានរួចហើយ។",
+    "Give a PIN or a password.": "សូមដាក់ PIN ឬពាក្យសម្ងាត់។",
+    "Username: 3–30 small letters, numbers, . _ -": "ឈ្មោះអ្នកប្រើ: អក្សរតូច លេខ . _ - ចំនួន 3–30",
+    "✅ Saved for": "✅ បានរក្សាទុកសម្រាប់",
+    "created. Sign in: choose “": "បានបង្កើត។ ចូល: ជ្រើស “",
+    "the PIN.": "PIN។",
+    "the password.": "ពាក្យសម្ងាត់។",
+    "no PIN yet": "មិនទាន់មាន PIN",
+    "pcs is not a number": "គ្រាប់ មិនមែនជាលេខ",
+    "unknown bun code": "កូដនំមិនស្គាល់",
+    "date cannot be read": "មិនអាចអានថ្ងៃ",
+    "date is empty": "ថ្ងៃទទេ",
+    "pcs is below 0": "គ្រាប់ តិចជាង 0",
+    "✅ Settings saved · targets:": "✅ បានរក្សាទុកការកំណត់ · គោលដៅ:",
+    "targets:": "គោលដៅ:",
+    "settings file is broken — the app uses the default settings": "ឯកសារការកំណត់ខូច — កម្មវិធីប្រើការកំណត់លំនាំដើម",
+    "Open ⚙️ Settings and press 💾 Save settings to write a good file again.": "បើក ⚙️ ការកំណត់ ហើយចុច 💾 រក្សាទុកការកំណត់ ដើម្បីសរសេរឯកសារល្អឡើងវិញ។",
+    "The settings file cannot be read — nothing was changed.": "មិនអាចអានឯកសារការកំណត់ — គ្មានអ្វីត្រូវបានផ្លាស់ប្តូរ។",
+    "Settings were being saved by someone else. Try again.": "មានអ្នកផ្សេងកំពុងរក្សាទុកការកំណត់។ សូមព្យាយាមម្តងទៀត។",
+    "Someone else is saving the accounts right now. Try again.": "មានអ្នកផ្សេងកំពុងរក្សាទុកគណនី។ សូមព្យាយាមម្តងទៀត។",
+    "The accounts file cannot be read safely — nothing was changed.": "មិនអាចអានឯកសារគណនីដោយសុវត្ថិភាព — គ្មានអ្វីត្រូវបានផ្លាស់ប្តូរ។",
+}
+
+# the 3D view (JavaScript text): exact phrases only
+KM_JS = {
+    "🟢 Door IN (new stock)": "🟢 ទ្វារចូល (ស្តុកថ្មី)",
+    "🟠 Door OUT (take first)": "🟠 ទ្វារចេញ (យកមុន)",
+    "🚪 Door IN / OUT": "🚪 ទ្វារចូល / ចេញ",
+    "🚶 Walkway (keep free)": "🚶 ផ្លូវដើរ (ទុកទំនេរ)",
+    " (keep empty)": " (ទុកទំនេរ)",
+    "👆 Tap a stack: bun, lot date, age, crates, pcs.": "👆 ចុចលើជង់: នំ ថ្ងៃឡូតិ៍ អាយុ កេស គ្រាប់។",
+    "Drag to turn · pinch / wheel to zoom.": "អូសដើម្បីបង្វិល · ច្បិច / កង់ដើម្បីពង្រីក។",
+    "All buns": "នំទាំងអស់",
+    "Color: age": "ពណ៌: អាយុ",
+    "Color: bun type": "ពណ៌: ប្រភេទនំ",
+    "Label: bun": "ស្លាក: នំ",
+    "Label: lot date": "ស្លាក: ថ្ងៃឡូតិ៍",
+    "⏸ Pause": "⏸ ផ្អាក",
+    "▶ Play": "▶ លេង",
+    "🏭 Both rooms": "🏭 បន្ទប់ទាំងពីរ",
+    "📥 new ": "📥 ថ្មី ",
+    " · ⭐ TAKE FIRST": " · ⭐ យកមុន",
+    " deep · ": " ជម្រៅ · ",
+    " stacks · ": " ជង់ · ",
+    " crates · ": " កេស · ",
+    " pcs": " គ្រាប់",
+    " 0–2 days · ": " 0–2 ថ្ងៃ · ",
+    " fresh · ": " ស្រស់ · ",
+    " near shelf life · ": " ជិតផុតអាយុកាល · ",
+    " past shelf life": " ហួសអាយុកាល",
+    "1 lane = 1 bun (yellow name at the front of each lane) · take from the FRONT · push new crates in at the BACK of the same lane · ⭐ = oldest (take first) · 📥 = space for tomorrow":
+        "1 ជួរ = 1 នំ (ឈ្មោះលឿងនៅខាងមុខជួរ) · យកពីខាងមុខ · រុញកេសថ្មីចូលនៅខាងក្រោយជួរដដែល · ⭐ = ចាស់ជាងគេ (យកមុន) · 📥 = កន្លែងសម្រាប់ការផលិតថ្ងៃស្អែក",
+    "\\'s production": "",
+    "Raw material": "វត្ថុធាតុដើម",
+    "Cooling fan": "កង្ហារត្រជាក់",
+    "Cooling room": "ទូរត្រជាក់",
+    "Freezer room": "ទូរកក",
+}
+
+LANGS = {"en": "🇬🇧 English", "km": "🇰🇭 ខ្មែរ"}
+_TR = {}
+
+
+def lang():
+    try:
+        return st.session_state.get("lang", "en")
+    except Exception:
+        return "en"
+
+
+def _tr_rx():
+    if "rx" not in _TR:
+        keys = sorted((k for k in KM if k.strip()), key=len, reverse=True)
+        parts = []
+        for k in keys:
+            p = re.escape(k)
+            if re.match(r"[A-Za-z0-9]", k):
+                p = r"(?<![A-Za-z0-9_])" + p
+            if re.search(r"[A-Za-z0-9]$", k):
+                p = p + r"(?![A-Za-z0-9_])"
+            parts.append(p)
+        _TR["rx"] = re.compile("|".join(parts))
+    return _TR["rx"]
+
+
+def _tr_plain(s):
+    hit = _TR.setdefault("cache", {})
+    if s not in hit:
+        if len(hit) > 20000:
+            hit.clear()
+        hit[s] = _tr_rx().sub(lambda m: KM.get(m.group(0), m.group(0)), s)
+    return hit[s]
+
+
+def tr(s):
+    """English -> Khmer when ខ្មែរ is chosen (phrases from KM; numbers, codes and bun names stay)."""
+    if lang() != "km" or not isinstance(s, str) or not s or not re.search(r"[A-Za-z]", s):
+        return s
+    if "<style" in s or "<script" in s:
+        return s
+    if "<" in s and ">" in s:                                   # HTML: only the text between the tags
+        return "".join(x if x.startswith("<") else _tr_plain(x) for x in re.split(r"(<[^>]*>)", s))
+    return _tr_plain(s)
+
+
+def tr_js(html):
+    if lang() != "km":
+        return html
+    for k in sorted(KM_JS, key=len, reverse=True):
+        html = html.replace(k, KM_JS[k])
+    return html
+
+
+def _tr_cfg(df, cfg):
+    """Column labels for st.dataframe / st.data_editor (the real column names stay, so the code still works)."""
+    cols = [str(c) for c in getattr(df, "columns", [])]
+    out = dict(cfg or {})
+    for c in cols:
+        v = out.get(c, None)
+        if v is None and c in out:
+            continue                                            # hidden column
+        if isinstance(v, str):
+            out[c] = tr(v)
+        elif isinstance(v, dict):
+            v = dict(v)
+            v["label"] = tr(v.get("label") or c)
+            if v.get("help"):
+                v["help"] = tr(v["help"])
+            out[c] = v
+        elif v is None:
+            t = tr(c)
+            if t != c:
+                out[c] = {"label": t}
+    return out
+
+
+def _install_tr():
+    """Wrap Streamlit's screen functions once, so every label / message goes through tr()."""
+    from streamlit.delta_generator import DeltaGenerator as DG
+    if getattr(DG, "_hk_tr", False):
+        return
+    first = ["markdown", "caption", "subheader", "header", "title", "info", "warning", "success", "error", "button",
+             "download_button", "expander", "checkbox", "toggle", "text_input", "number_input", "date_input",
+             "time_input", "text_area", "toast", "form_submit_button", "popover", "slider", "file_uploader",
+             "link_button", "radio", "selectbox", "multiselect", "select_slider", "pills", "segmented_control",
+             "metric", "write", "page_link", "status", "color_picker", "camera_input", "feedback"]
+    kw_text = ("label", "body", "help", "placeholder", "caption")
+    choice = {"radio", "selectbox", "multiselect", "select_slider", "pills", "segmented_control"}
+
+    def wrap(name, fn):
+        def w(self, *a, **k):
+            if lang() == "km":
+                a = list(a)
+                if a and isinstance(a[0], str) and name != "write":
+                    a[0] = tr(a[0])
+                elif name == "write":
+                    a = [tr(x) if isinstance(x, str) else x for x in a]
+                if name == "metric" and len(a) > 1 and isinstance(a[1], str):
+                    a[1] = tr(a[1])
+                for kk in kw_text:
+                    if isinstance(k.get(kk), str):
+                        k[kk] = tr(k[kk])
+                if name in choice:
+                    ff = k.get("format_func") or str
+                    k["format_func"] = lambda x, _f=ff: tr(_f(x))
+                if name == "radio" and isinstance(k.get("captions"), (list, tuple)):
+                    k["captions"] = [tr(x) for x in k["captions"]]
+            return fn(self, *a, **k)
+        w.__name__ = name
+        return w
+
+    for n in first:
+        if hasattr(DG, n):
+            setattr(DG, n, wrap(n, getattr(DG, n)))
+    tabs0 = DG.tabs
+
+    def tabs(self, labels, *a, **k):
+        return tabs0(self, [tr(x) for x in labels] if lang() == "km" else labels, *a, **k)
+    DG.tabs = tabs
+    for n in ("dataframe", "data_editor"):
+        f0 = getattr(DG, n)
+
+        def tbl(self, data=None, *a, _f=f0, _n=n, **k):
+            if lang() == "km" and data is not None and hasattr(data, "columns"):
+                k["column_config"] = _tr_cfg(data, k.get("column_config"))
+                if _n == "dataframe":                      # read-only: the words in the cells too
+                    try:
+                        data = data.copy()
+                        for c in data.columns:
+                            if data[c].dtype == object or str(data[c].dtype).startswith("str"):
+                                data[c] = data[c].map(lambda x: tr(x) if isinstance(x, str) else x)
+                    except Exception:
+                        pass
+            return _f(self, data, *a, **k)
+        setattr(DG, n, tbl)
+    DG._hk_tr = True
+    import streamlit as _st
+    main = getattr(_st, "_main", None)
+    for n in first + ["tabs", "dataframe", "data_editor"]:
+        if main is not None and hasattr(_st, n) and hasattr(main, n):
+            try:
+                setattr(_st, n, getattr(main, n))
+            except Exception:
+                pass
+
+
+_install_tr()
+
+
 try:
     from zoneinfo import ZoneInfo
     TZ = ZoneInfo("Asia/Phnom_Penh")
@@ -3345,7 +4296,7 @@ def page_rooms(cfg):
                      for i, b in enumerate(present)],
             "shelf": {b: int(cfg.get("shelf_by_bun", {}).get(b, cfg.get("shelf_days", 10))) for b in buns}}
     h = 430 if st.session_state.get("phone_mode") else 600
-    components.html(ROOM3D_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)).replace("__H__", str(h))
+    components.html(tr_js(ROOM3D_HTML.replace("__DATA__", json.dumps(data, ensure_ascii=False)).replace("__H__", str(h)))
                     .replace("__START__", ""), height=h + 190)
 
     st.markdown("#### 📋 Room sheet — your Excel layout (today)")
@@ -4351,7 +5302,30 @@ def bot_banner():
 # MAIN
 # ==========================================
 st.markdown(CSS, unsafe_allow_html=True)
-if not st.session_state.get("p_user") and not restore_login():
+_logged = bool(st.session_state.get("p_user")) or restore_login()
+# 🌐 English / ខ្មែរ — remembered per person (and in the link: ?lang=km)
+if "lang" not in st.session_state:
+    try:
+        _q = st.query_params.get("lang", "")
+    except Exception:
+        _q = ""
+    st.session_state["lang"] = _q if _q in LANGS else "en"
+if _logged and not st.session_state.get("lang_user_done"):
+    st.session_state["lang_user_done"] = True
+    try:
+        _pref = (load_settings()[0].get("lang_by_user") or {}).get(st.session_state.get("p_user"))
+        if _pref in LANGS and not st.session_state.get("lang_dirty"):
+            st.session_state["lang"] = _pref
+    except Exception:
+        pass
+_l1, _l2 = st.columns([5, 2])
+_l2.radio("🌐", list(LANGS), format_func=lambda x: LANGS[x], key="lang", horizontal=True,
+          label_visibility="collapsed", on_change=lambda: st.session_state.update(lang_dirty=True))
+try:
+    st.query_params["lang"] = st.session_state["lang"]
+except Exception:
+    pass
+if not _logged:
     login_box()
 if st.session_state.get("p_tok") and (st.session_state.pop("p_cookie_set", False)
                                       or time.time() - st.session_state.get("p_cookie_t", 0) > 600):
@@ -4359,6 +5333,11 @@ if st.session_state.get("p_tok") and (st.session_state.pop("p_cookie_set", False
     st.session_state["p_cookie_t"] = time.time()
 cfg, _srev = load_settings()
 me_user, me_role = st.session_state["p_user"], st.session_state.get("p_role", "staff")
+if st.session_state.pop("lang_dirty", False) and (cfg.get("lang_by_user") or {}).get(me_user) != lang():
+    try:                                                     # remember the language of this person
+        update_settings(lambda c: c.setdefault("lang_by_user", {}).update({me_user: lang()}))
+    except Exception:
+        pass
 me = st.session_state.get("p_name") or me_user
 level = access_of(me_user, me_role, cfg)
 if level == "hidden":
