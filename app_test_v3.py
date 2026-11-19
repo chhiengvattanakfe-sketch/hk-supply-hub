@@ -2457,8 +2457,10 @@ DOOR_SPOTS = ["front-middle", "front-left", "front-right", "back-middle", "back-
 DEFAULT_ROOMS = [{"name": "❄️ Cooling room", "cols": 9, "rows": 8, "high": 15, "blocked": "1:5-8=Cooling fan; 1:9",
                   "door_in": "right-back", "door_out": "front-middle", "h": 3.0},
                  {"name": "🧊 Freezer room", "cols": 9, "rows": 9, "high": 15, "blocked": "",
-                  "door_in": "front-middle", "door_out": "front-middle", "h": 3.0, "back_m": 1.6, "aeon_rows": 11}]
+                  "door_in": "front-middle", "door_out": "front-middle", "h": 3.0, "back_m": 1.6, "aeon_rows": 11,
+                  "aisle_m": 0.5}]
 RAW_LABEL = "Raw material"                                 # the empty space kept at the back of a room
+WALK_LABEL = "🚶 Walkway"                                  # kept free between the frozen lanes and the AEON line
 DEFAULT_CRATE = {"w": 44.0, "l": 63.0, "h": 14.6}                  # cm
 DEFAULT_CRATE_PCS = {"N1": 48, "N2": 62, "N21": 52, "N22": 62, "N23": 62, "N3": 63, "N31": 63, "N32": 63, "N33": 63,
                      "N34": 63, "N4": 60, "N41": 60, "N42": 60, "N43": 60}
@@ -2503,11 +2505,13 @@ def rooms_of(cfg):
             arows = (11 if i == 1 else 0) if arows is None or arows == "" else max(0, int(float(arows)))
             high = max(1, int(r.get("high") or 15))
             a_high = max(1, int(float(r.get("aeon_high") or high)))
+            aisle = r.get("aisle_m")
+            aisle = (0.5 if i == 1 else 0.0) if aisle is None or aisle == "" else max(0.0, float(aisle))
             out.append({"name": str(r["name"]).strip(), "cols": max(1, int(r["cols"])), "rows": max(1, int(r["rows"])),
                         "high": high, "aeon_high": a_high, "blocked": str(r.get("blocked") or ""),
                         "door_in": r.get("door_in") if r.get("door_in") in DOOR_SPOTS else "back-middle",
                         "door_out": r.get("door_out") if r.get("door_out") in DOOR_SPOTS else "front-middle",
-                        "h": float(r.get("h") or 3.0), "back_m": back, "aeon_rows": arows})
+                        "h": float(r.get("h") or 3.0), "back_m": back, "aeon_rows": arows, "aisle_m": aisle})
         except Exception:
             continue
     return [r for r in out if r["name"]] or [dict(x) for x in DEFAULT_ROOMS]
@@ -2540,6 +2544,13 @@ def room_geom(room, cr):
     for r in range(back_rows):                                 # kept empty at the back (row 1 = back)
         for c in range(room["cols"] - (1 if arows else 0)):    # (the turned AEON line runs the whole wall)
             blocked.setdefault((r, c), RAW_LABEL)
+    walk_cols = []
+    if arows and float(room.get("aisle_m") or 0) > 0 and room["cols"] > 2:
+        n_walk = max(1, int(round(float(room["aisle_m"]) / (cr["w"] + GRID_GAP))))   # whole columns
+        walk_cols = list(range(max(0, room["cols"] - 1 - n_walk), room["cols"] - 1))
+        for c in walk_cols:                                    # 🚶 free from the door to the back, next to AEON
+            for r in range(room["rows"]):
+                blocked[(r, c)] = WALK_LABEL
     fit = int((room["h"] - 0.15) // cr["h"])                  # crates that fit under the ceiling
     high = max(1, min(room["high"], fit))
     a_high = max(1, min(int(room.get("aeon_high") or room["high"]), fit)) if arows else high
@@ -2550,6 +2561,7 @@ def room_geom(room, cr):
     return {"name": room["name"], "cols": room["cols"], "rows": room["rows"], "high": high, "places": places,
             "capacity": (places - arows) * high + arows * a_high,
             "blocked": blocked, "back_rows": back_rows, "aeon_rows": arows, "aeon_high": a_high,
+            "walk_cols": walk_cols, "walk_m": round(len(walk_cols) * (cr["w"] + GRID_GAP), 2),
             "w": round((room["cols"] - (1 if arows else 0)) * (cr["w"] + GRID_GAP) + ((cr["l"] + GRID_GAP) if arows else 0), 2),
             "l": round(room["rows"] * (cr["l"] + GRID_GAP), 2), "h": room["h"]}
 
@@ -3012,6 +3024,7 @@ function draw(){const k=cam();ctx.setTransform(1,0,0,1,0,0);ctx.clearRect(0,0,cv
   if(dims){line(k,[o,0,-0.45],[o+r.w,0,-0.45],'#adb5bd',1);labels.push({v:[o+r.w/2,0,-0.75],t:r.cols+' stacks · '+r.w+' m',c:'#ced4da',fs:10,pr:2});
    line(k,[o-0.4,0,0],[o-0.4,0,r.l],'#adb5bd',1);labels.push({v:[o-0.8,0,r.l/2],t:r.rows+' deep · '+r.l+' m',c:'#ced4da',fs:10,pr:2});}
   r.blocked.forEach(([row,c,t,raw])=>{const [x,z]=XZ(r,c,row);
+   if(raw===2){quad(x,z,x+CW+GAP,z+CL+GAP,'rgba(255,212,59,.30)');if(row===r.rows-1)labels.push({v:[x+CW/2,0.15,z+CL/2],t:'🚶 Walkway (keep free)',c:'#ffe066',fs:10,pr:2});return;}
    if(raw){quad(x,z,x+CW+GAP,z+CL+GAP,'rgba(173,181,189,.35)');if(t&&t.trim())labels.push({v:[x+CW/2,0.15,z+CL/2],t:'📦 '+t+' (keep empty)',c:'#dee2e6',fs:10,pr:1});return;}
    addBox(L,k,x,0,z,CW,1.4,CL,t?'#364fc7':'#e8590c',0.55,null,0);
    if(t&&t.trim())labels.push({v:[x+CW/2,1.6,z+CL/2],t,c:'#bac8ff',fs:10,pr:1});});
@@ -3081,6 +3094,8 @@ def _lane_names(g, plan):
     out = {ln["c"]: f"L{i + 1} {lane_label(ln.get('key'))}" for i, ln in enumerate((plan or {}).get("lanes", []))}
     if g.get("aeon_rows") and g["cols"] > 1:
         out[g["cols"] - 1] = "🛒 AEON"
+    for c in g.get("walk_cols") or []:
+        out[c] = "🚶"
     return out
 
 
@@ -3123,8 +3138,9 @@ def room_sheet_html(room, g, stacks, names, new=None, reserve=None, plan=None, t
                 lab, span = g["blocked"][(r, c)], 1
                 while c + span < g["cols"] and g["blocked"].get((r, c + span)) == lab and (r, c + span) in g["blocked"]:
                     span += 1
-                bg = "#ED7D31" if not lab else ("#e9ecef" if lab == RAW_LABEL else "#fff")
-                h.append(f"<td colspan='{span}' style='{bd}background:{bg};padding:6px'>{lab}</td>")
+                bg = "#ED7D31" if not lab else ("#e9ecef" if lab == RAW_LABEL else "#fff3bf" if lab == WALK_LABEL else "#fff")
+                h.append(f"<td colspan='{span}' style='{bd}background:{bg};padding:6px'>"
+                         f"{'🚶' if lab == WALK_LABEL else lab}</td>")
                 c += span
                 continue
             s = cells.get((r, c))
@@ -3323,7 +3339,7 @@ def page_rooms(cfg):
                        "cap": geoms[r["name"]]["capacity"], "din": r["door_in"], "dout": r["door_out"],
                        "blocked": [[k[0], k[1], v if v and (k[0], k[1] - 1) not in geoms[r["name"]]["blocked"]
                                     or v and geoms[r["name"]]["blocked"].get((k[0], k[1] - 1)) != v else ("" if not v else " "),
-                                    1 if v == RAW_LABEL else 0]
+                                    1 if v == RAW_LABEL else 2 if v == WALK_LABEL else 0]
                                    for k, v in sorted(geoms[r["name"]]["blocked"].items())]} for r in rooms],
             "buns": [{"code": b, "label": f"{b} {names.get(b, '')}".strip(), "color": CRATE_COLORS.get(b, EXTRA_COLORS[i % 7])}
                      for i, b in enumerate(present)],
@@ -3377,6 +3393,7 @@ def rooms_settings(cfg, buns, names, n, kp="set", speed=None):
                "side). Blocked = places with no stock, e.g. `1:5-8=Cooling fan; 1:9-10` (row:columns=name).")
     rdf = pd.DataFrame([{"Room": r["name"], "Stacks across": r["cols"], "Stacks deep": r["rows"], "Crates high": r["high"],
                          "AEON line high": r["aeon_high"], "Height (m)": r["h"], "Empty at back (m)": r["back_m"], "AEON line places": r["aeon_rows"],
+                         "Walkway before AEON (m)": r["aisle_m"],
                          "Blocked places": r["blocked"],
                          "Door IN": r["door_in"], "Door OUT": r["door_out"]} for r in rooms_of(cfg)])
     hi_opts = sorted({12, 15} | {int(r["high"]) for r in rooms_of(cfg)} | {int(r["aeon_high"]) for r in rooms_of(cfg)})
@@ -3399,6 +3416,10 @@ def rooms_settings(cfg, buns, names, n, kp="set", speed=None):
                                             "🛒 AEON line places", min_value=0, max_value=40, step=1,
                                             help="Right-hand line for the AEON stock with the crates turned (e.g. 11). "
                                                  "0 = no AEON line in this room"),
+                                        "Walkway before AEON (m)": st.column_config.NumberColumn(
+                                            "🚶 Walkway before AEON (m)", min_value=0.0, max_value=3.0, step=0.1,
+                                            format="%.1f", help="Free path between the frozen lanes and the AEON line "
+                                                                "(whole stack columns, ~0.49 m each). 0 = none"),
                                         "Blocked places": st.column_config.TextColumn("Blocked places"),
                                         "Door IN": st.column_config.SelectboxColumn("🟢 Door IN", options=DOOR_SPOTS, required=True),
                                         "Door OUT": st.column_config.SelectboxColumn("🟠 Door OUT", options=DOOR_SPOTS, required=True)})
@@ -3412,6 +3433,7 @@ def rooms_settings(cfg, buns, names, n, kp="set", speed=None):
                               "h": float(r.get("Height (m)") or 3.0),
                               "back_m": float(r.get("Empty at back (m)") or 0),
                               "aeon_rows": int(r.get("AEON line places") or 0),
+                              "aisle_m": float(r.get("Walkway before AEON (m)") or 0),
                               "blocked": str(r.get("Blocked places") or ""), "door_in": r.get("Door IN") or "back-middle",
                               "door_out": r.get("Door OUT") or "front-middle"})
             except Exception:
@@ -3428,6 +3450,7 @@ def rooms_settings(cfg, buns, names, n, kp="set", speed=None):
         + (f" (AEON line {g['aeon_rows']} × {g['aeon_high']} high)" if g["aeon_rows"] else "")
         + f" = {g['capacity']:,} crates"
         + (f" (back {g['back_rows']} rows = {g['back_rows'] * (cr['l'] + GRID_GAP):.2f} m kept empty)" if g["back_rows"] else "")
+        + (f" (🚶 walkway {g['walk_m']:.2f} m before the AEON line)" if g.get("walk_cols") else "")
         for r in rooms for g in [room_geom(r, cr)]))
     st.caption("Which room: ❄️ cooling stock → the first room · 🧊 frozen stock → the second room · 🛒 AEON stock → "
                "its own line on the right of the frozen room (from the evening counts and 🚚 moves).")
