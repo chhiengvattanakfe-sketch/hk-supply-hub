@@ -797,6 +797,31 @@ KM = {
     "Settings were being saved by someone else. Try again.": "មានអ្នកផ្សេងកំពុងរក្សាទុកការកំណត់។ សូមព្យាយាមម្តងទៀត។",
     "Someone else is saving the accounts right now. Try again.": "មានអ្នកផ្សេងកំពុងរក្សាទុកគណនី។ សូមព្យាយាមម្តងទៀត។",
     "The accounts file cannot be read safely — nothing was changed.": "មិនអាចអានឯកសារគណនីដោយសុវត្ថិភាព — គ្មានអ្វីត្រូវបានផ្លាស់ប្តូរ។",
+
+    # --- morning / evening counts ------------------------------------------------------------------
+    "Count date": "ថ្ងៃរាប់",
+    "When did you count?": "តើអ្នករាប់នៅពេលណា?",
+    "🌅 Morning — before the day's sales": "🌅 ពេលព្រឹក — មុនការលក់ប្រចាំថ្ងៃ",
+    "🌙 Evening — after the day's sales": "🌙 ពេលល្ងាច — ក្រោយការលក់ប្រចាំថ្ងៃ",
+    "Count each stock and press its 💾 Save.": "រាប់ស្តុកនីមួយៗ ហើយចុច 💾 រក្សាទុក របស់វា។",
+    "— the others keep their last count. The sheets start with what the app expects: only change what is different. Evening: first":
+        "— ស្តុកផ្សេងរក្សាការរាប់ចុងក្រោយ។ តារាងចាប់ផ្តើមពីអ្វីដែលកម្មវិធីរំពឹង: កែតែអ្វីដែលខុស។ ពេលល្ងាច: ដំបូង",
+    "🚚 move": "🚚 ផ្ទេរ",
+    "what the cooling room needs for tomorrow.": "អ្វីដែលទូរត្រជាក់ត្រូវការសម្រាប់ថ្ងៃស្អែក។",
+    "🌅 Morning count of": "🌅 ការរាប់ពេលព្រឹកថ្ងៃ",
+    ": saved as the stock at the end of": ": រក្សាទុកជាស្តុកនៅចុងថ្ងៃ",
+    ". The sales of": "។ ការលក់ថ្ងៃ",
+    "are taken off it.": "ត្រូវដកចេញពីវា។",
+    "are taken off.": "ត្រូវដកចេញ។",
+    "Count before anything is sold or delivered.": "សូមរាប់មុនពេលលក់ ឬដឹកនំចេញ។",
+    "· counted": "· បានរាប់",
+    "(morning). Counted before the day's sales? Then press 🌅 below: the count becomes the stock at the end of":
+        "(ពេលព្រឹក)។ រាប់មុនការលក់ប្រចាំថ្ងៃឬ? បើដូច្នេះ ចុច 🌅 ខាងក្រោម: ការរាប់នឹងក្លាយជាស្តុកនៅចុងថ្ងៃ",
+    ", and the sales of": " ហើយការលក់ថ្ងៃ",
+    "🌅 Yes — counted before the day's sales (fix)": "🌅 បាទ/ចាស — រាប់មុនការលក់ (កែ)",
+    "🌙 No — it is the stock at the end of the day": "🌙 ទេ — វាជាស្តុកនៅចុងថ្ងៃ",
+    ": fixed — now the stock at the end of": ": បានកែ — ឥឡូវជាស្តុកនៅចុងថ្ងៃ",
+    "count moved to morning": "ការរាប់ត្រូវប្តូរទៅពេលព្រឹក",
 }
 
 # the 3D view (JavaScript text): exact phrases only
@@ -2174,6 +2199,8 @@ def page_live(cfg, can_edit):
     prod, counts, adjs, sales, names, buns = get_data(cfg)
     t = today_kh()
     pl_stock, short, hist, no_count, base = compute_places(buns, prod, counts, adjs, sales, t)
+    show_flash("c_flash")
+    morning_count_banner(cfg, can_edit, st.session_state.get("p_user", ""), base, "live")
     batches = merge_places(pl_stock, buns)
     speed, n_sell = sales_speed(sales, buns, t, int(cfg["lookback_days"]))
     total = sum(sum(v.values()) for v in batches.values())
@@ -2615,17 +2642,28 @@ def _count_phone(places, start_rows, show, names, cd, sig, single=False):
 
 
 def page_count(cfg, can_edit, me):
-    st.subheader("📦 Evening stock count")
+    st.subheader("📦 Stock count")
     prod, counts, adjs, sales, names, buns = get_data(cfg)
     show_flash("c_flash")
     pn = place_names(cfg)
     c1, c2 = st.columns([1, 2])
-    cd = c1.date_input("Count date (stock at the END of this day)", value=today_kh(), max_value=today_kh(), key="cnt_date")
-    pl_stock, _short, _h, _nc, base = compute_places(buns, prod, counts, adjs, sales, cd)
-    show = active_buns(buns, sales, merge_places(pl_stock, buns))
-    c2.caption("Evening: first **🚚 move** what the cooling room needs for tomorrow, then count each stock. "
-               "**Each stock is saved by itself** — count and save one, the others keep their last count. "
-               "The sheets start with what the app expects: only change what is different.")
+    cd = c1.date_input("Count date", value=today_kh(), max_value=today_kh(), key="cnt_date")
+    when_opts = ["🌅 Morning — before the day's sales", "🌙 Evening — after the day's sales"]
+    if "cnt_when" not in st.session_state:
+        st.session_state["cnt_when"] = when_opts[0] if now_kh().hour < 12 else when_opts[1]
+    when = c1.radio("When did you count?", when_opts, key="cnt_when")
+    morning = when.startswith("🌅")
+    cd_save = cd - timedelta(days=1) if morning else cd           # a morning count = the stock at the end of the day before
+    pl_now, _s0, _h0, _n0, base = compute_places(buns, prod, counts, adjs, sales, cd)
+    pl_stock = pl_now if not morning else compute_places(buns, prod, counts, adjs, sales, cd_save)[0]
+    show = active_buns(buns, sales, merge_places(pl_now, buns))
+    c2.caption("Count each stock and press its 💾 Save. **Each stock is saved by itself** — the others keep their "
+               "last count. The sheets start with what the app expects: only change what is different. "
+               "Evening: first **🚚 move** what the cooling room needs for tomorrow.")
+    if morning:
+        c2.info(f"🌅 Morning count of {cd:%d %b}: saved as the stock at the end of **{cd_save:%d %b}**. The sales of "
+                f"{cd:%d %b} are taken off it. Count before anything is sold or delivered.")
+    morning_count_banner(cfg, can_edit, me, base, "cnt")
     mode = st.radio("Start the sheets from", ["🧮 What the app expects (recommended)", "⬜ Empty sheets"],
                     horizontal=True, key="cnt_mode")
     sections = ["🚚 Move frozen → cooling"] + [place_label(cfg, r) for r in ROLES] + ["📊 All stock"]
@@ -2637,23 +2675,23 @@ def page_count(cfg, can_edit, me):
         boxes = dict(zip(sections, tabs))
     if boxes[sections[0]] is not None:
         with boxes[sections[0]]:
-            _move_panel(cfg, can_edit, me, cd, pl_stock, sales, buns, names, show)
+            _move_panel(cfg, can_edit, me, cd, pl_now, sales, buns, names, show)
     counted_all = {}
     for r in ROLES:
         box = boxes[place_label(cfg, r)]
         if box is None:
             continue
         with box:
-            counted_all[r] = _count_place(cfg, can_edit, me, r, cd, mode, pl_stock, base, show, names, buns)
+            counted_all[r] = _count_place(cfg, can_edit, me, r, cd_save, mode, pl_stock, base, show, names, buns)
     if boxes[sections[-1]] is not None:
         with boxes[sections[-1]]:
             rows = []
             for r in ROLES:
                 info = base.get(r)
-                rows.append({"Stock": place_label(cfg, r), "Now (app)": int(round(sum(sum(v.values()) for v in pl_stock[r].values()))),
+                rows.append({"Stock": place_label(cfg, r), "Now (app)": int(round(sum(sum(v.values()) for v in pl_now[r].values()))),
                              "Last count": f"{info[0]:%d %b} · {info[3][11:16]} · {info[4]}" if info else "never counted"})
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-            tot = merge_places(pl_stock, show)
+            tot = merge_places(pl_now, show)
             allr = {}
             for b in show:
                 for d, v in tot.get(b, {}).items():
@@ -2661,13 +2699,65 @@ def page_count(cfg, can_edit, me):
             st.markdown(excel_html(f"ស្តុកនំសរុប ({cd:%d.%m.%Y}) — all 3 stocks", [(day_label(d), v) for d, v in sorted(allr.items())],
                                    show), unsafe_allow_html=True)
             sheets = {pn[r]: sorted(counted_all.get(r) or [(d, {b: round(v) for b, v in vals.items()}) for d, vals in
-                                                             _rows_of(pl_stock[r], show)]) for r in ROLES}
+                                                             _rows_of(pl_now[r], show)]) for r in ROLES}
             st.download_button("📥 Count sheets for printing (Excel, your layout)",
                                data=count_sheet_excel([pn[r] for r in ROLES], sheets, show, cd),
                                file_name=f"Stock_count_{cd:%Y-%m-%d}.xlsx", key="cnt_xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.divider()
     _adjust_panel(cfg, can_edit, me, adjs, buns, names)
+
+
+def _fix_count_date(cid, new_cd):
+    """Moves one saved count to another count date (e.g. a morning count -> the end of the day before)."""
+    def change(df):
+        m = df["Count_Id"].astype(str) == str(cid)
+        old = df.loc[m, "Count_Date"].astype(str)
+        df.loc[m, "Count_Date"] = new_cd.isoformat()
+        z = m & (df["Pcs"].map(_num).astype(float) == 0) & (df["Prod_Date"].astype(str).isin(set(old)))
+        df.loc[z, "Prod_Date"] = new_cd.isoformat()           # the 0 rows of absent buns follow the count
+        return df
+    modify_csv(COUNT_FILE, COUNT_COLS, change)
+
+
+def morning_count_banner(cfg, can_edit, me, base, key):
+    """A count saved before noon with today's date was most likely counted BEFORE the day's sales. As the stock at
+    the end of that day, that day's sales would never be taken off — ask once, and fix it with one tap."""
+    ok_ids = set(cfg.get("count_checked") or [])
+    for role in ROLES:
+        info = base.get(role)
+        if not info:
+            continue
+        cd, cid, saved = info[0], str(info[2]), str(info[3])
+        try:
+            sd, hour = date.fromisoformat(saved[:10]), int(saved[11:13])
+        except Exception:
+            continue
+        if sd != cd or hour >= 12 or cid in ok_ids:
+            continue
+        pn = place_label(cfg, role)
+        st.warning(f"🌅 **{pn}** · counted {cd:%d %b} {saved[11:16]} (morning). Counted before the day's sales? Then "
+                   f"press 🌅 below: the count becomes the stock at the end of {cd - timedelta(days=1):%d %b}, and "
+                   f"the sales of {cd:%d %b} are taken off.")
+        if not can_edit:
+            continue
+        b1, b2 = st.columns(2)
+        if b1.button("🌅 Yes — counted before the day's sales (fix)", key=f"{key}_mfix_{role}", type="primary"):
+            try:
+                _fix_count_date(cid, cd - timedelta(days=1))
+                audit("count moved to morning", f"{pn}: {cd:%d %b} {saved[11:16]} -> end of {cd - timedelta(days=1):%d %b}")
+                st.session_state["c_flash"] = (f"✅ {pn}: fixed — now the stock at the end of "
+                                               f"{cd - timedelta(days=1):%d %b}. The sales of {cd:%d %b} are taken off.")
+            except Exception as e:
+                st.error(f"⚠️ Not changed: {e}")
+                return
+            st.rerun()
+        if b2.button("🌙 No — it is the stock at the end of the day", key=f"{key}_mok_{role}"):
+            try:
+                update_settings(lambda c: c.setdefault("count_checked", []).append(cid))
+            except Exception:
+                pass
+            st.rerun()
 
 
 def _rows_of(stock_role, show):
