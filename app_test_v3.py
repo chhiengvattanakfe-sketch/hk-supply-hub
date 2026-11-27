@@ -872,6 +872,19 @@ KM = {
     "⚠️ The sale journal of this month was not found in the Dropbox folder (": "⚠️ រកមិនឃើញបញ្ជីលក់ខែនេះក្នុង Dropbox (",
     ".xlsx) — today's sales count as 0, so the stock is too high. Put the file back in the folder (same name).":
         ".xlsx) — ការលក់ថ្ងៃនេះត្រូវបានគិតជា 0 ដូច្នេះស្តុកខ្ពស់ពេក។ សូមដាក់ឯកសារត្រឡប់ចូលថតវិញ (ឈ្មោះដដែល)។",
+    "📤 Stock for the sale journal (orange line)": "📤 ស្តុកសម្រាប់បញ្ជីលក់ (ជួរពណ៌ទឹកក្រូច)",
+    "sent": "បានផ្ញើ",
+    "Once a day — the first time 📊 Live stock is opened, and again after a new stock count — the stock that sales can sell goes to Dropbox **Auto_Status/LIVE_STOCK.csv**. The sale journal reads it (Power Query) into its orange line: stock this morning − today's orders in the journal = what is left to sell.":
+        "ម្តងក្នុងមួយថ្ងៃ — ពេលបើក 📊 ស្តុកផ្ទាល់ លើកដំបូង និងម្តងទៀតក្រោយរាប់ស្តុកថ្មី — ស្តុកដែលផ្នែកលក់អាចលក់បាន ត្រូវបានផ្ញើទៅ Dropbox **Auto_Status/LIVE_STOCK.csv**។ បញ្ជីលក់អានវា (Power Query) ចូលជួរពណ៌ទឹកក្រូច: ស្តុកព្រឹកនេះ − ការបញ្ជាទិញថ្ងៃនេះក្នុងបញ្ជីលក់ = ចំនួននៅសល់សម្រាប់លក់។",
+    "⚠️ Not sent:": "⚠️ មិនបានផ្ញើ:",
+    "Not sent today: the sale journal of this month is missing, so the stock would be too high.":
+        "មិនបានផ្ញើថ្ងៃនេះ: រកមិនឃើញបញ្ជីលក់ខែនេះ ដូច្នេះស្តុកនឹងខ្ពស់ពេក។",
+    "🌅 Can sell (this morning)": "🌅 អាចលក់ (ព្រឹកនេះ)",
+    "🧾 Sold so far": "🧾 លក់រួច",
+    "📦 Left now": "📦 នៅសល់ឥឡូវ",
+    "📤 Send to the sale journal now": "📤 ផ្ញើទៅបញ្ជីលក់ឥឡូវ",
+    "— in Excel press Data → Refresh All.": "— ក្នុង Excel ចុច Data → Refresh All។",
+    "stock sent to sale journal": "បានផ្ញើស្តុកទៅបញ្ជីលក់",
     "✏️ Adjust sales / day and target days": "✏️ កែការលក់ / ថ្ងៃ និងថ្ងៃគោលដៅ",
     "✏️ Adjust the plan — max production per day, sales / day, target days": "✏️ កែផែនការ — ការផលិតអតិបរមាក្នុងមួយថ្ងៃ, ការលក់ / ថ្ងៃ, ថ្ងៃគោលដៅ",
     "🎯 Target days": "🎯 ថ្ងៃគោលដៅ",
@@ -2359,6 +2372,96 @@ def stock_status(stock, speed, tgt):
     return "🟢 OK"
 
 
+
+# ---- 📤 stock for the sale journal (the orange line): Auto_Status/LIVE_STOCK.csv, once a day -------------------
+STOCK_PUB_FILE = "Auto_Status/LIVE_STOCK.csv"
+STOCK_PUB_COLS = ["Date", "Bun", "Name", "Can_Sell_Start", "Sold_At_Update", "Stock_Now", "Sales_Per_Day",
+                  "Days_Of_Stock", "Status", "Updated_At", "Count_Id"]
+
+
+def _pub_state():
+    m = _mem()
+    return m.setdefault("stock_pub", {"day": None, "sig": None, "at": None, "err": ""})
+
+
+def _pub_read_head():
+    """(date, count signature, updated at) of the file that is there now, or (None, None, None)."""
+    try:
+        if USE_DROPBOX:
+            _md, res = _dbx().files_download(f"{DROPBOX_FOLDER}/{STOCK_PUB_FILE}")
+            data = res.content
+        else:
+            with open(os.path.join(LOCAL_DIR, STOCK_PUB_FILE), "rb") as f:
+                data = f.read()
+        df = pd.read_csv(io.BytesIO(data), dtype=str, encoding="utf-8-sig")
+        if df.empty:
+            return None, None, None
+        return str(df["Date"].iloc[0]), str(df["Count_Id"].iloc[0]), str(df["Updated_At"].iloc[0])
+    except Exception:
+        return None, None, None
+
+
+def publish_stock(pub, sig):
+    """Write the stock list for the sale journal (overwrites; Excel reads it with Power Query)."""
+    stamp = now_kh().strftime("%Y-%m-%d %H:%M")
+    df = pd.DataFrame(pub)
+    df["Updated_At"], df["Count_Id"] = stamp, sig
+    data = df.reindex(columns=STOCK_PUB_COLS).to_csv(index=False).encode("utf-8-sig")
+    if USE_DROPBOX:
+        import dropbox
+        _dbx().files_upload(data, f"{DROPBOX_FOLDER}/{STOCK_PUB_FILE}", mode=dropbox.files.WriteMode.overwrite,
+                            mute=True)
+    else:
+        p = os.path.join(LOCAL_DIR, STOCK_PUB_FILE)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+    stt = _pub_state()
+    stt.update(day=pub[0]["Date"] if pub else None, sig=sig, at=stamp, err="")
+    return data
+
+
+def stock_for_journal(cfg, can_edit, pub, base):
+    """Once a day (first time 📊 Live stock is opened, and again after a new stock count) the stock for sale goes
+    to Auto_Status/LIVE_STOCK.csv; the journal's orange line reads it. Not when the journal is missing."""
+    if not pub:
+        return
+    sig = "|".join(f"{r}:{base[r][2]}" for r in sorted(base)) or "-"
+    stt = _pub_state()
+    day = pub[0]["Date"]
+    if stt["day"] is None:                                   # after a restart: what is in the file now?
+        d0, s0, a0 = _pub_read_head()
+        stt.update(day=d0, sig=s0, at=a0)
+    due = (stt["day"] != day or stt["sig"] != sig) and not JOURNAL_MISSING
+    if due:
+        try:
+            publish_stock(pub, sig)
+        except Exception as e:
+            stt["err"] = str(e)[:150]
+    with st.expander("📤 Stock for the sale journal (orange line)"
+                     + (f" · sent {stt['at']}" if stt.get("at") else ""), expanded=False):
+        st.caption("Once a day — the first time 📊 Live stock is opened, and again after a new stock count — the "
+                   "stock that sales can sell goes to Dropbox **Auto_Status/LIVE_STOCK.csv**. The sale journal reads it "
+                   "(Power Query) into its orange line: stock this morning − today's orders in the journal = what is "
+                   "left to sell.")
+        if stt.get("err"):
+            st.warning(f"⚠️ Not sent: {stt['err']}")
+        if JOURNAL_MISSING:
+            st.warning("Not sent today: the sale journal of this month is missing, so the stock would be too high.")
+        prev = pd.DataFrame(pub)[["Bun", "Name", "Can_Sell_Start", "Sold_At_Update", "Stock_Now", "Days_Of_Stock"]]
+        st.dataframe(prev, hide_index=True, width="stretch", column_config={
+            "Can_Sell_Start": st.column_config.NumberColumn("🌅 Can sell (this morning)", format="%d"),
+            "Sold_At_Update": st.column_config.NumberColumn("🧾 Sold so far", format="%d"),
+            "Stock_Now": st.column_config.NumberColumn("📦 Left now", format="%d")})
+        if can_edit and st.button("📤 Send to the sale journal now", key="pub_now"):
+            try:
+                publish_stock(pub, sig)
+                audit("stock sent to sale journal", f"{sum(r['Can_Sell_Start'] for r in pub):,} pcs")
+                st.success(f"✅ Sent {_pub_state()['at']} — in Excel press Data → Refresh All.")
+            except Exception as e:
+                st.error(f"⚠️ Not sent: {e}")
+
+
 def page_live(cfg, can_edit):
     st.subheader("📊 Live stock")
     prod, counts, adjs, sales, names, buns = get_data(cfg)
@@ -2386,7 +2489,7 @@ def page_live(cfg, can_edit):
     p_today = prod[prod["Prod_Date"].map(_day) == t]["Pcs"].map(_num).astype(float).sum()
     s_today = sales[sales["Date"] == t]["Pcs"].sum() if not sales.empty else 0
     shelf = int(cfg.get("shelf_days", 10))
-    rows, alerts = [], []
+    rows, alerts, pub = [], [], []
     for b in buns:
         stk = sum(batches[b].values())
         tgt = int(cfg["target_days"].get(b, cfg["target_default"]))
@@ -2397,6 +2500,9 @@ def page_live(cfg, can_edit):
         old_pcs = sum(v for k, v in batches[b].items() if (t - k).days > b_shelf)
         status = stock_status(stk, sp, tgt)
         sold_t = int(sales[(sales["Date"] == t) & (sales["Bun"] == b)]["Pcs"].sum()) if not sales.empty else 0
+        pub.append({"Date": t.isoformat(), "Bun": b, "Name": names.get(b, ""), "Can_Sell_Start": int(round(stk)) + sold_t,
+                    "Sold_At_Update": sold_t, "Stock_Now": int(round(stk)), "Sales_Per_Day": int(round(sp)),
+                    "Days_Of_Stock": round(stk / sp, 1) if sp else "", "Status": status})
         rows.append({"Bun": bun_label(b, names), "Before today's sales": int(round(stk)) + sold_t,
                      "Sold today": sold_t, "In stock now": int(round(stk)), "Sold / day": int(round(sp)),
                      "Days of stock": round(stk / sp, 1) if sp else None, "Target days": tgt, "Status": status,
@@ -2451,6 +2557,7 @@ def page_live(cfg, can_edit):
     if OWN_SPEED:
         st.caption("✏️ Sold / day typed by you: " + ", ".join(f"{b} {int(v):,}" for b, v in OWN_SPEED.items() if b in buns))
     own_sales_editor(cfg, can_edit, names, buns, sales, t, {b: sum(batches[b].values()) for b in buns}, "live")
+    stock_for_journal(cfg, can_edit, pub, base)
     with st.expander("🗓️ Stock by production date (oldest at the top = sell first)", expanded=True):
         dates = sorted({k for v in batches.values() for k in v})
         if dates:
