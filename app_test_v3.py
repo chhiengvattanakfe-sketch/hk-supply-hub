@@ -822,6 +822,28 @@ KM = {
     "🌙 No — it is the stock at the end of the day": "🌙 ទេ — វាជាស្តុកនៅចុងថ្ងៃ",
     ": fixed — now the stock at the end of": ": បានកែ — ឥឡូវជាស្តុកនៅចុងថ្ងៃ",
     "count moved to morning": "ការរាប់ត្រូវប្តូរទៅពេលព្រឹក",
+
+    # --- count from an Excel file -----------------------------------------------------------------
+    "📥 Fill from your Excel count sheet": "📥 បំពេញពីតារាងរាប់ Excel របស់អ្នក",
+    "Send the Excel file of your count (your usual layout: one row per production date, one column per bun). The numbers go into the sheet below — check them, then press 💾 Save.":
+        "ផ្ញើឯកសារ Excel នៃការរាប់របស់អ្នក (ទម្រង់ធម្មតា: មួយជួរសម្រាប់មួយថ្ងៃផលិត មួយជួរឈរសម្រាប់មួយនំ)។ លេខនឹងចូលក្នុងតារាងខាងក្រោម — ពិនិត្យ រួចចុច 💾 រក្សាទុក។",
+    "Excel file (.xlsx)": "ឯកសារ Excel (.xlsx)",
+    "⚠️ This file cannot be read:": "⚠️ មិនអាចអានឯកសារនេះបាន:",
+    "⚠️ No count found in this file: it needs a row with the bun names (N1, N2 … ស, ល, ក, តយ) and one row per production date under it.":
+        "⚠️ រកមិនឃើញការរាប់ក្នុងឯកសារនេះ: វាត្រូវការជួរដែលមានឈ្មោះនំ (N1, N2 … ស, ល, ក, តយ) និងមួយជួរសម្រាប់មួយថ្ងៃផលិតនៅខាងក្រោម។",
+    "Sheet in the file": "សន្លឹកក្នុងឯកសារ",
+    "dates": "ថ្ងៃ",
+    "⚠️ This sheet looks like": "⚠️ សន្លឹកនេះមើលទៅដូចជា",
+    ", not": " មិនមែន",
+    ". Check before you use it.": "។ សូមពិនិត្យមុនប្រើ។",
+    "⚠️ The sheet says": "⚠️ សន្លឹកសរសេរថ្ងៃ",
+    "; this count is saved for": "; ការរាប់នេះរក្សាទុកសម្រាប់ថ្ងៃ",
+    ". Check the date and morning / evening above.": "។ សូមពិនិត្យថ្ងៃ និងព្រឹក / ល្ងាច ខាងលើ។",
+    "Also in the file:": "មានក្នុងឯកសារផងដែរ:",
+    "⬇️ Put these numbers in the count sheet": "⬇️ ដាក់លេខទាំងនេះចូលតារាងរាប់",
+    "pcs from": "គ្រាប់ ពី",
+    "are in the count sheet of": "បានចូលតារាងរាប់នៃ",
+    "— open its tab, check them, then press 💾 Save.": "— បើកផ្ទាំងរបស់វា ពិនិត្យ រួចចុច 💾 រក្សាទុក។",
 }
 
 # the 3D view (JavaScript text): exact phrases only
@@ -2345,7 +2367,10 @@ def draft_grid(default_rows, buns, key, **kw):
     bases = st.session_state.setdefault("_grid_base", {})
     drafts = st.session_state.setdefault("_grid_draft", {})
     restored = False
-    if key not in st.session_state:                      # shown for the first time, or back from another page
+    preset = st.session_state.setdefault("_grid_preset", {}).pop(key, None)
+    if preset is not None:                               # numbers taken from an uploaded Excel sheet
+        bases[key] = preset
+    elif key not in st.session_state:                    # shown for the first time, or back from another page
         d = drafts.get(key)
         restored = bool(d) and any(v for _d, v in d)
         bases[key] = d if restored else default_rows
@@ -2374,7 +2399,12 @@ def _grid_values(df, buns):
         d = ts.date()
         vals = {b: int(_num(r.get(short(b)))) for b in buns if _num(r.get(short(b))) > 0}
         out.append((d, vals))
-    return out
+    merged = {}                                          # the same date typed on 2 rows: added together
+    for d, vals in out:
+        m = merged.setdefault(d, {})
+        for b, q in vals.items():
+            m[b] = m.get(b, 0) + q
+    return sorted(merged.items(), key=lambda x: x[0])
 
 
 def _grid(rows, buns, key, height=None, max_date=None):
@@ -2528,6 +2558,168 @@ def page_production(cfg, can_edit, me):
                 _rerun_here()
             except Exception as e:
                 st.error(f"Not saved: {e}")
+
+
+_MON = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov",
+                                      "dec"], 1)}
+
+
+def _sheet_date(v, year_hint):
+    """A date cell of a count sheet: a real date, or text like 'Wed, Nov-18, 26', '18/11/2026', '2026-11-18'."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, (int, float)) and 40000 < v < 60000:          # an Excel date number
+        return (datetime(1899, 12, 30) + timedelta(days=int(v))).date()
+    t = str(v or "").strip().lower()
+    if not t:
+        return None
+    m = re.search(r"([a-z]{3})[a-z]*[\s\-/.]*(\d{1,2})\b(?:[,\s\-/.]+(\d{2,4}))?", t)
+    if m and m.group(1) in _MON:
+        y = int(m.group(3)) if m.group(3) else year_hint
+        y = y + 2000 if y < 100 else y
+        try:
+            return date(y, _MON[m.group(1)], int(m.group(2)))
+        except ValueError:
+            return None
+    m = re.search(r"(\d{4})[\-/.](\d{1,2})[\-/.](\d{1,2})", t)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.search(r"(\d{1,2})[\-/.](\d{1,2})[\-/.](\d{2,4})", t)
+    if m:
+        y = int(m.group(3))
+        y = y + 2000 if y < 100 else y
+        try:
+            return date(y, int(m.group(2)), int(m.group(1)))       # day first, like in Cambodia
+        except ValueError:
+            return None
+    return None
+
+
+def parse_count_excel(data, cfg, buns, names):
+    """Your Excel count sheet -> [{"sheet", "role", "date" (from the title), "rows": [(prod_date, {bun: pcs})]}].
+    Finds the header row with the bun names (N1, N2 … ស, ល, ក, តយ), then one row per production date; the
+    total row and the សរុប column are left out."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    keys = {}
+    for b in buns:                                       # codes and short names first (N1 … ស, ល, ក, តយ)
+        for k in (b, short(b)):
+            keys.setdefault(str(k).strip().upper(), b)
+    by_name = {}
+    for b in buns:                                       # then the full names; one name for 2 buns -> the one
+        nm = str(names.get(b, "") or "").strip()         # with a short name (ល្ពៅ = N41, not N34)
+        if nm:
+            by_name.setdefault(nm.upper(), []).append(b)
+    for nm, lst in by_name.items():
+        keys.setdefault(nm, ([b for b in lst if b in SHORT] or lst)[0])
+    pn = place_names(cfg)
+    out = []
+    for ws in wb.worksheets:
+        grid = [list(r) for r in ws.iter_rows(min_row=1, max_row=min(ws.max_row or 200, 300), values_only=True)]
+        head_i, cols = None, {}
+        for i, row in enumerate(grid[:15]):
+            found = {}
+            for j, v in enumerate(row):
+                b = keys.get(str(v or "").strip().upper())
+                if b and b not in found.values():
+                    found[j] = b
+            if len(found) >= 3:
+                head_i, cols = i, found
+                break
+        if head_i is None:
+            continue
+        title = " ".join(str(v) for r in grid[:head_i] for v in r if v not in (None, "")) + " " + ws.title
+        role = None
+        if any(w.upper() in title.upper() for w in AEON_WORDS):
+            role = "aeon"
+        else:
+            for r_ in ("cool", "frozen"):
+                if pn.get(r_) and pn[r_] in title:
+                    role = r_
+            if role is None:
+                for nm, r_ in OLD_PLACE_ROLE.items():
+                    if nm in title:
+                        role = "frozen" if r_ == "aeon" else r_
+        m = re.search(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})", title)
+        t_date = None
+        if m:
+            try:
+                t_date = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            except ValueError:
+                t_date = None
+        year = (t_date or today_kh()).year
+        rows = {}
+        first_col = min(cols)
+        for row in grid[head_i + 1:]:
+            d = None
+            for v in row[:first_col]:                       # the date is left of the bun columns
+                d = _sheet_date(v, year)
+                if d:
+                    break
+            if not d:
+                continue
+            vals = {}
+            for j, b in cols.items():
+                n = _num(row[j] if j < len(row) else None)
+                if n > 0:
+                    vals[b] = vals.get(b, 0) + int(round(n))
+            if vals:
+                r0 = rows.setdefault(d, {})
+                for b, q in vals.items():
+                    r0[b] = r0.get(b, 0) + q
+        out.append({"sheet": ws.title, "role": role, "date": t_date, "rows": sorted(rows.items(), key=lambda x: x[0])})
+    return out
+
+
+def _upload_count(cfg, role, cd, mode, n, show, names, buns):
+    """📥 Fill this count sheet from your Excel file (then check and press 💾 Save)."""
+    pn = place_names(cfg)[role]
+    with st.expander("📥 Fill from your Excel count sheet", expanded=False):
+        st.caption("Send the Excel file of your count (your usual layout: one row per production date, one column per "
+                   "bun). The numbers go into the sheet below — check them, then press 💾 Save.")
+        up = st.file_uploader("Excel file (.xlsx)", type=["xlsx", "xlsm"], key=f"cnt_up_{role}_{n}")
+        if not up:
+            return
+        try:
+            found = [x for x in parse_count_excel(up.getvalue(), cfg, buns, names) if x["rows"]]
+        except Exception as e:
+            st.error(f"⚠️ This file cannot be read: {e}")
+            return
+        if not found:
+            st.error("⚠️ No count found in this file: it needs a row with the bun names (N1, N2 … ស, ល, ក, តយ) and "
+                     "one row per production date under it.")
+            return
+        mine = [x for x in found if x["role"] == role]
+        opts = mine + [x for x in found if x not in mine]
+        pick = st.selectbox("Sheet in the file", list(range(len(opts))), key=f"cnt_up_pick_{role}_{n}",
+                            format_func=lambda i: f"{opts[i]['sheet']} · {len(opts[i]['rows'])} dates · "
+                                                  f"{sum(sum(v.values()) for _d, v in opts[i]['rows']):,} pcs")
+        x = opts[pick]
+        if x["role"] and x["role"] != role:
+            st.warning(f"⚠️ This sheet looks like {place_label(cfg, x['role'])}, not {pn}. Check before you use it.")
+        if x["date"] and x["date"] != cd:
+            st.warning(f"⚠️ The sheet says {x['date']:%d.%m.%Y}; this count is saved for {cd:%d.%m.%Y}. "
+                       "Check the date and morning / evening above.")
+        unknown = [b for _d, v in x["rows"] for b in v if b not in show]
+        rows = [(d, {b: q for b, q in v.items() if b in buns}) for d, v in x["rows"]]
+        st.markdown(excel_html(f"{x['sheet']}", [(day_label(d), v) for d, v in rows], show), unsafe_allow_html=True)
+        if unknown:
+            st.caption("Also in the file: " + ", ".join(sorted(set(short(b) for b in unknown))))
+        if st.button("⬇️ Put these numbers in the count sheet", key=f"cnt_up_go_{role}_{n}", type="primary"):
+            n2 = n + 1
+            st.session_state[f"cnt_n_{role}"] = n2
+            st.session_state.setdefault("_grid_preset", {})[f"cnt_{role}_{cd}_{mode[:2]}_{n2}"] = rows
+            st.session_state["cntp_" + f"{role}_{cd}_{mode[:2]}_{n2}"] = {
+                "data": {pn: {d: dict(v) for d, v in rows}}, "done": {pn: []}, "idx": {pn: 0}}
+            st.session_state["c_flash"] = (f"📥 {sum(sum(v.values()) for _d, v in rows):,} pcs from "
+                                           f"{x['sheet']} are in the count sheet of {place_label(cfg, role)} — open "
+                                           f"its tab, check them, then press 💾 Save.")
+            _rerun_here()
 
 
 def count_sheet_excel(places, sheets, buns, cd):
@@ -2699,7 +2891,7 @@ def page_count(cfg, can_edit, me):
             st.markdown(excel_html(f"ស្តុកនំសរុប ({cd:%d.%m.%Y}) — all 3 stocks", [(day_label(d), v) for d, v in sorted(allr.items())],
                                    show), unsafe_allow_html=True)
             sheets = {pn[r]: sorted(counted_all.get(r) or [(d, {b: round(v) for b, v in vals.items()}) for d, vals in
-                                                             _rows_of(pl_now[r], show)]) for r in ROLES}
+                                                             _rows_of(pl_now[r], show)], key=lambda x: x[0]) for r in ROLES}
             st.download_button("📥 Count sheets for printing (Excel, your layout)",
                                data=count_sheet_excel([pn[r] for r in ROLES], sheets, show, cd),
                                file_name=f"Stock_count_{cd:%Y-%m-%d}.xlsx", key="cnt_xlsx",
@@ -2784,6 +2976,8 @@ def _count_place(cfg, can_edit, me, role, cd, mode, pl_stock, base, show, names,
     start = _rows_of(exp, show) if mode.startswith("🧮") else []
     if not any(d == cd for d, _v in start):
         start = start + [(cd, {})]
+    if can_edit:
+        _upload_count(cfg, role, cd, mode, n, show, names, buns)
     if st.session_state.get("phone_mode"):
         counted = _count_phone([pn], {pn: start}, show, names, cd, f"{role}_{cd}_{mode[:2]}_{n}", single=True)[pn]
     else:
@@ -2791,7 +2985,7 @@ def _count_place(cfg, can_edit, me, role, cd, mode, pl_stock, base, show, names,
         counted, restored = draft_grid(start, show, gk, max_date=cd)
         if restored:
             st.info("📝 Your count from before is still here — it is NOT saved yet.")
-        st.markdown(excel_html(f"{pn} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted)], show),
+        st.markdown(excel_html(f"{pn} ({cd:%d.%m.%Y})", [(day_label(d), v) for d, v in sorted(counted, key=lambda x: x[0])], show),
                     unsafe_allow_html=True)
     tot_c = {b: sum(v.get(b, 0) for _d, v in counted) for b in show}
     tot_e = {b: sum(exp.get(b, {}).values()) for b in show}
@@ -2822,7 +3016,7 @@ def _count_place(cfg, can_edit, me, role, cd, mode, pl_stock, base, show, names,
                         key=f"cnt_save_{role}", disabled=not ok_big, width="stretch")
     undo_bar(f"count_{role}", "c_flash")
     if clicked:
-        sig = json.dumps([role, cd.isoformat(), [(d.isoformat(), sorted(v.items())) for d, v in sorted(counted)]])
+        sig = json.dumps([role, cd.isoformat(), [(d.isoformat(), sorted(v.items())) for d, v in sorted(counted, key=lambda x: x[0])]])
         if not save_guard(f"count_{role}", sig):
             st.info("✅ Already saved a moment ago — it is not saved twice.")
             st.toast("✅ Already saved a moment ago — not saved twice.")
