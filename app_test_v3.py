@@ -258,6 +258,15 @@ KM = {
     "% of the limit) · sales speed from the last": "% នៃកម្រិត) · ល្បឿនលក់ពី",
     "selling days · updated": "ថ្ងៃលក់ចុងក្រោយ · បច្ចុប្បន្នភាព",
     "In stock (pcs)": "ក្នុងស្តុក (គ្រាប់)",
+    "🌅 Before today's sales": "🌅 មុនការលក់ថ្ងៃនេះ",
+    "🧾 Sold today": "🧾 លក់ថ្ងៃនេះ",
+    "📦 In stock now (after sales)": "📦 ស្តុកឥឡូវ (ក្រោយលក់)",
+    "The stock this morning: the last count + production, before the sales of today":
+        "ស្តុកព្រឹកនេះ: រាប់ចុងក្រោយ + ផលិត មុនការលក់ថ្ងៃនេះ",
+    "Sales of today in the sale journal so far": "ការលក់ថ្ងៃនេះក្នុងបញ្ជីលក់រហូតមកដល់ពេលនេះ",
+    "= before today's sales − sold today": "= មុនការលក់ថ្ងៃនេះ − លក់ថ្ងៃនេះ",
+    "🌅 Before today's sales − 🧾 Sold today = 📦 In stock now. Days of stock and the status use 📦 In stock now.":
+        "🌅 មុនការលក់ថ្ងៃនេះ − 🧾 លក់ថ្ងៃនេះ = 📦 ស្តុកឥឡូវ។ ថ្ងៃស្តុក និងស្ថានភាព ប្រើ 📦 ស្តុកឥឡូវ។",
     "Sold / day": "លក់ / ថ្ងៃ",
     "Days of stock": "ស្តុកគ្រប់ (ថ្ងៃ)",
     "Sold today": "លក់ថ្ងៃនេះ",
@@ -860,6 +869,9 @@ KM = {
     "🏭 Max production per day (pcs, 0 = no limit)": "🏭 ការផលិតអតិបរមាក្នុងមួយថ្ងៃ (គ្រាប់, 0 = គ្មានកម្រិត)",
     "Sales / day: the app's number comes from the sale journal (average of the selling days). Type your own number to use it instead — in 📊 Live stock, 📅 Next week plan and 🧊 rooms; empty = use the app's. The days of the week keep their shape.":
         "ការលក់ / ថ្ងៃ: លេខរបស់កម្មវិធីមកពីបញ្ជីលក់ (មធ្យមនៃថ្ងៃលក់)។ វាយលេខរបស់អ្នក ដើម្បីប្រើលេខនោះជំនួស — ក្នុង 📊 ស្តុកផ្ទាល់, 📅 ផែនការសប្តាហ៍ក្រោយ និង 🧊 បន្ទប់; ទទេ = ប្រើលេខកម្មវិធី។ ថ្ងៃនីមួយៗក្នុងសប្តាហ៍រក្សារូបរាងដដែល។",
+    "⚠️ The sale journal of this month was not found in the Dropbox folder (": "⚠️ រកមិនឃើញបញ្ជីលក់ខែនេះក្នុង Dropbox (",
+    ".xlsx) — today's sales count as 0, so the stock is too high. Put the file back in the folder (same name).":
+        ".xlsx) — ការលក់ថ្ងៃនេះត្រូវបានគិតជា 0 ដូច្នេះស្តុកខ្ពស់ពេក។ សូមដាក់ឯកសារត្រឡប់ចូលថតវិញ (ឈ្មោះដដែល)។",
     "✏️ Adjust sales / day and target days": "✏️ កែការលក់ / ថ្ងៃ និងថ្ងៃគោលដៅ",
     "✏️ Adjust the plan — max production per day, sales / day, target days": "✏️ កែផែនការ — ការផលិតអតិបរមាក្នុងមួយថ្ងៃ, ការលក់ / ថ្ងៃ, ថ្ងៃគោលដៅ",
     "🎯 Target days": "🎯 ថ្ងៃគោលដៅ",
@@ -1796,22 +1808,84 @@ def parse_journal(name, rev, data):
     return df.groupby(["Date", "Bun", "Aeon"], as_index=False)["Pcs"].sum(), names
 
 
+JOURNAL_MISSING = []    # months whose sale journal was not found (shown as a warning)
+
+
+def _sub_listing(sub, max_age=30):
+    """{name: rev} of a sub-folder (e.g. the year folder "2026"); {} if it does not exist."""
+    m = _mem()
+    key = ("sub", sub)
+    hit = m.setdefault("subs", {}).get(key)
+    if hit and time.time() - hit[0] < max_age:
+        return hit[1]
+    out = {}
+    if USE_DROPBOX:
+        try:
+            dbx = _dbx()
+            res = dbx.files_list_folder(f"{DROPBOX_FOLDER}/{sub}")
+            while True:
+                out.update({e.name: e.rev for e in res.entries if hasattr(e, "rev")})
+                if not res.has_more:
+                    break
+                res = dbx.files_list_folder_continue(res.cursor)
+        except Exception:
+            out = {}
+    else:
+        d = os.path.join(LOCAL_DIR, sub)
+        if os.path.isdir(d):
+            out = {n: str(os.stat(os.path.join(d, n)).st_mtime_ns) for n in os.listdir(d)}
+    m["subs"][key] = (time.time(), out)
+    return out
+
+
+def _read_sub(path):
+    """(bytes, rev) of 'sub/name' (a journal moved into its year folder)."""
+    sub, name = path.split("/", 1)
+    rev = _sub_listing(sub).get(name)
+    if rev is None:
+        return None, None
+    if not USE_DROPBOX:
+        with open(os.path.join(LOCAL_DIR, sub, name), "rb") as f:
+            return f.read(), rev
+    m = _mem()
+    hit = m["files"].get(path)
+    if hit and hit[0] == rev:
+        return hit[1], rev
+    _md, res = _dbx().files_download(f"{DROPBOX_FOLDER}/{path}")
+    m["files"][path] = (rev, res.content)
+    return res.content, rev
+
+
 def journal_names_for(days_back):
-    """Monthly journal files covering today and the last `days_back` days."""
+    """Monthly journal files covering today and the last `days_back` days. A month not in the main folder is also
+    looked for in its year folder (e.g. 2026/11_Sale_Journal_NOV_2026.xlsx)."""
     t = today_kh()
     months = {((t - timedelta(days=i)).year, (t - timedelta(days=i)).month) for i in range(days_back + 1)}
-    wanted = {f"{mo:02d}_SALE_JOURNAL_{MONTHS[mo - 1]}_{yr}" for yr, mo in months}
+    wanted = {f"{mo:02d}_SALE_JOURNAL_{MONTHS[mo - 1]}_{yr}": yr for yr, mo in months}
+    key = lambda n: os.path.splitext(n)[0].upper().replace(" ", "_")
+    pat = JOURNAL_PATTERN.lower()
     if USE_DROPBOX:
-        names = [n for n in _listing() if fnmatch.fnmatchcase(n.lower(), JOURNAL_PATTERN.lower())]
+        names = [n for n in _listing() if fnmatch.fnmatchcase(n.lower(), pat)]
     else:
-        names = [n for n in os.listdir(LOCAL_DIR) if fnmatch.fnmatchcase(n.lower(), JOURNAL_PATTERN.lower())]
-    return [n for n in names if os.path.splitext(n)[0].upper().replace(" ", "_") in wanted]
+        names = [n for n in os.listdir(LOCAL_DIR) if fnmatch.fnmatchcase(n.lower(), pat)]
+    out = [n for n in names if key(n) in wanted]
+    found = {key(n) for n in out}
+    JOURNAL_MISSING.clear()
+    for w, yr in sorted(wanted.items()):
+        if w in found:
+            continue
+        sub = [n for n in _sub_listing(str(yr)) if fnmatch.fnmatchcase(n.lower(), pat) and key(n) == w]
+        if sub:
+            out.append(f"{yr}/{sub[0]}")
+        elif w.split("_")[0] == f"{t.month:02d}" and w.endswith(str(t.year)):
+            JOURNAL_MISSING.append(w.replace("SALE_JOURNAL", "Sale_Journal"))
+    return out
 
 
 def load_sales(days_back):
     frames, names = [], {}
     for n in journal_names_for(days_back):
-        data, rev = read_bytes(n, max_age=20)
+        data, rev = _read_sub(n) if "/" in n else read_bytes(n, max_age=20)
         if data:
             df, nm = parse_journal(n, rev, data)
             frames.append(df)
@@ -2322,10 +2396,12 @@ def page_live(cfg, can_edit):
         b_shelf = int(cfg.get("shelf_by_bun", {}).get(b, shelf))
         old_pcs = sum(v for k, v in batches[b].items() if (t - k).days > b_shelf)
         status = stock_status(stk, sp, tgt)
-        rows.append({"Bun": bun_label(b, names), "In stock (pcs)": int(round(stk)), "Sold / day": int(round(sp)),
+        sold_t = int(sales[(sales["Date"] == t) & (sales["Bun"] == b)]["Pcs"].sum()) if not sales.empty else 0
+        rows.append({"Bun": bun_label(b, names), "Before today's sales": int(round(stk)) + sold_t,
+                     "Sold today": sold_t, "In stock now": int(round(stk)), "Sold / day": int(round(sp)),
                      "Days of stock": round(stk / sp, 1) if sp else None, "Target days": tgt, "Status": status,
                      "Oldest batch": f"{oldest:%d %b} ({age} d)" if oldest else "-",
-                     f"Older than {b_shelf} d": int(old_pcs), "Sold today": int(sales[(sales["Date"] == t) & (sales["Bun"] == b)]["Pcs"].sum()) if not sales.empty else 0})
+                     f"Older than {b_shelf} d": int(old_pcs)})
         if status.startswith("🔴"):
             alerts.append(f"🔴 **{bun_label(b, names)}**: {status[2:]} — {int(stk):,} pcs ≈ {stk / sp:.1f} days (target {tgt})" if sp else
                           f"🔴 **{bun_label(b, names)}**: out of stock")
@@ -2351,6 +2427,10 @@ def page_live(cfg, can_edit):
                 f"<div style='font-size:.85rem;opacity:.8'>Total stock {int(total):,} / {int(cap):,} pcs "
                 f"({total / cap * 100:.0f}% of the limit) · sales speed from the last {n_sell} selling days · "
                 f"updated {now_kh():%H:%M:%S}</div>", unsafe_allow_html=True)
+    if JOURNAL_MISSING:
+        st.error("⚠️ The sale journal of this month was not found in the Dropbox folder ("
+                 + ", ".join(JOURNAL_MISSING) + ".xlsx) — today's sales count as 0, so the stock is too high. "
+                 "Put the file back in the folder (same name).")
     if no_count:
         st.warning("No stock count yet for: " + ", ".join(no_count) + ". Enter one in **📦 Stock count** — "
                    "until then their stock only counts production logged here.")
@@ -2359,7 +2439,15 @@ def page_live(cfg, can_edit):
     df = pd.DataFrame(rows)
     st.dataframe(df, hide_index=True, width="stretch", column_config={
         "Days of stock": st.column_config.ProgressColumn("Days of stock", min_value=0, max_value=10, format="%.1f d"),
-        "In stock (pcs)": st.column_config.NumberColumn(format="%d")})
+        "Before today's sales": st.column_config.NumberColumn(
+            "🌅 Before today's sales", format="%d",
+            help="The stock this morning: the last count + production, before the sales of today"),
+        "Sold today": st.column_config.NumberColumn("🧾 Sold today", format="%d",
+                                                    help="Sales of today in the sale journal so far"),
+        "In stock now": st.column_config.NumberColumn("📦 In stock now (after sales)", format="%d",
+                                                      help="= before today's sales − sold today")})
+    st.caption("🌅 Before today's sales − 🧾 Sold today = 📦 In stock now. Days of stock and the status use "
+               "📦 In stock now.")
     if OWN_SPEED:
         st.caption("✏️ Sold / day typed by you: " + ", ".join(f"{b} {int(v):,}" for b, v in OWN_SPEED.items() if b in buns))
     own_sales_editor(cfg, can_edit, names, buns, sales, t, {b: sum(batches[b].values()) for b in buns}, "live")
