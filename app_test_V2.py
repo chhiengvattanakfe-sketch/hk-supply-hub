@@ -5621,7 +5621,7 @@ def _dashboard_body():
             st.caption("Report download disabled")
 
     if period != PERIOD_CHOICES[0]:
-        _period_search(q, period, selected_date, can_reports)
+        _period_search(q, period, selected_date, can_reports, display)
         return
 
     with st.expander("🎚️ Filters: region, province, verifier"):
@@ -5790,7 +5790,7 @@ def _buns_by_type(texts):
     return out
 
 
-def _period_search(q, period, selected_date, can_reports):
+def _period_search(q, period, selected_date, can_reports, display="🖥️ Table"):
     d0, d1 = _period_dates(period, selected_date)
     if d1 < d0:
         d0, d1 = d1, d0
@@ -5849,6 +5849,64 @@ def _period_search(q, period, selected_date, can_reports):
                      "Buns by type": " · ".join(f"{k} {v:,}" for k, v in sorted(buns.items(), key=lambda x: (len(x[0]), x[0]))),
                      "Status days": " · ".join(f"{k.split(' ')[0]} {int(stc[k])}" for k in STATUS_RANK if int(stc.get(k, 0)))})
     summ = pd.DataFrame(summ)
+    if not display.endswith("Table"):
+        _period_cards(res, summ, d0, d1)
+    else:
+        _period_tables(res, summ)
+    if can_reports:
+        _period_excel(res, summ, d0, d1)
+
+
+def _period_cards(res, summ, d0, d1):
+    """📱 Cards: one total card per customer, then the day cards (newest first), read only."""
+    st.markdown("##### 🧾 Total for the time")
+    parts = []
+    for r in summ.to_dict("records"):
+        left = f" · <b>{r['Left to send']} left</b>" if r["Left to send"] else ""
+        parts.append(
+            "<div class='hk-card' style='border-left:6px solid #1565c0'>"
+            f"<div class='hk-top'><span class='hk-name'>{_e(r['Customer'])}</span>"
+            f"<span class='hk-badge' style='background:#1565c0;color:#fff'>🗓️ {r['Days']} day(s)</span></div>"
+            f"<div class='hk-sub'>{_e(r['First'])} – {_e(r['Last'])} · {_e(r['Status days'])}</div>"
+            f"<div class='hk-nums'><span>កេស <b>{r['កេស ordered']:,}</b></span><span>📦 <b>{r['Packed']:,}</b></span>"
+            f"<span>🚚 sent <b>{r['Sent']:,}</b>{left}</span><span>🥐 <b>{r['Buns total']:,}</b></span></div>"
+            + (f"<div class='hk-note'>🥐 {_e(r['Buns by type'])}</div>" if r["Buns by type"] else "")
+            + "</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+    st.markdown("##### 📅 Every day")
+    page = 30
+    sig = (str(d0), str(d1), len(res))
+    if st.session_state.get("_period_sig") != sig:
+        st.session_state["_period_sig"] = sig
+        st.session_state["period_card_limit"] = page
+    limit = st.session_state.get("period_card_limit", page)
+    d = res.sort_values(["Date", "Customer"], ascending=[False, True]).head(limit)
+    parts, last = [], None
+    counts = res.groupby("Date").size().to_dict()
+    for r in d.to_dict("records"):
+        if r["Date"] != last:
+            last = r["Date"]
+            parts.append(f"<div class='hk-group'>📅 {r['Date']:%a %d %b} ({counts[last]})</div>")
+        for k, v in (("🔥", ""), ("Area", ""), ("Time", "-"), ("Prepared By", "-"), ("Assigned To", "-"),
+                     ("Journal Note", "-"), ("Handled By", "-"), ("Driver/Station", "-"), ("Verified By", "-"),
+                     ("Invoice", "-"), ("Province", "")):
+            if r.get(k) is None or (isinstance(r.get(k), float) and pd.isna(r.get(k))):
+                r[k] = v
+        try:
+            parts.append(card_html(r))
+        except Exception:
+            parts.append(f"<div class='hk-card'><b>{_e(r['Customer'])}</b> · {_e(r['Status'])}</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+    st.caption(f"Showing {min(limit, len(res))} of {len(res)} day cards")
+    if len(res) > limit and st.button(f"⬇️ Show {page} more", key="period_card_more"):
+        st.session_state["period_card_limit"] = limit + page
+        try:
+            st.rerun(scope="fragment")
+        except TypeError:
+            st.rerun()
+
+
+def _period_tables(res, summ):
     st.markdown("##### 🧾 Total for the time")
     show_df(summ, key="dash_period_sum")
     st.markdown("##### 📅 Every day")
@@ -5858,7 +5916,11 @@ def _period_search(q, period, selected_date, can_reports):
         "Customer": st.column_config.TextColumn("Customer", width="large"),
         "Status": st.column_config.TextColumn("Status", width="medium"),
         "Buns": st.column_config.TextColumn("Buns", width="large")})
-    if can_reports:
+
+
+def _period_excel(res, summ, d0, d1):
+    """📥 the search as Excel: Total + Every day."""
+    if True:
         try:
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -5876,6 +5938,7 @@ def _period_search(q, period, selected_date, can_reports):
                                key="dash_period_xl")
         except Exception as e:
             st.warning(f"Could not build the Excel file: {e}")
+
 
 def _update_panel(selected, df_report, selected_date):
     """Check / edit one customer: packing, sending, move to tomorrow / cancel."""
