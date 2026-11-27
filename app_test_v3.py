@@ -844,6 +844,25 @@ KM = {
     "pcs from": "គ្រាប់ ពី",
     "are in the count sheet of": "បានចូលតារាងរាប់នៃ",
     "— open its tab, check them, then press 💾 Save.": "— បើកផ្ទាំងរបស់វា ពិនិត្យ រួចចុច 💾 រក្សាទុក។",
+
+    # --- plan: own sales / day and max per day ---------------------------------------------------------
+    "✏️ Adjust the plan — max production per day, sales / day": "✏️ កែផែនការ — ការផលិតអតិបរមាក្នុងមួយថ្ងៃ, ការលក់ / ថ្ងៃ",
+    "bun(s) set by you": "នំកំណត់ដោយអ្នក",
+    "🏭 Max production per day (pcs, 0 = no limit)": "🏭 ការផលិតអតិបរមាក្នុងមួយថ្ងៃ (គ្រាប់, 0 = គ្មានកម្រិត)",
+    "Sales / day: the app's number comes from the sale journal (same weekday average). Type your own number to plan with it instead; empty = use the app's. The days of the week keep their shape.":
+        "ការលក់ / ថ្ងៃ: លេខរបស់កម្មវិធីមកពីបញ្ជីលក់ (មធ្យមថ្ងៃដូចគ្នាក្នុងសប្តាហ៍)។ វាយលេខរបស់អ្នក ដើម្បីធ្វើផែនការដោយលេខនោះ; ទទេ = ប្រើលេខកម្មវិធី។ ថ្ងៃនីមួយៗក្នុងសប្តាហ៍រក្សារូបរាងដដែល។",
+    "App (pcs/day)": "កម្មវិធី (គ្រាប់/ថ្ងៃ)",
+    "✏️ Your sales / day": "✏️ ការលក់ / ថ្ងៃ របស់អ្នក",
+    "Your sales / day": "ការលក់ / ថ្ងៃ របស់អ្នក",
+    "Empty = use the app's number": "ទទេ = ប្រើលេខកម្មវិធី",
+    "↺ Use the app's sales / day for all": "↺ ប្រើការលក់ / ថ្ងៃ របស់កម្មវិធីសម្រាប់ទាំងអស់",
+    "✅ Saved — the plan below uses it now.": "✅ បានរក្សាទុក — ផែនការខាងក្រោមប្រើវាឥឡូវនេះ។",
+    "✏️ Planned with": "✏️ ធ្វើផែនការដោយ",
+    "your sales / day": "ការលក់ / ថ្ងៃ របស់អ្នក",
+    "🏭 At most": "🏭 យ៉ាងច្រើន",
+    "pcs a day. When it is not enough, every bun first gets enough not to run out before it is made again; the rest is shared so all buns come closer to their target at the same pace.":
+        "គ្រាប់ក្នុងមួយថ្ងៃ។ ពេលមិនគ្រប់ នំនីមួយៗទទួលបានគ្រប់មុនសិន ដើម្បីកុំឲ្យអស់មុនពេលផលិតម្តងទៀត; ដែលនៅសល់ចែកឲ្យនំទាំងអស់ខិតជិតគោលដៅក្នុងល្បឿនដូចគ្នា។",
+    "plan settings saved": "បានរក្សាទុកការកំណត់ផែនការ",
 }
 
 # the 3D view (JavaScript text): exact phrases only
@@ -1106,7 +1125,7 @@ DEFAULT_SETTINGS = {
     "prod_days_default": [0, 1, 2, 3, 4, 5],   # Mon-Sat (Sunday off) for the others
     "lookback_days": 28,            # sales history used for the sales speed / forecast
     "round_to": 10,                 # planned pcs rounded up to this
-    "max_prod_per_day": 0,          # 0 = no limit
+    "max_prod_per_day": 20000,      # 0 = no limit (the factory makes at most ~20,000 pcs a day)
     "access_by_role": {"staff": "edit", "sales": "view", "viewer": "view"},   # automatic, by Supply Hub role
     "access_override": {},          # username -> hidden / view / edit, only for people who differ from their role
     "access_default": "view",
@@ -2052,17 +2071,31 @@ def plan_production(buns, stock_now, fc, start, days, cfg):
                 j += 1
             want = need + fc.get((d, b), 0) - stock.get(b, 0)
             prod[b] = int(-(-max(want, 0) // rnd) * rnd)
-        # daily capacity
+        # daily capacity (e.g. 20,000 pcs): first every bun gets enough not to run out before its next production
+        # day, then the rest is shared so every bun comes closer to its target at the same pace
         if cap_prod and sum(prod.values()) > cap_prod:
-            over = sum(prod.values()) - cap_prod
-            for group in ([b for b in buns if b not in prio], prio):
-                tot = sum(prod[b] for b in group)
-                if tot <= 0 or over <= 0:
+            must = {}
+            for b in buns:
+                if prod[b] <= 0:
+                    must[b] = 0
                     continue
-                cut = min(over, tot)
-                for b in group:
-                    prod[b] -= int(cut * prod[b] / tot // rnd * rnd)
-                over = sum(prod.values()) - cap_prod
+                cover, j = fc.get((d, b), 0), 1
+                while j <= 14:                                   # sales until this bun is made again
+                    dd = d + timedelta(days=j)
+                    if dd.weekday() in pdays[b] and j >= 1 and sum(fc.get((dd, x), 0) for x in buns) > 0:
+                        cover += fc.get((dd, b), 0)              # (bread made that day sells from the next day)
+                        break
+                    cover += fc.get((dd, b), 0)
+                    j += 1
+                must[b] = min(prod[b], int(-(-max(cover - stock.get(b, 0), 0) // rnd) * rnd))
+            if sum(must.values()) >= cap_prod:                   # not even that fits: share the shortage
+                f = cap_prod / max(sum(must.values()), 1)
+                prod = {b: int(must[b] * f // rnd * rnd) for b in buns}
+            else:
+                room = cap_prod - sum(must.values())
+                extra = {b: prod[b] - must[b] for b in buns}
+                f = min(1.0, room / max(sum(extra.values()), 1))
+                prod = {b: must[b] + int(extra[b] * f // rnd * rnd) for b in buns}
         # total stock limit at the end of the day
         end = {b: stock.get(b, 0) + prod[b] - fc.get((d, b), 0) for b in buns}
         over = sum(max(v, 0) for v in end.values()) - cap_total
@@ -3481,7 +3514,81 @@ def page_plan(cfg, can_edit):
         for b in buns:
             stock_now[b] = max(stock_now[b] - sum(gap.get((t + timedelta(days=i + 1), b), 0)
                                                   for i in range((start - t).days - 1)), 0)
+    # ✏️ your own sales / day per bun and the daily maximum (saved in the settings)
+    if not cfg.get("max_prod_per_day") and not cfg.get("max_prod_set"):    # old settings files saved 0 = no limit
+        cfg = {**cfg, "max_prod_per_day": DEFAULT_SETTINGS["max_prod_per_day"]}
+    sp, _n = sales_speed(sales, buns, t, int(cfg["lookback_days"]))
+    app_avg = {b: (sum(fc.get((start + timedelta(days=i), b), 0) for i in range(days)) / days) for b in buns}
+    own = {b: float(v) for b, v in (cfg.get("sales_per_day") or {}).items() if b in buns and _num(v) > 0}
+    with st.expander("✏️ Adjust the plan — max production per day, sales / day"
+                     + (f" · {len(own)} bun(s) set by you" if own else ""), expanded=False):
+        cA, cB = st.columns([1, 2])
+        cap_v = cA.number_input("🏭 Max production per day (pcs, 0 = no limit)", min_value=0, max_value=500000,
+                                step=1000, value=int(cfg.get("max_prod_per_day") or 0), key="plan_cap",
+                                disabled=not can_edit)
+        cB.caption("Sales / day: the app's number comes from the sale journal (same weekday average). Type your own "
+                   "number to plan with it instead; empty = use the app's. The days of the week keep their shape.")
+        edf = pd.DataFrame([{"Bun": b, "Name": names.get(b, ""), "App (pcs/day)": int(round(app_avg[b])),
+                             "Your sales / day": (int(own[b]) if b in own else None)}
+                            for b in buns if app_avg[b] > 0 or b in own or stock_now.get(b)])
+        ed = st.data_editor(edf, hide_index=True, width="stretch", key=f"plan_own_{st.session_state.get('plan_own_n', 0)}",
+                            disabled=["Bun", "Name", "App (pcs/day)"] if can_edit else True,
+                            column_config={"Your sales / day": st.column_config.NumberColumn(
+                                "✏️ Your sales / day", min_value=0, max_value=100000, step=10, format="%d",
+                                help="Empty = use the app's number")})
+        if can_edit:
+            b1, b2 = st.columns(2)
+            if b1.button("💾 Save", key="plan_own_save", type="primary"):
+                new_own = {r["Bun"]: int(_num(r["Your sales / day"])) for r in ed.to_dict("records")
+                           if _num(r["Your sales / day"]) > 0}
+                try:
+                    def _ch(c):
+                        c["sales_per_day"] = new_own
+                        c["max_prod_per_day"] = int(cap_v)
+                        c["max_prod_set"] = True
+                    update_settings(_ch)
+                    audit("plan settings saved", f"max/day {int(cap_v):,} · sales/day " + ", ".join(
+                        f"{b} {v:,}" for b, v in new_own.items()))
+                    st.session_state["plan_flash"] = "✅ Saved — the plan below uses it now."
+                except Exception as e:
+                    st.error(f"⚠️ Not saved: {e}")
+                    st.stop()
+                _rerun_here()
+            if b2.button("↺ Use the app's sales / day for all", key="plan_own_clear", disabled=not own):
+                try:
+                    update_settings(lambda c: c.update(sales_per_day={}))
+                    st.session_state["plan_own_n"] = st.session_state.get("plan_own_n", 0) + 1
+                except Exception as e:
+                    st.error(f"⚠️ Not saved: {e}")
+                    st.stop()
+                _rerun_here()
+    show_flash("plan_flash")
+    for b, v in own.items():                                 # plan with your number, keep the weekday shape
+        for src in (fc,):
+            keys = [k for k in src if k[1] == b]
+            if app_avg.get(b, 0) > 0:
+                f = v / app_avg[b]
+                for k in keys:
+                    src[k] = src[k] * f
+            else:
+                for k in keys:
+                    if sum(src.get((k[0], x), 0) for x in buns) > 0:
+                        src[k] = v
+        sp[b] = v
+    if own and start > t + timedelta(days=1):                # the days before the plan start use your number too
+        stock_now = {b: sum(v.values()) for b, v in batches.items()}
+        for b in buns:
+            per = own.get(b)
+            g = sum((per if per is not None else gap.get((t + timedelta(days=i + 1), b), 0))
+                    for i in range((start - t).days - 1))
+            stock_now[b] = max(stock_now[b] - g, 0)
     plan = plan_production(buns, stock_now, fc, start, days, cfg)
+    if own:
+        st.info("✏️ Planned with **your sales / day** for: " + ", ".join(f"{b} {int(v):,}" for b, v in own.items()))
+    if cfg.get("max_prod_per_day"):
+        st.caption(f"🏭 At most **{int(cfg['max_prod_per_day']):,} pcs** a day. When it is not enough, every bun first "
+                   "gets enough not to run out before it is made again; the rest is shared so all buns come closer to "
+                   "their target at the same pace.")
     if no_count:
         st.warning("No stock count yet for " + ", ".join(no_count) + " — the plan treats their stock as 0.")
     dates = [start + timedelta(days=i) for i in range(days)]
@@ -3490,7 +3597,6 @@ def page_plan(cfg, can_edit):
     piv.insert(0, "Bun", [names.get(b, "") for b in piv.index])
     piv["TOTAL"] = piv.drop(columns=["Bun"]).sum(axis=1)
     last = plan[plan["Date"] == dates[-1]].set_index("Bun")
-    sp, _n = sales_speed(sales, buns, t, int(cfg["lookback_days"]))
     piv["Stock now"] = [int(stock_now.get(b, 0)) for b in piv.index]
     piv["Stock at the end"] = [int(last.at[b, "Stock end of day"]) for b in piv.index]
     piv["Days at the end"] = [round(last.at[b, "Stock end of day"] / sp[b], 1) if sp.get(b) else None for b in piv.index]
@@ -3647,7 +3753,7 @@ def page_settings(cfg, me):
     def do_save():
         rows = ed.to_dict("records")
         changes = dict(max_total=int(max_total), target_default=int(t_all), shelf_days=int(s_all), lookback_days=int(look),
-                       round_to=int(rnd), max_prod_per_day=int(capp), priority=list(prio),
+                       round_to=int(rnd), max_prod_per_day=int(capp), max_prod_set=True, priority=list(prio),
                        place_names=new_pn, cool_days=int(cool_days), daily_in_pcs=int(daily_in),
                        # every bun saved with its own value: exactly what the table shows is what the app uses
                        target_days={r["Bun"]: int(r["Target days"]) for r in rows},
