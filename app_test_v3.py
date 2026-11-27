@@ -849,14 +849,16 @@ KM = {
     "✏️ Adjust the plan — max production per day, sales / day": "✏️ កែផែនការ — ការផលិតអតិបរមាក្នុងមួយថ្ងៃ, ការលក់ / ថ្ងៃ",
     "bun(s) set by you": "នំកំណត់ដោយអ្នក",
     "🏭 Max production per day (pcs, 0 = no limit)": "🏭 ការផលិតអតិបរមាក្នុងមួយថ្ងៃ (គ្រាប់, 0 = គ្មានកម្រិត)",
-    "Sales / day: the app's number comes from the sale journal (same weekday average). Type your own number to plan with it instead; empty = use the app's. The days of the week keep their shape.":
-        "ការលក់ / ថ្ងៃ: លេខរបស់កម្មវិធីមកពីបញ្ជីលក់ (មធ្យមថ្ងៃដូចគ្នាក្នុងសប្តាហ៍)។ វាយលេខរបស់អ្នក ដើម្បីធ្វើផែនការដោយលេខនោះ; ទទេ = ប្រើលេខកម្មវិធី។ ថ្ងៃនីមួយៗក្នុងសប្តាហ៍រក្សារូបរាងដដែល។",
+    "Sales / day: the app's number comes from the sale journal (average of the selling days). Type your own number to use it instead — in 📊 Live stock, 📅 Next week plan and 🧊 rooms; empty = use the app's. The days of the week keep their shape.":
+        "ការលក់ / ថ្ងៃ: លេខរបស់កម្មវិធីមកពីបញ្ជីលក់ (មធ្យមនៃថ្ងៃលក់)។ វាយលេខរបស់អ្នក ដើម្បីប្រើលេខនោះជំនួស — ក្នុង 📊 ស្តុកផ្ទាល់, 📅 ផែនការសប្តាហ៍ក្រោយ និង 🧊 បន្ទប់; ទទេ = ប្រើលេខកម្មវិធី។ ថ្ងៃនីមួយៗក្នុងសប្តាហ៍រក្សារូបរាងដដែល។",
+    "✏️ Adjust sales / day": "✏️ កែការលក់ / ថ្ងៃ",
+    "✏️ Sold / day typed by you:": "✏️ លក់ / ថ្ងៃ ដែលអ្នកវាយ:",
     "App (pcs/day)": "កម្មវិធី (គ្រាប់/ថ្ងៃ)",
     "✏️ Your sales / day": "✏️ ការលក់ / ថ្ងៃ របស់អ្នក",
     "Your sales / day": "ការលក់ / ថ្ងៃ របស់អ្នក",
     "Empty = use the app's number": "ទទេ = ប្រើលេខកម្មវិធី",
     "↺ Use the app's sales / day for all": "↺ ប្រើការលក់ / ថ្ងៃ របស់កម្មវិធីសម្រាប់ទាំងអស់",
-    "✅ Saved — the plan below uses it now.": "✅ បានរក្សាទុក — ផែនការខាងក្រោមប្រើវាឥឡូវនេះ។",
+    "✅ Saved — the app uses your sales / day now.": "✅ បានរក្សាទុក — កម្មវិធីប្រើការលក់ / ថ្ងៃ របស់អ្នកឥឡូវនេះ។",
     "✏️ Planned with": "✏️ ធ្វើផែនការដោយ",
     "your sales / day": "ការលក់ / ថ្ងៃ របស់អ្នក",
     "🏭 At most": "🏭 យ៉ាងច្រើន",
@@ -2005,21 +2007,29 @@ def compute_stock(buns, prod, counts, adjs, sales, until):
     return merge_places(pl, buns), short, hist, no_count
 
 
-def sales_speed(sales, buns, until, lookback):
-    """Average pcs per SELLING day (days the journal has sales) over the last `lookback` days before `until`."""
+OWN_SPEED = {}          # {bun: pcs/day} typed by Admin ("✏️ Your sales / day"); used instead of the journal's number
+
+
+def sales_speed(sales, buns, until, lookback, raw=False):
+    """Average pcs per SELLING day (days the journal has sales) over the last `lookback` days before `until`.
+    Buns with "your sales / day" set use that number (raw=True = always the journal's number)."""
     lo = until - timedelta(days=lookback)
     win = sales[(sales["Date"] > lo) & (sales["Date"] < until)] if not sales.empty else sales
     sell_days = sorted(set(win["Date"])) if not win.empty else []
     n = max(len(sell_days), 1)
     tot = win.groupby("Bun")["Pcs"].sum().to_dict() if not win.empty else {}
-    return {b: tot.get(b, 0) / n for b in buns}, len(sell_days)
+    out = {b: tot.get(b, 0) / n for b in buns}
+    if not raw:
+        out.update({b: v for b, v in OWN_SPEED.items() if b in out})
+    return out, len(sell_days)
 
 
-def forecast(sales, buns, start, days, lookback):
-    """{(date, bun): pcs} — same weekday average over the last weeks (falls back to the overall average)."""
+def forecast(sales, buns, start, days, lookback, raw=False):
+    """{(date, bun): pcs} — same weekday average over the last weeks (falls back to the overall average).
+    Buns with "your sales / day" are scaled to that number (the weekday shape stays)."""
     lo = start - timedelta(days=lookback)
     win = sales[(sales["Date"] >= lo) & (sales["Date"] < start)] if not sales.empty else sales
-    speed, _n = sales_speed(sales, buns, start, lookback)
+    speed, _n = sales_speed(sales, buns, start, lookback, raw=True)
     by_wd = {}
     if not win.empty:
         w = win.copy()
@@ -2041,6 +2051,18 @@ def forecast(sales, buns, start, days, lookback):
         d = start + timedelta(days=i)
         for b in buns:
             out[(d, b)] = by_wd.get((d.weekday(), b), speed.get(b, 0))
+    if not raw:
+        for b, v in OWN_SPEED.items():
+            if b not in buns:
+                continue
+            wk = [by_wd.get((wd, b), speed.get(b, 0)) for wd in range(7)]
+            open_wd = [wd for wd in range(7) if not (by_wd and all(by_wd.get((wd, x), 1) == 0 for x in buns))]
+            avg = sum(wk[wd] for wd in open_wd) / max(len(open_wd), 1)
+            for i in range(days):
+                d = start + timedelta(days=i)
+                if d.weekday() not in open_wd:
+                    continue
+                out[(d, b)] = out[(d, b)] * v / avg if avg > 0 else float(v)
     return out
 
 
@@ -2229,6 +2251,8 @@ def get_data(cfg):
     counts, _ = read_csv(COUNT_FILE, COUNT_COLS)
     adjs, _ = read_csv(ADJ_FILE, ADJ_COLS)
     sales, names = load_sales(max(int(cfg.get("lookback_days", 28)), 7) + 45)
+    OWN_SPEED.clear()
+    OWN_SPEED.update({b: float(_num(v)) for b, v in (cfg.get("sales_per_day") or {}).items() if _num(v) > 0})
     buns = list(dict.fromkeys([b for b in DEFAULT_BUNS] + sorted(set(sales["Bun"]) if not sales.empty else [],
                                                                        key=lambda x: (len(x), x))))
     return prod, counts, adjs, sales, names, buns
@@ -2324,6 +2348,9 @@ def page_live(cfg, can_edit):
     st.dataframe(df, hide_index=True, width="stretch", column_config={
         "Days of stock": st.column_config.ProgressColumn("Days of stock", min_value=0, max_value=10, format="%.1f d"),
         "In stock (pcs)": st.column_config.NumberColumn(format="%d")})
+    if OWN_SPEED:
+        st.caption("✏️ Sold / day typed by you: " + ", ".join(f"{b} {int(v):,}" for b, v in OWN_SPEED.items() if b in buns))
+    own_sales_editor(cfg, can_edit, names, buns, sales, t, {b: sum(batches[b].values()) for b in buns}, "live")
     with st.expander("🗓️ Stock by production date (oldest at the top = sell first)", expanded=True):
         dates = sorted({k for v in batches.values() for k in v})
         if dates:
@@ -2339,6 +2366,65 @@ def page_live(cfg, can_edit):
             h["Limit"] = cap
             st.line_chart(h.set_index("Date"))
 
+
+
+def own_sales_editor(cfg, can_edit, names, buns, sales, t, stock, kp, with_cap=False):
+    """✏️ Your sales / day per bun (+ the max production per day on the plan page). Saved in the settings and used
+    everywhere: 📊 Live stock (days of stock, status), 📅 plan, 🧊 rooms. Returns {bun: your pcs/day}."""
+    app, _n = sales_speed(sales, buns, t, int(cfg["lookback_days"]), raw=True)
+    own = {b: float(_num(v)) for b, v in (cfg.get("sales_per_day") or {}).items() if b in buns and _num(v) > 0}
+    title = ("✏️ Adjust the plan — max production per day, sales / day" if with_cap else "✏️ Adjust sales / day")
+    with st.expander(title + (f" · {len(own)} bun(s) set by you" if own else ""), expanded=False):
+        cap_v = None
+        if with_cap:
+            cA, cB = st.columns([1, 2])
+            cap_v = cA.number_input("🏭 Max production per day (pcs, 0 = no limit)", min_value=0, max_value=500000,
+                                    step=1000, value=int(cfg.get("max_prod_per_day") or 0), key=f"{kp}_cap",
+                                    disabled=not can_edit)
+            box = cB
+        else:
+            box = st
+        box.caption("Sales / day: the app's number comes from the sale journal (average of the selling days). Type "
+                    "your own number to use it instead — in 📊 Live stock, 📅 Next week plan and 🧊 rooms; empty = use "
+                    "the app's. The days of the week keep their shape.")
+        n = st.session_state.get("own_n", 0)
+        edf = pd.DataFrame([{"Bun": b, "Name": names.get(b, ""), "App (pcs/day)": int(round(app.get(b, 0))),
+                             "Your sales / day": (int(own[b]) if b in own else None)}
+                            for b in buns if app.get(b, 0) > 0 or b in own or stock.get(b)])
+        ed = st.data_editor(edf, hide_index=True, width="stretch", key=f"{kp}_own_{n}",
+                            disabled=["Bun", "Name", "App (pcs/day)"] if can_edit else True,
+                            column_config={"Your sales / day": st.column_config.NumberColumn(
+                                "✏️ Your sales / day", min_value=0, max_value=100000, step=10, format="%d",
+                                help="Empty = use the app's number")})
+        if can_edit:
+            b1, b2 = st.columns(2)
+            if b1.button("💾 Save", key=f"{kp}_own_save", type="primary"):
+                new_own = {r["Bun"]: int(_num(r["Your sales / day"])) for r in ed.to_dict("records")
+                           if _num(r["Your sales / day"]) > 0}
+                try:
+                    def _ch(c):
+                        c["sales_per_day"] = new_own
+                        if cap_v is not None:
+                            c["max_prod_per_day"] = int(cap_v)
+                            c["max_prod_set"] = True
+                    update_settings(_ch)
+                    audit("plan settings saved", (f"max/day {int(cap_v):,} · " if cap_v is not None else "")
+                          + "sales/day " + ", ".join(f"{b} {v:,}" for b, v in new_own.items()))
+                    st.session_state["own_flash"] = "✅ Saved — the app uses your sales / day now."
+                except Exception as e:
+                    st.error(f"⚠️ Not saved: {e}")
+                    st.stop()
+                _rerun_here()
+            if b2.button("↺ Use the app's sales / day for all", key=f"{kp}_own_clear", disabled=not own):
+                try:
+                    update_settings(lambda c: c.update(sales_per_day={}))
+                    st.session_state["own_n"] = n + 1
+                except Exception as e:
+                    st.error(f"⚠️ Not saved: {e}")
+                    st.stop()
+                _rerun_here()
+    show_flash("own_flash")
+    return own
 
 def _rerun_here():
     """Refresh only this page (smooth); falls back to a full refresh when not inside a page refresh."""
@@ -3518,70 +3604,7 @@ def page_plan(cfg, can_edit):
     if not cfg.get("max_prod_per_day") and not cfg.get("max_prod_set"):    # old settings files saved 0 = no limit
         cfg = {**cfg, "max_prod_per_day": DEFAULT_SETTINGS["max_prod_per_day"]}
     sp, _n = sales_speed(sales, buns, t, int(cfg["lookback_days"]))
-    app_avg = {b: (sum(fc.get((start + timedelta(days=i), b), 0) for i in range(days)) / days) for b in buns}
-    own = {b: float(v) for b, v in (cfg.get("sales_per_day") or {}).items() if b in buns and _num(v) > 0}
-    with st.expander("✏️ Adjust the plan — max production per day, sales / day"
-                     + (f" · {len(own)} bun(s) set by you" if own else ""), expanded=False):
-        cA, cB = st.columns([1, 2])
-        cap_v = cA.number_input("🏭 Max production per day (pcs, 0 = no limit)", min_value=0, max_value=500000,
-                                step=1000, value=int(cfg.get("max_prod_per_day") or 0), key="plan_cap",
-                                disabled=not can_edit)
-        cB.caption("Sales / day: the app's number comes from the sale journal (same weekday average). Type your own "
-                   "number to plan with it instead; empty = use the app's. The days of the week keep their shape.")
-        edf = pd.DataFrame([{"Bun": b, "Name": names.get(b, ""), "App (pcs/day)": int(round(app_avg[b])),
-                             "Your sales / day": (int(own[b]) if b in own else None)}
-                            for b in buns if app_avg[b] > 0 or b in own or stock_now.get(b)])
-        ed = st.data_editor(edf, hide_index=True, width="stretch", key=f"plan_own_{st.session_state.get('plan_own_n', 0)}",
-                            disabled=["Bun", "Name", "App (pcs/day)"] if can_edit else True,
-                            column_config={"Your sales / day": st.column_config.NumberColumn(
-                                "✏️ Your sales / day", min_value=0, max_value=100000, step=10, format="%d",
-                                help="Empty = use the app's number")})
-        if can_edit:
-            b1, b2 = st.columns(2)
-            if b1.button("💾 Save", key="plan_own_save", type="primary"):
-                new_own = {r["Bun"]: int(_num(r["Your sales / day"])) for r in ed.to_dict("records")
-                           if _num(r["Your sales / day"]) > 0}
-                try:
-                    def _ch(c):
-                        c["sales_per_day"] = new_own
-                        c["max_prod_per_day"] = int(cap_v)
-                        c["max_prod_set"] = True
-                    update_settings(_ch)
-                    audit("plan settings saved", f"max/day {int(cap_v):,} · sales/day " + ", ".join(
-                        f"{b} {v:,}" for b, v in new_own.items()))
-                    st.session_state["plan_flash"] = "✅ Saved — the plan below uses it now."
-                except Exception as e:
-                    st.error(f"⚠️ Not saved: {e}")
-                    st.stop()
-                _rerun_here()
-            if b2.button("↺ Use the app's sales / day for all", key="plan_own_clear", disabled=not own):
-                try:
-                    update_settings(lambda c: c.update(sales_per_day={}))
-                    st.session_state["plan_own_n"] = st.session_state.get("plan_own_n", 0) + 1
-                except Exception as e:
-                    st.error(f"⚠️ Not saved: {e}")
-                    st.stop()
-                _rerun_here()
-    show_flash("plan_flash")
-    for b, v in own.items():                                 # plan with your number, keep the weekday shape
-        for src in (fc,):
-            keys = [k for k in src if k[1] == b]
-            if app_avg.get(b, 0) > 0:
-                f = v / app_avg[b]
-                for k in keys:
-                    src[k] = src[k] * f
-            else:
-                for k in keys:
-                    if sum(src.get((k[0], x), 0) for x in buns) > 0:
-                        src[k] = v
-        sp[b] = v
-    if own and start > t + timedelta(days=1):                # the days before the plan start use your number too
-        stock_now = {b: sum(v.values()) for b, v in batches.items()}
-        for b in buns:
-            per = own.get(b)
-            g = sum((per if per is not None else gap.get((t + timedelta(days=i + 1), b), 0))
-                    for i in range((start - t).days - 1))
-            stock_now[b] = max(stock_now[b] - g, 0)
+    own = own_sales_editor(cfg, can_edit, names, buns, sales, t, stock_now, "plan", with_cap=True)
     plan = plan_production(buns, stock_now, fc, start, days, cfg)
     if own:
         st.info("✏️ Planned with **your sales / day** for: " + ", ".join(f"{b} {int(v):,}" for b, v in own.items()))
