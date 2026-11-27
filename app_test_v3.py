@@ -727,6 +727,15 @@ KM = {
     "pcs, the other buns are lowered first and N1/N2 keep their days.": "គ្រាប់ នំផ្សេងត្រូវបន្ថយមុន ហើយ N1/N2 រក្សាថ្ងៃរបស់វា។",
     "ℹ️ Keeping every bun at its target would need about": "ℹ️ ដើម្បីរក្សានំទាំងអស់តាមគោលដៅ ត្រូវការប្រហែល",
     "in stock, more than the": "ក្នុងស្តុក ច្រើនជាង",
+    "in stock,": "ក្នុងស្តុក,",
+    "more than the": "ច្រើនជាង",
+    "total limit": "កម្រិតសរុប",
+    "but only": "ប៉ុន្តែអាចផលិតបានតែ",
+    "pcs a day": "គ្រាប់ក្នុងមួយថ្ងៃ",
+    "can be made": "ប៉ុណ្ណោះ",
+    "— so these buns end below their target days:": "— ដូច្នេះនំទាំងនេះនៅក្រោមថ្ងៃគោលដៅ:",
+    ". Lower their 🎯 target days in ✏️ Adjust the plan (top of this page) to change this.":
+        "។ បន្ថយ 🎯 ថ្ងៃគោលដៅ ក្នុង ✏️ កែផែនការ (ខាងលើទំព័រនេះ) ដើម្បីផ្លាស់ប្តូរ។",
     "limit — so these buns end below their target days:": "កម្រិត — ដូច្នេះនំទាំងនេះនៅក្រោមថ្ងៃគោលដៅ:",
     ". Raise the limit or lower the target days in ⚙️ Settings to change this.": "។ បង្កើនកម្រិត ឬបន្ថយថ្ងៃគោលដៅក្នុង ⚙️ ការកំណត់ ដើម្បីផ្លាស់ប្តូរ។",
     "— the plan treats their stock as 0.": "— ផែនការគិតស្តុករបស់ពួកវាជា 0។",
@@ -851,7 +860,10 @@ KM = {
     "🏭 Max production per day (pcs, 0 = no limit)": "🏭 ការផលិតអតិបរមាក្នុងមួយថ្ងៃ (គ្រាប់, 0 = គ្មានកម្រិត)",
     "Sales / day: the app's number comes from the sale journal (average of the selling days). Type your own number to use it instead — in 📊 Live stock, 📅 Next week plan and 🧊 rooms; empty = use the app's. The days of the week keep their shape.":
         "ការលក់ / ថ្ងៃ: លេខរបស់កម្មវិធីមកពីបញ្ជីលក់ (មធ្យមនៃថ្ងៃលក់)។ វាយលេខរបស់អ្នក ដើម្បីប្រើលេខនោះជំនួស — ក្នុង 📊 ស្តុកផ្ទាល់, 📅 ផែនការសប្តាហ៍ក្រោយ និង 🧊 បន្ទប់; ទទេ = ប្រើលេខកម្មវិធី។ ថ្ងៃនីមួយៗក្នុងសប្តាហ៍រក្សារូបរាងដដែល។",
-    "✏️ Adjust sales / day": "✏️ កែការលក់ / ថ្ងៃ",
+    "✏️ Adjust sales / day and target days": "✏️ កែការលក់ / ថ្ងៃ និងថ្ងៃគោលដៅ",
+    "✏️ Adjust the plan — max production per day, sales / day, target days": "✏️ កែផែនការ — ការផលិតអតិបរមាក្នុងមួយថ្ងៃ, ការលក់ / ថ្ងៃ, ថ្ងៃគោលដៅ",
+    "🎯 Target days": "🎯 ថ្ងៃគោលដៅ",
+    "How many days of sales to keep in stock for this bun": "ចំនួនថ្ងៃនៃការលក់ ដែលត្រូវទុកក្នុងស្តុកសម្រាប់នំនេះ",
     "✏️ Sold / day typed by you:": "✏️ លក់ / ថ្ងៃ ដែលអ្នកវាយ:",
     "App (pcs/day)": "កម្មវិធី (គ្រាប់/ថ្ងៃ)",
     "✏️ Your sales / day": "✏️ ការលក់ / ថ្ងៃ របស់អ្នក",
@@ -2373,7 +2385,8 @@ def own_sales_editor(cfg, can_edit, names, buns, sales, t, stock, kp, with_cap=F
     everywhere: 📊 Live stock (days of stock, status), 📅 plan, 🧊 rooms. Returns {bun: your pcs/day}."""
     app, _n = sales_speed(sales, buns, t, int(cfg["lookback_days"]), raw=True)
     own = {b: float(_num(v)) for b, v in (cfg.get("sales_per_day") or {}).items() if b in buns and _num(v) > 0}
-    title = ("✏️ Adjust the plan — max production per day, sales / day" if with_cap else "✏️ Adjust sales / day")
+    title = ("✏️ Adjust the plan — max production per day, sales / day, target days" if with_cap
+             else "✏️ Adjust sales / day and target days")
     with st.expander(title + (f" · {len(own)} bun(s) set by you" if own else ""), expanded=False):
         cap_v = None
         if with_cap:
@@ -2388,28 +2401,36 @@ def own_sales_editor(cfg, can_edit, names, buns, sales, t, stock, kp, with_cap=F
                     "your own number to use it instead — in 📊 Live stock, 📅 Next week plan and 🧊 rooms; empty = use "
                     "the app's. The days of the week keep their shape.")
         n = st.session_state.get("own_n", 0)
+        tgt0 = {b: int(cfg["target_days"].get(b, cfg["target_default"])) for b in buns}
         edf = pd.DataFrame([{"Bun": b, "Name": names.get(b, ""), "App (pcs/day)": int(round(app.get(b, 0))),
-                             "Your sales / day": (int(own[b]) if b in own else None)}
+                             "Your sales / day": (int(own[b]) if b in own else None), "Target days": tgt0[b]}
                             for b in buns if app.get(b, 0) > 0 or b in own or stock.get(b)])
         ed = st.data_editor(edf, hide_index=True, width="stretch", key=f"{kp}_own_{n}",
                             disabled=["Bun", "Name", "App (pcs/day)"] if can_edit else True,
                             column_config={"Your sales / day": st.column_config.NumberColumn(
                                 "✏️ Your sales / day", min_value=0, max_value=100000, step=10, format="%d",
-                                help="Empty = use the app's number")})
+                                help="Empty = use the app's number"),
+                                "Target days": st.column_config.NumberColumn(
+                                "🎯 Target days", min_value=1, max_value=30, step=1, format="%d",
+                                help="How many days of sales to keep in stock for this bun")})
         if can_edit:
             b1, b2 = st.columns(2)
             if b1.button("💾 Save", key=f"{kp}_own_save", type="primary"):
                 new_own = {r["Bun"]: int(_num(r["Your sales / day"])) for r in ed.to_dict("records")
                            if _num(r["Your sales / day"]) > 0}
+                new_tgt = {r["Bun"]: max(int(_num(r["Target days"])), 1) for r in ed.to_dict("records")
+                           if _num(r["Target days"]) > 0}
                 try:
                     def _ch(c):
                         c["sales_per_day"] = new_own
+                        c.setdefault("target_days", {}).update(new_tgt)
                         if cap_v is not None:
                             c["max_prod_per_day"] = int(cap_v)
                             c["max_prod_set"] = True
                     update_settings(_ch)
                     audit("plan settings saved", (f"max/day {int(cap_v):,} · " if cap_v is not None else "")
-                          + "sales/day " + ", ".join(f"{b} {v:,}" for b, v in new_own.items()))
+                          + "sales/day " + ", ".join(f"{b} {v:,}" for b, v in new_own.items())
+                          + " · target days " + ", ".join(f"{b} {v}" for b, v in new_tgt.items() if v != tgt0.get(b)))
                     st.session_state["own_flash"] = "✅ Saved — the app uses your sales / day now."
                 except Exception as e:
                     st.error(f"⚠️ Not saved: {e}")
@@ -3636,10 +3657,12 @@ def page_plan(cfg, can_edit):
                   < int(cfg["target_days"].get(b, cfg["target_default"])) - 0.5]
     if short_days:
         need_total = sum(sp[b] * int(cfg["target_days"].get(b, cfg["target_default"])) for b in buns if sp.get(b))
-        st.info(f"ℹ️ Keeping every bun at its target would need about **{int(need_total):,} pcs** in stock, more than the "
-                f"**{int(cfg['max_total']):,}** limit — so these buns end below their target days: "
+        why = (f"more than the **{int(cfg['max_total']):,}** total limit" if need_total > float(cfg["max_total"])
+               else f"but only **{int(cfg.get('max_prod_per_day') or 0):,} pcs a day** can be made")
+        st.info(f"ℹ️ Keeping every bun at its target would need about **{int(need_total):,} pcs** in stock, " + why
+                + " — so these buns end below their target days: "
                 + ", ".join(f"{b} ({last.at[b, 'Stock end of day'] / sp[b]:.1f} d)" for b in short_days)
-                + ". Raise the limit or lower the target days in ⚙️ Settings to change this.")
+                + ". Lower their 🎯 target days in ✏️ Adjust the plan (top of this page) to change this.")
     daily_total = plan.groupby("Date")["Stock end of day"].sum()
     over = daily_total[daily_total > float(cfg["max_total"])]
     tiles([("🏭 To produce", f"{int(plan['Produce'].sum()):,}", f"pcs in {days} days"),
