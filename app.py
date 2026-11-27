@@ -5602,6 +5602,9 @@ def _dashboard_body():
     c1, c2, c3 = st.columns([3, 2, 2])
     q = c1.text_input("🔎 Search", key="dash_q", max_chars=60,
                       placeholder="customer, invoice, province, taxi station, taxi no., staff... (several words = all must match)")
+    period = c1.radio("🗓️ Search in", PERIOD_CHOICES, horizontal=True, key="dash_q_period",
+                      help="Selected day = the board of the date above (you can Check / Edit). This month, last 7 / 30 days "
+                           "or your own dates = find a customer on every day of that time (read only).")
     display = c2.radio("Display", ["📱 Cards", "🖥️ Table"], horizontal=True, index=0 if mobile else 1, key="dash_display")
     with c3:
         st.write("")
@@ -5616,6 +5619,10 @@ def _dashboard_body():
                 st.warning(f"Could not build Excel report: {e}")
         else:
             st.caption("Report download disabled")
+
+    if period != PERIOD_CHOICES[0]:
+        _period_search(q, period, selected_date, can_reports, display)
+        return
 
     with st.expander("🎚️ Filters: region, province, verifier"):
         pick_status = [] if pick_one == "All" else [pick_one]
@@ -5714,6 +5721,223 @@ def _dashboard_body():
     selected = st.session_state.get("sel_cust")
     if selected in set(df_report["Customer"]) and not shown_inline:
         _update_panel(selected, df_report, selected_date)
+
+
+
+# ---- 🗓️ search one customer across many days (this month, last 7 / 30 days, own dates) -------------------------
+PERIOD_CHOICES = ["📅 Selected day", "🗓️ This month", "Last 7 days", "Last 30 days", "✏️ Pick dates"]
+PERIOD_MAX_DAYS = 62
+PERIOD_COLUMNS = ["Date", "Customer", "Invoice", "Status", "កេស", "Packed Cases", "Sent Cases", "Left to send", "Buns",
+                  "Buns total", "Province", "Driver/Station", "Taxi Station", "Taxi No.", "Prepared By", "Handled By",
+                  "Verified By", "Journal Note", "Moved/Cancel Reason"]
+_PERIOD_HAY = ["Customer", "Invoice", "Province", "Region", "Taxi Station", "Taxi No.", "Handled By", "Prepared By",
+               "Assigned To", "Driver/Station", "Verified By", "Status"]
+
+
+@st.cache_resource
+def _period_cache():
+    return {"lock": threading.Lock(), "days": {}}
+
+
+def _report_for_day(day):
+    """build_report of one day, kept a short while (today / yesterday 30 s, older days 10 min) so a month search
+    does not rebuild 30 boards on every refresh."""
+    c = _period_cache()
+    ttl = 30 if day >= today_kh() - timedelta(days=1) else 600
+    with c["lock"]:
+        hit = c["days"].get(day)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    try:
+        df, _cf, _err = build_report(day)
+    except Exception as e:
+        bot_log("warn", "Period search", f"{day}: {str(e)[:120]}", "day skipped")
+        df = pd.DataFrame()
+    with c["lock"]:
+        c["days"][day] = (time.time(), df)
+        if len(c["days"]) > 120:                      # keep the cache small
+            for k in sorted(c["days"], key=lambda k: c["days"][k][0])[:40]:
+                c["days"].pop(k, None)
+    return df
+
+
+def _period_dates(period, selected_date):
+    t = today_kh()
+    if period == "🗓️ This month":
+        d0 = selected_date.replace(day=1)
+        nxt = (d0 + timedelta(days=32)).replace(day=1)
+        return d0, min(nxt - timedelta(days=1), max(t, selected_date))
+    if period == "Last 7 days":
+        return selected_date - timedelta(days=6), selected_date
+    if period == "Last 30 days":
+        return selected_date - timedelta(days=29), selected_date
+    rng = st.date_input("From – to", value=(selected_date.replace(day=1), selected_date), key="dash_q_range",
+                        max_value=t + timedelta(days=7), format="DD/MM/YYYY")
+    if isinstance(rng, (list, tuple)):
+        if len(rng) == 2:
+            return rng[0], rng[1]
+        if len(rng) == 1:
+            return rng[0], rng[0]
+    return rng, rng
+
+
+def _buns_by_type(texts):
+    """'N1 50 · N2 36' texts -> {'N1': 50, 'N2': 36} summed."""
+    out = {}
+    for t in texts:
+        for code, n in re.findall(r"(N\d+[A-Za-z]?)\s+(\d+)", str(t or "")):
+            out[code] = out.get(code, 0) + int(n)
+    return out
+
+
+def _period_search(q, period, selected_date, can_reports, display="🖥️ Table"):
+    d0, d1 = _period_dates(period, selected_date)
+    if d1 < d0:
+        d0, d1 = d1, d0
+    n_days = (d1 - d0).days + 1
+    if n_days > PERIOD_MAX_DAYS:
+        st.warning(f"Please pick {PERIOD_MAX_DAYS} days or less (you picked {n_days}).")
+        return
+    st.caption(f"🗓️ Searching **{d0:%d %b %Y} – {d1:%d %b %Y}** ({n_days} days) · read only — choose "
+               "📅 Selected day to Check / Edit a customer.")
+    words = q.strip().split()
+    if not words:
+        st.info("🔎 Type a customer name (or invoice, province, driver...) in Search to see that customer on every "
+                "day of this time.")
+        return
+    frames = []
+    bar = st.progress(0.0, text="Reading the days…") if n_days > 3 else None
+    for i in range(n_days):
+        d = d0 + timedelta(days=i)
+        df = _report_for_day(d)
+        if not df.empty:
+            hay = df.reindex(columns=_PERIOD_HAY).fillna("").astype(str).agg(" ".join, axis=1)
+            m = pd.Series(True, index=df.index)
+            for w in words:
+                m &= hay.str.contains(w, case=False, regex=False, na=False)
+            if m.any():
+                f = df[m].copy()
+                f.insert(0, "Date", d)
+                frames.append(f)
+        if bar is not None:
+            bar.progress((i + 1) / n_days, text=f"Reading the days… {d:%d %b}")
+    if bar is not None:
+        bar.empty()
+    if not frames:
+        st.info(f"No customer matches “{q.strip()}” between {d0:%d %b} and {d1:%d %b}.")
+        return
+    res = pd.concat(frames, ignore_index=True)
+    for c in PERIOD_COLUMNS:
+        if c not in res.columns:
+            res[c] = ""
+    for c in ("កេស", "Packed Cases", "Sent Cases", "Left to send", "Buns total"):
+        res[c] = pd.to_numeric(res[c], errors="coerce").fillna(0).astype(int)
+    res = res.sort_values(["Customer", "Date"], ascending=[True, False]).reset_index(drop=True)
+    custs = res["Customer"].nunique()
+    st.success(f"🔎 **{len(res)}** day(s) found for **{custs}** customer(s) between {d0:%d %b} and {d1:%d %b}.")
+
+    # one line per customer: the whole time together
+    summ = []
+    for cust, g in res.groupby("Customer", sort=True):
+        stc = g["Status"].value_counts()
+        buns = _buns_by_type(g["Buns"])
+        summ.append({"Customer": cust, "Days": int(g["Date"].nunique()),
+                     "First": g["Date"].min().strftime("%d/%m"), "Last": g["Date"].max().strftime("%d/%m"),
+                     "កេស ordered": int(g["កេស"].sum()), "Packed": int(g["Packed Cases"].sum()),
+                     "Sent": int(g["Sent Cases"].sum()), "Left to send": int(g["Left to send"].sum()),
+                     "Buns total": int(g["Buns total"].sum()),
+                     "Buns by type": " · ".join(f"{k} {v:,}" for k, v in sorted(buns.items(), key=lambda x: (len(x[0]), x[0]))),
+                     "Status days": " · ".join(f"{k.split(' ')[0]} {int(stc[k])}" for k in STATUS_RANK if int(stc.get(k, 0)))})
+    summ = pd.DataFrame(summ)
+    if not display.endswith("Table"):
+        _period_cards(res, summ, d0, d1)
+    else:
+        _period_tables(res, summ)
+    if can_reports:
+        _period_excel(res, summ, d0, d1)
+
+
+def _period_cards(res, summ, d0, d1):
+    """📱 Cards: one total card per customer, then the day cards (newest first), read only."""
+    st.markdown("##### 🧾 Total for the time")
+    parts = []
+    for r in summ.to_dict("records"):
+        left = f" · <b>{r['Left to send']} left</b>" if r["Left to send"] else ""
+        parts.append(
+            "<div class='hk-card' style='border-left:6px solid #1565c0'>"
+            f"<div class='hk-top'><span class='hk-name'>{_e(r['Customer'])}</span>"
+            f"<span class='hk-badge' style='background:#1565c0;color:#fff'>🗓️ {r['Days']} day(s)</span></div>"
+            f"<div class='hk-sub'>{_e(r['First'])} – {_e(r['Last'])} · {_e(r['Status days'])}</div>"
+            f"<div class='hk-nums'><span>កេស <b>{r['កេស ordered']:,}</b></span><span>📦 <b>{r['Packed']:,}</b></span>"
+            f"<span>🚚 sent <b>{r['Sent']:,}</b>{left}</span><span>🥐 <b>{r['Buns total']:,}</b></span></div>"
+            + (f"<div class='hk-note'>🥐 {_e(r['Buns by type'])}</div>" if r["Buns by type"] else "")
+            + "</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+    st.markdown("##### 📅 Every day")
+    page = 30
+    sig = (str(d0), str(d1), len(res))
+    if st.session_state.get("_period_sig") != sig:
+        st.session_state["_period_sig"] = sig
+        st.session_state["period_card_limit"] = page
+    limit = st.session_state.get("period_card_limit", page)
+    d = res.sort_values(["Date", "Customer"], ascending=[False, True]).head(limit)
+    parts, last = [], None
+    counts = res.groupby("Date").size().to_dict()
+    for r in d.to_dict("records"):
+        if r["Date"] != last:
+            last = r["Date"]
+            parts.append(f"<div class='hk-group'>📅 {r['Date']:%a %d %b} ({counts[last]})</div>")
+        for k, v in (("🔥", ""), ("Area", ""), ("Time", "-"), ("Prepared By", "-"), ("Assigned To", "-"),
+                     ("Journal Note", "-"), ("Handled By", "-"), ("Driver/Station", "-"), ("Verified By", "-"),
+                     ("Invoice", "-"), ("Province", "")):
+            if r.get(k) is None or (isinstance(r.get(k), float) and pd.isna(r.get(k))):
+                r[k] = v
+        try:
+            parts.append(card_html(r))
+        except Exception:
+            parts.append(f"<div class='hk-card'><b>{_e(r['Customer'])}</b> · {_e(r['Status'])}</div>")
+    st.markdown("".join(parts), unsafe_allow_html=True)
+    st.caption(f"Showing {min(limit, len(res))} of {len(res)} day cards")
+    if len(res) > limit and st.button(f"⬇️ Show {page} more", key="period_card_more"):
+        st.session_state["period_card_limit"] = limit + page
+        try:
+            st.rerun(scope="fragment")
+        except TypeError:
+            st.rerun()
+
+
+def _period_tables(res, summ):
+    st.markdown("##### 🧾 Total for the time")
+    show_df(summ, key="dash_period_sum")
+    st.markdown("##### 📅 Every day")
+    det = res[PERIOD_COLUMNS].copy()
+    det["Date"] = [f"{d:%a %d/%m}" for d in res["Date"]]
+    show_df(det, height=min(80 + 35 * len(det), 560), key="dash_period_det", column_config={
+        "Customer": st.column_config.TextColumn("Customer", width="large"),
+        "Status": st.column_config.TextColumn("Status", width="medium"),
+        "Buns": st.column_config.TextColumn("Buns", width="large")})
+
+
+def _period_excel(res, summ, d0, d1):
+    """📥 the search as Excel: Total + Every day."""
+    if True:
+        try:
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                summ.to_excel(w, index=False, sheet_name="Total")
+                out = res[PERIOD_COLUMNS].copy()
+                out["Date"] = pd.to_datetime(out["Date"]).dt.date
+                hide_money(out).to_excel(w, index=False, sheet_name="Every day")
+                for ws in w.sheets.values():
+                    for col in ws.columns:
+                        ws.column_dimensions[col[0].column_letter].width = min(
+                            max(len(str(c.value or "")) for c in col[:200]) + 2, 45)
+            st.download_button("📥 Download this search (Excel)", data=buf.getvalue(),
+                               file_name=f"Customer_search_{d0:%Y%m%d}-{d1:%Y%m%d}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dash_period_xl")
+        except Exception as e:
+            st.warning(f"Could not build the Excel file: {e}")
 
 
 def _update_panel(selected, df_report, selected_date):
@@ -15392,3 +15616,4 @@ elif _label.startswith("📸"):
     tab_media()
 else:
     tab_bot()
+    
